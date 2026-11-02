@@ -57,27 +57,8 @@ pub(crate) struct PlatformSpecificEventLoopAttributes {
     pub(crate) forced_backend: Option<Backend>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApplicationName {
-    pub general: String,
-    pub instance: String,
-}
-
-impl ApplicationName {
-    #[cfg(wayland_platform)]
-    pub fn new(general: String, instance: String) -> Self {
-        Self { general, instance }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct PlatformSpecificWindowAttributes {
-    pub name: Option<ApplicationName>,
-    /// The launcher's startup-notification token (`DESKTOP_STARTUP_ID` on X11, `XDG_ACTIVATION_TOKEN` on Wayland).
-    pub activation_token: Option<String>,
-    /// The X11 window's background (`0x00RRGGBB`) and top-left gravity.
-    pub x11_background: Option<u32>,
-}
+mod attributes;
+pub use attributes::{ApplicationName, PlatformSpecificWindowAttributes};
 
 #[cfg(x11_platform)]
 pub(crate) static X11_BACKEND: Lazy<Mutex<Result<Arc<XConnection>, XNotSupported>>> =

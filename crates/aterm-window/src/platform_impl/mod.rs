@@ -12,6 +12,10 @@ use crate::window::Fullscreen as RootFullscreen;
 
 #[cfg(any(x11_platform, wayland_platform))]
 mod linux;
+// Exercise the actual Linux attribute formatter on other test hosts without a display server.
+#[cfg(all(test, not(any(x11_platform, wayland_platform))))]
+#[path = "linux/attributes.rs"]
+mod linux_attributes_tests;
 #[cfg(macos_platform)]
 mod macos;
 #[cfg(windows_platform)]
