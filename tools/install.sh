@@ -122,6 +122,19 @@
 # `ship site` publishes it); piped, it installs from alabsystems/aterm. The
 # same file at the public main's tip:
 #   curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash
+# Any shell but bash stops at this one line, before the whole-file group, and
+# says to run the script with bash. zsh parses the group and runs it by zsh's
+# rules (`curl … | zsh`): ${!name} is a bad substitution there, so the toolset
+# and PATH halves read as excluded and --no-toolchain's lasting
+# `auto_install = false` was written though no flag asked for it, and every
+# release tag failed its check. dash (the `sh` of Debian and Ubuntu, where
+# `curl … | sh` is the usual way in) and ksh cannot parse the group at all, so
+# a stop inside it never ran for them: they printed a syntax error from deep
+# in the file (round 13). A shell reads and runs a script's top-level commands
+# one at a time, so this line runs before any of the group is parsed; for bash
+# it does nothing, and a download cut short inside it runs no more than its
+# test.
+[ -n "${BASH_VERSION:-}" ] || { echo "install.sh: run this installer with bash: curl -fsSL https://alab.systems/install.sh | bash (or: bash install.sh)" >&2; exit 2; }
 # The whole-file guard (WHOLE-FILE EXECUTION GUARD, at main): this group runs
 # to the file's last line, and bash runs none of it until all of it arrived.
 {
@@ -130,16 +143,7 @@
 # failing command, before it prints what failed, and its caller reads the
 # empty answer as "nothing failed". This script is written for bash's own
 # mode, so it leaves POSIX mode before anything runs (bash 4.4 and later keep
-# inherit_errexit on after that). dash stops before any of it runs: it
-# cannot parse the whole-file group. zsh parses it and runs it by zsh's rules
-# (`curl … | zsh`): ${!name} is a bad substitution there, so the toolset and
-# PATH halves read as excluded and --no-toolchain's lasting
-# `auto_install = false` was written though no flag asked for it, and every
-# release tag failed its check. So any shell but bash stops here, first.
-if [ -z "${BASH_VERSION:-}" ]; then
-	echo "install.sh: run this installer with bash: curl -fsSL https://alab.systems/install.sh | bash (or: bash install.sh)" >&2
-	exit 2
-fi
+# inherit_errexit on after that).
 set +o posix
 shopt -u inherit_errexit 2>/dev/null || :
 set -euo pipefail
@@ -1011,12 +1015,14 @@ temp_dir() { # <var> <dir> <prefix>
 }
 
 # Set TMP to the run's private download folder in TMPDIR, with <cleanup> as
-# the EXIT trap that removes it. The trap is set before the folder is made,
-# and the folder named before it exists (temp_dir): made by mktemp -d first,
-# with the trap set after, one a Ctrl-C caught in between stayed.
+# the EXIT trap that removes it, then the run's ASKED (drop_asked): each
+# <cleanup> turns set -e off first, so a step of it that fails ends neither it
+# nor the trap. The trap is set before the folder is made, and the folder named
+# before it exists (temp_dir): made by mktemp -d first, with the trap set
+# after, one a Ctrl-C caught in between stayed.
 make_download_dir() { # <cleanup>
 	TMP=""
-	trap "$1" EXIT
+	trap "$1; drop_asked" EXIT
 	temp_dir TMP "${TMPDIR:-/tmp}" aterm-install || {
 		echo "install.sh: cannot create a private folder under ${TMPDIR:-/tmp}" >&2
 		exit 1
@@ -2167,12 +2173,16 @@ find_managed_targo() { # <root>
 		# the refusal when nothing else is in reach (find_cargo_and_rustup).
 		MANAGED_ROOT_REFUSED="$aterm"
 	elif [[ -n "$aterm" ]]; then
-		out="$("$aterm" pkg which targo 2>/dev/null | head -n 1 || true)"
+		# Asked as every binary is asked what it knows (first_line_bounded):
+		# a wedged aterm or one macOS's check holds, which the pre-flight may
+		# have cut off already, held the run with no end, and one that read
+		# its stdin swallowed the rest of a piped script.
+		out="$(first_line_bounded "$aterm" pkg which targo)"
 		case "$out" in
 		*" — SHADOWED by "*)
 			# A foreign targo ahead of the managed bin/ on PATH: the alias
 			# names the managed copy (route 1 above).
-			out="$("$aterm" pkg which alab-targo 2>/dev/null | head -n 1 || true)"
+			out="$(first_line_bounded "$aterm" pkg which alab-targo)"
 			;;
 		esac
 		case "$out" in
@@ -2833,7 +2843,9 @@ linux_verifier_ready() { # <arch>
 		return 0
 	fi
 	linux_verifier_cleanup
-	trap linux_verifier_cleanup EXIT
+	# set -e holds in a trap: an rm that cannot remove all of the folder ended
+	# the trap there, before drop_asked, and with its own status for the run's.
+	trap 'linux_verifier_cleanup || true; drop_asked' EXIT
 	temp_dir LINUX_VERIFIER_DIR "${TMPDIR:-/tmp}" aterm-verifier || {
 		LINUX_VERIFIER_WHY="cannot create a private directory for the bootstrap verifier under ${TMPDIR:-/tmp}"
 		return 1
@@ -4592,10 +4604,11 @@ root_entry() { # <path>
 
 # first_line_bounded <exe> [args…] -> the first line a run that finished printed,
 # or nothing: what a binary says it is (`--version`), asked of one this installer
-# placed or one it did not. It runs through bounded: on /dev/null (under
-# `curl … | bash` the inherited stdin is the rest of this script, which a binary
-# that reads it would swallow), in its own process group, and cut off at
-# VERIFY_WAIT_SECS. A run cut off answered nothing, whatever it printed first.
+# placed or one it did not. It runs through bounded (ask_bounded): on /dev/null
+# (under `curl … | bash` the inherited stdin is the rest of this script, which a
+# binary that reads it would swallow), in its own process group, and cut off at
+# VERIFY_WAIT_SECS. A run cut off answered nothing, whatever it printed first,
+# and a binary ask_bounded took as wedged answers nothing at once.
 # Every caller runs it in a subshell, a $(…) or a pipeline's, which starts
 # with the run's traps reset, so it sets them again (end_on_ctrl_c): a Ctrl-C
 # then removes its file there, which the run's own shell never named.
@@ -4605,9 +4618,112 @@ first_line_bounded() {
 	end_on_ctrl_c
 	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
 	probe_temp out aterm-probe || return 0
-	BOUNDED_OUT="$out" BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" "$@" || s=$?
+	BOUNDED_OUT="$out" BOUNDED_ERR=/dev/null ask_bounded "$@" || s=$?
 	[[ "$s" -eq 124 ]] || head -n 1 "$out"
 	rm -f "$out"
+}
+
+# `bounded "$VERIFY_WAIT_SECS" <exe> [args…]`, for asking <exe> what it is or
+# what it knows, with what the asks learn kept in ASKED (keep_asked), since each
+# step asks from a $(…), which keeps nothing: a `ran <device> <inode>` line for
+# each binary seen to start, which ended with a status other than 124 (the
+# deadline's), 126 or 127 (which may be the shell's own failure to exec it), or
+# 129, 130, 131 or 143 (an interrupt's), and a `cut <device> <inode>` line for
+# each taken as wedged. Both are read through links, as `-ef` reads them: a
+# link to a binary is that binary, and one renamed into a binary's place since
+# (the app swap, the store's rename) is asked afresh. A binary not seen to
+# start that is cut off may be in its first exec's wait on macOS's check, which
+# can take minutes while syspolicyd is backed up and goes on past the cut-off
+# (showed_it_ran): it is asked once more at once, and cut off again it is taken
+# as wedged, answering 124 at once with nothing run for the rest of the run. So
+# a wedged binary costs the run two detectors however many steps ask it: the
+# pre-flight, install_cli, toolset_driver, setup_aterm and secrets_aterm ask
+# the same bundle. One seen to start is past that check, so a later cut-off of
+# it (a lock, a machine swapping hard) is that ask's alone, and the next ask
+# runs it. showed_it_ran asks for itself: its proof is a run it watched write a
+# line or end, which ASKED does not keep. With no ASKED, one that cannot be
+# written, or a binary stat cannot read, each ask runs once, as bounded runs it.
+ask_bounded() { # <exe> [args…]
+	local id s=0
+	id="$(asked_id "$1")"
+	if [[ -z "$id" ]]; then
+		bounded "$VERIFY_WAIT_SECS" "$@" || s=$?
+		return "$s"
+	fi
+	! asked_has "cut $id" || return 124
+	bounded "$VERIFY_WAIT_SECS" "$@" || s=$?
+	if [[ "$s" -eq 124 ]] && ! asked_has "ran $id" && asked_ready; then
+		s=0
+		bounded "$VERIFY_WAIT_SECS" "$@" || s=$?
+		[[ "$s" -ne 124 ]] || asked_note "cut $id"
+	fi
+	case "$s" in
+	124 | 126 | 127 | 129 | 130 | 131 | 143) ;;
+	*) asked_note "ran $id" ;;
+	esac
+	return "$s"
+}
+
+# The file ask_bounded keeps what the run's asks learned in, or nothing.
+ASKED=""
+
+# The `<device> <inode>` of the file <exe> names, read through links, or
+# nothing: with no ASKED, or when stat cannot read it.
+asked_id() { # <exe>
+	[[ -n "${ASKED:-}" ]] || return 0
+	if [[ "$OSTYPE" == darwin* ]]; then
+		/usr/bin/stat -L -f '%d %i' -- "$1" 2>/dev/null || true
+	else
+		stat -L -c '%d %i' -- "$1" 2>/dev/null || true
+	fi
+}
+
+# Whether ASKED holds <line>.
+asked_has() { # <line>
+	grep -Fqx -- "$1" "$ASKED" 2>/dev/null
+}
+
+# Whether ASKED can take a note, made first when nothing is at its name: mode
+# 0600, as probe_temp makes a file, so a run that asks no binary makes none.
+# Whichever subshell makes it, the run's own shell named it, and removes it
+# (drop_asked).
+asked_ready() {
+	[[ -n "${ASKED:-}" ]] || return 1
+	[[ -e "$ASKED" || -L "$ASKED" ]] || (umask 077 && set -C && : >"$ASKED") 2>/dev/null || true
+	[[ -f "$ASKED" && ! -L "$ASKED" && -w "$ASKED" ]]
+}
+
+# Add <line> to ASKED, once; a note that cannot be written is lost, and the
+# next ask runs as if it had not been made.
+asked_note() { # <line>
+	! asked_has "$1" || return 0
+	asked_ready || return 0
+	printf '%s\n' "$1" 2>/dev/null >>"$ASKED" || true
+}
+
+# Whether an ask of this run took <exe> as wedged (ask_bounded).
+asked_wedged() { # <exe>
+	local id
+	id="$(asked_id "$1")"
+	[[ -n "$id" ]] && asked_has "cut $id"
+}
+
+# Name ASKED, once, in the run's own shell, so every step's subshell reads and
+# adds to the same file: after run_as_home_account and uninstall_everything,
+# whose exec runs no EXIT trap, and before the pre-flight, which asks a damaged
+# bundle at DEST what it is. Only named here (temp_path): the run's first note
+# makes it (asked_ready). The EXIT trap that removes it (drop_asked) is set
+# first, and the EXIT traps set later (make_download_dir's,
+# linux_verifier_ready's) run it too. With no name drawn, ASKED is empty.
+keep_asked() {
+	ASKED=""
+	trap drop_asked EXIT
+	ASKED="$(temp_path "${TMPDIR:-/tmp}" aterm-asked)" || ASKED=""
+}
+
+# Remove ASKED, a step of every EXIT trap of a run (keep_asked).
+drop_asked() {
+	[[ -z "${ASKED:-}" ]] || rm -f -- "$ASKED" 2>/dev/null || true
 }
 
 # Whether <exe> has shown it ran, asked `--version` through bounded; when it
@@ -4788,7 +4904,7 @@ find_bundle_cli() {
 		for b in aterm-cli aterm-ctl atpkg aterm-fleet aterm-drive; do
 			[[ -x "$m/$b" ]] || { ok=0; break; }
 		done
-		if [[ "$ok" -eq 1 ]] && may_run "$m/aterm-cli" && BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" "$m/aterm-cli" --version; then
+		if [[ "$ok" -eq 1 ]] && may_run "$m/aterm-cli" && BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null ask_bounded "$m/aterm-cli" --version; then
 			echo "$m/aterm-cli"
 			return 0
 		fi
@@ -4796,9 +4912,19 @@ find_bundle_cli() {
 	return 0
 }
 
-# The folders find_bundle_cli asks for an aterm.app, in its order.
+# The folders find_bundle_cli asks for an aterm.app, in its order, each once
+# (a folder by its name, or by `-ef` through another spelling or a link): DEST
+# is often ATERM_INSTALL_DIR, /Applications or ~/Applications, and named twice,
+# each of its bundles was asked twice.
 bundle_dirs() {
-	printf '%s\n' ${DEST:+"$DEST"} ${ATERM_INSTALL_DIR:+"$ATERM_INSTALL_DIR"} /Applications "$HOME/Applications"
+	local c d seen=()
+	for c in ${DEST:+"$DEST"} ${ATERM_INSTALL_DIR:+"$ATERM_INSTALL_DIR"} /Applications "$HOME/Applications"; do
+		for d in ${seen[@]+"${seen[@]}"}; do
+			if [[ "$c" == "$d" || "$c" -ef "$d" ]]; then continue 2; fi
+		done
+		seen+=("$c")
+		printf '%s\n' "$c"
+	done
 }
 
 # Under root on macOS, the first folder another account can change on the way
@@ -4836,11 +4962,19 @@ root_bundle_refusal() { # <folder> [<remedy>]
 }
 
 # The aterm install_toolchain drives, as `run <path>`: the `aterm` in BIN_DIR,
-# else an installed bundle's; or, as `skip <reason>`, why it drives none.
+# else an installed bundle's; or, as `skip <reason>`, why it drives none. A
+# BIN_DIR aterm an ask of this run took as wedged (asked_wedged) is not handed
+# to `pkg seed`, which runs with no deadline.
 toolset_driver() {
-	local a="$BIN_DIR/aterm"
+	local a="$BIN_DIR/aterm" wedged=""
+	if [[ -x "$a" ]] && asked_wedged "$a"; then
+		wedged="$a"
+		a=""
+	fi
 	[[ -x "$a" ]] || a="$(find_bundle_cli)"
-	if [[ -z "$a" || ! -x "$a" ]]; then
+	if [[ -z "$a" && -n "$wedged" ]]; then
+		echo "skip $wedged did not answer when this run asked it what it is (cut off twice at ${VERIFY_WAIT_SECS}s), so it is not run with no deadline — run install.sh again in 10 minutes, or after a restart"
+	elif [[ -z "$a" || ! -x "$a" ]]; then
 		echo "skip no installed \`aterm\` to drive it"
 	elif ! may_run "$a"; then
 		echo "skip another account can change $a (or a folder or link on its way), so root does not run it — run the install as that account, or set ATERM_BIN_DIR and ATERM_STORE_DIR to folders root owns"
@@ -4894,11 +5028,25 @@ setup_aterm() { # <verb> <bin-dir> <store-dir> <app-dir>...
 		done
 		asked+=("$c")
 		first_line_bounded "$c" --version | grep -q '^aterm ' || continue
-		BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" "$c" pkg help "$verb" || continue
+		BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null ask_bounded "$c" pkg help "$verb" || continue
 		echo "$c"
 		return 0
 	done
 	return 0
+}
+
+# Whether `<exe> pkg help <verb>`, asked as setup_aterm asks it (ask_bounded),
+# ends 0 and names <word>: a run cut off answered nothing.
+help_names() { # <exe> <verb> <word>
+	local out s=0
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
+	probe_temp out aterm-probe || return 1
+	BOUNDED_OUT="$out" BOUNDED_ERR=/dev/null ask_bounded "$1" pkg help "$2" || s=$?
+	if [[ "$s" -ne 0 ]] || ! grep -qF -- "$3" "$out"; then
+		s=1
+	fi
+	rm -f "$out"
+	return "$s"
 }
 
 # The aterm that runs `aterm members join --no-wait` (or, for an older one or
@@ -4935,8 +5083,8 @@ secrets_aterm() { # <bin-dir> <store-dir> <app-dir>...
 # member, then types the phrase that member shows into `aterm members join`
 # here (docs/DESIGN-fluid-swarm-2026-10-28.md §3.3.3). It also joins the ALab
 # vault without waiting and starts this Mac's vault subscriber, which asks the
-# members again every minute while the Mac waits, so a member away when this
-# ran shows the request too. An aterm older than the members verb, or an
+# members again while the Mac waits (after 1, 2, 4 and 8 minutes, then every
+# 15), so a member away when this ran shows the request too. An aterm older than the members verb, or an
 # ATERM_INSTALL_VAULT_URL, runs `aterm secrets join --no-wait` instead
 # (docs/DESIGN-alab-swarm-2026-10-27.md §5.3, C6). Best effort and silent when
 # neither an ALab member nor the vault answers.
@@ -5230,6 +5378,113 @@ persist_no_toolchain() { # <cfg>
 	echo "install.sh: --no-toolchain: wrote \`[packages] auto_install = false\` into $cfg — $NO_TOOLCHAIN_EFFECT"
 }
 
+# --- the cli half: the one `aterm` command, preferring the installed bundle ----
+# Current releases use Contents/MacOS/aterm for the session, window and product
+# commands. The preferred install symlinks that executable; the previous separate
+# CLI toolset is accepted below for compatibility. Neither bundle lane builds
+# source, and the link tracks app updates at the same path.
+
+# What the line that reports placing <exe> names it: the first line of its
+# `--version` (first_line_bounded), or, when that gave none (a run cut off, or
+# one that printed nothing), aterm and that it did not say its version.
+placed_name() { # <exe>
+	local said
+	said="$(first_line_bounded "$1" --version)"
+	printf '%s' "${said:-aterm (it did not say its version)}"
+}
+
+install_cli() {
+	local target="" o
+	[[ "$LINUX_APP_INSTALLED" -eq 1 ]] || target="$(find_bundle_cli)"
+	if [[ "$LINUX_APP_INSTALLED" -eq 1 ]]; then
+		# The app half already landed the released Linux binary in the store and
+		# exposed the `aterm` symlink (place_store_binary); a source build here
+		# would replace that verified release with an unverified dev build.
+		PLACED_ATERM="$STORE_DIR/aterm"
+	elif [[ -n "$target" ]]; then
+		PLACED_ATERM="$target"
+		# One name on PATH (the [workspace.metadata.atpkg] expose declaration):
+		# `aterm` alone — a symlink at the bundle's one binary (or, against a
+		# previous-generation bundle, its aterm-cli front door).
+		claim_bin_aterm || return 0
+		ln -sfn "$target" "$BIN_DIR/aterm"
+		BIN_ATERM_EXPOSED=1
+		echo "install.sh: linked $(placed_name "$BIN_DIR/aterm") -> $BIN_DIR/aterm (follows the app's updates)"
+	elif [[ -n "$CLI_CARGO_SKIP" ]]; then
+		# Neither source is available here: no installed bundle ships the
+		# toolset (older release, or no app), and the build fallback is
+		# impossible for the pre-flighted reason.
+		o="$(root_bundle_unsealed)"
+		if [[ -n "$o" ]]; then
+			echo "install.sh: SKIPPED the CLI (aterm): $(root_bundle_refusal "$o" 1), and $CLI_CARGO_SKIP" >&2
+		elif [[ "$(uname -s)" == Darwin ]]; then
+			echo "install.sh: SKIPPED the CLI (aterm): no installed aterm.app ships the toolset (newer releases do — update or reinstall the app first), and $CLI_CARGO_SKIP" >&2
+		else
+			# No bundle exists off macOS: the released binary is the app half's,
+			# and this run did not install it (its own line says why).
+			echo "install.sh: SKIPPED the CLI (aterm): this run installed no released aterm (see the app line), and $CLI_CARGO_SKIP" >&2
+		fi
+		return 0
+	else
+		o="$(root_bundle_unsealed)"
+		[[ -z "$o" ]] || echo "install.sh: the CLI is built from source: $(root_bundle_refusal "$o")"
+		install_cli_from_source
+	fi
+	retire_exposed_siblings
+	setup_completions_and_man
+	# The hand-edit PATH hint waits for the end of the run, which prints it only
+	# when no managed PATH block exists (wire_shell_path edits that profile).
+	CLI_PATH_HINT_WANTED=1
+	INSTALLED_ANY=1
+}
+
+# Man pages, shell completions and the Linux desktop entry, by the aterm just
+# placed (`aterm pkg shell-setup`): completions only for the `aterm` PATH
+# resolves to (BIN_ATERM_EXPOSED — otherwise they would complete someone else's
+# binary), man pages and icons from a checkout, else (a piped run has none —
+# Linux delivery is one signed binary) the ones the binary carries: its icons
+# whenever no --icons is named, its page by --own-man, asked only of a binary
+# whose shell-setup names the flag (an older one would refuse the whole call).
+# Best effort, never fatal: the binary is in place either way.
+setup_completions_and_man() {
+	local aterm want=0 own_man=0
+	local args=(pkg shell-setup --bin-dir "$BIN_DIR" --man-root "${ATERM_MAN_DIR:-$HOME/.local/share/man}")
+	if [[ "$BIN_ATERM_EXPOSED" -eq 1 ]]; then
+		args+=(--completions)
+		want=1
+	else
+		echo "install.sh: shell completions: skipped — $BIN_DIR/aterm is not this installer's"
+	fi
+	if [[ -n "$ROOT" && -d "$ROOT/man" ]]; then
+		args+=(--man "$ROOT/man")
+		want=1
+	else
+		own_man=1
+		want=1
+	fi
+	if [[ "$(uname -s)" == Linux ]]; then
+		args+=(--desktop)
+		want=1
+		[[ -n "$ROOT" && -d "$ROOT/assets/linux/icons/hicolor" ]] &&
+			args+=(--icons "$ROOT/assets/linux/icons/hicolor")
+	fi
+	[[ "$want" -eq 1 ]] || return 0
+	aterm="$(setup_aterm shell-setup "$BIN_DIR" "$STORE_DIR" ${DEST:+"$DEST"})"
+	# With none, the line says why: the binary this run placed was taken as
+	# wedged (asked_wedged), so no answer says what it has, or none has the verb.
+	if [[ -z "$aterm" && -n "${PLACED_ATERM:-}" ]] && asked_wedged "$PLACED_ATERM"; then
+		echo "install.sh: NOTE: $PLACED_ATERM did not answer when this run asked it what it is (cut off twice at ${VERIFY_WAIT_SECS}s), so completions, man pages and the desktop entry were not set up — run \`aterm pkg shell-setup --completions\` in 10 minutes, or after a restart" >&2
+		return 0
+	elif [[ -z "$aterm" ]]; then
+		echo "install.sh: NOTE: no installed aterm has \`aterm pkg shell-setup\` yet — completions, man pages and the desktop entry come with it: run \`aterm pkg shell-setup --completions\` after its next update" >&2
+		return 0
+	fi
+	if [[ "$own_man" -eq 1 ]] && help_names "$aterm" shell-setup --own-man; then
+		args+=(--own-man)
+	fi
+	"$aterm" "${args[@]}" </dev/null || true
+}
+
 # Land one binary in the private store and expose it: the argv0 verb siblings
 # beside it, the single `aterm` symlink on PATH. Shared by both producers — the
 # source build and the released Linux binary — so the two lanes cannot drift
@@ -5263,6 +5518,356 @@ place_store_binary() {
 	expose_store_binary
 }
 
+install_cli_from_source() {
+	echo "install.sh: building aterm from $ROOT at $(checkout_git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo '(not a git checkout)')"
+	# Pin the target dir (a global CARGO_TARGET_DIR / build.target-dir redirect
+	# would strand the fresh binaries elsewhere) but NEVER a --target triple:
+	# cargo withholds [target.*] rustflags from HOST units (build scripts, proc
+	# macros, and their dependencies) whenever an explicit target is set — the
+	# flag, CARGO_BUILD_TARGET, or [build] target — and this repo compiles with
+	# Trust, whose rustup lane carries its off-switch in exactly those rustflags
+	# (CARGO_UNVERIFIED_LANE). Under a pinned triple the host units
+	# lose them, and on rustup's lane verify strictly and fail closed (first
+	# casualty: shlex, under cc). A plain host build applies them to every unit
+	# and lands the binary
+	# at the ONE deterministic path target/release/. CARGO_BUILD_TARGET is
+	# unset for the same reason; a [build] target redirect in user cargo
+	# config cannot be neutralized from here, so the freshness proof below
+	# turns that into a loud abort instead of a stale (or missing) install.
+	local rel="$ROOT/target/release"
+	# The rename at the end replaces the store's aterm: asked here first, so one
+	# that stays costs no build; place_store_binary asks again before the rename.
+	may_replace "$STORE_DIR/aterm" || exit 1
+	# Existence-after-build IS the freshness proof: cargo always re-links a
+	# deleted output, so a redirected build can never leave a previous build's
+	# binary here to be silently installed.
+	rm -f "$rel/aterm"
+	# ONE shipped binary carries the session, window and product commands
+	# in-process (`-p aterm` pulls their library graph). Development-only tools
+	# retain separate executables. cargo_build_pinned
+	# runs the pre-flighted $CARGO_BIN (find_cargo_and_rustup +
+	# cargo_honours_pin) on the lane the pre-flight took: the aterm-managed
+	# store's targo on its explicit `--unverified` lane, the store's bin dir
+	# first on PATH and RUSTC/CARGO_BUILD_RUSTC scrubbed, so its compiler is
+	# the trustc beside it ($CARGO_RUSTC); else rustup's proxy with
+	# RUSTUP_TOOLCHAIN scrubbed as the probes had it, and $CARGO_HOME/bin
+	# then its own dir first on PATH so that cargo's `rustc` is the proxy
+	# proved with it ($CARGO_RUSTC). It never runs PATH's bare `cargo` or
+	# `rustc`, which differ on a Mac whose login shell put Homebrew's ahead
+	# of rustup's.
+	echo "install.sh: toolchain ${CARGO_TOOLCHAIN%% (*}: $CARGO_VERSION ($CARGO_BIN)"
+	local built=0
+	cargo_build_pinned "$ROOT" || built=$?
+	if [[ "$built" -ne 0 ]]; then
+		# Under `set -e` a failed build would end the run with cargo's own
+		# status and no line of this script's: say what it means here.
+		echo "install.sh: the source build failed (cargo exit $built, its error above) — the \`aterm\` command was not installed" >&2
+		exit 1
+	fi
+	if [[ ! -x "$rel/aterm" ]]; then
+		echo "install.sh: the build finished but produced no $rel/aterm — a [build] target in your cargo config redirected it; remove that setting (or install the released app instead: tools/install.sh --no-cli)" >&2
+		exit 1
+	fi
+	# STORE_DIR was pre-flighted (created + writability-checked) before the build.
+	place_store_binary "$rel/aterm"
+	PLACED_ATERM="$STORE_DIR/aterm"
+	echo "install.sh: installed $(placed_name "$STORE_DIR/aterm") -> $STORE_DIR"
+	say_store_command ""
+}
+
+expose_store_binary() {
+	# argv0 compatibility aliases point to the same executable, as in the app
+	# bundle, so older scripts invoking aterm-ctl, atpkg, aterm-fleet or
+	# aterm-drive still reach their in-process entry points.
+	local alias
+	for alias in $STORE_ALIASES; do
+		ln -sfn aterm "$STORE_DIR/$alias"
+	done
+	# The entry on PATH only when it is ours to write (claim_bin_aterm): a
+	# leftover regular file from a pre-store install is replaced — it would
+	# shadow the store — and anything foreign is left, SKIPPED. Which of the two
+	# happened is BIN_ATERM_EXPOSED, so no caller claims a PATH entry it left.
+	BIN_ATERM_EXPOSED=0
+	claim_bin_aterm || return 0
+	ln -sfn "$STORE_DIR/aterm" "$BIN_DIR/aterm"
+	BIN_ATERM_EXPOSED=1
+}
+
+# The store lanes' PATH line, true either way: the one command when
+# expose_store_binary linked it, else where the command is and why PATH's is not it.
+say_store_command() { # <what the command is>
+	if [[ "$BIN_ATERM_EXPOSED" -eq 1 ]]; then
+		echo "  ONE command on PATH: $BIN_DIR/aterm$1"
+	else
+		echo "  NOT on PATH: $BIN_DIR/aterm is not this installer's (SKIPPED above) — run $STORE_DIR/aterm, or move that file aside and re-run"
+	fi
+}
+
+# Whether $BIN_DIR/aterm may be (re)written, per bin_aterm_verdict: absent or
+# ours, yes; a pre-store aterm file, yes — removed first, and said; anything
+# else, no — SKIPPED with the uninstaller's line and left exactly as it is.
+claim_bin_aterm() {
+	local p="$BIN_DIR/aterm" verdict
+	verdict="$(bin_aterm_verdict "$p" "$STORE_DIR")"
+	case "$verdict" in
+	absent | ours) return 0 ;;
+	pre-store)
+		rm -f "$p" || return 1
+		echo "install.sh: replaced $p — a regular file from a pre-store install that answers as aterm; left in place it would shadow the managed command"
+		return 0
+		;;
+	esac
+	ownership_skip "$p" "${verdict#foreign }"
+	return 1
+}
+
+# Reduce an absolute spelling without I/O, retaining every byte in a component.
+zsh_rc_lexical() { # <output-variable> <path>
+	local zl_rest="$2" zl_part zl_path=""
+	[[ "$zl_rest" == /* ]] || return 1
+	while [[ -n "$zl_rest" ]]; do
+		zl_part="${zl_rest%%/*}"
+		if [[ "$zl_rest" == */* ]]; then zl_rest="${zl_rest#*/}"; else zl_rest=""; fi
+		case "$zl_part" in
+		'' | .) ;;
+		..) zl_path="${zl_path%/*}" ;;
+		*) zl_path="$zl_path/$zl_part" ;;
+		esac
+	done
+	printf -v "$1" '%s' "${zl_path:-/}"
+}
+
+# macOS canonical/case equivalence, component by component, without looking up a
+# pathname. The stock interpreter's core modules operate only on stdin. Its empty
+# environment and taint mode exclude user Perl startup options and module paths.
+# Invalid UTF-8 components retain byte identity with ASCII case folding, as the
+# native guard does. A sentinel preserves every trailing LF in the result.
+zsh_rc_fold_mac() { # <output-variable> <path>
+	local zm_value
+	[[ -x /usr/bin/perl ]] || return 1
+	zm_value="$(
+		printf '%s' "$2" | /usr/bin/env -i LC_ALL=C /usr/bin/perl -T \
+			-MUnicode::Normalize=NFD -MEncode=decode,encode,FB_CROAK -Mfeature=fc -e '
+binmode STDIN, ":raw";
+binmode STDOUT, ":raw";
+local $/;
+my $raw = <STDIN> // "";
+my @folded;
+for my $part (split m{/}, $raw, -1) {
+    my $copy = $part;
+    my $text = eval { decode("UTF-8", $copy, FB_CROAK) };
+    if ($@) {
+        $part =~ tr/A-Z/a-z/;
+        push @folded, $part;
+    } else {
+        push @folded, encode("UTF-8", NFD(fc(NFD($text))));
+    }
+}
+print join "/", @folded;
+' && printf '\001'
+	)" || return 1
+	zm_value="${zm_value%$'\001'}"
+	printf -v "$1" '%s' "$zm_value"
+}
+
+# The same consent roots as atpkg/protected.rs. Call before querying a candidate,
+# including a link's target text; a lexical prefix must never request consent.
+# macOS conservatively reserves case/canonical aliases on case-sensitive volumes
+# too. The subshell keeps byte locale and nocasematch from changing its caller.
+zsh_rc_protected() ( # <normalized-path> <home>...
+	local zp_path="$1" zp_home zp_rest
+	shift
+	local LC_ALL=C
+	shopt -u nocasematch
+	if [[ "$OSTYPE" == darwin* ]]; then
+		shopt -s nocasematch
+		if [[ "$zp_path" == *[$'\200'-$'\377']* ]]; then
+			zsh_rc_fold_mac zp_path "$zp_path" || return 0
+		fi
+	fi
+	case "$zp_path" in /Volumes | /Volumes/*) return 0 ;; esac
+	for zp_home in "$@"; do
+		if [[ "$OSTYPE" == darwin* && "$zp_home" == *[$'\200'-$'\377']* ]]; then
+			zsh_rc_fold_mac zp_home "$zp_home" || return 0
+		fi
+		zp_home="${zp_home%/}"
+		case "$zp_path" in "$zp_home"/*) zp_rest="${zp_path:${#zp_home}+1}" ;; *) continue ;; esac
+		case "$zp_rest" in
+		Documents | Documents/* | Desktop | Desktop/* | Downloads | Downloads/* | \
+			Pictures | Pictures/* | Movies | Movies/* | Music | Music/* | \
+			Library/Mobile\ Documents | Library/Mobile\ Documents/* | \
+			Library/CloudStorage | Library/CloudStorage/* | \
+			Library/Containers | Library/Containers/* | Library/Group\ Containers | Library/Group\ Containers/*)
+			return 0 ;;
+		esac
+	done
+	return 1
+)
+
+# Small I/O boundaries: a test can refuse a protected query before it happens.
+zsh_rc_path_kind() { # <output-variable> <admitted-path>
+	local zk_kind
+	if [[ -L "$2" ]]; then zk_kind=link
+	elif [[ -d "$2" ]]; then zk_kind=dir
+	elif [[ -f "$2" ]]; then zk_kind=file
+	elif [[ -e "$2" ]]; then zk_kind=other
+	elif [[ -d "${2%/*}" && ! -x "${2%/*}" ]]; then return 1
+	else zk_kind=missing; fi
+	printf -v "$1" '%s' "$zk_kind"
+}
+
+zsh_rc_readlink() { # <output-variable> <admitted-link>
+	local zr_text
+	# -n emits only target bytes; a sentinel keeps command substitution from
+	# eating LF bytes in the target itself. BSD readlink without -n coalesces an
+	# ending LF with its output terminator, so stripping one would lose data.
+	zr_text="$(readlink -n "$2" && printf '\001')" || return 1
+	zr_text="${zr_text%$'\001'}"
+	printf -v "$1" '%s' "$zr_text"
+}
+
+# Walk raw components after lexical admission; reducing link/.. first would
+# erase the link's meaning. Missing descendants are legitimate ZDOTDIRs.
+# Refusal is 3 for escape from a redirected HOME, 2 for a protected path, and
+# 1 for unknown or unusable paths. Only an inherited escape permits fallback.
+zsh_rc_walk() { # <path-output> <kind-output> <path> <confined-home-or-empty> <home>...
+	local zw_out="$1" zw_kind_out="$2" zw_rest="$3" zw_root="$4"
+	local zw_named zw_path=/ zw_next zw_part zw_kind=dir zw_link zw_links=0
+	shift 4
+	zsh_rc_lexical zw_named "$zw_rest" || return 1
+	[[ -z "$zw_root" || "$zw_named" == "$zw_root" || "$zw_named" == "$zw_root"/* ]] || return 3
+	zsh_rc_protected "$zw_named" "$@" && return 2
+	while [[ -n "$zw_rest" ]]; do
+		zw_part="${zw_rest%%/*}"
+		if [[ "$zw_rest" == */* ]]; then zw_rest="${zw_rest#*/}"; else zw_rest=""; fi
+		case "$zw_part" in
+		'' | .) continue ;;
+		..)
+			[[ -z "$zw_root" || "$zw_path" != "$zw_root" ]] || return 3
+			zw_path="${zw_path%/*}"
+			zw_path="${zw_path:-/}"
+			continue ;;
+		esac
+		zw_next="${zw_path%/}/$zw_part"
+		if [[ -n "$zw_root" && "$zw_next" != "$zw_root" && "$zw_next" != "$zw_root"/* && "$zw_root" != "$zw_next"/* ]]; then
+			return 3
+		fi
+		zsh_rc_protected "$zw_next" "$@" && return 2
+		zsh_rc_path_kind zw_kind "$zw_next" || return 1
+		case "$zw_kind" in
+		link)
+			zw_links=$((zw_links + 1))
+			[[ "$zw_links" -le 32 ]] || return 1
+			zsh_rc_readlink zw_link "$zw_next" || return 1
+			[[ "$zw_link" == /* ]] || zw_link="${zw_path%/}/$zw_link"
+			zsh_rc_lexical zw_named "$zw_link" || return 1
+			[[ -z "$zw_root" || "$zw_named" == "$zw_root" || "$zw_named" == "$zw_root"/* ]] || return 3
+			zsh_rc_protected "$zw_named" "$@" && return 2
+			zw_rest="$zw_link${zw_rest:+/$zw_rest}"
+			zw_path=/
+			;;
+		dir | missing) zw_path="$zw_next" ;;
+		file) [[ -z "$zw_rest" ]] || return 1; zw_path="$zw_next" ;;
+		*) return 1 ;;
+		esac
+	done
+	printf -v "$zw_out" '%s' "$zw_path"
+	printf -v "$zw_kind_out" '%s' "$zw_kind"
+}
+
+# The twin of atpkg/zdotdir.rs: inherited environment (confined when HOME is
+# redirected), then HOME without startup files, then zsh's explicit answer.
+# Assign a variable: printing through command substitution loses trailing LF.
+# Root never queries startup paths. A text-first walk refuses protected targets
+# before metadata, and a fresh nonce plus byte count binds the binary reply.
+zsh_rc_dir() { # <output-variable>
+	printf -v "$1" '%s' ''
+	local zrc_uid zrc_named zrc_home zrc_kind zrc_account zrc_physical zrc_own=0
+	local zrc_roots=() zrc_accounts=() zrc_file zrc_seen=0 zrc_zsh="" zrc_dir="" zrc_confine=""
+	local zrc_tmp zrc_nonce zrc_begin zrc_end zrc_field zrc_count zrc_finish zrc_status=0
+	zrc_uid="$(installer_uid)"
+	[[ "$zrc_uid" != 0 ]] || return 0
+	zsh_rc_lexical zrc_named "$HOME" || return 0
+	zrc_roots+=("$zrc_named")
+	while IFS= read -r zrc_account; do
+		zsh_rc_lexical zrc_account "$zrc_account" || continue
+		zrc_roots+=("$zrc_account")
+		zrc_accounts+=("$zrc_account")
+	done <<<"$(account_homes "$zrc_uid")"
+	zsh_rc_walk zrc_home zrc_kind "$HOME" "" "${zrc_roots[@]}" || return 0
+	[[ "$zrc_kind" == dir || "$zrc_kind" == missing ]] || return 0
+	zrc_roots+=("$zrc_home")
+	for zrc_account in ${zrc_accounts[@]+"${zrc_accounts[@]}"}; do
+		if [[ "$zrc_account" == "$zrc_named" ]] ||
+			{ zsh_rc_walk zrc_physical zrc_kind "$zrc_account" "" "${zrc_roots[@]}" && [[ "$zrc_physical" == "$zrc_home" ]]; }; then
+			zrc_own=1
+			break
+		fi
+	done
+	if [[ "${ZDOTDIR:-}" == /* ]]; then
+		zrc_dir="$ZDOTDIR"
+		if [[ "$zrc_own" -eq 0 ]]; then
+			zrc_confine="$zrc_home"
+			case "$zrc_dir" in
+			"$HOME" | "$HOME"/*) zrc_dir="$zrc_home${zrc_dir#"$HOME"}" ;;
+			"$zrc_named" | "$zrc_named"/*) zrc_dir="$zrc_home${zrc_dir#"$zrc_named"}" ;;
+			esac
+		fi
+		if zsh_rc_walk zrc_physical zrc_kind "$zrc_dir" "$zrc_confine" "${zrc_roots[@]}"; then
+			[[ "$zrc_kind" == dir || "$zrc_kind" == missing ]] || return 0
+			printf -v "$1" '%s' "$ZDOTDIR"
+			return 0
+		else
+			zrc_status=$?
+			[[ -n "$zrc_confine" && "$zrc_status" -eq 3 ]] || return 0
+		fi
+	fi
+	for zrc_file in /etc/zshenv /etc/zsh/zshenv "$HOME/.zshenv"; do
+		zsh_rc_walk zrc_physical zrc_kind "$zrc_file" "" "${zrc_roots[@]}" || return 0
+		case "$zrc_kind" in
+		missing) ;;
+		file) [[ -r "$zrc_physical" ]] || return 0; zrc_seen=1 ;;
+		*) return 0 ;;
+		esac
+	done
+	if [[ "$zrc_seen" -eq 0 ]]; then printf -v "$1" '%s' "$HOME"; return 0; fi
+	for zrc_file in /bin/zsh /usr/bin/zsh; do
+		[[ -x "$zrc_file" ]] && { zrc_zsh="$zrc_file"; break; }
+	done
+	[[ -n "$zrc_zsh" ]] || return 0
+	zrc_nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" || return 0
+	[[ "${#zrc_nonce}" -eq 32 && "$zrc_nonce" != *[!0-9a-f]* ]] || return 0
+	zrc_begin="install.sh-zdotdir:$zrc_nonce:begin"
+	zrc_end="install.sh-zdotdir:$zrc_nonce:end"
+	zrc_status=0
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
+	probe_temp zrc_tmp aterm-zdotdir || return 0
+	(
+		unset ZDOTDIR
+		cd "$HOME" 2>/dev/null && BOUNDED_ERR=/dev/null bounded 5 "$zrc_zsh" -c \
+			"builtin setopt nomultibyte; builtin printf '\\0%s\\0%d\\0%s\\0%s\\0' '$zrc_begin' \"\${#\${ZDOTDIR-}}\" \"\${ZDOTDIR-}\" '$zrc_end'"
+	) >"$zrc_tmp" || zrc_status=$?
+	# Change byte counting only after startup has run with its inherited locale.
+	local LC_ALL=C
+	zrc_seen=0
+	if [[ "$zrc_status" -ne 124 ]]; then
+		while IFS= read -r -d '' zrc_field; do
+			[[ "$zrc_field" == "$zrc_begin" ]] || continue
+			IFS= read -r -d '' zrc_count && IFS= read -r -d '' zrc_dir && IFS= read -r -d '' zrc_finish || break
+			[[ "$zrc_count" == "${#zrc_dir}" && "$zrc_finish" == "$zrc_end" ]] && zrc_seen=1
+			break
+		done <"$zrc_tmp"
+	fi
+	rm -f "$zrc_tmp"
+	[[ "$zrc_seen" -eq 1 ]] || return 0
+	[[ -n "$zrc_dir" ]] || zrc_dir="$HOME"
+	if zsh_rc_walk zrc_physical zrc_kind "$zrc_dir" "" "${zrc_roots[@]}" &&
+		[[ "$zrc_kind" == dir || "$zrc_kind" == missing ]]; then
+		printf -v "$1" '%s' "$zrc_dir"
+	fi
+	return 0
+}
+
 # The hand-edit hint for a $BIN_DIR that PATH lacks, naming the rc a new
 # terminal's login shell reads; silent when $BIN_DIR is on PATH.
 cli_path_hint() {
@@ -5272,9 +5877,11 @@ cli_path_hint() {
 	*)
 		case "${SHELL##*/}" in
 		zsh)
-			# zsh reads $ZDOTDIR/.zshrc, and never ~/.zshrc, when ZDOTDIR is set.
-			rc_name="$HOME/.zshrc"
-			if [[ "${ZDOTDIR:-}" == /* ]]; then rc_name="$ZDOTDIR/.zshrc"; fi
+			# zsh reads $ZDOTDIR/.zshrc, and never ~/.zshrc, when ZDOTDIR is
+			# set, here or only in zsh's own zshenv files (zsh_rc_dir).
+			zsh_rc_dir f
+			rc_name="zsh's .zshrc (zsh did not say which folder it reads it from)"
+			[[ -z "$f" ]] || rc_name="$f/.zshrc"
 			;;
 		bash)
 			rc_name="$HOME/.bashrc"
@@ -5351,8 +5958,9 @@ uninstall_everything() {
 	for p in "${paths[@]}" "$store" "${ATERM_MAN_DIR:-$HOME/.local/share/man}/man1/aterm.1"; do
 		[[ -e "$p" || -L "$p" ]] && echo "  $p" >&2
 	done
-	local zdot=()
-	[[ "${ZDOTDIR:-}" == /* && "$ZDOTDIR" != "$HOME" ]] && zdot=("$ZDOTDIR/.zshrc")
+	local zdot=() zdir
+	zsh_rc_dir zdir
+	[[ -n "$zdir" && "$zdir" != "$HOME" ]] && zdot=("$zdir/.zshrc")
 	for p in ${zdot[@]+"${zdot[@]}"} "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" \
 		"${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"; do
 		grep -qF '>>> aterm ALab toolset' "$p" 2>/dev/null && echo "  $p: the marker-fenced aterm block" >&2
@@ -5649,6 +6257,7 @@ if [[ "$DO_UNINSTALL" -eq 1 ]]; then
 	uninstall_everything
 	exit $?
 fi
+keep_asked
 # Install-mode --dry-run deliberately has no dispatch here: the pre-flights
 # below are read-only under DRY_RUN (ensure_dirs_writable), and the plan
 # prints once they have decided everything — see print_install_plan.
@@ -6296,204 +6905,6 @@ install_linux_app() {
 	LINUX_APP_INSTALLED=1
 }
 
-# --- the cli half: the one `aterm` command, preferring the installed bundle ----
-# Current releases use Contents/MacOS/aterm for the session, window and product
-# commands. The preferred install symlinks that executable; the previous separate
-# CLI toolset is accepted below for compatibility. Neither bundle lane builds
-# source, and the link tracks app updates at the same path.
-
-install_cli() {
-	local target="" o
-	[[ "$LINUX_APP_INSTALLED" -eq 1 ]] || target="$(find_bundle_cli)"
-	if [[ "$LINUX_APP_INSTALLED" -eq 1 ]]; then
-		# The app half already landed the released Linux binary in the store and
-		# exposed the `aterm` symlink (place_store_binary); a source build here
-		# would replace that verified release with an unverified dev build.
-		PLACED_ATERM="$STORE_DIR/aterm"
-	elif [[ -n "$target" ]]; then
-		PLACED_ATERM="$target"
-		# One name on PATH (the [workspace.metadata.atpkg] expose declaration):
-		# `aterm` alone — a symlink at the bundle's one binary (or, against a
-		# previous-generation bundle, its aterm-cli front door).
-		claim_bin_aterm || return 0
-		ln -sfn "$target" "$BIN_DIR/aterm"
-		BIN_ATERM_EXPOSED=1
-		echo "install.sh: linked $(first_line_bounded "$BIN_DIR/aterm" --version) -> $BIN_DIR/aterm (follows the app's updates)"
-	elif [[ -n "$CLI_CARGO_SKIP" ]]; then
-		# Neither source is available here: no installed bundle ships the
-		# toolset (older release, or no app), and the build fallback is
-		# impossible for the pre-flighted reason.
-		o="$(root_bundle_unsealed)"
-		if [[ -n "$o" ]]; then
-			echo "install.sh: SKIPPED the CLI (aterm): $(root_bundle_refusal "$o" 1), and $CLI_CARGO_SKIP" >&2
-		elif [[ "$(uname -s)" == Darwin ]]; then
-			echo "install.sh: SKIPPED the CLI (aterm): no installed aterm.app ships the toolset (newer releases do — update or reinstall the app first), and $CLI_CARGO_SKIP" >&2
-		else
-			# No bundle exists off macOS: the released binary is the app half's,
-			# and this run did not install it (its own line says why).
-			echo "install.sh: SKIPPED the CLI (aterm): this run installed no released aterm (see the app line), and $CLI_CARGO_SKIP" >&2
-		fi
-		return 0
-	else
-		o="$(root_bundle_unsealed)"
-		[[ -z "$o" ]] || echo "install.sh: the CLI is built from source: $(root_bundle_refusal "$o")"
-		install_cli_from_source
-	fi
-	retire_exposed_siblings
-	setup_completions_and_man
-	# The hand-edit PATH hint waits for the end of the run, which prints it only
-	# when no managed PATH block exists (wire_shell_path edits that profile).
-	CLI_PATH_HINT_WANTED=1
-	INSTALLED_ANY=1
-}
-
-install_cli_from_source() {
-	echo "install.sh: building aterm from $ROOT at $(checkout_git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo '(not a git checkout)')"
-	# Pin the target dir (a global CARGO_TARGET_DIR / build.target-dir redirect
-	# would strand the fresh binaries elsewhere) but NEVER a --target triple:
-	# cargo withholds [target.*] rustflags from HOST units (build scripts, proc
-	# macros, and their dependencies) whenever an explicit target is set — the
-	# flag, CARGO_BUILD_TARGET, or [build] target — and this repo compiles with
-	# Trust, whose rustup lane carries its off-switch in exactly those rustflags
-	# (CARGO_UNVERIFIED_LANE). Under a pinned triple the host units
-	# lose them, and on rustup's lane verify strictly and fail closed (first
-	# casualty: shlex, under cc). A plain host build applies them to every unit
-	# and lands the binary
-	# at the ONE deterministic path target/release/. CARGO_BUILD_TARGET is
-	# unset for the same reason; a [build] target redirect in user cargo
-	# config cannot be neutralized from here, so the freshness proof below
-	# turns that into a loud abort instead of a stale (or missing) install.
-	local rel="$ROOT/target/release"
-	# The rename at the end replaces the store's aterm: asked here first, so one
-	# that stays costs no build; place_store_binary asks again before the rename.
-	may_replace "$STORE_DIR/aterm" || exit 1
-	# Existence-after-build IS the freshness proof: cargo always re-links a
-	# deleted output, so a redirected build can never leave a previous build's
-	# binary here to be silently installed.
-	rm -f "$rel/aterm"
-	# ONE shipped binary carries the session, window and product commands
-	# in-process (`-p aterm` pulls their library graph). Development-only tools
-	# retain separate executables. cargo_build_pinned
-	# runs the pre-flighted $CARGO_BIN (find_cargo_and_rustup +
-	# cargo_honours_pin) on the lane the pre-flight took: the aterm-managed
-	# store's targo on its explicit `--unverified` lane, the store's bin dir
-	# first on PATH and RUSTC/CARGO_BUILD_RUSTC scrubbed, so its compiler is
-	# the trustc beside it ($CARGO_RUSTC); else rustup's proxy with
-	# RUSTUP_TOOLCHAIN scrubbed as the probes had it, and $CARGO_HOME/bin
-	# then its own dir first on PATH so that cargo's `rustc` is the proxy
-	# proved with it ($CARGO_RUSTC). It never runs PATH's bare `cargo` or
-	# `rustc`, which differ on a Mac whose login shell put Homebrew's ahead
-	# of rustup's.
-	echo "install.sh: toolchain ${CARGO_TOOLCHAIN%% (*}: $CARGO_VERSION ($CARGO_BIN)"
-	local built=0
-	cargo_build_pinned "$ROOT" || built=$?
-	if [[ "$built" -ne 0 ]]; then
-		# Under `set -e` a failed build would end the run with cargo's own
-		# status and no line of this script's: say what it means here.
-		echo "install.sh: the source build failed (cargo exit $built, its error above) — the \`aterm\` command was not installed" >&2
-		exit 1
-	fi
-	if [[ ! -x "$rel/aterm" ]]; then
-		echo "install.sh: the build finished but produced no $rel/aterm — a [build] target in your cargo config redirected it; remove that setting (or install the released app instead: tools/install.sh --no-cli)" >&2
-		exit 1
-	fi
-	# STORE_DIR was pre-flighted (created + writability-checked) before the build.
-	place_store_binary "$rel/aterm"
-	PLACED_ATERM="$STORE_DIR/aterm"
-	echo "install.sh: installed $(first_line_bounded "$STORE_DIR/aterm" --version) -> $STORE_DIR"
-	say_store_command ""
-}
-
-expose_store_binary() {
-	# argv0 compatibility aliases point to the same executable, as in the app
-	# bundle, so older scripts invoking aterm-ctl, atpkg, aterm-fleet or
-	# aterm-drive still reach their in-process entry points.
-	local alias
-	for alias in $STORE_ALIASES; do
-		ln -sfn aterm "$STORE_DIR/$alias"
-	done
-	# The entry on PATH only when it is ours to write (claim_bin_aterm): a
-	# leftover regular file from a pre-store install is replaced — it would
-	# shadow the store — and anything foreign is left, SKIPPED. Which of the two
-	# happened is BIN_ATERM_EXPOSED, so no caller claims a PATH entry it left.
-	BIN_ATERM_EXPOSED=0
-	claim_bin_aterm || return 0
-	ln -sfn "$STORE_DIR/aterm" "$BIN_DIR/aterm"
-	BIN_ATERM_EXPOSED=1
-}
-
-# The store lanes' PATH line, true either way: the one command when
-# expose_store_binary linked it, else where the command is and why PATH's is not it.
-say_store_command() { # <what the command is>
-	if [[ "$BIN_ATERM_EXPOSED" -eq 1 ]]; then
-		echo "  ONE command on PATH: $BIN_DIR/aterm$1"
-	else
-		echo "  NOT on PATH: $BIN_DIR/aterm is not this installer's (SKIPPED above) — run $STORE_DIR/aterm, or move that file aside and re-run"
-	fi
-}
-
-# Whether $BIN_DIR/aterm may be (re)written, per bin_aterm_verdict: absent or
-# ours, yes; a pre-store aterm file, yes — removed first, and said; anything
-# else, no — SKIPPED with the uninstaller's line and left exactly as it is.
-claim_bin_aterm() {
-	local p="$BIN_DIR/aterm" verdict
-	verdict="$(bin_aterm_verdict "$p" "$STORE_DIR")"
-	case "$verdict" in
-	absent | ours) return 0 ;;
-	pre-store)
-		rm -f "$p" || return 1
-		echo "install.sh: replaced $p — a regular file from a pre-store install that answers as aterm; left in place it would shadow the managed command"
-		return 0
-		;;
-	esac
-	ownership_skip "$p" "${verdict#foreign }"
-	return 1
-}
-
-# Man pages, shell completions and the Linux desktop entry, by the aterm just
-# placed (`aterm pkg shell-setup`): completions only for the `aterm` PATH
-# resolves to (BIN_ATERM_EXPOSED — otherwise they would complete someone else's
-# binary), man pages and icons from a checkout, else (a piped run has none —
-# Linux delivery is one signed binary) the ones the binary carries: its icons
-# whenever no --icons is named, its page by --own-man, asked only of a binary
-# whose shell-setup names the flag (an older one would refuse the whole call).
-# Best effort, never fatal: the binary is in place either way.
-setup_completions_and_man() {
-	local aterm want=0 own_man=0
-	local args=(pkg shell-setup --bin-dir "$BIN_DIR" --man-root "${ATERM_MAN_DIR:-$HOME/.local/share/man}")
-	if [[ "$BIN_ATERM_EXPOSED" -eq 1 ]]; then
-		args+=(--completions)
-		want=1
-	else
-		echo "install.sh: shell completions: skipped — $BIN_DIR/aterm is not this installer's"
-	fi
-	if [[ -n "$ROOT" && -d "$ROOT/man" ]]; then
-		args+=(--man "$ROOT/man")
-		want=1
-	else
-		own_man=1
-		want=1
-	fi
-	if [[ "$(uname -s)" == Linux ]]; then
-		args+=(--desktop)
-		want=1
-		[[ -n "$ROOT" && -d "$ROOT/assets/linux/icons/hicolor" ]] &&
-			args+=(--icons "$ROOT/assets/linux/icons/hicolor")
-	fi
-	[[ "$want" -eq 1 ]] || return 0
-	aterm="$(setup_aterm shell-setup "$BIN_DIR" "$STORE_DIR" ${DEST:+"$DEST"})"
-	if [[ -z "$aterm" ]]; then
-		echo "install.sh: NOTE: no installed aterm has \`aterm pkg shell-setup\` yet — completions, man pages and the desktop entry come with it: run \`aterm pkg shell-setup --completions\` after its next update" >&2
-		return 0
-	fi
-	if [[ "$own_man" -eq 1 ]]; then
-		local usage
-		usage="$("$aterm" pkg help shell-setup </dev/null 2>/dev/null)" || usage=""
-		[[ "$usage" == *--own-man* ]] && args+=(--own-man)
-	fi
-	"$aterm" "${args[@]}" </dev/null || true
-}
-
 # --- the toolset half: what "installing aterm" is for ---------------------------
 # docs/GOLDEN-INSTALL-PATH.md §1: "Installing aterm installs all those packages."
 #
@@ -6563,15 +6974,15 @@ install_toolchain() {
 # --- PATH, for shells that are not aterm ------------------------------------------
 # atpkg writes a per-shell hook into ~/.aterm/shell.d on every install, and its
 # seed, install and update passes append a block sourcing it to each EXISTING
-# ~/.zshrc, ~/.bashrc, ~/.bash_profile or ~/.config/fish/config.fish, creating
-# only the login shell's own rc when it is absent (the account record's shell,
-# never $SHELL). The installed aterm's `pkg shell-setup --path` adds ONE
-# marker-fenced block — the hook when a toolset is installed or coming, and
-# $BIN_DIR when PATH lacks it — to the rc that same login shell reads (zsh's
-# under $ZDOTDIR when that is set; a macOS login bash's first of
+# .zshrc (the one zsh reads: in the ZDOTDIR this environment or zsh's zshenv
+# files set, else ~), ~/.bashrc, ~/.bash_profile or ~/.config/fish/config.fish,
+# creating only the login shell's own rc when it is absent (the account
+# record's shell, never $SHELL). The installed aterm's `pkg shell-setup --path`
+# adds ONE marker-fenced block — the hook when a toolset is installed or
+# coming, and $BIN_DIR when PATH lacks it — to the rc that same login shell
+# reads (zsh's in that same ZDOTDIR; a macOS login bash's first of
 # ~/.bash_profile, ~/.bash_login and ~/.profile that exists; fish's under
-# $XDG_CONFIG_HOME), made
-# when absent, which `self-uninstall` undoes. PATH_BLOCK_WROTE says a block
+# $XDG_CONFIG_HOME), made when absent, which `self-uninstall` undoes. PATH_BLOCK_WROTE says a block
 # stands; without a runnable aterm nothing is written, and the hand-edit hint
 # below says what to add.
 wire_shell_path() {
