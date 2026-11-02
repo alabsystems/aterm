@@ -229,10 +229,6 @@ const CHANGING_READS: u8 = 10;
 /// whenever its window regains focus (§3.6).
 pub(crate) const TOKEN_LOOK: Duration = Duration::from_secs(60);
 
-/// How recently a keyboard, mouse or trackpad must have been used for the page to answer a
-/// setup offer by itself ([`App::person_at_this_screen`]): a person who just opened aterm has.
-pub(crate) const PERSON_PRESENT_WITHIN: Duration = Duration::from_secs(60);
-
 /// How a request to read the shown page's rows went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observe {
@@ -621,7 +617,7 @@ impl App {
         }
         self.refresh_system_state_tab_indicators();
         self.system_state_host.action_refusal = None;
-        // The page answers the offer on its first tick with a person at this Mac: tick now.
+        // The page answers the offer automatically on its first tick.
         self.system_state_host.next_tick = None;
         self.system_state_host.latest_status = SetupStatus::default();
         let views: Vec<_> = self
@@ -982,16 +978,12 @@ impl App {
         if self.system_state_access_step() != self.system_state_host.access_step {
             self.publish_system_state(self.system_state_host.latest_status.clone());
         }
-        // `present` only lets the page answer the offer by itself, so the input and screen
-        // readings (an IOKit and a window server read on this thread) are made only while an
-        // offer waits.
-        let present = self.system_state_host.pending.is_some() && self.person_at_this_screen();
         // The village walks only on a page someone can see, and only where a
         // view someone sees draws it.
         let seen = self.system_state_seen_views(instance);
         let changed = self
             .native_runtime
-            .tick_system_state(present, !shown.is_empty(), &seen);
+            .tick_system_state(false, !shown.is_empty(), &seen);
         self.drain_system_state_actions();
         if !self.system_state_host.status_in_flight {
             self.system_state_host.next_status.get_or_insert(now);
@@ -1258,15 +1250,6 @@ impl App {
             self.system_state_host.shown = false;
             self.system_state_host.next_tick = Some(Instant::now());
         }
-    }
-
-    /// Whether a person is at this Mac's screen: a keyboard, mouse or trackpad was used within
-    /// [`PERSON_PRESENT_WITHIN`], and this login's screen is neither locked nor switched away
-    /// for another login. The page answers a setup offer by itself only then, so a window that
-    /// opened with nobody there (a launch from another Mac, a login with nobody at the screen)
-    /// changes nothing until a person comes (SAFE-1).
-    fn person_at_this_screen(&self) -> bool {
-        (self.user_input_recent)(PERSON_PRESENT_WITHIN) && !(self.screen_away)()
     }
 
     /// Ask the worker for a fresh, prompt-free reading of every row for the

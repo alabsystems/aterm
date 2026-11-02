@@ -1481,6 +1481,10 @@ fn the_page_answers_the_offer_without_waiting_for_screen_presence() {
         }
         receive.try_recv().is_ok()
     };
+    assert!(answers(
+        |_| panic!("startup must not read recent input"),
+        || panic!("startup must not read screen presence")
+    ));
     assert!(answers(|within| within >= Duration::from_secs(5), || false));
     assert!(answers(
         |within| within >= Duration::from_secs(10 * 60),
