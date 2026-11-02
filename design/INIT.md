@@ -114,7 +114,7 @@ Validated locally with Trust's explicitly unverified build lane (no proof claim)
 
 Several existing test fixtures contained doubled `/Users//` paths that disagreed with the account paths produced by the implementation. These were normalized in test code; no production account paths changed.
 
-Delivery remains local on `codex/lan-init`. GitHub's routed write decision is `write_none`; no configured owner writer is available. The installed app and remote admission service have not been replaced. The native System State interface and full single-coordinator design remain future implementation; the interactive HTML is a reviewable prototype, not a deployed feature.
+All changes are fast-forwarded onto local `main`; the merged working branch has been removed. Remote main is still awaiting authenticated push. GitHub's routed write decision is `write_none`; no configured owner writer is available. The installed app and remote admission service have not been replaced. The native System State interface and full single-coordinator design remain future implementation; the interactive HTML is a reviewable prototype, not a deployed feature.
 
 The Secrets stage also retains indefinite retry with its existing one-to-four-minute capped backoff. Failures no longer become a permanent hold after two attempts. Input changes still bypass the deadline, and unknown reads preserve known fingerprints without resetting the failure history.
 
