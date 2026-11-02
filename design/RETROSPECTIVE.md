@@ -64,7 +64,7 @@ The prior subscriber configuration is saved at `/Users/ayates/.local/state/aterm
 
 ## Final fresh attempt
 
-The final requested attempt used the updated executable and fresh LAN discovery. It returned `Waiting for automatic LAN credential sync: the other Mac asked for something this Mac does not serve`. A subsequent check still found no `~/.secrets` directory, no `aterm agh` profiles, and anonymous routing. No further peer-provisioning attempt was made after that requested final try.
+The final requested attempt used the updated executable and fresh LAN discovery. It returned `Waiting for automatic LAN credential sync: the other Mac asked for something this Mac does not serve`. A subsequent check still found no `~/.secrets` directory, no `aterm agh` profiles, and anonymous routing. No further manual peer-provisioning attempt was made after that requested final try. The installed subscriber remains active and retries automatically.
 
 
 ## Naming mismatch
