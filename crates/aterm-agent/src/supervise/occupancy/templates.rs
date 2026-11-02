@@ -15,7 +15,10 @@
 //! 2.8): the local clock at its ready since and the build slots its need names.
 //!
 //! `wait-nudge` leaves out §3.2's `(2 workflows, 3 shells)`: no reader counts a
-//! session's workflows yet, and a count the harness cannot measure is not typed.
+//! session's workflows yet, and a count the harness cannot measure is not typed. From slice 2 it
+//! names `wake` (`WAKE`), which slice 1's line did not: a replay of a recording made before it
+//! did (no `[setup] occupancy.nudge_wake` in its header) types slice 1's line
+//! ([`wait_nudge_slice1`]), as that recording typed it.
 
 use super::super::facts::FACT_CAP;
 use super::rules::RuleId;
@@ -41,6 +44,12 @@ const REREAD: &str = "Re-read the base of any cut, mint or publish before you st
 /// `wait-nudge`'s ask for the declaration, a constant like the advice.
 const DECLARE: &str = "Put one line starting WAITING: that names what you wait for and the step \
                        it unblocks.";
+
+/// `wait-nudge`'s teaching of the declared wake (§3.2, from slice 2), a constant like the advice:
+/// the verb and its two required words as placeholders, never a label or a condition of the
+/// session's. Filled in, it is a declaration `wake` reads (`WakeReq::parse`).
+const WAKE: &str = "`aterm ctl @self wake label=<word> when=<condition>` makes aterm tell you \
+                    here when it holds.";
 
 /// One line a built-in rule would type ([module docs](self)).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,14 +123,29 @@ pub fn stuck_line(fact: &str) -> String {
     format!("{HEAD}{fact}.")
 }
 
-/// `wait-nudge@v1`: the hold has stood `held_ms` and the agent has not declared it.
+/// `wait-nudge@v1`: the hold has stood `held_ms` and the agent has not declared it. It asks for
+/// the declaration and names `wake` (`WAKE`), which a host with slice 2's doors serves.
 #[must_use]
 pub fn wait_nudge(held_ms: i64) -> FactLine {
-    let fact = format!(
+    FactLine::new(
+        RuleId::WaitNudge,
+        nudge_fact(held_ms),
+        &[DECLARE, WAKE, ADVICE],
+    )
+}
+
+/// `wait-nudge@v1` as slice 1 typed it, naming no `wake`: the line a replay of a recording made
+/// before the nudge named it types ([`super::rules::WakeSight::nudge_wake`]).
+#[must_use]
+pub fn wait_nudge_slice1(held_ms: i64) -> FactLine {
+    FactLine::new(RuleId::WaitNudge, nudge_fact(held_ms), &[DECLARE, ADVICE])
+}
+
+fn nudge_fact(held_ms: i64) -> String {
+    format!(
         "this tab has waited {} on its own background work.",
         span(held_ms)
-    );
-    FactLine::new(RuleId::WaitNudge, fact, &[DECLARE, ADVICE])
+    )
 }
 
 /// `hold-room@v1`: the hold has stood `held_ms`; `usable` of `slots` build slots have been free

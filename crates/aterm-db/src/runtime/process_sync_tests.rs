@@ -95,7 +95,8 @@ fn child_runtime() {
     } else {
         assert!(opened > 0, "an active owner must have opened its transport");
     }
-    println!("commons-runtime-ready");
+    // Keep the readiness proof on its own line even after libtest's single-thread prefix.
+    println!("\ncommons-runtime-ready");
     std::io::stdout().flush().unwrap();
     if std::io::stdin().read(&mut [0; 1]).unwrap() == 1 {
         aterm_uds::process::kill_self_now();
@@ -237,6 +238,15 @@ fn wait_owner(config: &Path, pid: u32) -> aterm_types::network_state::NetworkObs
 
 #[test]
 fn separate_processes_transfer_live_repair() {
+    transfer_live_repair(false);
+}
+
+#[test]
+fn separate_configurations_share_live_repair_and_transfer_its_owner() {
+    transfer_live_repair(true);
+}
+
+fn transfer_live_repair(separate_configs: bool) {
     let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
     let observers = aterm_tempfile::Builder::new()
         .prefix("commons-proc-")
@@ -248,6 +258,20 @@ fn separate_processes_transfer_live_repair() {
         fsx::ensure_private_dir(directory).unwrap();
     }
     let config = local.join("aterm.toml");
+    let follower_config = if separate_configs {
+        let directory = observers.path().join("follower");
+        fsx::ensure_private_dir(&directory).unwrap();
+        directory.join("aterm.toml")
+    } else {
+        config.clone()
+    };
+    let restart_config = if separate_configs {
+        let directory = observers.path().join("restart");
+        fsx::ensure_private_dir(&directory).unwrap();
+        directory.join("aterm.toml")
+    } else {
+        config.clone()
+    };
     let proposals = Proposals::at(lab.paths[0].clone());
     let table = proposals.initialize().unwrap();
     let write = |request, key: &str| {
@@ -287,10 +311,25 @@ fn separate_processes_transfer_live_repair() {
     .unwrap();
     progress.wait_for(table.digest(), 1, "peer discovered the initial table");
 
-    let follower = Process::start(&lab.paths[0], &config, port, Some(owner.id()));
+    let follower = Process::start(&lab.paths[0], &follower_config, port, Some(owner.id()));
+    if separate_configs {
+        assert!(
+            !network_state::read_live_observation(&follower_config)
+                .is_ok_and(|state| state.visibility == Visibility::Active),
+            "a configuration relay cannot recursively forward the active transport owner"
+        );
+    }
+    assert_eq!(
+        super::read_live_publication(&lab.paths[0], &follower_config)
+            .unwrap()
+            .observation()
+            .via_local_process,
+        Some(owner.id()),
+        "the CLI must read the actual owner directly, without a recursive relay"
+    );
     owner.crash();
     assert_eq!(
-        wait_owner(&config, follower.id()).observer,
+        wait_owner(&follower_config, follower.id()).observer,
         Some(identity.clone())
     );
     let after_crash = write(62, "after-owner-crash");
@@ -300,9 +339,12 @@ fn separate_processes_transfer_live_repair() {
         "peer received the successor's fresh operation",
     );
 
-    let restarted = Process::start(&lab.paths[0], &config, port, Some(follower.id()));
+    let restarted = Process::start(&lab.paths[0], &restart_config, port, Some(follower.id()));
     follower.stop();
-    assert_eq!(wait_owner(&config, restarted.id()).observer, Some(identity));
+    assert_eq!(
+        wait_owner(&restart_config, restarted.id()).observer,
+        Some(identity)
+    );
     let after_exit = write(63, "after-owner-exit");
     progress.wait_for(
         table.digest(),

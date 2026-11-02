@@ -18,16 +18,17 @@
 //! Revision and retry checks cover every table read, under one writer.
 //!
 //! An F19 build from before the ring wrote `accounts/claims/1`, rolling to `claims.2` through
-//! `claims.6`. A ring Mac that finds that declaration declares the same table at version 2, once
+//! `claims.6`. A ring Mac that finds those declarations declares each table at version 2, once
 //! (`Directory::seal`): the old build's reads and writes then fail, so it keeps to its home
-//! accounts. Ring Macs read the old tables, ranked below every ring row, while the old table is
-//! still subscribed and for two days after the seal.
+//! accounts, and no generation stays subscribed to take a catalog slot. Ring Macs read the old
+//! tables, ranked below every ring row, while the old table is still subscribed and for two days
+//! after the seal.
 
 use crate::{
     Error, Result,
     catalog::{
         Descriptor, Directory, Snapshot as CatalogSnapshot, State,
-        ring::{CLAIMS, RingState},
+        ring::{self, CLAIMS, RingState, Shares, Unplaced, Used},
     },
     database::{Change, Command},
     documents::log::Log,
@@ -69,6 +70,18 @@ impl Default for Caps {
         Self {
             records: 7_680,
             writer_records: 960,
+        }
+    }
+}
+
+impl Caps {
+    /// The ring placement's shares: records only, since a claim row is at most [`MAX_ROW`].
+    const fn shares(self) -> Shares {
+        Shares {
+            records: self.records,
+            bytes: usize::MAX,
+            writer_records: self.writer_records,
+            writer_bytes: usize::MAX,
         }
     }
 }
@@ -347,32 +360,25 @@ fn legacy_logs(
 
 /// Whether this writer has no room left in the day table `epoch` of `logs`.
 fn full(logs: &[(Source, Log)], epoch: u64, actor: Actor, caps: Caps) -> bool {
-    let (records, writer_records, needed) = logs
+    let (used, needed) = logs
         .iter()
         .find(|(source, _)| *source == Source::Ring(epoch))
-        .map_or((0, 0, 1), |(_, log)| {
+        .map_or((Used::default(), 1), |(_, log)| {
             let (records, writer_records) = log.retained_counts(actor);
-            (records, writer_records, log.append_records_bound())
+            let used = Used {
+                records,
+                writer_records,
+                ..Used::default()
+            };
+            (used, log.append_records_bound())
         });
-    needed > caps.records.saturating_sub(records)
-        || needed > caps.writer_records.saturating_sub(writer_records)
+    caps.shares().full(&used, needed, 0)
 }
 
-/// The day table a row that lapses at `until` goes into, by the clock `now` and this Mac's ring
-/// `state`: the current day's, this writer's own latest day's (`own`) where later, never below the
-/// floor, so never a table this Mac deleted (`RingState::outdated`), and never earlier than the
-/// day before the one `until` falls in, so `until < (epoch + 2) · EPOCH_S` and the row has lapsed
-/// on any clock that deletes its table. A full table spills into the next day's while that lies
-/// in the window.
-///
-/// No row is written while the clock is behind the floor. Such a clock either ran ahead and came
-/// back or is set back, and no Mac can tell which: set back, its window (the clock's,
-/// `RingState::current`) leaves out the day after the floor, its peers' today, where its own
-/// latest row and its peers' current claims can sit, so a row written at the floor would be
-/// claimed on a view without them and outranked by its own later one. Once the clock reaches the
-/// floor, the window reaches every table that holds a row of this Mac's: each write raises the
-/// floor to the day before the current one first and goes at most a day past the current one, so
-/// no row lies more than two days past the floor.
+/// The day table a row that lapses at `until` goes into: the ring placement (`ring::place`) on the
+/// claims ring, whose period is a UTC day, so `until < (epoch + 2) · EPOCH_S` and the row has
+/// lapsed on any clock that deletes its table. A full table spills into the next day's while that
+/// lies in the window, and no row is written while the clock is behind the floor.
 ///
 /// # Errors
 /// The clock is behind the floor, the row lapses beyond the window's last day, or both its tables
@@ -392,24 +398,14 @@ pub(crate) fn target(
     until: u64,
     full: impl Fn(u64) -> bool,
 ) -> Result<u64> {
-    let last = *state.window(&CLAIMS, now).end();
-    let epoch = state
-        .current(&CLAIMS, now)
-        .max(state.floor)
-        .max(own.unwrap_or(0))
-        .max(CLAIMS.epoch_of(until).saturating_sub(1));
-    if CLAIMS.epoch_of(now) < state.floor {
-        return Err(Error::new(
+    ring::place(&CLAIMS, state, now, own, until, full).map_err(|unplaced| match unplaced {
+        Unplaced::Behind => Error::new(
             "this Mac's clock is behind the claims tables it took up; claims resume when it reaches them",
-        ));
-    }
-    if epoch > last {
-        return Err(Error::new(
-            "claim row lapses beyond the claims tables' window",
-        ));
-    }
-    (epoch..=last).find(|epoch| !full(*epoch)).ok_or_else(|| {
-        Error::new("account claims are at today's capacity; they resume at 00:00 UTC")
+        ),
+        Unplaced::Beyond => Error::new("claim row lapses beyond the claims tables' window"),
+        Unplaced::Full => {
+            Error::new("account claims are at today's capacity; they resume at 00:00 UTC")
+        }
     })
 }
 
@@ -614,10 +610,23 @@ fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Result<()> {
     let encoded = encode(&command)?;
 
     let directory = Directory::new(paths, bootstrap.trust());
-    // An F19 build from before the ring finds its table retired; a seal this Mac cannot make
-    // (its creator budget is spent) never fails the write.
-    if let Ok(first) = legacy_descriptor(&bootstrap, 1) {
-        let _ = directory.seal(&session, &first);
+    // An F19 build from before the ring finds every table it declared retired: `claims` and each
+    // generation it rolled to (`claims.2` .. `claims.6`), so none stays subscribed and takes a
+    // catalog slot on a new Mac (lab model design §3.10). Only a generation still declared alone
+    // is sealed, once; a seal this Mac cannot make (its creator budget is spent) never fails the
+    // write.
+    let declared = directory
+        .snapshot_if_exists(&session)
+        .map(|snapshot| snapshot.entries)
+        .unwrap_or_default();
+    for generation in 1..=LEGACY_GENERATIONS {
+        if let Ok(retired) = legacy_descriptor(&bootstrap, generation)
+            && declared
+                .get(&retired.scope.digest())
+                .is_some_and(|entry| entry.declarations.iter().all(|d| d.descriptor == retired))
+        {
+            let _ = directory.seal(&session, &retired);
+        }
     }
     let state = directory.retire(&session, &CLAIMS, now)?;
 

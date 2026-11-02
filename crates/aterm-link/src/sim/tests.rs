@@ -2406,15 +2406,15 @@ fn proof_open(
 }
 
 /// R6: A START THE PROOF ADMITTED LEAVES NO CLEAN STOP UNDER A POWER CUT. A successor that finds
-/// the OPEN it would write, its inode the one `run.durable` links, writes nothing, so the law of
+/// the OPEN it would write, with a `run.durable` proof standing for it, writes nothing, so the law of
 /// [`once_an_attach_is_admitted_a_power_cut_never_reads_the_clean_stop`] must hold with the proof
 /// standing in for that write. Boot 1 runs and stops cleanly; a second start, in the same boot or
 /// the next, finishes, is killed at a write, or has its record's rename made and its directory
 /// flush fail; two successors in turn, each a handoff's or a restart's, attach in that boot;
 /// a tearing power cut follows. Every schedule in which an attach was admitted reads an open
 /// record after the cut. Controls: the proof made as soon as the rename is visible, whatever its
-/// flush does ([`crate::state::ProofRule::AtTheRename`]), and a proof read by its presence, not
-/// by the inode it links ([`crate::state::ProofRule::ByPresence`]): each leaves an admitted attach
+/// flush does ([`crate::state::ProofRule::AtTheRename`]), and a proof read by its presence under
+/// the bare stem, whatever the name holds ([`crate::state::ProofRule::ByPresence`]): each leaves an admitted attach
 /// under the clean stop's record. The law also counts successors the proof admitted, after a
 /// start in full in the same boot and, after a reboot, after a start by the barrier that the
 /// boot's first incarnation flushed.
@@ -2526,8 +2526,8 @@ fn a_start_its_proof_admitted_never_leaves_the_clean_stop_under_a_power_cut() {
 /// is one the mirror sends batches under, so a later boot must read one at least as high. A
 /// first open raises the floor; a second raises it again and finishes, is killed at a write, or
 /// has its rename made and its directory flush fail; two fresh opens of the same boot, each a
-/// successor's, raise to a top below it, admitting the floor that reads where `logfloor.durable`
-/// links its inode ([`crate::state::StateDir::admit_logfloor_by_its_proof`]) and writing it again
+/// successor's, raise to a top below it, admitting the floor that reads where a `logfloor.durable`
+/// proof stands for it ([`crate::state::StateDir::admit_logfloor_by_its_proof`]) and writing it again
 /// where it does not; a tearing power cut follows. Controls as for the run's proof
 /// ([`a_start_its_proof_admitted_never_leaves_the_clean_stop_under_a_power_cut`]): each lets a
 /// cut take back a floor a batch was sent under.
@@ -2613,6 +2613,223 @@ fn a_floor_its_proof_admitted_is_never_taken_back_by_a_power_cut() {
     }
 }
 
+/// What `tar`, `ditto` and `rsync -aH` each make of the top of a state dir: every regular file of
+/// `from` a new inode at its name in `to`, renamed in and never flushed, on `core`'s device, and
+/// two names of one inode in `from` two names of one inode in `to`. A hard link's other name is
+/// not journaled, as [`crate::state::StateDir`]'s own proof is not (a control's proof is such a
+/// link): it stands whatever the cut.
+fn copy_keeping_its_links(from: &std::path::Path, to: &std::path::Path, core: &super::Core) {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut entries: Vec<_> = std::fs::read_dir(from)
+        .expect("the dir to copy")
+        .flatten()
+        .collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut copied = std::collections::BTreeMap::new();
+    for entry in entries {
+        let meta = entry.metadata().expect("the entry's metadata");
+        if !meta.is_file() {
+            continue;
+        }
+        let target = to.join(entry.file_name());
+        if let Some(first) = copied.get(&meta.ino()) {
+            let _ = std::fs::remove_file(&target);
+            std::fs::hard_link(first, &target).expect("the second name of one inode");
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).expect("the copied bytes");
+        let staged = to.join(".copying");
+        std::fs::write(&staged, &bytes).expect("the copy's new inode");
+        std::fs::rename(&staged, &target).expect("renamed in");
+        core.device.journal(crate::fx::Write::Replace {
+            path: &target,
+            bytes: &bytes,
+            flush: None,
+            mode: crate::state::STATE_FILE_MODE,
+        });
+        copied.insert(meta.ino(), target);
+    }
+}
+
+/// What `cp -R` and, `keeping_times`, `cp -a` each make of the top of a state dir over the names a
+/// dir already holds: every regular file of `from` written INTO the file at its name in `to`, its
+/// inode kept (a name `to` lacks is a new file), never flushed, on `core`'s device; `cp -a` then
+/// puts the source's modification time back on it. A proof's name is not journaled, as
+/// [`crate::state::StateDir`]'s own proof is not. `state::tests`'
+/// `a_restore_written_into_the_files_a_dir_holds_proves_nothing` runs the real tool.
+fn copy_in_place(
+    from: &std::path::Path,
+    to: &std::path::Path,
+    core: &super::Core,
+    keeping_times: bool,
+) {
+    use std::io::Write as _;
+    crate::state::past_the_clock_tick(to);
+    let mut entries: Vec<_> = std::fs::read_dir(from)
+        .expect("the dir to copy")
+        .flatten()
+        .collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let meta = entry.metadata().expect("the entry's metadata");
+        if !meta.is_file() {
+            continue;
+        }
+        let named = entry.file_name();
+        let target = to.join(&named);
+        let bytes = std::fs::read(entry.path()).expect("the copied bytes");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&target)
+            .expect("the file at its name");
+        file.write_all(&bytes).expect("the bytes written into it");
+        if keeping_times {
+            file.set_modified(meta.modified().expect("the source's time"))
+                .expect("the source's time put back");
+        }
+        let proof = [crate::state::RUN_PROOF, crate::state::LOGFLOOR_PROOF]
+            .iter()
+            .any(|stem| named.as_encoded_bytes().starts_with(stem.as_bytes()));
+        if !proof {
+            core.device.journal(crate::fx::Write::Replace {
+                path: &target,
+                bytes: &bytes,
+                flush: None,
+                mode: crate::state::STATE_FILE_MODE,
+            });
+        }
+    }
+}
+
+/// R6r: NO COPY OF THE DIR, NOR ANY RESTORE OVER IT, PROVES ANYTHING. A bridge of boot 1 has its
+/// OPEN and its floor proved in one dir, and a copy in the same boot, with no flush, puts them in
+/// another or back in that one. `tar`, `ditto` and `rsync -aH` each make a new inode: into a fresh
+/// dir (the media holds nothing), over a dir whose media holds a clean stop of its own, or, from a
+/// copy taken while it ran, back over the very dir that made them after it stopped cleanly. `cp -R`
+/// and `cp -a` write into the inode the name holds: back over the dir of a bridge that died with
+/// its OPEN proved, its own bytes and, under `cp -a`, its own modification time; or another dir's
+/// over a dir whose floor was proved and whose bridge stopped cleanly. A bridge attaches there and
+/// a tearing power cut follows. Its OPEN must read after the cut, and the floor its raise answered.
+/// CONTROLS, each a proof that vouches for bytes no flush covered, so that the start writes nothing
+/// or the raise flushes nothing and the cut brings back the clean stop, no record, a torn one or a
+/// lower floor: [`crate::state::ProofRule::AnyDirectory`], R6 as first merged, in every arm;
+/// [`crate::state::ProofRule::ThisDirectory`], a name that says the directory and not the inode,
+/// in every arm that lands on the dir that made the proof; and
+/// [`crate::state::ProofRule::ThisInode`], a name that says the inode and not its state, in every
+/// arm `cp` writes.
+#[test]
+fn no_copy_of_the_dir_nor_restore_over_it_proves_anything_under_a_power_cut() {
+    use crate::state::{ProofRule, StateDir};
+    const ARMS: [&str; 6] = [
+        "a new inode: a fresh dir",
+        "a new inode: over a clean stop",
+        "a new inode: restored over its own dir",
+        "cp -R: back over a bridge that died",
+        "cp -a: back over a bridge that died",
+        "cp -R: another dir's over a clean stop",
+    ];
+    let run = |st: &StateDir, floor: u64| {
+        st.begin_run().expect("its start");
+        st.take_incarnation(0).expect("its incarnation");
+        st.raise_logfloor(floor).expect("its floor");
+    };
+    for (control, rule) in [
+        ("", ProofRule::Ships),
+        ("any_directory", ProofRule::AnyDirectory),
+        ("this_directory", ProofRule::ThisDirectory),
+        ("this_inode", ProofRule::ThisInode),
+    ] {
+        let mut counts = [(0u64, 0u64, 0u64); ARMS.len()];
+        for (arm, count) in counts.iter_mut().enumerate() {
+            for seed in 1..=32u64 {
+                let scratch = |prefix: &str| {
+                    aterm_tempfile::Builder::new()
+                        .prefix(prefix)
+                        .tempdir_in("/tmp")
+                        .expect("scratch")
+                };
+                let (elsewhere, target) = (scratch("sim-copy-from"), scratch("sim-copy-to"));
+                let core = proof_world(target.path(), seed);
+                let other_core = proof_world(elsewhere.path(), seed);
+                match arm {
+                    2..=4 => {
+                        let earlier = proof_open(&core, target.path(), 1, 1, rule);
+                        run(&earlier, 300);
+                        copy_keeping_its_links(target.path(), elsewhere.path(), &other_core);
+                        if arm == 2 {
+                            earlier.end_run_clean().expect("its clean stop");
+                        }
+                    }
+                    _ => {
+                        run(&proof_open(&other_core, elsewhere.path(), 1, 1, rule), 300);
+                        if arm != 0 {
+                            let earlier = proof_open(&core, target.path(), 1, 1, rule);
+                            run(&earlier, 100);
+                            earlier.end_run_clean().expect("its clean stop");
+                        }
+                    }
+                }
+                match arm {
+                    0..=2 => copy_keeping_its_links(elsewhere.path(), target.path(), &core),
+                    _ => copy_in_place(elsewhere.path(), target.path(), &core, arm == 4),
+                }
+                let copy = proof_open(&core, target.path(), 2, 1, rule);
+                let began = copy.begin_run().expect("the copy's start");
+                copy.take_incarnation(0).expect("the copy's incarnation");
+                let before = copy.ops().fsyncs;
+                let sent_under = copy.raise_logfloor(150).expect("the copy's floor");
+                let raise_flushed = copy.ops().fsyncs != before;
+                if control.is_empty() {
+                    assert_eq!(
+                        (began.proven, began.ordered, began.full, raise_flushed),
+                        (false, 0, 2, true),
+                        "{}, seed {seed}: a copy's start and raise are written in full",
+                        ARMS[arm]
+                    );
+                }
+                core.device.power_cut(&mut Rng::new(seed * 64 + 3));
+                let next = StateDir::open(target.path()).expect("the next boot's look");
+                let open_reads = matches!(next.last_run(), Ok(Some(run)) if !run.clean);
+                let floor = next.logfloor().ok().flatten().unwrap_or(0);
+                count.0 += u64::from(began.proven);
+                count.1 += u64::from(!raise_flushed);
+                count.2 += u64::from(!open_reads || floor < sent_under);
+            }
+        }
+        for (arm, (starts, raises, lost)) in ARMS.iter().zip(counts) {
+            eprintln!(
+                "a copy or a restore, control {control:?}, {arm}: 32 schedules, the proof admitted \
+                 {starts} starts and {raises} floors, {lost} lost the OPEN or the floor at the cut"
+            );
+        }
+        let held = |&(starts, raises, lost): &(u64, u64, u64)| (starts, raises, lost) == (0, 0, 0);
+        let lied = |&(starts, raises, lost): &(u64, u64, u64)| starts + raises > 0 && lost > 0;
+        match control {
+            "" => assert!(
+                counts.iter().all(held),
+                "a copy's or a restore's proof vouched: {counts:?}"
+            ),
+            "any_directory" => assert!(
+                counts.iter().all(lied),
+                "CONTROL {control}: some copy's proof never vouched for what the cut took: \
+                 {counts:?}"
+            ),
+            "this_directory" => assert!(
+                held(&counts[0]) && held(&counts[1]) && counts[2..].iter().all(lied),
+                "CONTROL {control}: a copy elsewhere proves nothing, what lands on the dir that \
+                 made the proof does: {counts:?}"
+            ),
+            _ => assert!(
+                counts[..3].iter().all(held) && counts[3..].iter().all(lied),
+                "CONTROL {control}: a new inode proves nothing, bytes written into the old one \
+                 do: {counts:?}"
+            ),
+        }
+    }
+}
+
 fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
     let pin = |seq| crate::state::PublishPin {
         seq,
@@ -2647,7 +2864,7 @@ fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
 
 #[test]
 fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
-    use crate::state::{StateDir, LOGFLOOR, LOGFLOOR_PROOF};
+    use crate::state::{StateDir, LOGFLOOR};
     let boot = |n| crate::state::IncSeam {
         boot: Some(Some(crate::durability::test_boot(n))),
         off_volume: false,
@@ -2774,10 +2991,15 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
             assert_eq!(
                 fresh.ops().fsyncs,
                 before,
-                "its first raise admits the floor the proof links, written by none (R6)"
+                "its first raise admits the floor its proof names, written by none (R6)"
             );
             assert!(fresh.logfloor_admitted());
-            std::fs::remove_file(root.join(LOGFLOOR_PROOF)).expect("the proof");
+            std::fs::remove_file(
+                fresh
+                    .proof_of_what_reads(LOGFLOOR)
+                    .expect("the floor reads"),
+            )
+            .expect("the proof");
             let (_bare_core, bare) = open(root, 4);
             let before = bare.ops().fsyncs;
             assert_eq!(bare.raise_logfloor(60).unwrap(), 100);

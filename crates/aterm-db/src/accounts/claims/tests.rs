@@ -406,8 +406,26 @@ pub(crate) fn ring_transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    const HALF: u64 = DAY / 2;
+    ring_step(
+        &CLAIMS,
+        |ring, now, own, until| target(ring, now, own, until, |_| false).unwrap(),
+        state,
+        action,
+    )
+}
+
+/// [`ring_transition`] for any ring of period tables (`periods`): the model's day is one of its
+/// periods, its row lapses a period after it is written, and `place` puts the row
+/// (`ring::place` under that ring's errors).
+fn ring_step(
+    periods: &ring::Ring,
+    place: impl Fn(&RingState, u64, Option<u64>, u64) -> u64,
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
     const HELD: [&str; 6] = ["h1", "h2", "h3", "h4", "h5", "h6"];
+    let period = periods.period_s;
+    let half = period / 2;
     let get = |name: &str| u64::try_from(state[name]).unwrap();
     let int = |value: u64| i64::try_from(value).unwrap();
     let mut next = state.clone();
@@ -419,17 +437,17 @@ pub(crate) fn ring_transition(
             .map(|(day, _)| day)
             .collect(),
     };
-    let mut clock = get("day") * DAY + get("tick") * HALF;
+    let mut clock = get("day") * period + get("tick") * half;
     let retire = |ring: &mut RingState, next: &mut aterm_spec::interp::State, clock: u64| {
-        let window = ring.window(&CLAIMS, clock);
-        let doomed = ring.ratchet(&CLAIMS, clock);
+        let window = ring.window(periods, clock);
+        let doomed = ring.ratchet(periods, clock);
         ring.held.retain(|day| !doomed.contains(day));
         let row = get("row");
         // The row goes with its table: below the window, or above it and below the floor. A live
         // row's table deleted below the window is lost; a row above the window at or above the
         // floor stays, out of sight, until the clock comes back to its table.
         if row > 0 && row < ring.floor && !window.contains(&row) {
-            if row < *window.start() && get("until") * HALF > clock {
+            if row < *window.start() && get("until") * half > clock {
                 next.insert("lost", 1);
             }
             next.insert("row", 0);
@@ -441,43 +459,43 @@ pub(crate) fn ring_transition(
     };
     match action {
         "Tick" => {
-            clock += HALF;
-            next.insert("tick", int(clock % DAY / HALF));
-            next.insert("day", int(clock / DAY));
+            clock += half;
+            next.insert("tick", int(clock % period / half));
+            next.insert("day", int(clock / period));
         }
         "ClockBack" | "ClockCorrected" => {
-            clock -= DAY;
-            next.insert("day", int(clock / DAY));
+            clock -= period;
+            next.insert("day", int(clock / period));
         }
         "Retire" => retire(&mut ring, &mut next, clock),
         "Enroll" => {
             retire(&mut ring, &mut next, clock);
-            for day in ring.window(&CLAIMS, clock) {
-                ring.hold(&CLAIMS, day, clock).unwrap();
+            for day in ring.window(periods, clock) {
+                ring.hold(periods, day, clock).unwrap();
             }
         }
         "Write" => {
             retire(&mut ring, &mut next, clock);
             // The writer's own latest row, where the window it reads holds it.
-            let window = ring.window(&CLAIMS, clock);
+            let window = ring.window(periods, clock);
             let own = u64::try_from(next["row"]).unwrap();
             if own > *window.end() {
                 next.insert("blind", 1);
             }
             let own = (own > 0 && window.contains(&own)).then_some(own);
-            let until = clock + DAY;
-            let day = target(&ring, clock, own, until, |_| false).unwrap();
-            ring.hold(&CLAIMS, day, clock).unwrap();
+            let until = clock + period;
+            let day = place(&ring, clock, own, until);
+            ring.hold(periods, day, clock).unwrap();
             if day < get("gone") {
                 next.insert("reentered", 1);
             }
             next.insert("row", int(day));
-            next.insert("until", int(until / HALF));
+            next.insert("until", int(until / half));
         }
         _ => panic!("unknown claim ring action"),
     }
     next.insert("floor", int(ring.floor));
-    next.insert("e", int(ring.current(&CLAIMS, clock)));
+    next.insert("e", int(ring.current(periods, clock)));
     for (day, name) in (1..).zip(HELD) {
         next.insert(name, i64::from(ring.held.contains(&day)));
     }
@@ -517,6 +535,76 @@ fn claim_ring_conforms() {
     lost.insert("lost", 1);
     assert!(!model.check_invariant("NoLiveRowRetired", &lost));
     assert!(!model.successors("Retire", &live).contains(&lost));
+}
+
+/// The `DbClaimRing` model holds the journal's week ring too (lab model design §11 step 4): every
+/// step the code takes on `ring::JOURNAL`, whose period is 604,800 seconds, is a model successor
+/// over every reachable state, the model's day being a week.
+/// NEGATIVE CONTROL: with the Write step placed on the day ring (`ring::place(&CLAIMS, ..)` in
+/// place of `JOURNAL`), a row that lives a week lapses past the day ring's window:
+/// `` called `Result::unwrap()` on an `Err` value: Beyond ``.
+#[test]
+fn journal_ring_conforms() {
+    let model = aterm_models_db::claim_ring_model();
+    let journal = |state: &aterm_spec::interp::State, action: &str| {
+        ring_step(
+            &ring::JOURNAL,
+            |state, now, own, until| {
+                ring::place(&ring::JOURNAL, state, now, own, until, |_| false).unwrap()
+            },
+            state,
+            action,
+        )
+    };
+    let mut steps = 0;
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = journal(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{} from {state:?} steps to {next:?}",
+                    action.name
+                );
+                steps += 1;
+            }
+        }
+    }
+    assert!(steps > 1);
+}
+
+/// An F19 build that rolled past its first table declared `claims.2` and up; a ring Mac's write
+/// seals every generation it finds declared, so none stays subscribed and takes a catalog slot on
+/// a new Mac, and declares nothing for a generation nobody declared.
+/// NEGATIVE CONTROL: sealing generation 1 alone (`write_at`'s loop over `1..=1`) leaves
+/// `claims.2` subscribed: `` left: Subscribed, right: Conflict ``.
+#[test]
+fn every_rolled_legacy_generation_is_sealed() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let (old, new) = (&lab.paths[0], &lab.paths[1]);
+    legacy_write(old, &json!({"counter": 1, "claims": []})).unwrap();
+    with_session(old, true, |session, directory, bootstrap| {
+        for generation in [2, 3] {
+            directory
+                .publish(session, &legacy_descriptor(bootstrap, generation).unwrap())
+                .unwrap();
+        }
+    });
+    repair_commons(&lab, 6);
+    write(new, &json!({"counter": 1, "claims": []})).unwrap();
+    with_session(new, true, |session, directory, bootstrap| {
+        let snapshot = directory.snapshot(session).unwrap();
+        for generation in 1..=3 {
+            let retired = legacy_descriptor(bootstrap, generation).unwrap();
+            assert_eq!(
+                snapshot.entries[&retired.scope.digest()].state,
+                State::Conflict,
+                "claims.{generation}"
+            );
+        }
+        let never = legacy_descriptor(bootstrap, 4).unwrap();
+        assert!(!snapshot.entries.contains_key(&never.scope.digest()));
+    });
 }
 
 /// A year of the owner's swarm in miniature: 80 days of writes, three on even days and one on odd

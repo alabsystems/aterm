@@ -639,6 +639,15 @@ pub fn transforms(
     // and `targo` did not just build it from that checkout: its build stamp decides.
     let differs = match &facts.handed {
         Some(Ok(built)) if *built == full => None,
+        Some(Ok(built))
+            if crate::accepted_measure::policy_cutter(
+                &crate::ledger::GitCli::new(root),
+                &full,
+                built,
+            ) =>
+        {
+            None
+        }
         Some(Ok(built)) => Some(format!(
             "the cutter handed to the engine is the build of {}, not {short}",
             &built[..built.len().min(12)]
@@ -650,10 +659,15 @@ pub fn transforms(
     };
     let Some(why) = differs else {
         if facts.handed.is_some() {
+            let identity = match &facts.handed {
+                Some(Ok(built)) if *built != full => {
+                    "owner-accepted release policy with unchanged export rules".to_string()
+                }
+                _ => format!("the build of {short} itself"),
+            };
             let _ = writeln!(
                 out,
-                "== transforms: by the cutter handed to the engine, the build of {short} itself \
-                 (nothing built)"
+                "== transforms: by the cutter handed to the engine, {identity} (nothing built)"
             );
         }
         let inputs = crate::transforms::Inputs {

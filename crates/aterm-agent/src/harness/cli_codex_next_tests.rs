@@ -972,6 +972,9 @@ fn with_no_row_active_next_is_the_row_a_launch_takes() {
         }),
     ];
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        if !signs_in_here(cli) {
+            continue;
+        }
         let programs: &[bool] = if cli == Cli::Codex {
             &[false, true]
         } else {
@@ -1244,6 +1247,9 @@ fn every_codex_judge_reads_the_program_a_launch_runs() {
 #[test]
 fn under_a_pin_a_launch_takes_next_is_the_pinned_row() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        if !signs_in_here(cli) {
+            continue;
+        }
         let programs: &[bool] = if cli == Cli::Codex {
             &[false, true]
         } else {
@@ -1646,6 +1652,9 @@ fn under_a_keyring_login_accounts_use_records_that_a_worker_takes_no_row() {
 #[test]
 fn for_grok_and_kimi_accounts_use_says_what_a_launch_does() {
     for cli in [Cli::Grok, Cli::Kimi] {
+        if !signs_in_here(cli) {
+            continue;
+        }
         for mode in ["early", "off"] {
             let at = format!("{} under {mode}", cli.id());
             let pool = Pool::of(cli, "use-grok-kimi");
@@ -1720,6 +1729,9 @@ fn not_ours_cases() -> [NotOurs; 3] {
 fn a_pin_on_a_row_this_mac_may_not_use_records_what_a_launch_does_instead() {
     use crate::harness::accounts_pool::unpin_line;
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        if !signs_in_here(cli) {
+            continue;
+        }
         for mode in ["early", "off"] {
             for (case, not_ours) in not_ours_cases() {
                 let at = format!("{} under {mode}, {case}", cli.id());
@@ -1782,4 +1794,25 @@ fn claude_codes_accounts_use_words_are_its_supervisors() {
         out,
         format!("work: no longer pinned\n{ACCOUNTS_AUTO_RECORDED}\n")
     );
+}
+
+/// Off Unix aterm makes no symbolic-link overlay home (`accounts_overlay::make_link`), so a
+/// walled Kimi `main` row cannot launch on `work`, and `accounts use work --cli kimi` records
+/// that overlay refusal.
+#[cfg(not(unix))]
+#[test]
+fn kimi_walled_default_and_pinned_use_report_the_overlay_refusal_where_aterm_makes_no_links() {
+    let pool = Pool::of(Cli::Kimi, "kimi-no-links");
+    assert_eq!(
+        pool.launch_on(None).expect("main needs no overlay"),
+        Some("main".to_string())
+    );
+    pool.wall("main", pool.env.now + 7200);
+    let refused = pool
+        .launch_on(None)
+        .expect_err("work needs an overlay home");
+    assert!(refused.ends_with("only on Unix"), "{refused}");
+    let host = CodexProgram(None);
+    let said = pool.recorded("work", &host);
+    assert!(said.contains(without_no_worker(&refused)), "{said}");
 }

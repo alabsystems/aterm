@@ -744,13 +744,12 @@ fn call_by(
     params: Value,
     deadline: Instant,
 ) -> Result<Value, String> {
-    cdp.call(
-        session,
-        method,
-        params,
-        deadline.saturating_duration_since(Instant::now()),
-    )
-    .map_err(|why| format!("{method}: {why}"))
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!("{method}: browser operation deadline expired"));
+    }
+    cdp.call(session, method, params, remaining)
+        .map_err(|why| format!("{method}: {why}"))
 }
 
 /// The keys (name, domain, path and partition) of the identity providers' cookies

@@ -65,6 +65,15 @@ enum Reply {
         messages: Vec<Message>,
     },
     Read(Message),
+    Synced {
+        account: usize,
+        folder: String,
+        messages: Vec<Message>,
+    },
+    SyncWaiting {
+        account: usize,
+        reason: String,
+    },
     Sent(u64),
     Error(String),
 }
@@ -206,16 +215,106 @@ impl MailApp {
         let (reply_tx, reply_rx) = mpsc::sync_channel(8);
         crate::qos::spawn_lane_thread("aterm-mail", crate::qos::Role::Background, move || {
             let mut accounts = Vec::new();
-            while let Ok((revision, work)) = work_rx.recv() {
-                let mut verify = |url| {
-                    let _ = reply_tx.send((revision, Reply::Progress(url)));
-                    wake();
+            let mut watched: Option<(usize, String)> = None;
+            let mut last_messages = Vec::new();
+            let mut failures = 0u32;
+            let mut last_error = String::new();
+            let mut next_sync = std::time::Instant::now();
+            loop {
+                let wait = if watched.is_some() {
+                    next_sync.saturating_duration_since(std::time::Instant::now())
+                } else {
+                    std::time::Duration::from_secs(3600)
                 };
-                let result = perform(work, &mut accounts, &mut verify).unwrap_or_else(Reply::Error);
-                if reply_tx.send((revision, result)).is_err() {
-                    break;
+                match work_rx.recv_timeout(wait) {
+                    Ok((revision, work)) => {
+                        let target = match &work {
+                            Work::List { account, folder }
+                            | Work::Read {
+                                account, folder, ..
+                            } => Some((*account, folder.clone())),
+                            _ => None,
+                        };
+                        let mut verify = |url| {
+                            let _ = reply_tx.send((revision, Reply::Progress(url)));
+                            wake();
+                        };
+                        let result =
+                            perform(work, &mut accounts, &mut verify).unwrap_or_else(Reply::Error);
+                        match &result {
+                            Reply::Connected {
+                                account,
+                                folder,
+                                messages,
+                                ..
+                            } => {
+                                watched = Some((*account, folder.clone()));
+                                last_messages = messages.clone();
+                                failures = 0;
+                                next_sync = std::time::Instant::now() + sync_interval(0);
+                            }
+                            Reply::Listed { messages, .. } => {
+                                watched = target;
+                                last_messages = messages.clone();
+                                failures = 0;
+                                next_sync = std::time::Instant::now() + sync_interval(0);
+                            }
+                            Reply::Read(_) if watched != target => {
+                                watched = target;
+                                next_sync = std::time::Instant::now() + sync_interval(0);
+                            }
+                            _ => {}
+                        }
+                        if reply_tx.send((revision, result)).is_err() {
+                            break;
+                        }
+                        wake();
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let Some((account, folder)) = watched.clone() else {
+                            continue;
+                        };
+                        let result = perform(
+                            Work::List {
+                                account,
+                                folder: folder.clone(),
+                            },
+                            &mut accounts,
+                            &mut |_| {},
+                        );
+                        let update = match result {
+                            Ok(Reply::Listed { messages, .. }) => {
+                                let changed = messages != last_messages || failures != 0;
+                                failures = 0;
+                                last_error.clear();
+                                last_messages = messages.clone();
+                                changed.then_some(Reply::Synced {
+                                    account,
+                                    folder,
+                                    messages,
+                                })
+                            }
+                            Err(reason) => {
+                                failures = failures.saturating_add(1);
+                                if reason == last_error {
+                                    None
+                                } else {
+                                    last_error = reason.clone();
+                                    Some(Reply::SyncWaiting { account, reason })
+                                }
+                            }
+                            _ => None,
+                        };
+                        next_sync = std::time::Instant::now() + sync_interval(failures);
+                        if let Some(update) = update {
+                            if reply_tx.send((0, update)).is_err() {
+                                break;
+                            }
+                            wake();
+                        }
+                    }
                 }
-                wake();
             }
         })
         .map_err(|e| e.to_string())?;
@@ -266,6 +365,28 @@ impl MailApp {
         let mut changed = false;
         while let Ok((revision, reply)) = self.replies.try_recv() {
             changed = true;
+            let reply = match reply {
+                Reply::Synced {
+                    account,
+                    folder,
+                    messages,
+                } => {
+                    if self.account == Some(account) && self.folder == folder {
+                        self.messages = messages;
+                        if self.notice.starts_with("Sync waiting:") {
+                            self.notice.clear();
+                        }
+                    }
+                    continue;
+                }
+                Reply::SyncWaiting { account, reason } => {
+                    if self.account == Some(account) && self.pending.is_none() {
+                        self.notice = format!("Sync waiting: {reason}");
+                    }
+                    continue;
+                }
+                reply => reply,
+            };
             if let Reply::Connected {
                 account,
                 email,
@@ -317,7 +438,9 @@ impl MailApp {
                     }
                 }
                 Reply::Error(message) => self.notice = message,
-                Reply::Progress(_) => unreachable!(),
+                Reply::Progress(_) | Reply::Synced { .. } | Reply::SyncWaiting { .. } => {
+                    unreachable!()
+                }
             }
         }
         self.connect_next_stored();
@@ -331,6 +454,10 @@ fn stored_provider(email: &str) -> Option<Provider> {
         "gmail.com" | "googlemail.com" => Some(Provider::Gmail),
         _ => None,
     }
+}
+
+fn sync_interval(failures: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(30u64.saturating_mul(1u64 << failures.min(5)).min(900))
 }
 
 fn verify_proton(
@@ -364,6 +491,30 @@ fn read_with_verification<T>(
         ),
         Account::Standard { imap, .. } => operation(imap),
     }
+}
+
+#[cfg(unix)]
+fn connect_browser(
+    home: &std::path::Path,
+    credentials: aterm_agent::harness::mail_browser::Credentials<'_>,
+    notify: &mut impl FnMut(String),
+) -> Result<Account, String> {
+    notify("Connecting to Proton Mail…".into());
+    aterm_agent::harness::mail_browser::HeadlessMail::connect_with_credentials(
+        home,
+        credentials,
+        |_| {},
+    )
+    .and_then(|browser| browser.into_mailbox())
+    .map(|proton| Account::Proton(Box::new(proton)))
+}
+
+fn permits_browser_fallback(kind: aterm_mail::proton_error::Kind) -> bool {
+    use aterm_mail::proton_error::Kind;
+    matches!(
+        kind,
+        Kind::Verification | Kind::DeviceVerification | Kind::Scope | Kind::ClientRejected
+    )
 }
 
 fn failed_proton_connection(proton: &aterm_mail::proton::Proton, error: String) -> String {
@@ -432,76 +583,133 @@ fn perform(
             let mut account = if provider == Provider::Proton {
                 let home = aterm_types::dirs::home_dir()
                     .ok_or("Home directory unavailable for mail session")?;
-                let lease = aterm_mail::session::acquire(&home, &email)?;
-                let saved = aterm_mail::session::load(&home, &email)?;
-                let resumed = match saved {
-                    Some(credentials) => {
-                        aterm_mail::proton::Proton::resume(credentials, |challenge| {
-                            verify_proton(challenge, verify)
-                        })?
-                    }
-                    None => None,
+                #[cfg(unix)]
+                let browser_credentials = || aterm_agent::harness::mail_browser::Credentials {
+                    email: &email,
+                    login: &login,
+                    password: password.expose(),
+                    mailbox_password: mailbox_password.as_ref().map(Secret::expose),
+                    totp_secret: totp_secret.as_ref().map(Secret::expose),
                 };
-                let was_resumed = resumed.is_some();
-                let mut proton = match resumed {
-                    Some(proton) => proton,
-                    None => aterm_mail::proton::Proton::sign_in_with_verifier(
-                        &login,
-                        &password,
-                        |challenge| verify_proton(challenge, verify),
-                    )?,
-                };
-                if was_resumed {
-                    // Rotation must reach disk before slower mailbox setup begins.
-                    proton.persist(&home, &email)?;
-                }
-                let mut prepare = |proton: &mut aterm_mail::proton::Proton| {
-                    if proton.needs_two_factor {
-                        let fresh_code = totp_secret
-                            .as_ref()
-                            .map(|secret| {
-                                aterm_agent::harness::headless_oauth::generate_totp_at(
-                                    secret.expose(),
-                                    aterm_time::unix_secs().ok_or("Invalid system clock")?,
-                                )
-                                .map(Secret::new)
-                                .ok_or("Invalid stored TOTP secret")
-                            })
-                            .transpose()?;
-                        proton.two_factor(fresh_code.as_ref().unwrap_or(&code))?;
+                #[cfg(unix)]
+                let saved_browser =
+                    aterm_agent::harness::mail_browser::HeadlessMail::has_session(&home, &email);
+                #[cfg(not(unix))]
+                let saved_browser = false;
+                if saved_browser {
+                    #[cfg(unix)]
+                    {
+                        connect_browser(&home, browser_credentials(), verify)?
                     }
-                    if !proton.has_address(&email)? {
-                        return Err("Signed-in account does not own this address".into());
+                    #[cfg(not(unix))]
+                    {
+                        unreachable!()
                     }
-                    // A mailbox-key or listing failure must not discard an
-                    // authenticated, identity-checked session and force a new login.
-                    proton.persist(&home, &email)?;
-                    proton.unlock_mailbox(mailbox_password.as_ref().unwrap_or(&password))
-                };
-                let mut setup = proton
-                    .with_verification(&mut prepare, |challenge| verify_proton(challenge, verify));
-                if setup.is_err()
-                    && was_resumed
-                    && proton
-                        .last_failure()
-                        .is_some_and(|failure| failure.rejects_refresh_token())
-                {
-                    // Only explicit refresh-token rejection permits a password
-                    // login. The account lease remains held across both attempts.
-                    proton = aterm_mail::proton::Proton::sign_in_with_verifier(
-                        &login,
-                        &password,
-                        |challenge| verify_proton(challenge, verify),
-                    )?;
-                    setup = proton.with_verification(&mut prepare, |challenge| {
-                        verify_proton(challenge, verify)
-                    });
+                } else {
+                    let mut fallback_needed = false;
+                    let api = (|| -> Result<Account, String> {
+                        let lease = aterm_mail::session::acquire(&home, &email)?;
+                        let saved = aterm_mail::session::load(&home, &email)?;
+                        let resumed = match saved {
+                            Some(credentials) => {
+                                aterm_mail::proton::Proton::resume(credentials, |challenge| {
+                                    verify_proton(challenge, verify)
+                                        .inspect_err(|_| fallback_needed = true)
+                                })?
+                            }
+                            None => None,
+                        };
+                        let was_resumed = resumed.is_some();
+                        let mut proton = match resumed {
+                            Some(proton) => proton,
+                            None => aterm_mail::proton::Proton::sign_in_with_verifier(
+                                &login,
+                                &password,
+                                |challenge| {
+                                    verify_proton(challenge, verify)
+                                        .inspect_err(|_| fallback_needed = true)
+                                },
+                            )?,
+                        };
+                        if was_resumed {
+                            // Rotation must reach disk before slower mailbox setup begins.
+                            proton.persist(&home, &email)?;
+                        }
+                        let mut prepare = |proton: &mut aterm_mail::proton::Proton| {
+                            if proton.needs_two_factor {
+                                let fresh_code = totp_secret
+                                    .as_ref()
+                                    .map(|secret| {
+                                        aterm_agent::harness::headless_oauth::generate_totp_at(
+                                            secret.expose(),
+                                            aterm_time::unix_secs()
+                                                .ok_or("Invalid system clock")?,
+                                        )
+                                        .map(Secret::new)
+                                        .ok_or("Invalid stored TOTP secret")
+                                    })
+                                    .transpose()?;
+                                proton.two_factor(fresh_code.as_ref().unwrap_or(&code))?;
+                            }
+                            if !proton.has_address(&email)? {
+                                return Err("Signed-in account does not own this address".into());
+                            }
+                            // A mailbox-key or listing failure must not discard an
+                            // authenticated, identity-checked session and force a new login.
+                            proton.persist(&home, &email)?;
+                            proton.unlock_mailbox(mailbox_password.as_ref().unwrap_or(&password))
+                        };
+                        let mut setup = proton.with_verification(&mut prepare, |challenge| {
+                            verify_proton(challenge, verify).inspect_err(|_| fallback_needed = true)
+                        });
+                        if setup.is_err()
+                            && was_resumed
+                            && proton
+                                .last_failure()
+                                .is_some_and(|failure| failure.rejects_refresh_token())
+                        {
+                            // Only explicit refresh-token rejection permits a password
+                            // login. The account lease remains held across both attempts.
+                            proton = aterm_mail::proton::Proton::sign_in_with_verifier(
+                                &login,
+                                &password,
+                                |challenge| {
+                                    verify_proton(challenge, verify)
+                                        .inspect_err(|_| fallback_needed = true)
+                                },
+                            )?;
+                            setup = proton.with_verification(&mut prepare, |challenge| {
+                                verify_proton(challenge, verify)
+                                    .inspect_err(|_| fallback_needed = true)
+                            });
+                        }
+                        proton.hold_session(lease);
+                        if let Err(error) = setup {
+                            fallback_needed |= proton
+                                .last_failure()
+                                .is_some_and(|failure| permits_browser_fallback(failure.kind));
+                            return Err(failed_proton_connection(&proton, error));
+                        }
+                        Ok(Account::Proton(Box::new(proton)))
+                    })();
+                    match api {
+                        Ok(account) => account,
+                        Err(error) => {
+                            #[cfg(unix)]
+                            if fallback_needed {
+                                connect_browser(&home, browser_credentials(), verify).map_err(
+                                    |fallback| format!("{error}; headless fallback: {fallback}"),
+                                )?
+                            } else {
+                                return Err(error);
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                return Err(error);
+                            }
+                        }
+                    }
                 }
-                proton.hold_session(lease);
-                if let Err(error) = setup {
-                    return Err(failed_proton_connection(&proton, error));
-                }
-                Account::Proton(Box::new(proton))
             } else {
                 let host = if provider == Provider::Gmail {
                     "imap.gmail.com".to_string()
@@ -525,11 +733,11 @@ fn perform(
                     refresh: None,
                 }
             };
-            let folder: String = if provider == Provider::Proton {
-                "0".into()
-            } else {
-                "INBOX".into()
-            };
+            let folder: String = match &account {
+                Account::Proton(_) => "0",
+                Account::Standard { .. } => "INBOX",
+            }
+            .into();
             let listing = read_with_verification(
                 &mut account,
                 |mailbox| Ok((mailbox.folders()?, mailbox.messages(&folder, 50)?)),
@@ -830,7 +1038,7 @@ impl NativeAppModel for MailApp {
                         view.setup = false;
                         view.compose = false;
                     }
-                    "mail/compose" => {
+                    "mail/compose" if self.account.is_some() => {
                         if !self.draft_dirty {
                             self.to = TextInputState::new(String::new());
                             self.subject = TextInputState::new(String::new());
@@ -1442,6 +1650,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn background_refresh_preserves_open_message_and_pending_draft() {
+        let mut app = MailApp::with_stored(|| {}, Default::default()).unwrap();
+        let (tx, rx) = mpsc::sync_channel(2);
+        app.replies = rx;
+        app.account = Some(0);
+        app.folder = "0".into();
+        app.draft_dirty = true;
+        app.pending = Some(7);
+        app.message = Some(Message {
+            id: "open".into(),
+            from: String::new(),
+            to: String::new(),
+            subject: "Open".into(),
+            date: String::new(),
+            unread: false,
+            text: "Body".into(),
+        });
+        tx.send((
+            0,
+            Reply::Synced {
+                account: 0,
+                folder: "0".into(),
+                messages: Vec::new(),
+            },
+        ))
+        .unwrap();
+        app.poll();
+        assert_eq!(app.message.as_ref().unwrap().id, "open");
+        assert!(app.draft_dirty);
+        assert_eq!(app.pending, Some(7));
+        assert_eq!(sync_interval(0).as_secs(), 30);
+        assert_eq!(sync_interval(1).as_secs(), 60);
+        assert_eq!(sync_interval(u32::MAX).as_secs(), 900);
+    }
+
+    #[test]
     fn send_acknowledgement_does_not_discard_newer_edits() {
         let mut app = MailApp::with_stored(|| {}, Default::default()).unwrap();
         let (tx, rx) = mpsc::sync_channel(2);
@@ -1456,6 +1700,69 @@ mod tests {
         tx.send((8, Reply::Sent(4))).unwrap();
         app.poll();
         assert!(!app.draft_dirty);
+    }
+
+    #[test]
+    #[ignore = "requires ATERM_MAIL_TEST_ACCOUNT and an authenticated headless profile"]
+    fn headless_account_connects_and_reads_through_native_worker() {
+        aterm_uds::secret::no_core_dumps();
+        let email = std::env::var("ATERM_MAIL_TEST_ACCOUNT").expect("set the live test account");
+        let mut accounts = Vec::new();
+        let connected = perform(Work::Stored(email), &mut accounts, &mut |_| {}).unwrap();
+        let Reply::Connected {
+            account,
+            folder,
+            messages,
+            ..
+        } = connected
+        else {
+            panic!("mail worker did not connect");
+        };
+        let message = messages.first().expect("the live test needs one message");
+        let read = perform(
+            Work::Read {
+                account,
+                folder,
+                id: message.id.clone(),
+            },
+            &mut accounts,
+            &mut |_| {},
+        )
+        .unwrap();
+        let Reply::Read(read) = read else {
+            panic!("mail worker did not read");
+        };
+        assert_eq!(read.id, message.id);
+        assert!(read.subject == message.subject);
+        assert!(!read.text.is_empty());
+    }
+
+    #[test]
+    fn browser_fallback_does_not_repeat_credentials_or_network_failures() {
+        use aterm_mail::proton_error::Kind;
+        for kind in [
+            Kind::Verification,
+            Kind::DeviceVerification,
+            Kind::Scope,
+            Kind::ClientRejected,
+        ] {
+            assert!(permits_browser_fallback(kind));
+        }
+        for kind in [
+            Kind::Credentials,
+            Kind::RateLimited,
+            Kind::Network,
+            Kind::Timeout,
+            Kind::AccessDenied,
+            Kind::Configuration,
+            Kind::AccountRestricted,
+            Kind::Service,
+            Kind::SessionExpired,
+            Kind::Protocol,
+            Kind::Refused,
+        ] {
+            assert!(!permits_browser_fallback(kind));
+        }
     }
 
     #[test]

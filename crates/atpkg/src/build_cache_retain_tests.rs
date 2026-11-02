@@ -375,9 +375,9 @@ fn retaining_a_pending_payload_keeps_its_original_receipt_and_pending_authority(
     assert!(payload.join("debug/deps/precious").is_file());
 }
 
-/// A Pending payload hiding its marker keeps its permissions and bytes. The index's grant
-/// cannot establish what that unreadable marker says. Once the fixture restores search, the
-/// same authorized payload is removed normally.
+/// A pending payload hiding its marker keeps its permissions and bytes. Without search,
+/// neither the marker nor its complete Cargo-lock inventory can be established, so no
+/// removal intent starts. Restoring search allows the same authorized payload to retire.
 #[test]
 fn a_pending_payload_hiding_custody_stays_unchanged_until_search_is_available() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -388,6 +388,7 @@ fn a_pending_payload_hiding_custody_stays_unchanged_until_search_is_available() 
     let mut receipt = registered::read(&world.path()).unwrap();
     receipt.pending.as_mut().unwrap().authorized = true;
     registered::write(&world.path(), &receipt).unwrap();
+    let recorded = std::fs::read(world.path()).unwrap();
     let payload = stage.join("cache.noindex");
     let marker = std::fs::read(payload.join(MARKER)).unwrap();
     std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -410,11 +411,12 @@ fn a_pending_payload_hiding_custody_stays_unchanged_until_search_is_available() 
         },
         &Fence::new(&clear),
     );
-    assert_eq!(
-        removed,
-        [(stage.clone(), build_cache::Unused::Revoked { freed: 0 })]
+    assert!(removed.is_empty());
+    assert!(
+        asked.is_empty(),
+        "unknown Cargo locks admit no removal intent"
     );
-    assert_eq!(asked, [(stage.clone(), build_cache::Unused::Unfinished)]);
+    assert_eq!(std::fs::read(world.path()).unwrap(), recorded);
     let after = std::fs::symlink_metadata(&payload).unwrap();
     assert_eq!(
         (after.ino(), after.mode(), after.ctime(), after.ctime_nsec()),

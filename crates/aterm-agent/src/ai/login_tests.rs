@@ -961,11 +961,7 @@ fn a_codex_default_row_on_a_build_that_ignores_codex_auth_path_signs_in_by_codex
                 .join(if reads { "store/new" } else { "store/old" }),
             reads,
         );
-        std::fs::write(
-            &launcher,
-            format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
-        )
-        .expect("launcher");
+        std::fs::write(&launcher, crate::harness::codex_alab::twin_text(&exe)).expect("launcher");
     };
     lay(false);
     let now = 1_800_000_000_i64;
@@ -1434,11 +1430,7 @@ fn a_held_signed_out_default_row_on_a_build_that_ignores_codex_auth_path_signs_i
     let b = machine(&["codex"]);
     let launcher = b.pkg.agents_dir().join("codex");
     let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/old"), false);
-    std::fs::write(
-        &launcher,
-        format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
-    )
-    .expect("launcher");
+    std::fs::write(&launcher, crate::harness::codex_alab::twin_text(&exe)).expect("launcher");
     let config = b.dir.path().join("config");
     std::fs::create_dir_all(&config).expect("config");
     std::fs::create_dir_all(b.home.join(".codex")).expect("default home");

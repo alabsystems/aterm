@@ -548,6 +548,32 @@ fn pet_take(ctl: &Ctl, scene: SpinScene, edge: &str) -> Result<String, CouldNotR
     Ok(fields)
 }
 
+/// Raise the sole test session's native window before starting the sleep clock.
+/// Sending a PTY focus report would not establish this OS precondition.
+fn prepare_pet_focus(ctl: &Ctl) -> Result<(), CouldNotRun> {
+    let sessions = ctl.call(&["ls"]);
+    if !sessions.ok() {
+        return could_not_run("cannot list the pet measurement's session");
+    }
+    let sid = sole_session(&sessions.stdout).ok_or_else(|| {
+        CouldNotRun::Refused("the pet measurement needs exactly one session".into())
+    })?;
+    ctl.ok(&["raise", sid])?;
+    ctl.await_event("the pet measurement's native window to gain focus", || {
+        let reply = ctl.call(&["trail", "status"]);
+        (reply.ok() && field(&reply.stdout, "focused") == Some("true")).then_some(())
+    })
+}
+
+fn sole_session(list: &str) -> Option<&str> {
+    let mut ids = list.split_whitespace().filter(|word| {
+        word.strip_prefix("s-")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    });
+    let sid = ids.next()?;
+    ids.next().is_none().then_some(sid)
+}
+
 /// The [`PET_FIELDS`] of a `trail status` reply, space-separated.
 fn pet_fields(line: &str) -> String {
     PET_FIELDS
@@ -607,6 +633,9 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         Instance::launch(&rig.aterm, &world, budget)?
     };
     let ctl = &inst.ctl;
+    if row.scene.pet() {
+        prepare_pet_focus(ctl)?;
+    }
     ctl.ok(&["await", "idle", SETTLE_QUIET_MS, "timeout=60000"])?;
     std::thread::sleep(settle);
     if row.scene == SpinScene::Rewound {
@@ -1157,5 +1186,21 @@ mod tests {
              pet_active=true pet_action=sleep pet_deep=? pet_pose=? pet_reason=? pet_event_seq=? \
              resting=?"
         );
+    }
+}
+
+#[cfg(test)]
+mod focus_precondition_tests {
+    use super::sole_session;
+
+    #[test]
+    fn native_raise_selects_only_the_isolated_session() {
+        assert_eq!(
+            sole_session("123 0 s-a12b - alive test active=1"),
+            Some("s-a12b")
+        );
+        assert_eq!(sole_session("OK 1\nsession s-a12b alive\n"), Some("s-a12b"));
+        assert_eq!(sole_session("123 0 s-a12b alive\n123 1 s-c34d alive"), None);
+        assert_eq!(sole_session("ERR unavailable"), None);
     }
 }

@@ -46,8 +46,14 @@ pub fn verify(data: &[u8], signature: &str, keys: &[[u8; 32]]) -> Result<(), Str
     }
     let bytes = armor(signature, "SIGNATURE")?;
     let (tag, sig, rest) = packet(&bytes)?;
-    if tag != 2 || !rest.is_empty() || sig.len() < 10 || sig[..3] != [4, 0, 22] {
+    if tag != 2 || !rest.is_empty() || sig.len() < 10 {
         return Err("Unsupported address-token signature".into());
+    }
+    if sig[0] != 4 || !matches!(sig[1], 0 | 1) || sig[2] != 22 {
+        return Err(format!(
+            "Unsupported address-token signature (version {}, type {}, algorithm {})",
+            sig[0], sig[1], sig[2]
+        ));
     }
     let algorithm = match sig[3] {
         8 => &ring::digest::SHA256,
@@ -75,6 +81,13 @@ pub fn verify(data: &[u8], signature: &str, keys: &[[u8; 32]]) -> Result<(), Str
     raw[32 - r.len()..32].copy_from_slice(r);
     raw[64 - s.len()..].copy_from_slice(s);
     let mut hash = ring::digest::Context::new(algorithm);
+    let canonical;
+    let data = if sig[1] == 1 {
+        canonical = canonical_text(data);
+        canonical.as_slice()
+    } else {
+        data
+    };
     hash.update(data);
     hash.update(hashed);
     hash.update(&[4, 255]);
@@ -94,8 +107,61 @@ pub fn verify(data: &[u8], signature: &str, keys: &[[u8; 32]]) -> Result<(), Str
     }
 }
 
+fn canonical_text(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(data.len());
+    let mut bytes = data.iter().copied().peekable();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'\r' => {
+                if bytes.peek() == Some(&b'\n') {
+                    bytes.next();
+                }
+                result.extend_from_slice(b"\r\n");
+            }
+            b'\n' => result.extend_from_slice(b"\r\n"),
+            byte => result.push(byte),
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canonical_text_signature_accepts_line_endings_but_not_changed_content() {
+        use ring::signature::KeyPair;
+        let signer = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let header = [4, 1, 22, 8, 0, 0];
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        hash.update(b"first\r\nsecond\r\n");
+        hash.update(&header);
+        hash.update(&[4, 255, 0, 0, 0, 6]);
+        let hash = hash.finish();
+        let signature = signer.sign(hash.as_ref());
+        let mut body = header.to_vec();
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&hash.as_ref()[..2]);
+        for part in signature.as_ref().as_chunks::<32>().0 {
+            body.extend_from_slice(&256u16.to_be_bytes());
+            body.extend_from_slice(part);
+        }
+        let mut packet = vec![0xc2, body.len() as u8];
+        packet.extend_from_slice(&body);
+        let armor = format!(
+            "-----BEGIN PGP SIGNATURE-----\n\n{}\n-----END PGP SIGNATURE-----\n",
+            aterm_codec::base64::encode(&packet).unwrap()
+        );
+        let keys = [signer.public_key().as_ref().try_into().unwrap()];
+        for text in [
+            b"first\nsecond\n".as_slice(),
+            b"first\r\nsecond\r\n",
+            b"first\rsecond\r",
+        ] {
+            super::verify(text, &armor, &keys).unwrap();
+        }
+        assert!(super::verify(b"first\nchanged\n", &armor, &keys).is_err());
+    }
+
     #[test]
     fn published_signature_and_altered_token() {
         let keys = super::signing_keys(include_str!("../../tests/fixtures/proton-key-v4.asc"), b"")

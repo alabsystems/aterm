@@ -495,8 +495,11 @@ fn write_world(tmp: &Path) {
          # *.gate one until it exists, a *.look one until $log.next exists\n\
          # (taken: the test makes one per look), a *.late one is that wait\n\
          # with nothing drawn, and after a *.type screen ONE bounded read takes\n\
-         # what was written, logged text:. A *.hold's seconds start once\n\
-         # $log.go exists (the test says when: the host has attached).\n\
+         # what was written, logged text:. A *.over one is a *.look\n\
+         # drawn with no clear first, its own bytes homing the cursor and\n\
+         # erasing each row's tail, as a real program moves its screen. A\n\
+         # *.hold's seconds start once $log.go exists (the test says when: the\n\
+         # host has attached).\n\
          # It first clears what the shell printed between its fork and this\n\
          # exec, then writes a cell and erases it in place, as a real Claude\n\
          # Code moves the screen as it starts (start_fake says why).\n\
@@ -507,14 +510,14 @@ fn write_world(tmp: &Path) {
          stty -icanon -echo min 1\n\
          for scene in \"$@\"; do\n\
          \x20 case \"$scene\" in *.late) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;; esac\n\
-         \x20 printf '\\033[2J\\033[H'\n\
+         \x20 case \"$scene\" in *.over) ;; *) printf '\\033[2J\\033[H' ;; esac\n\
          \x20 cat \"$scene\"\n\
          \x20 r=$(grep -n '^❯' \"$scene\" | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
          \x20 case \"$scene\" in\n\
          \x20 *.hold) while [ ! -e \"$log.go\" ]; do sleep 0.1; done; sleep {HOLD_S}; continue ;;\n\
          \x20 *.until) n=0; while [ ! -e \"$log.release\" ] && [ $n -lt {UNTIL_MAX_TENTHS} ]; do sleep 0.1; n=$((n+1)); done; continue ;;\n\
          \x20 *.gate) while [ ! -e \"$log.release\" ]; do sleep 0.1; done; continue ;;\n\
-         \x20 *.look) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;;\n\
+         \x20 *.look|*.over) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;;\n\
          \x20 *.type) t=$(dd bs=4096 count=1 2>/dev/null); printf 'text:%s\\n' \"$t\" >> \"$log\"; continue ;;\n\
          \x20 esac\n\
          \x20 while :; do\n\
@@ -3012,4 +3015,104 @@ fn a_hosted_run_is_taped_and_replays_offline_in_a_changed_world() {
         before == contents(&drive),
         "the replays touched none of the recording's files"
     );
+}
+
+/// Claude Code 2.1.316's dialog for `--dangerously-skip-permissions`, as `lab text` read it: a
+/// dialog of no kind aterm reads.
+const BYPASS_DIALOG: &str = concat!(
+    "────────────────────────────────────────────────────────────────────────────────\n",
+    "  WARNING: Claude Code running in Bypass Permissions mode\n",
+    "  In Bypass Permissions mode, Claude Code will not ask for your approval before running\n",
+    "  potentially dangerous commands.\n",
+    "  By proceeding, you accept all responsibility for actions taken while running in Bypass\n",
+    "  Permissions mode.\n",
+    "  https://code.claude.com/docs/en/security\n",
+    "  ❯ No, exit\n",
+    "    Yes, I accept\n",
+    "  Enter to confirm · Esc to cancel\n",
+);
+
+/// A DIALOG ATERM CANNOT READ IS TOLD AND TAKEN DOWN, AND THE TURN AFTER IT IS JUDGED (run ctl0 of
+/// 2026-11-02, a real Claude Code under the lab's stub: `attention=-` through the dialog, and past
+/// it a take-down owed every 2 s while the first turn went unjudged and nothing was typed). The turn
+/// here goes from one rest to another in place, the agent's word never moving, as the stub's did,
+/// on the shipped clock. Before the fix (at 21b1e42025) this stand-in's turn is read some 20 s on,
+/// where the real one's never was:
+/// `a_take_down_the_host_keeps_refusing_holds_back_no_later_turn_end` holds the stall itself. A
+/// short turn's continue is two minutes on, past this test's hang detector: the policy tests and
+/// the real-Claude run read it. NEGATIVE CONTROL: the rest before the turn is judged with the turn
+/// not yet drawn, so the reply's own row is what the last wait reads.
+#[test]
+fn a_dialog_aterm_cannot_read_is_told_and_taken_down_and_the_turn_after_it_is_judged() {
+    const REPLY: &str = "Hi! A turn too short to read busy.";
+    let inst = boot_on(
+        "bd",
+        "autopilot = \"cruise\"\nupgrade = false\n",
+        40,
+        None,
+        false,
+        |_| Vec::new(),
+    );
+    let sel = format!("@{}", inst.sid);
+    let scene = |name: &str, text: &str| {
+        std::fs::write(inst.tmp.join("sc").join(name), text).expect("a screen");
+    };
+    let rest = bypass_start();
+    scene("dialog.txt", BYPASS_DIALOG);
+    scene("rest.look", &rest);
+    // In place, as a real Claude Code draws: a stand-in's clear would move the agent's word.
+    let over = |rows: String| {
+        let caret = rows
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with('❯'))
+            .last()
+            .map_or(1, |(r, _)| r + 1);
+        format!("\x1b[H{}\x1b[{caret};3H", rows.replace('\n', "\x1b[K\n"))
+    };
+    scene(
+        "replied.over",
+        &over(rest.replacen("\n\n", &format!("\n\n❯ hi\n\n⏺ {REPLY}\n\n"), 1)),
+    );
+    run_fake(&inst, "bd", &["dialog.txt", "rest.look", "replied.over"]);
+    until(
+        HANG,
+        "the dialog escalated",
+        || journal(&inst),
+        |j| j.contains("ESCALATED seq=") && j.contains("kind=other"),
+    );
+    let told = attention(&inst);
+    ctl_ok(&inst, &[&sel, "key", "enter"]);
+    let rested = until(
+        HANG,
+        "the rest past the dialog judged",
+        || journal(&inst),
+        |j| j.contains("EVENT idle"),
+    );
+    assert!(
+        !rested.contains(REPLY),
+        "CONTROL: the turn is not drawn yet"
+    );
+    // Past the reads that follow a point and into the wait; a shorter pause only blunts the
+    // control, and no pass or failure here reads a duration.
+    std::thread::sleep(Duration::from_secs(3));
+    std::fs::write(inst.tmp.join("bd.next"), b"").expect("the turn");
+    let log = until(
+        HANG,
+        "the turn after the dialog judged",
+        || journal(&inst),
+        |j| j.contains(&format!("⏺ {REPLY}")),
+    );
+    assert!(
+        told.as_deref()
+            .is_some_and(|t| t.starts_with("claude other: ")),
+        "a person is told of the dialog: {told:?}\n{log}"
+    );
+    until(
+        HANG,
+        "the badge down past the dialog",
+        || attention(&inst).unwrap_or_default(),
+        |a| !a.starts_with("claude other: "),
+    );
+    assert!(!log.contains("denied supervisor input authority"), "{log}");
 }

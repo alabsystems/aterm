@@ -131,6 +131,8 @@ unsafe fn sockaddr_ip(at: *const libc::sockaddr, family: i32) -> Option<IpAddr> 
 /// routing and neighbour tables with no packet sent: the route table names the default route's
 /// gateway, and the ARP/NDP table its hardware address. `None` where there is no default route,
 /// where the gateway is not an IPv4 next hop, or where the gateway has no neighbour entry yet.
+/// On macOS only the unscoped primary route counts, and its neighbour entry must belong to
+/// that same interface, even when another attached network uses the same gateway address.
 /// The hardware address tells one network from another far more sharply than its subnet does:
 /// two routers both numbering a LAN `192.168.1.0/24` have different hardware addresses, so a
 /// fact kept against one does not stand on the other.
@@ -139,13 +141,20 @@ unsafe fn sockaddr_ip(at: *const libc::sockaddr, family: i32) -> Option<IpAddr> 
 pub fn default_gateway_hw() -> Option<Box<[u8]>> {
     #[cfg(target_os = "macos")]
     {
-        let gateway = default_gateway_ipv4(&route_table(NET_RT_DUMP, 0)?)?;
-        gateway_hardware(&route_table(NET_RT_FLAGS, RTF_LLINFO)?, gateway)
+        primary_gateway_hardware(
+            &route_table(NET_RT_DUMP, 0)?,
+            &route_table(NET_RT_FLAGS, RTF_LLINFO)?,
+            interface_name,
+        )
     }
     #[cfg(target_os = "linux")]
     {
-        let gateway = linux_default_gateway(&std::fs::read_to_string("/proc/net/route").ok()?)?;
-        linux_neighbour_hardware(&std::fs::read_to_string("/proc/net/arp").ok()?, gateway)
+        linux_default_routes(
+            &std::fs::read_to_string("/proc/net/route").ok()?,
+            &std::fs::read_to_string("/proc/net/arp").ok()?,
+        )
+        .primary?
+        .gateway_hw
     }
 }
 
@@ -155,6 +164,212 @@ pub fn default_gateway_hw() -> Option<Box<[u8]>> {
 #[must_use]
 pub fn default_gateway_hw() -> Option<Box<[u8]>> {
     None
+}
+
+/// One IPv4 default route (`0.0.0.0/0`) as the kernel holds it ([`default_routes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefaultRoute {
+    /// The interface the route leaves by (`en0`, `utun4`), named from the route's own interface
+    /// index, so its gateway and its interface always come from one route.
+    pub interface: String,
+    /// Its IPv4 next hop; `None` for a route straight onto a link (a VPN's `utun`).
+    pub gateway: Option<Ipv4Addr>,
+    /// That next hop's hardware address in the ARP table, on that same interface; `None` before
+    /// ARP resolves it (after a wake or a join) or with no IPv4 next hop.
+    pub gateway_hw: Option<Box<[u8]>>,
+}
+
+/// This machine's IPv4 default routes, read from the kernel's routing and ARP tables with no
+/// packet sent and no question asked ([`default_routes`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DefaultRoutes {
+    /// The default route traffic takes: the first up default route that is not scoped to one
+    /// interface (`RTF_IFSCOPE`). With two networks attached (Wi-Fi and Ethernet), macOS keeps a
+    /// scoped default on each and one unscoped primary, and only the primary says where traffic
+    /// goes, so a reader that took the first default of any kind would pair one network's
+    /// gateway with the other's address as the table's order moved.
+    pub primary: Option<DefaultRoute>,
+    /// The scoped defaults (`RTF_IFSCOPE`), in table order: where a tunnel holds the primary,
+    /// the physical network under it is the scoped default on another interface.
+    pub scoped: Vec<DefaultRoute>,
+}
+
+/// This machine's IPv4 default routes ([`DefaultRoutes`]), read with no packet: on macOS from
+/// `sysctl`'s routing and ARP tables, on Linux from `/proc/net/route` and `/proc/net/arp` (which
+/// keep no scoped defaults). Empty where neither is read, or with no default route.
+#[must_use]
+pub fn default_routes() -> DefaultRoutes {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(table) = route_table(NET_RT_DUMP, 0) else {
+            return DefaultRoutes::default();
+        };
+        let arp = route_table(NET_RT_FLAGS, RTF_LLINFO).unwrap_or_default();
+        default_routes_of(&table, &arp, interface_name)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(route) = std::fs::read_to_string("/proc/net/route") else {
+            return DefaultRoutes::default();
+        };
+        let arp = std::fs::read_to_string("/proc/net/arp").unwrap_or_default();
+        linux_default_routes(&route, &arp)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        DefaultRoutes::default()
+    }
+}
+
+/// `net/route.h`'s `RTF_IFSCOPE`: a route scoped to one interface, which traffic takes only when
+/// it is bound to that interface.
+#[cfg(target_os = "macos")]
+const RTF_IFSCOPE: i32 = 0x0100_0000;
+
+/// The primary default's gateway hardware, bound to the route's own interface.
+#[cfg(target_os = "macos")]
+fn primary_gateway_hardware(
+    table: &[u8],
+    arp: &[u8],
+    name_of: impl Fn(u16) -> Option<String>,
+) -> Option<Box<[u8]>> {
+    default_routes_of(table, arp, name_of).primary?.gateway_hw
+}
+
+/// The name of the interface whose index is `index` (`if_indextoname`), `None` for none.
+#[cfg(target_os = "macos")]
+fn interface_name(index: u16) -> Option<String> {
+    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
+    // SAFETY: `buf` holds IF_NAMESIZE bytes, as if_indextoname(3) writes at most.
+    let named = unsafe { libc::if_indextoname(u32::from(index), buf.as_mut_ptr()) };
+    if named.is_null() {
+        return None;
+    }
+    // SAFETY: if_indextoname wrote a NUL-terminated name into `buf`.
+    let name = unsafe { CStr::from_ptr(buf.as_ptr()) };
+    Some(name.to_string_lossy().into_owned()).filter(|name| !name.is_empty())
+}
+
+/// [`default_routes`] of a `NET_RT_DUMP` `table` and a `NET_RT_FLAGS`/`RTF_LLINFO` `arp` table,
+/// each route's interface named by `name_of` from its index. A route whose interface has no
+/// name is passed over: it cannot be told apart from another.
+#[cfg(target_os = "macos")]
+fn default_routes_of(
+    table: &[u8],
+    arp: &[u8],
+    name_of: impl Fn(u16) -> Option<String>,
+) -> DefaultRoutes {
+    let mut routes = DefaultRoutes::default();
+    for_each_route_at(table, |index, flags, addrs, block| {
+        if flags & RTF_UP == 0 {
+            return;
+        }
+        let (dst, gw) = dst_and_gateway(block, addrs);
+        if !is_default_destination(dst) {
+            return;
+        }
+        let Some(interface) = name_of(index) else {
+            return;
+        };
+        let gateway = (flags & RTF_GATEWAY != 0)
+            .then(|| sockaddr_ipv4(gw))
+            .flatten();
+        let gateway_hw = gateway.and_then(|gateway| gateway_hardware_on(arp, gateway, index));
+        let route = DefaultRoute {
+            interface,
+            gateway,
+            gateway_hw,
+        };
+        if flags & RTF_IFSCOPE != 0 {
+            routes.scoped.push(route);
+        } else if routes.primary.is_none() {
+            routes.primary = Some(route);
+        }
+    });
+    routes
+}
+
+/// [`for_each_route`] that also hands each message's interface index (`rtm_index`).
+#[cfg(target_os = "macos")]
+fn for_each_route_at(table: &[u8], mut f: impl FnMut(u16, i32, i32, &[u8])) {
+    let header = std::mem::size_of::<RtMsghdr>();
+    let index_at = std::mem::offset_of!(RtMsghdr, rtm_index);
+    let mut at = 0;
+    for_each_route(table, |flags, addrs, block| {
+        // `for_each_route` walks the same messages in order, each `header` bytes before its
+        // block, so the index is read from the message this block belongs to.
+        let msg = &table[at..];
+        let msglen = usize::from(u16::from_ne_bytes([msg[0], msg[1]]));
+        let index = u16::from_ne_bytes([msg[index_at], msg[index_at + 1]]);
+        debug_assert_eq!(msglen, header + block.len());
+        at += msglen;
+        f(index, flags, addrs, block);
+    });
+}
+
+/// [`gateway_hardware`] restricted to the ARP entry on interface `index`: two networks whose
+/// gateways share an address (`192.168.1.1` on Wi-Fi and on Ethernet) keep one entry each.
+#[cfg(target_os = "macos")]
+fn gateway_hardware_on(table: &[u8], gateway: Ipv4Addr, index: u16) -> Option<Box<[u8]>> {
+    let mut hardware = None;
+    for_each_route_at(table, |at, _flags, addrs, block| {
+        if hardware.is_some() || at != index {
+            return;
+        }
+        let (dst, gw) = dst_and_gateway(block, addrs);
+        if sockaddr_ipv4(dst) == Some(gateway) {
+            hardware = sockaddr_dl_hardware(gw);
+        }
+    });
+    hardware
+}
+
+/// [`default_routes`] of `/proc/net/route` and `/proc/net/arp`: the first up default row with a
+/// `/0` mask is the primary; Linux keeps no scoped defaults in this table.
+#[cfg(any(test, target_os = "linux"))]
+fn linux_default_routes(route: &str, arp: &str) -> DefaultRoutes {
+    const RTF_UP: u32 = 0x1;
+    const RTF_GATEWAY: u32 = 0x2;
+    for line in route.lines().skip(1) {
+        let mut column = line.split_whitespace();
+        let (Some(iface), Some(destination), Some(gateway), Some(flags)) =
+            (column.next(), column.next(), column.next(), column.next())
+        else {
+            continue;
+        };
+        let mask = column.nth(3);
+        let hex = |s: &str, len: Option<usize>| {
+            len.is_none_or(|len| s.len() == len) && s.bytes().all(|b| b.is_ascii_hexdigit())
+        };
+        if destination != "00000000"
+            || !hex(flags, None)
+            || !hex(gateway, Some(8))
+            || mask.is_some_and(|m| m != "00000000")
+        {
+            continue;
+        }
+        let (Ok(flags), Ok(raw)) = (
+            u32::from_str_radix(flags, 16),
+            u32::from_str_radix(gateway, 16),
+        ) else {
+            continue;
+        };
+        if flags & RTF_UP == 0 {
+            continue;
+        }
+        let gateway =
+            (flags & RTF_GATEWAY != 0 && raw != 0).then(|| Ipv4Addr::from(raw.to_le_bytes()));
+        let gateway_hw = gateway.and_then(|gateway| linux_neighbour_hardware(arp, gateway, iface));
+        return DefaultRoutes {
+            primary: Some(DefaultRoute {
+                interface: iface.to_owned(),
+                gateway,
+                gateway_hw,
+            }),
+            scoped: Vec::new(),
+        };
+    }
+    DefaultRoutes::default()
 }
 
 /// `sys/sysctl.h` and `net/route.h` values the first-party `libc` does not carry (it has
@@ -472,42 +687,6 @@ fn is_default_destination(dst: Option<&[u8]>) -> bool {
     (0..4).all(|i| dst.get(4 + i).copied().unwrap_or(0) == 0)
 }
 
-/// The gateway of this machine's default IPv4 route (`0.0.0.0/0`) in a `NET_RT_DUMP` table: the
-/// first up gateway route to the unspecified destination whose next hop is an IPv4 address.
-/// `None` where none is present (no default route, or a non-IPv4 next hop such as a VPN link).
-#[cfg(target_os = "macos")]
-fn default_gateway_ipv4(table: &[u8]) -> Option<Ipv4Addr> {
-    let mut gateway = None;
-    for_each_route(table, |flags, addrs, block| {
-        if gateway.is_some() || flags & (RTF_GATEWAY | RTF_UP) != RTF_GATEWAY | RTF_UP {
-            return;
-        }
-        let (dst, gw) = dst_and_gateway(block, addrs);
-        if is_default_destination(dst) {
-            gateway = sockaddr_ipv4(gw);
-        }
-    });
-    gateway
-}
-
-/// The hardware address recorded for `gateway` in a `NET_RT_FLAGS`/`RTF_LLINFO` ARP/NDP table:
-/// the entry whose destination is that IPv4 address, its gateway a link-layer `sockaddr_dl`.
-/// `None` where no entry names it yet, or the entry carries no hardware address (incomplete).
-#[cfg(target_os = "macos")]
-fn gateway_hardware(table: &[u8], gateway: Ipv4Addr) -> Option<Box<[u8]>> {
-    let mut hardware = None;
-    for_each_route(table, |_flags, addrs, block| {
-        if hardware.is_some() {
-            return;
-        }
-        let (dst, gw) = dst_and_gateway(block, addrs);
-        if sockaddr_ipv4(dst) == Some(gateway) {
-            hardware = sockaddr_dl_hardware(gw);
-        }
-    });
-    hardware
-}
-
 /// The hardware address in a link-layer `sockaddr_dl` (family `AF_LINK`): `sdl_alen` bytes at
 /// `sdl_data` (offset eight) past the `sdl_nlen`-byte interface name. `None` for another family
 /// or an empty address (an incomplete ARP entry).
@@ -526,52 +705,12 @@ fn sockaddr_dl_hardware(sockaddr: Option<&[u8]>) -> Option<Box<[u8]>> {
     Some(Box::from(sockaddr.get(start..start + alen)?))
 }
 
-/// The default IPv4 gateway in `/proc/net/route`: the `Gateway` column (host-order hex of the
-/// little-endian address) of the first row whose `Destination` is `00000000`. `None` where there
-/// is no default route. Only an up gateway route (`RTF_UP | RTF_GATEWAY`, `0x3`) with a `/0` mask
-/// (`00000000` when present) and a non-zero next hop qualifies.
-#[cfg(any(test, target_os = "linux"))]
-fn linux_default_gateway(route: &str) -> Option<Ipv4Addr> {
-    const RTF_UP_GATEWAY: u32 = 0x1 | 0x2;
-    for line in route.lines().skip(1) {
-        let mut column = line.split_whitespace();
-        let (Some(_iface), Some(destination), Some(gateway), Some(flags)) =
-            (column.next(), column.next(), column.next(), column.next())
-        else {
-            continue;
-        };
-        let mask = column.nth(3);
-        if !flags.bytes().all(|b| b.is_ascii_hexdigit())
-            || gateway.len() != 8
-            || !gateway.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            continue;
-        }
-        let Ok(flags) = u32::from_str_radix(flags, 16) else {
-            continue;
-        };
-        if destination != "00000000"
-            || flags & RTF_UP_GATEWAY != RTF_UP_GATEWAY
-            || mask.is_some_and(|m| m != "00000000")
-        {
-            continue;
-        }
-        let Ok(raw) = u32::from_str_radix(gateway, 16) else {
-            continue;
-        };
-        if raw != 0 {
-            return Some(Ipv4Addr::from(raw.to_le_bytes()));
-        }
-    }
-    None
-}
-
 /// The hardware address recorded for `gateway` in `/proc/net/arp`: the `HW address` column of the
-/// row whose `IP address` is that address, when it is a real address (not all zeroes, which is an
+/// row whose `IP address` and `Device` match, when it is a real address (not all zeroes, which is an
 /// incomplete entry). `None` where no row names it. Rows without `ATF_COM` (`0x2`) are skipped so
 /// a stale or incomplete entry on an inactive interface never shadows a complete entry below it.
 #[cfg(any(test, target_os = "linux"))]
-fn linux_neighbour_hardware(arp: &str, gateway: Ipv4Addr) -> Option<Box<[u8]>> {
+fn linux_neighbour_hardware(arp: &str, gateway: Ipv4Addr, interface: &str) -> Option<Box<[u8]>> {
     const ATF_COM: u32 = 0x2;
     for line in arp.lines().skip(1) {
         let mut column = line.split_whitespace();
@@ -581,6 +720,9 @@ fn linux_neighbour_hardware(arp: &str, gateway: Ipv4Addr) -> Option<Box<[u8]>> {
         else {
             continue;
         };
+        if column.nth(1) != Some(interface) {
+            continue;
+        }
         let Ok(ip) = ip.parse::<Ipv4Addr>() else {
             continue;
         };
@@ -968,7 +1110,12 @@ mod gateway_tests {
             RTA_DST | RTA_GATEWAY,
             &[&sockaddr_in(Ipv4Addr::UNSPECIFIED), &sockaddr_in(gw)],
         );
-        assert_eq!(default_gateway_ipv4(&default), Some(gw));
+        let read = |table: &[u8]| {
+            default_routes_of(table, &[], |_| Some("en0".into()))
+                .primary
+                .and_then(|route| route.gateway)
+        };
+        assert_eq!(read(&default), Some(gw));
         // Negative control: a host route to a non-default destination is not the default route,
         // so its gateway is never taken for the default gateway.
         let host = route_message(
@@ -979,11 +1126,104 @@ mod gateway_tests {
                 &sockaddr_in(Ipv4Addr::new(10, 0, 0, 1)),
             ],
         );
-        assert_eq!(default_gateway_ipv4(&host), None);
+        assert_eq!(read(&host), None);
         // A table that leads with the host route still finds the default behind it.
         let mut both = host.clone();
         both.extend_from_slice(&default);
-        assert_eq!(default_gateway_ipv4(&both), Some(gw));
+        assert_eq!(read(&both), Some(gw));
+    }
+
+    /// `message` with its interface index (`rtm_index`) set to `index`.
+    fn on_interface(mut message: Vec<u8>, index: u16) -> Vec<u8> {
+        let at = std::mem::offset_of!(RtMsghdr, rtm_index);
+        message[at..at + 2].copy_from_slice(&index.to_ne_bytes());
+        message
+    }
+
+    /// With Wi-Fi and Ethernet both attached, the kernel keeps an interface-scoped default on
+    /// each and one primary: the primary alone names where traffic goes, whichever comes first
+    /// in the table, and each route's gateway is paired with its own interface and with that
+    /// interface's ARP entry, even where both gateways share an address.
+    /// NEGATIVE CONTROL: dropping the `RTF_IFSCOPE` test makes the scoped Ethernet default,
+    /// first in the table, the primary (`interface` reads `en7`), and this test fails.
+    #[test]
+    fn the_primary_default_is_the_unscoped_one_with_its_own_gateway_and_arp_entry() {
+        let gw = Ipv4Addr::new(192, 168, 1, 1);
+        let wifi_mac = [0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33];
+        let wired_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x07];
+        let default_on = |index: u16, flags: i32| {
+            on_interface(
+                route_message(
+                    flags,
+                    RTA_DST | RTA_GATEWAY,
+                    &[&sockaddr_in(Ipv4Addr::UNSPECIFIED), &sockaddr_in(gw)],
+                ),
+                index,
+            )
+        };
+        let mut table = default_on(7, RTF_UP | RTF_GATEWAY | RTF_IFSCOPE);
+        table.extend_from_slice(&default_on(4, RTF_UP | RTF_GATEWAY));
+        table.extend_from_slice(&default_on(4, RTF_UP | RTF_GATEWAY | RTF_IFSCOPE));
+        let arp_on = |index: u16, mac: &[u8]| {
+            on_interface(
+                route_message(
+                    0,
+                    RTA_DST | RTA_GATEWAY,
+                    &[&sockaddr_in(gw), &sockaddr_dl(mac)],
+                ),
+                index,
+            )
+        };
+        let mut arp = arp_on(7, &wired_mac);
+        arp.extend_from_slice(&arp_on(4, &wifi_mac));
+        let name = |index: u16| match index {
+            4 => Some("en0".to_owned()),
+            7 => Some("en7".to_owned()),
+            _ => None,
+        };
+        let routes = default_routes_of(&table, &arp, name);
+        // The home-LAN evidence reader must use this same primary/interface pairing.
+        // The former reader chose the first scoped route and the first matching ARP entry.
+        assert_eq!(
+            primary_gateway_hardware(&table, &arp, name).as_deref(),
+            Some(wifi_mac.as_slice())
+        );
+        assert_eq!(
+            primary_gateway_hardware(&table, &arp_on(7, &wired_mac), name),
+            None
+        );
+        let primary = routes.primary.expect("the unscoped default");
+        assert_eq!(primary.interface, "en0");
+        assert_eq!(primary.gateway, Some(gw));
+        assert_eq!(primary.gateway_hw.as_deref(), Some(wifi_mac.as_slice()));
+        let scoped: Vec<(&str, Option<&[u8]>)> = routes
+            .scoped
+            .iter()
+            .map(|route| (route.interface.as_str(), route.gateway_hw.as_deref()))
+            .collect();
+        assert_eq!(
+            scoped,
+            [
+                ("en7", Some(wired_mac.as_slice())),
+                ("en0", Some(wifi_mac.as_slice()))
+            ]
+        );
+        // A default straight onto a link (a VPN's utun) has no IPv4 next hop.
+        let utun = on_interface(
+            route_message(
+                RTF_UP,
+                RTA_DST | RTA_GATEWAY,
+                &[&sockaddr_in(Ipv4Addr::UNSPECIFIED), &sockaddr_dl(&[])],
+            ),
+            9,
+        );
+        let routes = default_routes_of(&utun, &arp, |_| Some("utun4".to_owned()));
+        let primary = routes.primary.expect("the tunnel's default");
+        assert_eq!(
+            (primary.interface.as_str(), primary.gateway),
+            ("utun4", None)
+        );
+        assert_eq!(default_routes_of(&[], &arp, name), DefaultRoutes::default());
     }
 
     #[test]
@@ -996,12 +1236,12 @@ mod gateway_tests {
             &[&sockaddr_in(gw), &sockaddr_dl(&mac)],
         );
         assert_eq!(
-            gateway_hardware(&entry, gw).as_deref(),
+            gateway_hardware_on(&entry, gw, 0).as_deref(),
             Some(mac.as_slice())
         );
         // Negative control: no entry names this gateway yet, so the key cannot be formed.
         assert_eq!(
-            gateway_hardware(&entry, Ipv4Addr::new(192, 168, 1, 254)),
+            gateway_hardware_on(&entry, Ipv4Addr::new(192, 168, 1, 254), 0),
             None
         );
         // An incomplete entry (no hardware address) is no entry.
@@ -1010,7 +1250,7 @@ mod gateway_tests {
             RTA_DST | RTA_GATEWAY,
             &[&sockaddr_in(gw), &sockaddr_dl(&[])],
         );
-        assert_eq!(gateway_hardware(&incomplete, gw), None);
+        assert_eq!(gateway_hardware_on(&incomplete, gw, 0), None);
     }
 
     /// `route_source_ipv4`'s lookup asks the kernel for the route to its destination with the
@@ -1157,16 +1397,17 @@ mod linux_gateway_tests {
              en0\t00000000\t00000000\t0001\t0\t0\t90\t00000000\n\
              en0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\n";
         assert_eq!(
-            linux_default_gateway(route),
-            Some(Ipv4Addr::new(192, 168, 1, 1))
+            linux_default_routes(route, "").primary.unwrap().gateway,
+            None,
+            "the gatewayless primary must not borrow a later route's gateway"
         );
         // Negative control: with no default-destination row there is no gateway.
         let no_default = "Iface\tDestination\tGateway\tFlags\nen0\t0001A8C0\t00000000\t0001\n";
-        assert_eq!(linux_default_gateway(no_default), None);
+        assert_eq!(linux_default_routes(no_default, "").primary, None);
         let signed_route = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
              en0\t00000000\t+101A8C0\t0003\t0\t0\t100\t00000000\n\
              en0\t00000000\t0101A8C0\t+003\t0\t0\t100\t00000000\n";
-        assert_eq!(linux_default_gateway(signed_route), None);
+        assert_eq!(linux_default_routes(signed_route, "").primary, None);
 
         let arp = "IP address       HW type     Flags       HW address            Mask     Device\n\
              192.168.1.1      0x1         0x0         de:ad:be:ef:00:01     *        wlan0\n\
@@ -1174,20 +1415,44 @@ mod linux_gateway_tests {
              192.168.1.1      0x1         0x2         +a:bb:cc:11:22:33     *        wlan0\n\
              192.168.1.1      0x1         0x2         aa:bb:cc:11:22:33     *        en0\n";
         assert_eq!(
-            linux_neighbour_hardware(arp, Ipv4Addr::new(192, 168, 1, 1)).as_deref(),
+            linux_neighbour_hardware(arp, Ipv4Addr::new(192, 168, 1, 1), "en0").as_deref(),
             Some([0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33].as_slice())
         );
         // Negative control: a stranger, and an incomplete entry, give nothing.
         assert_eq!(
-            linux_neighbour_hardware(arp, Ipv4Addr::new(192, 168, 1, 9)),
+            linux_neighbour_hardware(arp, Ipv4Addr::new(192, 168, 1, 9), "en0"),
             None
         );
         let incomplete = "IP address       HW type     Flags       HW address            Mask     Device\n\
              192.168.1.1      0x1         0x0         00:00:00:00:00:00     *        en0\n\
              192.168.1.1      0x1         0x0         de:ad:be:ef:00:01     *        en0\n";
         assert_eq!(
-            linux_neighbour_hardware(incomplete, Ipv4Addr::new(192, 168, 1, 1)),
+            linux_neighbour_hardware(incomplete, Ipv4Addr::new(192, 168, 1, 1), "en0"),
             None
         );
+    }
+
+    /// The first up `/0` row of `/proc/net/route` is the primary default, with its own
+    /// interface, gateway and that gateway's ARP entry; a down row is passed over.
+    #[test]
+    fn proc_route_names_the_primary_defaults_interface_and_gateway() {
+        let route = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+             eth9\t00000000\t0101A8C0\t0002\t0\t0\t10\t00000000\n\
+             wlan0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\n";
+        let arp = "IP address       HW type     Flags       HW address            Mask     Device\n\
+             192.168.1.1      0x1         0x2         de:ad:be:ef:00:07     *        eth9\n\
+             192.168.1.1      0x1         0x2         aa:bb:cc:11:22:33     *        wlan0\n";
+        let routes = linux_default_routes(route, arp);
+        let primary = routes.primary.expect("a default");
+        assert_eq!(primary.interface, "wlan0");
+        assert_eq!(primary.gateway, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(
+            primary.gateway_hw.as_deref(),
+            Some([0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33].as_slice())
+        );
+        assert!(routes.scoped.is_empty());
+        // Negative control: no default row, no primary.
+        let none = "Iface\tDestination\tGateway\tFlags\nen0\t0001A8C0\t00000000\t0001\n";
+        assert_eq!(linux_default_routes(none, arp), DefaultRoutes::default());
     }
 }

@@ -36,6 +36,21 @@ pub(crate) use relay::{
     read_publication as read_live_publication,
 };
 
+/// A second address for the current transport owner's observation, kept only while
+/// that runtime holds the corresponding Commons lease.
+pub(crate) struct TransportRelay(relay::Server);
+
+impl TransportRelay {
+    pub(crate) fn is_running(&self) -> bool {
+        self.0.is_running()
+    }
+}
+
+/// Read the leased transport owner's observation independently of its GUI configuration.
+pub(crate) fn read_transport_publication(dir: &Path) -> std::io::Result<Publication> {
+    relay::read_owner_at(dir)
+}
+
 /// An observation and its original local monotonic sample time. This lease is
 /// process-local evidence and is never stored in the history journal.
 #[derive(Clone, Debug)]
@@ -583,6 +598,12 @@ pub(crate) struct Observer {
     repair_sampled: BTreeMap<[u8; 16], Instant>,
 }
 impl Observer {
+    /// Publish this observer beside its transport lease. Failure leaves repair running;
+    /// the runtime retries the relay while it retains that lease.
+    pub(crate) fn transport_relay(&self, dir: &Path) -> std::io::Result<TransportRelay> {
+        relay::Server::start(dir, self.published.clone()).map(TransportRelay)
+    }
+
     pub(crate) fn open(
         config: &Path,
         published: ObservationHandle,

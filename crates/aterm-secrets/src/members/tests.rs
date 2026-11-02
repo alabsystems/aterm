@@ -821,6 +821,7 @@ fn a_joiner_shown_several_phrases_is_told_each_ones_address() {
             challenge: [0; desk::CHALLENGE_LEN],
         },
         answer: Answer::Allowed,
+        signed: joiner::Signed::Unsigned,
     };
     let heard = [at("10.0.0.7:7100", 0xab), at("10.0.0.66:7100", 0xcd)];
     for member in [None, Some("m7")] {
@@ -1137,6 +1138,12 @@ fn refreshing_without_a_roster_binding_or_on_a_new_network_cancels_live_phrases(
     assert!(m1.lock().unwrap().rows(Instant::now()).is_empty());
 }
 
+/// A run the node job relays to the window's desk gets its bundle, and the relay passes the new
+/// Mac's acknowledgement back, so the row closes.
+///
+/// NEGATIVE CONTROL: `relay` returning after the bundle without passing the acknowledgement on
+/// (`if acks && false`): `left: Unacknowledged("the other Mac closed the join exchange")`,
+/// `right: Acknowledged`.
 #[test]
 fn a_run_relayed_between_the_node_job_and_the_window_gets_its_bundle() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1152,16 +1159,27 @@ fn a_run_relayed_between_the_node_job_and_the_window_gets_its_bundle() {
     for end in [&window, &window_end, &joiner_end, &node_end] {
         end.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
     }
+    let shared = &m1;
     let got = std::thread::scope(|scope| {
         let bundle = bundle_of(&value);
-        let served = scope.spawn(move || desk::serve(&m1, &mut window, address(9), &bundle));
+        let served = scope.spawn(move || desk::serve(shared, &mut window, address(9), &bundle));
         let relayed = scope.spawn(move || super::relay(&mut node_end, &mut window_end));
         let greeting = joiner::greeting(&mut joiner_end).unwrap();
         let got = joiner::run(&mut joiner_end, &greeting, &j, &phrase);
-        assert!(served.join().unwrap().unwrap().is_some());
+        let let_in = served
+            .join()
+            .unwrap()
+            .unwrap()
+            .expect("a run that sent its bundle");
+        assert_eq!(
+            let_in.delivered,
+            desk::Delivered::Acknowledged,
+            "the relay passes the acknowledgement on"
+        );
         relayed.join().unwrap().unwrap();
         got
     });
+    assert_eq!(states(&m1), [RowState::Closed]);
     let bundle = got.expect("the bundle through the relay");
     assert_eq!(
         text::parse_locker(bundle.files().expect("files").as_slice()).unwrap()[0]
@@ -1302,7 +1320,11 @@ fn proving<T>(
                 &mut ours,
                 address(5),
                 &bundle,
-                Some(desk::Proof { decide, fleet }),
+                Some(desk::Proof {
+                    decide,
+                    refuses: &|_| None,
+                    fleet,
+                }),
             )
         });
         let said = joiner(&mut theirs);
@@ -1492,4 +1514,343 @@ impl<S: std::io::Write + ?Sized> std::io::Write for Tee<'_, S> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+/// A stream that loses everything the joiner writes from its acknowledgement on: the link went
+/// down just after the bundle arrived.
+struct LosesTheAck<'a> {
+    inner: &'a mut UnixStream,
+    lost: bool,
+}
+
+impl std::io::Read for LosesTheAck<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(self.inner, buf)
+    }
+}
+
+impl std::io::Write for LosesTheAck<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.lost |= buf.starts_with(b"ack ");
+        if self.lost {
+            return Ok(buf.len());
+        }
+        std::io::Write::write(self.inner, buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(self.inner)
+    }
+}
+
+/// A bundle the member wrote that the new Mac never acknowledged (the link dropped after the
+/// write, or a relay cut it) leaves the row allowed, its phrase spent, so a person's Allow again
+/// works at once and that phrase lets the Mac in; the row closes on the acknowledgement. A joiner
+/// that asks for no acknowledgement (one from before them) closes the row at the write, as
+/// before.
+///
+/// NEGATIVE CONTROL: `steps` closing the row before it reads the acknowledgement (the
+/// `desk.close(..)` moved above the `acknowledged` read): the row is closed at once,
+/// `left: [Closed]`, `right: [Allowed(PhraseId(..))]`.
+#[test]
+fn a_bundle_the_new_mac_never_acknowledged_leaves_its_row_open_for_allow_again() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let m1 = member(root.path(), "m1");
+    let (_, device) = mac(root.path(), "j");
+    let j = joining(&device, [7; 32], "j");
+    assert_eq!(ask(&m1, address(9), &j), Answer::Asking);
+    let words = allow(&m1);
+    let pid = phrase_of(&m1);
+    let phrase = Phrase::parse(&words).expect("three words");
+    let (served, got) = exchange(&m1, address(9), &token(), |stream| {
+        let greeting = joiner::greeting(stream)?;
+        let mut lossy = LosesTheAck {
+            inner: stream,
+            lost: false,
+        };
+        joiner::run(&mut lossy, &greeting, &j, &phrase)
+    });
+    got.expect("the bundle arrived, its acknowledgement did not");
+    let sent = served
+        .expect("served")
+        .expect("the member wrote its bundle");
+    assert!(
+        matches!(sent.delivered, desk::Delivered::Unacknowledged(_)),
+        "sent, not acknowledged"
+    );
+    assert_eq!(
+        states(&m1),
+        [RowState::Allowed(pid)],
+        "an unacknowledged bundle leaves the row allowed"
+    );
+    assert_eq!(
+        m1.lock().unwrap().phrase_state(pid),
+        Some(crate::pake::PhraseState::Admitted),
+        "its phrase is spent"
+    );
+
+    let words = allow(&m1);
+    let value = token();
+    let (served, got) = run(&m1, address(9), &j, &words, &value);
+    let bundle = got.expect("Allow again lets it in");
+    let let_in = served.expect("served").expect("a run that sent its bundle");
+    assert_eq!(let_in.delivered, desk::Delivered::Acknowledged);
+    assert_eq!(
+        text::parse_locker(bundle.files().expect("files").as_slice()).unwrap()[0]
+            .value
+            .as_slice(),
+        value.as_bytes()
+    );
+    assert_eq!(
+        states(&m1),
+        [RowState::Closed],
+        "acknowledged, the row closes"
+    );
+
+    // A joiner that asks for no acknowledgement: closed at the write.
+    let (_, k_device) = mac(root.path(), "k");
+    let k = joining(&k_device, [7; 32], "k");
+    assert_eq!(ask(&m1, address(10), &k), Answer::Asking);
+    let words = {
+        let mut desk = m1.lock().unwrap();
+        let now = Instant::now();
+        let row = desk
+            .rows(now)
+            .iter()
+            .find(|row| row.name == "k")
+            .unwrap()
+            .id;
+        let phrase = desk.allow(row, now).expect("allowed");
+        desk.words(phrase, now).expect("live").join(" ")
+    };
+    let phrase = Phrase::parse(&words).expect("three words");
+    let request = k.request(&joiner_greeting(&m1)).unwrap();
+    let (served, got) = exchange(&m1, address(10), "", |stream| {
+        let greeting = joiner::greeting(stream)?;
+        stolen_run(stream, &greeting, &request, &k_device, &k_device, &phrase)
+    });
+    got.expect("the bundle");
+    let let_in = served.expect("served").expect("a run that sent its bundle");
+    assert_eq!(let_in.delivered, desk::Delivered::Written);
+    assert_eq!(states(&m1), [RowState::Closed, RowState::Closed]);
+}
+
+/// A stream that keeps every byte read through it.
+struct Recording<'a, S: ?Sized> {
+    inner: &'a mut S,
+    read: Vec<u8>,
+}
+
+impl<S: std::io::Read + ?Sized> std::io::Read for Recording<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
+impl<S: std::io::Write + ?Sized> std::io::Write for Recording<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A LAN host that copies a member's greeting (its key, name and network) and answers every ask
+/// "allowed" is no candidate beside that member: its greeting proves no key, while the member's
+/// own answers prove its key on each connection. One member reached at two addresses (Wi-Fi and
+/// Ethernet) is one candidate, so the phrase goes to it with no `--at`.
+///
+/// NEGATIVE CONTROLS: `ask_checked` taking any `gsig` as verified without checking it: the
+/// copier that replays an answer m5 signed for another connection is heard,
+/// `an answer m5 signed for another connection proves nothing: []`. `pick` skipping `outranked`:
+/// `one candidate: Error("3 members show a phrase (m5 at 10.0.0.67:7100, m5 at 10.0.0.5:7100,
+/// m5 at [fd00::5]:7100): ...`.
+#[test]
+fn a_host_that_copies_a_members_greeting_is_no_candidate_beside_it() {
+    use super::join;
+    use super::wire;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let m5 = member(root.path(), "m5");
+    let (_, device) = mac(root.path(), "j");
+    let j = joining(&device, [7; 32], "j");
+    assert_eq!(ask(&m5, address(9), &j), Answer::Asking);
+    let _words = allow(&m5);
+    // What the copier took from m5: its greeting line, and an answer m5 gave another ask.
+    let (_, copied) = exchange(&m5, address(66), "", |stream| {
+        let mut recording = Recording {
+            inner: stream,
+            read: Vec::new(),
+        };
+        let greeting = joiner::greeting(&mut recording)?;
+        joiner::ask(&mut recording, &greeting, &j)?;
+        Ok::<_, crate::Error>(String::from_utf8(recording.read).unwrap())
+    });
+    let copied = copied.expect("m5 answered the copier");
+    let mut lines = copied.lines();
+    let (greeting_line, answer_line) = (
+        lines.next().unwrap().to_owned(),
+        lines.next().unwrap().to_owned(),
+    );
+    let bundle = bundle_of("");
+    std::thread::scope(|scope| {
+        let dial = |at: &str| -> Result<Box<dyn join::Stream>> {
+            let (ours, theirs) = UnixStream::pair()?;
+            for end in [&ours, &theirs] {
+                end.set_read_timeout(Some(Duration::from_secs(60)))?;
+            }
+            let replays = match at {
+                "10.0.0.66:7100" => Some(answer_line.clone()),
+                "10.0.0.67:7100" => Some("OK state=allowed".to_owned()),
+                _ => None,
+            };
+            let (m5, bundle, greeting_line) = (&m5, &bundle, &greeting_line);
+            scope.spawn(move || {
+                let mut ours = ours;
+                match replays {
+                    Some(answer) => {
+                        wire::write_line(&mut ours, greeting_line)?;
+                        wire::read_line(&mut ours)?;
+                        wire::write_line(&mut ours, &answer)
+                    }
+                    None => desk::serve(m5, &mut ours, address(9), bundle).map(drop),
+                }
+            });
+            Ok(Box::new(theirs))
+        };
+        let ats = [
+            "10.0.0.66:7100",
+            "10.0.0.67:7100",
+            "10.0.0.5:7100",
+            "[fd00::5]:7100",
+        ]
+        .map(String::from);
+        let (heard, missed) = join::ask_all(&dial, &j, &ats);
+        assert!(
+            !heard.iter().any(|heard| heard.at == "10.0.0.66:7100"),
+            "an answer m5 signed for another connection proves nothing: {missed:?}"
+        );
+        assert!(
+            missed.iter().any(|(at, _)| at == "10.0.0.66:7100"),
+            "{missed:?}"
+        );
+        let signed = |at: &str| {
+            heard
+                .iter()
+                .find(|heard| heard.at == at)
+                .map(|heard| heard.signed)
+        };
+        assert_eq!(signed("10.0.0.67:7100"), Some(joiner::Signed::Unsigned));
+        assert_eq!(signed("10.0.0.5:7100"), Some(joiner::Signed::Verified));
+        assert_eq!(signed("[fd00::5]:7100"), Some(joiner::Signed::Verified));
+        for member in [None, Some("m5")] {
+            let picked = join::pick(&heard, member).expect("one candidate");
+            assert!(
+                picked.at == "10.0.0.5:7100" || picked.at == "[fd00::5]:7100",
+                "{}",
+                picked.at
+            );
+        }
+    });
+}
+
+/// What a member at `at` said to an ask, for [`super::join::pick`]: its greeting under `key` and
+/// `name`, showing an invite where `invite`, its answer, and whether it proved its key.
+fn heard_from(
+    at: &str,
+    key: u8,
+    name: &str,
+    invite: bool,
+    answer: Answer,
+    signed: joiner::Signed,
+) -> super::join::Heard {
+    super::join::Heard {
+        at: at.to_owned(),
+        greeting: joiner::Greeting {
+            key: [key; 32],
+            network: TRUST.network,
+            authority: TRUST.authority,
+            genesis: TRUST.genesis,
+            name: name.to_owned(),
+            can_allow: true,
+            invite,
+            challenge: [0; desk::CHALLENGE_LEN],
+        },
+        answer,
+        signed,
+    }
+}
+
+/// A host that copies a member's greeting and answers "allowed", where the member itself shows an
+/// invite (it answers "asking" with `invite=1`, signed), is no candidate: the copy proves no key,
+/// and the member beside it proves that key. The phrase goes to the member, with no `--at`.
+///
+/// NEGATIVE CONTROL: ranking the answers after the tier is chosen (as before): the copier alone
+/// said "allowed", nothing signed in that tier, and the phrase goes to it ("the phrase went to the
+/// copier: 10.0.0.66:7100").
+#[test]
+fn a_copier_saying_allowed_is_no_candidate_beside_the_member_showing_an_invite() {
+    let heard = [
+        heard_from(
+            "10.0.0.5:7100",
+            5,
+            "m5",
+            true,
+            Answer::Asking,
+            joiner::Signed::Verified,
+        ),
+        heard_from(
+            "10.0.0.66:7100",
+            5,
+            "m5",
+            true,
+            Answer::Allowed,
+            joiner::Signed::Unsigned,
+        ),
+    ];
+    let picked = super::join::pick(&heard, None).expect("one candidate");
+    assert_eq!(
+        picked.at, "10.0.0.5:7100",
+        "the phrase went to the copier: {}",
+        picked.at
+    );
+}
+
+/// A member from before signed greetings (m3) and a member that signs (m5) both show a phrase for
+/// this Mac: two candidates under two keys, so the run names both and sends the phrase to neither,
+/// as before signed greetings. Sending it to m5 because m5 signs would burn m5's phrase when the
+/// person typed m3's, and they would have to Allow again.
+///
+/// NEGATIVE CONTROL: dropping every unsigned answer beside any signed one (as before): the phrase
+/// goes to m5 ("an old member beside a new one: Ok(\"10.0.0.5:7100\")").
+#[test]
+fn an_old_member_and_a_new_one_that_both_show_a_phrase_are_both_named() {
+    let heard = [
+        heard_from(
+            "10.0.0.3:7100",
+            3,
+            "m3",
+            false,
+            Answer::Allowed,
+            joiner::Signed::Unsigned,
+        ),
+        heard_from(
+            "10.0.0.5:7100",
+            5,
+            "m5",
+            false,
+            Answer::Allowed,
+            joiner::Signed::Verified,
+        ),
+    ];
+    let picked = super::join::pick(&heard, None).map(|heard| heard.at.clone());
+    let Err(error) = &picked else {
+        panic!("an old member beside a new one: {picked:?}");
+    };
+    let said = error.to_string();
+    assert!(
+        said.contains("m3 at 10.0.0.3:7100") && said.contains("m5 at 10.0.0.5:7100"),
+        "{said}"
+    );
 }

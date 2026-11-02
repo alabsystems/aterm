@@ -35,6 +35,42 @@ pub(crate) enum PathEvent {
         expect(dead_code, reason = "the route source is macOS's and Linux's")
     )]
     Moved,
+    /// The network place settled onto a network (`crate::network_moved::Woke::Place`): the new
+    /// network is usable, so the API's reach is measured now (and again while it reads down),
+    /// whether or not a session holds a lease ([`NetProbe::settled`]), and the place's internet
+    /// axis says what this network gives. Built on every platform: [`NetProbe::settled`] hands it
+    /// on.
+    Settled,
+}
+
+/// The lease a settled place takes on the probe ([`NetProbe::settled`]): one measure, then it
+/// lapses with no session renewing it, unless that measure read down ([`SETTLED_DOWN_FOR`]).
+pub(crate) const SETTLED_LEASE: &str = "network-place";
+
+/// How long after the place settles its lease is renewed while the API reads down
+/// ([`keep_settled`]): a router's Wi-Fi comes back a minute or two before its WAN, and one
+/// measure would read the whole stay down with no session asking. The probe then measures at its
+/// down cadence until an Up, for at most this long; past it the place's down note goes stale
+/// (`aterm_netplace::place::INTERNET_FRESH_MS`) and the place reads what the path says.
+pub(crate) const SETTLED_DOWN_FOR: Duration = Duration::from_secs(10 * 60);
+
+/// After a probe that ended `outcome` at `now`, while the place's settle (`until`: its watch's
+/// end) still runs and the API did not read up: the settled lease renewed in `st`, so the probe
+/// measures again at its down cadence. An Up, or the watch run out, ends it. The watch's next
+/// state.
+fn keep_settled(
+    st: &mut NetState,
+    outcome: Outcome,
+    until: Option<Instant>,
+    (now, wall): (Instant, SystemTime),
+) -> Option<Instant> {
+    match until {
+        Some(until) if outcome != Outcome::Up && now < until => {
+            let _ = st.ask(SETTLED_LEASE, now, wall);
+            Some(until)
+        }
+        _ => None,
+    }
 }
 
 /// Where each reading of this Mac's network goes ([`PathSource::watch`]). It may be called once
@@ -140,8 +176,14 @@ impl RouteMoves {
             crate::qos::Role::Background,
             move || {
                 while !ended.load(Ordering::SeqCst) {
-                    if route_move(moved.wait(Self::SLICE)) && !ended.load(Ordering::SeqCst) {
+                    let woke = moved.wait(Self::SLICE);
+                    if ended.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if route_move(woke) {
                         sink(PathEvent::Moved);
+                    } else if woke == crate::network_moved::Woke::Place {
+                        sink(PathEvent::Settled);
                     }
                 }
             },
@@ -425,6 +467,9 @@ pub(crate) struct NetProbe {
     /// The instance's book of answered turns, the witnesses on each route (v6 §14.17.5.4,
     /// [`Self::answered`], [`Self::witness`]), kept on the instance's own probe.
     witnesses: Mutex<Witnesses>,
+    /// Until when the settled place's lease is renewed while the API reads down
+    /// ([`keep_settled`]); `None` outside a settle's watch.
+    settled_until: Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for NetProbe {
@@ -469,6 +514,7 @@ impl NetProbe {
             saturated: AtomicBool::new(false),
             usable: Mutex::default(),
             witnesses: Mutex::default(),
+            settled_until: Mutex::new(None),
         })
     }
 
@@ -541,7 +587,18 @@ impl NetProbe {
 
     /// Session `sid`'s turn on route `key` ended on a real reply `at`: booked as a witness on that
     /// route ([`Witnesses::answered`]).
+    /// A real reply from an internet host also says the internet answered when that reply came,
+    /// for this Mac's network place (`crate::net_place::note_internet`, a turn reply stamped with
+    /// the reply's own time, which can be hours old: the place counts it only for the stay it came
+    /// in, and a stale one is noted nowhere).
     pub(crate) fn answered(&self, key: RouteKey, sid: &str, at: Instant) {
+        let age_ms = u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        crate::net_place::note_internet(
+            true,
+            aterm_netplace::InternetSource::TurnReply,
+            &key.base.target.host,
+            aterm_netplace::unix_ms_now().saturating_sub(age_ms),
+        );
         self.witnesses
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -598,7 +655,10 @@ impl NetProbe {
         let me = Arc::downgrade(self);
         *watch = source.watch(Box::new(move |event| {
             if let Some(me) = me.upgrade() {
-                me.path_moved(event);
+                match event {
+                    PathEvent::Settled => me.settled(),
+                    event => me.path_moved(event),
+                }
             }
         }));
         if watch.is_none() {
@@ -643,7 +703,7 @@ impl NetProbe {
                 PathEvent::Usable(satisfied) => {
                     st.path(satisfied, Instant::now(), SystemTime::now())
                 }
-                PathEvent::Moved => st.moved(Instant::now()),
+                PathEvent::Moved | PathEvent::Settled => st.moved(Instant::now()),
             };
             if owed {
                 self.wake.notify_all();
@@ -652,7 +712,7 @@ impl NetProbe {
         };
         let satisfied = match event {
             PathEvent::Usable(satisfied) => satisfied,
-            PathEvent::Moved => {
+            PathEvent::Moved | PathEvent::Settled => {
                 if owed {
                     aterm_log::info!(
                         "harness: the network's routes moved; the API reach is measured again \
@@ -673,6 +733,22 @@ impl NetProbe {
             }
             _ => {}
         }
+    }
+
+    /// THE NETWORK PLACE SETTLED onto a network ([`PathEvent::Settled`]): the routes moved
+    /// ([`Self::path_moved`]), and the API's reach is measured now under the [`SETTLED_LEASE`],
+    /// which no session renews, so it lapses after that measure, or, while the API reads down,
+    /// once an Up came or [`SETTLED_DOWN_FOR`] passed ([`keep_settled`]). A route move alone owes
+    /// a probe only to a session's lease, and with no session asking (the usual case while every
+    /// turn ends on a reply) nothing measured the new network: its internet read "path up, not
+    /// measured" for as long as no turn ended on one.
+    pub(crate) fn settled(self: &Arc<Self>) {
+        self.path_moved(PathEvent::Settled);
+        *self
+            .settled_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Instant::now().checked_add(SETTLED_DOWN_FOR);
+        let _ = self.ask(SETTLED_LEASE);
     }
 
     /// When a new measure can next land ([`NetState::landing`]): always later than now, `None`
@@ -795,10 +871,26 @@ impl NetProbe {
         let (edge, waiting) = {
             let mut st = self.lock();
             let edge = st.finish(outcome, now, wall);
+            let mut until = self
+                .settled_until
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *until = keep_settled(&mut st, outcome, *until, (now, wall));
+            drop(until);
             (edge, st.waiting(now))
         };
         if let Some(edge) = edge {
             aterm_log::info!("{}", edge_line(&edge, waiting));
+        }
+        // A measured answer, either way, is the internet axis of this Mac's network place.
+        match outcome {
+            Outcome::Up | Outcome::Down => crate::net_place::note_internet(
+                outcome == Outcome::Up,
+                aterm_netplace::InternetSource::ApiProbe,
+                &self.target.host,
+                aterm_netplace::unix_ms_now(),
+            ),
+            Outcome::Unknown => {}
         }
     }
 
@@ -1087,9 +1179,83 @@ mod tests {
     impl Handing {
         /// The watch reads the path: `satisfied`, on the calling thread.
         fn read(&self, satisfied: bool) {
-            let sink = self.sink.lock().unwrap();
-            (sink.as_ref().expect("a watch started"))(PathEvent::Usable(satisfied));
+            self.send(PathEvent::Usable(satisfied));
         }
+
+        /// The watch hears `event`, on the calling thread.
+        fn send(&self, event: PathEvent) {
+            let sink = self.sink.lock().unwrap();
+            (sink.as_ref().expect("a watch started"))(event);
+        }
+    }
+
+    /// A SETTLED PLACE MEASURES THE API ONCE, with no session asking: a peek starts the path's
+    /// watch and takes no lease, a route move then owes nothing, and the network place settling
+    /// onto a network probes the API (the place's internet axis then reads what this network
+    /// gives, not "path up, not measured").
+    /// NEGATIVE CONTROL: `settled` without its `ask` (a route move's handling alone) probes
+    /// nothing, and the wait for the probe's resolve hangs past the one-minute detector: "the
+    /// settled network is measured".
+    #[test]
+    fn a_settled_place_measures_the_api_once_with_no_session_asking() {
+        let (probe, resolved) = Answering::new();
+        let np = NetProbe::with(probe, Duration::from_secs(5));
+        let path = Arc::new(Handing::default());
+        assert!(np.path_from(Arc::clone(&path) as Arc<dyn PathSource>));
+        assert_eq!(np.peek(), Reach::Unknown, "a peek takes no lease");
+        path.send(PathEvent::Moved);
+        assert!(
+            resolved.try_recv().is_err(),
+            "a route move owes no session-less probe"
+        );
+        path.send(PathEvent::Settled);
+        assert!(
+            resolved.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok(),
+            "the settled network is measured"
+        );
+        np.stop();
+    }
+
+    /// A SETTLED PLACE READING DOWN IS MEASURED AGAIN UNTIL UP: no session asks, so the settled
+    /// lease alone keeps the probe going, and each measure that reads down renews it within the
+    /// settle's watch, past one lease's length; an Up ends it, and the lease then lapses. A watch
+    /// that ran out renews nothing.
+    /// NEGATIVE CONTROL: `keep_settled` renewing nothing (its first arm returning `None` without
+    /// the `ask`) lets the lease lapse a minute after the settle, and "measured again while
+    /// down" fails.
+    #[test]
+    fn a_settled_place_reading_down_is_measured_again_until_up() {
+        let (t, w) = (Instant::now(), SystemTime::now());
+        let at = |now: Instant| (now, w + now.saturating_duration_since(t));
+        let mut st = NetState::with_budget(Duration::from_secs(5));
+        let _ = st.ask(SETTLED_LEASE, t, w);
+        let mut until = Some(t + SETTLED_DOWN_FOR);
+        let mut now = t;
+        while now <= t + netwatch::NET_LEASE + Duration::from_secs(10) {
+            let (due, wall) = at(now);
+            now = st
+                .next_probe(due, wall)
+                .expect("measured again while down")
+                .max(now);
+            assert!(st.begin(now));
+            let _ = st.finish(Outcome::Down, now, at(now).1);
+            until = keep_settled(&mut st, Outcome::Down, until, at(now));
+        }
+        assert!(st.begin(now));
+        let _ = st.finish(Outcome::Up, now, at(now).1);
+        until = keep_settled(&mut st, Outcome::Up, until, at(now));
+        assert_eq!(until, None, "an Up ends the watch");
+        let lapsed = now + netwatch::NET_LEASE;
+        assert_eq!(
+            st.next_probe(lapsed, at(lapsed).1),
+            None,
+            "then the lease lapses"
+        );
+        assert_eq!(
+            keep_settled(&mut st, Outcome::Down, Some(t), at(lapsed)),
+            None,
+            "a watch that ran out renews nothing"
+        );
     }
 
     /// The real probe loop, parked an hour after an Up, and `event` published at its checked,
@@ -1172,7 +1338,7 @@ mod tests {
                 PathEvent::Usable(satisfied) => {
                     np.lock().path(satisfied, Instant::now(), SystemTime::now())
                 }
-                PathEvent::Moved => np.lock().moved(Instant::now()),
+                PathEvent::Moved | PathEvent::Settled => np.lock().moved(Instant::now()),
             };
             assert!(
                 owed,

@@ -24,6 +24,7 @@ const W: Mac = Mac(10);
 const V: Mac = Mac(11);
 const U: Mac = Mac(12);
 const P: Mac = Mac(13);
+const R: Mac = Mac(14);
 
 impl Mac {
     fn seed(self) -> [u8; 32] {
@@ -32,14 +33,16 @@ impl Mac {
     fn incarnation(self) -> [u8; 16] {
         [self.0; 16]
     }
+    fn identity(self) -> age::Identity {
+        age::Identity::from_secret_bytes([self.0 ^ 0x55; 32])
+    }
     fn request(self) -> Request {
-        let identity = age::Identity::from_secret_bytes([self.0 ^ 0x55; 32]);
         Request::create(
             [2; 16],
             [3; 32],
             [self.0; 16],
             self.incarnation(),
-            &identity,
+            &self.identity(),
             &self.seed(),
         )
         .unwrap()
@@ -1608,6 +1611,255 @@ fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
     );
 }
 
+/// A `[everyone]` entry.
+fn everyone(name: &str, value: &[u8]) -> crate::text::Entry {
+    crate::text::Entry {
+        name: name.to_owned(),
+        value: crate::SecretBytes::from(value),
+        audience: crate::text::Audience::Everyone,
+        if_absent: false,
+        anchor: None,
+    }
+}
+
+/// Sign `draft` as `by`, hold it in `log`, and hand it back.
+fn signed_by(log: &mut Log, by: Mac, draft: Draft) -> Record {
+    log.keep(draft.sign(&by.seed(), by.incarnation()).unwrap())
+}
+
+/// F21's split, as records: the genesis (A, R and Y, with `E0` for `[everyone]` wrapped to all
+/// three and `S=v0` under it), A's removal of R at the genesis, and on a log that lacks that
+/// removal R's epoch `E` (wrapped to all three, with `T` under it) and then Y's `S=v1` under `E`.
+struct KeyedLab {
+    genesis: Log,
+    removal: Record,
+    /// `E`, R's `Wrap`s of it to A, R and Y, and R's `Put` of `T`, in that order.
+    minted: Vec<Record>,
+    edit: Record,
+    e0: RecordId,
+    epoch: RecordId,
+    key: zeroize::Zeroizing<[u8; 32]>,
+}
+
+impl KeyedLab {
+    /// The genesis and then `records`, each held in turn.
+    fn with(&self, records: &[&Record]) -> Log {
+        let mut log = self.genesis.clone();
+        for record in records {
+            log.keep((*record).clone());
+        }
+        log
+    }
+    fn minted(&self) -> Vec<&Record> {
+        self.minted.iter().collect()
+    }
+}
+
+fn keyed_lab() -> KeyedLab {
+    let mut lab = found(&[(A, "m1"), (R, "m2"), (Y, "m3")]);
+    let (draft, key0) = lab
+        .draft_epoch(&A.id(), 7, EpochAudience::Everyone, 1)
+        .unwrap();
+    let e0 = *signed_by(&mut lab, A, draft).id();
+    for mac in [A, R, Y] {
+        let wrap = lab
+            .draft_wrap(&A.id(), 7, e0, &key0, mac.identity().recipient())
+            .unwrap();
+        signed_by(&mut lab, A, wrap);
+    }
+    let put = lab
+        .draft_put(&A.id(), 7, e0, &key0, &everyone("S", b"v0"))
+        .unwrap();
+    signed_by(&mut lab, A, put);
+    let removal = remove(&lab, A, R, lab.network());
+    let mut island = lab.clone();
+    let (draft, key) = island
+        .draft_epoch(&R.id(), 7, EpochAudience::Everyone, 2)
+        .unwrap();
+    let minted_epoch = signed_by(&mut island, R, draft);
+    let epoch = *minted_epoch.id();
+    let mut minted = vec![minted_epoch];
+    for mac in [A, R, Y] {
+        let wrap = island
+            .draft_wrap(&R.id(), 7, epoch, &key, mac.identity().recipient())
+            .unwrap();
+        minted.push(signed_by(&mut island, R, wrap));
+    }
+    let put = island
+        .draft_put(&R.id(), 7, epoch, &key, &everyone("T", b"t"))
+        .unwrap();
+    minted.push(signed_by(&mut island, R, put));
+    let edit = island
+        .draft_put(&Y.id(), 7, epoch, &key, &everyone("S", b"v1"))
+        .unwrap();
+    let edit = signed_by(&mut island, Y, edit);
+    KeyedLab {
+        genesis: lab,
+        removal,
+        minted,
+        edit,
+        e0,
+        epoch,
+        key,
+    }
+}
+
+/// The dependents of `epoch` in `log` (F21 rule 1), by id.
+fn dependents_of(log: &Log, epoch: &RecordId) -> Vec<RecordId> {
+    log.effective()
+        .dependents(log.held[epoch])
+        .iter()
+        .map(|&d| *log.order[d].id())
+        .collect()
+}
+
+/// F21's rule 1, clause by clause, over [`keyed_lab`]'s records and variations of them.
+///
+/// - Every clause holds: `E` is keyed and Y's `Put` is its one dependent. R's `Wrap`s of `E`, all
+///   in that `Put`'s past, open it, though none counts; R's own `Put` is no dependent, and `E0`,
+///   which counts, is not keyed.
+/// - counts(d): when A also removes Y at the genesis, Y's `Put` is cut and is no dependent.
+/// - !counts(e): without A's removal `E` counts, and nothing depends on it.
+/// - plain(e): an epoch Z signs, where R let Z in after R held its own removal, was signed by no
+///   member, so Y's write under it is no dependent.
+/// - writer(d) ≠ writer(e): R's next incarnation (R's writer key, another incarnation), let in by
+///   Y on R's side, writes under `E`, and is no dependent.
+/// - Good faith: Y's write under `E` once it holds A's removal is no dependent, while Y's own
+///   removal of R at R's `Put` of `T`, whose cutoff reaches `E`, leaves Y's next write one.
+///
+/// NEGATIVE CONTROLS, one clause dropped from `Graph::depends` (or `Graph::dependents`) at a
+/// time, each failing its own assertion:
+/// - counts(d) ("a cut write is no dependent");
+/// - !counts(e) ("an epoch that counts is not keyed");
+/// - plain(e) ("an epoch no member signed is not keyed");
+/// - the writer clause ("R's next incarnation is R's writer");
+/// - good faith ("a write signed once its signer held the removal is no dependent").
+#[test]
+fn an_epoch_is_keyed_only_by_an_honest_write_from_another_writer_that_never_saw_its_cut() {
+    let lab = keyed_lab();
+    let minted = lab.minted();
+
+    let healed = lab.with(&[&[&lab.removal][..], &minted[..], &[&lab.edit][..]].concat());
+    let effective = healed.effective();
+    let at = |id: &RecordId| healed.held[id];
+    assert!(effective.keyed(at(&lab.epoch)), "E is keyed");
+    assert_eq!(
+        dependents_of(&healed, &lab.epoch),
+        [*lab.edit.id()],
+        "Y's Put is E's one dependent, R's own is none"
+    );
+    for wrap in &lab.minted[1..4] {
+        let w = at(wrap.id());
+        assert!(
+            !effective.counts(w) && effective.opens_wrap(w),
+            "R's Wrap in the dependent's past opens E"
+        );
+    }
+    assert!(effective.counts(at(&lab.e0)) && !effective.keyed(at(&lab.e0)));
+
+    let mut log = lab.with(&[&lab.removal]);
+    let cut_y = remove(&log, A, Y, log.network());
+    log.keep(cut_y);
+    for record in minted.iter().chain([&&lab.edit]) {
+        log.keep((*record).clone());
+    }
+    assert!(!log.effective().counts(log.held[lab.edit.id()]));
+    assert!(
+        dependents_of(&log, &lab.epoch).is_empty(),
+        "a cut write is no dependent"
+    );
+
+    let log = lab.with(&[&minted[..], &[&lab.edit][..]].concat());
+    assert!(log.effective().counts(log.held[&lab.epoch]));
+    assert!(
+        dependents_of(&log, &lab.epoch).is_empty(),
+        "an epoch that counts is not keyed"
+    );
+
+    let mut log = lab.with(&[&lab.removal]);
+    let let_in = admit(&log, R, Z, "m4");
+    log.keep(let_in);
+    let (draft, key) = log
+        .draft_epoch(&Z.id(), 7, EpochAudience::Everyone, 2)
+        .unwrap();
+    let unsigned = *signed_by(&mut log, Z, draft).id();
+    let put = log
+        .draft_put(&Y.id(), 7, unsigned, &key, &everyone("S", b"v2"))
+        .unwrap();
+    let put = *signed_by(&mut log, Y, put).id();
+    assert!(!log.effective().counts(log.held[&unsigned]));
+    assert!(log.effective().counts(log.held[&put]));
+    assert!(
+        dependents_of(&log, &unsigned).is_empty(),
+        "an epoch no member signed is not keyed"
+    );
+
+    let mut island = lab.with(&minted);
+    let next = Entrant {
+        request: Request::create(
+            [2; 16],
+            [3; 32],
+            [R.0; 16],
+            [0xEE; 16],
+            &age::Identity::from_secret_bytes([0xEE; 32]),
+            &R.seed(),
+        )
+        .unwrap(),
+        node_key: [0xEE; 32],
+        name: "mac-14".to_owned(),
+        label: "m4".to_owned(),
+    };
+    let next_id = next.member();
+    assert!(next_id[..32] == R.id()[..32] && next_id != R.id());
+    let let_in = sign(
+        &island,
+        Y,
+        Body::Admit {
+            entrant: next,
+            evidence: Evidence::Phrase,
+        },
+    );
+    island.keep(let_in);
+    let put = island
+        .draft_put(&next_id, 7, lab.epoch, &lab.key, &everyone("S", b"v3"))
+        .unwrap();
+    let put = *island.keep(put.sign(&R.seed(), [0xEE; 16]).unwrap()).id();
+    island.keep(lab.removal.clone());
+    assert!(
+        island.effective().counts(island.held[&put]),
+        "the next incarnation's write counts"
+    );
+    assert!(
+        dependents_of(&island, &lab.epoch).is_empty(),
+        "R's next incarnation is R's writer"
+    );
+
+    let mut log = lab.with(&[&[&lab.removal][..], &minted[..]].concat());
+    let late = log
+        .draft_put(&Y.id(), 7, lab.epoch, &lab.key, &everyone("S", b"v4"))
+        .unwrap();
+    let late = *signed_by(&mut log, Y, late).id();
+    assert!(log.effective().counts(log.held[&late]));
+    assert!(
+        dependents_of(&log, &lab.epoch).is_empty(),
+        "a write signed once its signer held the removal is no dependent"
+    );
+
+    let mut island = lab.with(&minted);
+    let accepted = remove(&island, Y, R, lab.minted[4].id());
+    island.keep(accepted);
+    let put = island
+        .draft_put(&Y.id(), 7, lab.epoch, &lab.key, &everyone("S", b"v5"))
+        .unwrap();
+    let put = signed_by(&mut island, Y, put);
+    island.keep(lab.removal.clone());
+    assert_eq!(
+        dependents_of(&island, &lab.epoch),
+        [*put.id()],
+        "a removal whose cutoff reaches E does not cut it there"
+    );
+}
+
 /// One `Membership` scenario, built for real: its genesis, the records each of the model's
 /// three record slots stands for, and which Macs `u`, `v`, `w` and `x` read.
 struct Scenario {
@@ -1615,11 +1867,25 @@ struct Scenario {
     slots: [Vec<Record>; 3],
     reads: Vec<Mac>,
     labels: bool,
+    /// Scenario 7: the epoch R mints past its cutoff, read through `reads[0]`'s entries.
+    keyed: Option<RecordId>,
+}
+
+/// Scenario 7: [`keyed_lab`]'s removal, R's epoch and Y's write, as the model's three slots.
+fn keyed_write() -> Scenario {
+    let lab = keyed_lab();
+    Scenario {
+        genesis: lab.genesis,
+        slots: [vec![lab.removal], lab.minted, vec![lab.edit]],
+        reads: vec![Y],
+        labels: false,
+        keyed: Some(lab.epoch),
+    }
 }
 
 /// The scenarios of `aterm_models_swarm::membership_model`, by `sc` (index `sc - 1`).
-fn scenarios() -> &'static [Scenario; 6] {
-    static SCENARIOS: OnceLock<[Scenario; 6]> = OnceLock::new();
+fn scenarios() -> &'static [Scenario; 7] {
+    static SCENARIOS: OnceLock<[Scenario; 7]> = OnceLock::new();
     SCENARIOS.get_or_init(|| {
         let alone = |log: &Log, record: Record| {
             let mut log = log.clone();
@@ -1637,6 +1903,7 @@ fn scenarios() -> &'static [Scenario; 6] {
             genesis: lab,
             reads: vec![X, Y, Z],
             labels: true,
+            keyed: None,
         };
         // 2: C lets X in, while B lets it in and D removes it.
         let lab = found(&[(B, "m1"), (C, "m2"), (D, "m3")]);
@@ -1651,6 +1918,7 @@ fn scenarios() -> &'static [Scenario; 6] {
             genesis: lab,
             reads: vec![X],
             labels: false,
+            keyed: None,
         };
         // 3: A and B remove each other.
         let lab = found(&[(A, "m1"), (B, "m2"), (C, "m3")]);
@@ -1663,6 +1931,7 @@ fn scenarios() -> &'static [Scenario; 6] {
             genesis: lab,
             reads: vec![A, B],
             labels: false,
+            keyed: None,
         };
         // 4: A removes B, while B, unaware, lets Z in.
         let lab = found(&[(A, "m1"), (B, "m2")]);
@@ -1675,6 +1944,7 @@ fn scenarios() -> &'static [Scenario; 6] {
             genesis: lab,
             reads: vec![B, Z],
             labels: false,
+            keyed: None,
         };
         // 5: A removes B, C and D; B and C each sign a quorum remove of A from the genesis.
         let lab = found(&[(A, "m1"), (B, "m2"), (C, "m3"), (D, "m4")]);
@@ -1693,6 +1963,7 @@ fn scenarios() -> &'static [Scenario; 6] {
             genesis: lab,
             reads: vec![A, B, C, D],
             labels: false,
+            keyed: None,
         };
         // 6: B removes S; S, having heard, alone signs a quorum remove of B.
         let lab = found(&[(B, "m1"), (S, "m2")]);
@@ -1703,6 +1974,7 @@ fn scenarios() -> &'static [Scenario; 6] {
             genesis: lab,
             reads: vec![B, S],
             labels: false,
+            keyed: None,
         };
         [
             labels,
@@ -1711,6 +1983,7 @@ fn scenarios() -> &'static [Scenario; 6] {
             cutoff,
             mass_remove,
             lone_share,
+            keyed_write(),
         ]
     })
 }
@@ -1732,12 +2005,48 @@ fn island_log(state: &aterm_spec::interp::State, island: char) -> Log {
     log
 }
 
+/// Scenario 7's outputs on `log`, read through `reader`: `S` (1 for `v0`, 2 for `v1`), whether
+/// `T` is there, whether `epoch` is newest or winning in `[everyone]`, and 0.
+fn keyed_outputs(log: &Log, reader: Mac, epoch: &RecordId) -> [i64; 4] {
+    let opened = log
+        .open_audience_entries(&reader.identity())
+        .unwrap()
+        .expect("Y reads");
+    let everyone = opened.by_audience.get(&crate::text::Audience::Everyone);
+    let value = |name: &str| {
+        everyone
+            .and_then(|m| m.get(name))
+            .map(|e| e.value.as_slice())
+    };
+    let s = match value("S") {
+        Some(b"v0") => 1,
+        Some(b"v1") => 2,
+        other => panic!("unexpected S {other:?}"),
+    };
+    let newest = opened
+        .maximal_epochs
+        .get(&EpochAudience::Everyone)
+        .is_some_and(|ids| ids.contains(epoch))
+        || opened
+            .winning_epochs
+            .get(&EpochAudience::Everyone)
+            .is_some_and(|ids| ids.contains(epoch));
+    [s, i64::from(value("T").is_some()), i64::from(newest), 0]
+}
+
 /// What island `island` (`'1'` or `'2'`) evaluates in `state`, written into `next`: the real
 /// evaluator's membership or labels, and each label change counted.
 fn project(state: &aterm_spec::interp::State, island: char, next: &mut aterm_spec::interp::State) {
     let get = |k: &str| *state.get(k).unwrap_or(&0);
     let scenario = &scenarios()[usize::try_from(get("sc") - 1).unwrap()];
     let holds = if island == '1' { 'a' } else { 'b' };
+    if let Some(epoch) = &scenario.keyed {
+        let outputs = keyed_outputs(&island_log(state, holds), scenario.reads[0], epoch);
+        for (out, value) in ["u", "v", "w", "x"].into_iter().zip(outputs) {
+            next.insert(var(&format!("{out}{island}")), value);
+        }
+        return;
+    }
     let membership = island_log(state, holds).membership();
     for (at, out) in ["u", "v", "w", "x"].into_iter().enumerate() {
         let output = format!("{out}{island}");
@@ -1787,6 +2096,7 @@ pub(crate) fn membership_transition(
         "Cutoff" => Some(4),
         "MassRemove" => Some(5),
         "LoneShare" => Some(6),
+        "KeyedWrite" => Some(7),
         _ => None,
     };
     if let Some(sc) = scenario {
@@ -1822,6 +2132,14 @@ pub(crate) fn membership_transition(
     next
 }
 
+/// Every transition the real evaluator makes from a reachable state of
+/// `aterm_models_swarm::membership_model` is one the model allows, and each `Buggy` dial breaks
+/// an invariant.
+///
+/// NEGATIVE CONTROLS (F21, scenario 7): with `Log::unwrap_keyed_epochs` opening nothing this
+/// fails "conformance mismatch on Evaluate2 from {.. "sc": 7, "u2": 2 ..}" (the real evaluator
+/// reads `S=v0`, `u2` 1, where the model allows only 2); with `HonestWriteOnACutEpochStands` made
+/// vacuous (`sc <= 7 ||`) it fails "Buggy=8 breaks no invariant".
 #[test]
 fn membership_model_conforms_across_reachable_transitions_and_catches_mutants() {
     let model = aterm_models_swarm::membership_model();
@@ -1865,4 +2183,24 @@ fn membership_model_conforms_across_reachable_transitions_and_catches_mutants() 
     kept.insert("u1", 1);
     assert!(!model.successors("Evaluate1", &split).contains(&kept));
     assert!(!model.check_invariant("MutualRemovesRemoveBoth", &kept));
+
+    // Negative control (F21): island 1 holds A's removal of R, R's epoch and Y's write under it.
+    // The real evaluator reads Y's `S=v1`; main's, where a cut epoch opens for nobody, read
+    // `S=v0`, which is no successor the model allows and breaks `HonestWriteOnACutEpochStands`.
+    let mut healed = model.init_state();
+    for (var, value) in [
+        ("sc", 7),
+        ("a1", 1),
+        ("a2", 1),
+        ("a3", 1),
+        ("d1", 1),
+        ("u1", 1),
+    ] {
+        healed.insert(var, value);
+    }
+    let mut reverted = membership_transition(&healed, "Evaluate1");
+    assert_eq!((reverted["u1"], reverted["v1"], reverted["w1"]), (2, 0, 0));
+    reverted.insert("u1", 1);
+    assert!(!model.successors("Evaluate1", &healed).contains(&reverted));
+    assert!(!model.check_invariant("HonestWriteOnACutEpochStands", &reverted));
 }

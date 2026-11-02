@@ -106,9 +106,15 @@ fn the_longest_words_fit_the_record_and_the_ledger_whole() {
     let host = "h".repeat(super::super::open_url::Met::HOST_MAX);
     let mets: Vec<Option<Met>> = std::iter::once(None)
         .chain(
-            [MetWord::BotCheck, MetWord::BlockPage, MetWord::Stall]
-                .into_iter()
-                .map(|word| Some(Met::new(word, Some(&host)))),
+            [
+                MetWord::BrowserStart,
+                MetWord::BrowserControl,
+                MetWord::BotCheck,
+                MetWord::BlockPage,
+                MetWord::Stall,
+            ]
+            .into_iter()
+            .map(|word| Some(Met::new(word, Some(&host)))),
         )
         .collect();
     let how = longest(
@@ -206,6 +212,8 @@ fn a_run_that_met_a_bot_check_names_it_on_record_and_keeps_its_backoff_key() {
         "{unfinished}"
     );
     for met in [
+        Met::new(MetWord::BrowserStart, None),
+        Met::new(MetWord::BrowserControl, None),
         Met::new(MetWord::BlockPage, Some("claude.ai")),
         Met::new(MetWord::Stall, Some("claude.com")),
     ] {

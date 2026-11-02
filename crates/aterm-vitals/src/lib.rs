@@ -32,10 +32,10 @@ pub use model::{
     AccountIx, COMMIT_NEAR_PCT, CapBasis, ClusterSpec, ClusterView, CommitSample, CoreView,
     CpuView, DiskFacts, DiskLevel, GpuSample, GpuView, HeatCell, HeatSlot, Hog, LinkKind,
     LinkRates, LinkSample, LinkView, MemCounters, MemRates, MemSample, MemView, NetState, NetView,
-    NoFigure, PlanFact, Pressure, ProcLimits, ProcSample, ProcState, ProcView, Resource,
-    ResourceView, RowFacts, RowScope, Sample, SavedStrip, ScopeFig, ScopeView, Series, Snapshot,
-    Split, State, StripEvent, StripEventKind, TabRoot, TabTokens, TabView, TcpCounts, Thermal,
-    Throttle, Ticks, Vitals, VolumeSample, Writer,
+    NoFigure, PlaceValue, PlaceView, PlanFact, Pressure, ProcLimits, ProcSample, ProcState,
+    ProcView, Resource, ResourceView, RowFacts, RowScope, Sample, SavedStrip, ScopeFig, ScopeView,
+    Series, Snapshot, Split, State, StripEvent, StripEventKind, TabRoot, TabTokens, TabView,
+    TcpCounts, Thermal, Throttle, Ticks, Vitals, VolumeSample, Writer,
 };
 pub use peaks::{DailyMax, PeakRow, Peaks};
 pub use ring::{

@@ -1617,6 +1617,7 @@ fn a_renewal_on_a_bot_check_fails_on_record_and_asks_no_one() {
 /// so its end is all there is. Its record fails where the binding moved during the sign-in, or
 /// where the ledger cannot be written. CONTROLS: a plain failure so unrecorded ends `Failed`, and
 /// a bot check on record ends `BotCheck` with its line there.
+#[cfg(unix)]
 #[test]
 fn an_unrecorded_bot_check_still_ends_as_a_bot_check() {
     let (tmp, env) = kimi_env("unrecorded-bot-check");

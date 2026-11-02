@@ -46,12 +46,12 @@ pub use announcement::{
 };
 pub use autocompact::{Offer, OfferFocus};
 pub use harness_version::{
-    CliHarness, HarnessVersion, SHARED_LANE, cli_build_later, cli_version_build, cli_version_core,
+    CliHarness, HarnessVersion, cli_build_later, cli_version_build, cli_version_core,
     cli_version_later, cli_version_offered,
 };
 pub use login::{
     LoginAtWall, LoginMethod, LoginScreen, Picker as LoginPicker, login_at_wall, login_interrupted,
-    login_screen,
+    login_over_limit, login_screen,
 };
 pub use notice::{NoticePlace, NoticeScan, update_notice_scan, update_notice_unmoved};
 pub use panel::{

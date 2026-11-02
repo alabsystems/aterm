@@ -76,6 +76,16 @@ impl LabScreen {
 }
 
 fn progress_facts(progress: Option<&AccountProgress>) -> Vec<(String, String)> {
+    progress_facts_at(
+        progress,
+        aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()),
+    )
+}
+
+pub(crate) fn progress_facts_at(
+    progress: Option<&AccountProgress>,
+    now: Option<i64>,
+) -> Vec<(String, String)> {
     let Some(progress) = progress else {
         return vec![(
             "Recovery".into(),
@@ -118,6 +128,65 @@ fn progress_facts(progress: Option<&AccountProgress>) -> Vec<(String, String)> {
             ),
         ),
     ];
+    use aterm_agent::harness::account_progress::OwnClaimBlocker;
+    let observation_confirmed = now.is_some_and(|now| {
+        (1..=253_402_300_799).contains(&now)
+            && (1..=253_402_300_799).contains(&progress.observed_at)
+            && progress.observed_at <= now
+    });
+    match progress.own_claim {
+        None => facts.push((
+            "Own account claim".into(),
+            "No retained blocker observation; current claim unknown".into(),
+        )),
+        Some(finding) => {
+            facts.push((
+                "Own account claim".into(),
+                if observation_confirmed {
+                    match finding.blocker {
+                        OwnClaimBlocker::HeldElsewhere { .. } => {
+                            "Another Mac held this account at the decision"
+                        }
+                        OwnClaimBlocker::CannotRecord => {
+                            "This Mac could not record a claim at the decision"
+                        }
+                    }
+                } else {
+                    "Claim blocker observation time is unconfirmed; current claim unknown"
+                }
+                .into(),
+            ));
+            if let OwnClaimBlocker::HeldElsewhere { until } = finding.blocker {
+                facts.push(("Claim recorded until".into(), observed_seconds(until)));
+                let timing = match now {
+                    Some(now)
+                        if observation_confirmed
+                            && (1..=253_402_300_799).contains(&until)
+                            && progress.observed_at < until =>
+                    {
+                        if until <= now {
+                            "Recorded lease expired; current claim unknown"
+                        } else {
+                            "Recorded lease only; current ownership is not rechecked here"
+                        }
+                    }
+                    _ => "Current claim unknown; recorded lease timing is unconfirmed",
+                };
+                facts.push(("Claim timing".into(), timing.into()));
+            }
+            if finding.pinned {
+                facts.push((
+                    "Switch blocker".into(),
+                    if observation_confirmed {
+                        "A pinned account prevented switching at the decision"
+                    } else {
+                        "Pinned selection reported with unconfirmed observation time; current block unknown"
+                    }
+                    .into(),
+                ));
+            }
+        }
+    }
     // Retained details include arbitrary persisted route text. The account
     // projection below supplies typed sign-in outcomes without exposing it.
     facts.extend(
@@ -135,6 +204,11 @@ fn progress_facts(progress: Option<&AccountProgress>) -> Vec<(String, String)> {
 /// Only fixed producer words may cross from the free-text recovery record.
 fn safe_finding(detail: &str) -> bool {
     use aterm_agent::harness::account_progress as progress;
+    // A historical wrapper never admits its free-text payload: the exact existing fixed
+    // finding below must still match after one wrapper is removed.
+    let detail = detail
+        .strip_prefix(progress::RECOVERY_HISTORY_PREFIX)
+        .unwrap_or(detail);
     if let Some(previous) = detail.strip_prefix(progress::EXECUTION_HISTORY_PREFIX) {
         return matches!(
             previous,
@@ -155,6 +229,9 @@ fn safe_finding(detail: &str) -> bool {
             | aterm_agent::harness::account_progress::EXECUTION_CONTEXT_UNREAD_FINDING
             | aterm_agent::harness::account_progress::EXECUTION_RECORDS_UNREAD_FINDING
             | aterm_agent::harness::account_progress::EXECUTION_REFRESH_FINDING
+            | aterm_agent::harness::account_progress::OBSERVER_BUSY_FINDING
+            | progress::SESSION_AUTOPILOT_OFF_FINDING
+            | progress::RECOVERY_RESUME_FINDING
             | "No account roster is available"
             | "This process is not bound to a listed account"
             | "This process uses a separate account home"
@@ -581,6 +658,214 @@ mod tests {
         assert!(facts.contains(&("Limit".into(), "weekly allowance".into())));
         assert!(facts.contains(&("Finding 1".into(), "No eligible alternate account".into())));
         assert!(facts.contains(&("Next event".into(), observed_seconds(200))));
+    }
+
+    #[test]
+    fn own_claim_blockers_reach_lab_as_typed_retained_evidence() {
+        use aterm_agent::harness::{
+            account_progress::{OwnClaimBlocker, enrich_inventory},
+            accounts::{Logins, Me, Point, Roster, Row, State},
+        };
+        const NOW: i64 = 1_790_000_000;
+        let roster = Roster {
+            rows: ["own", "selected"]
+                .map(|label| Row {
+                    label: label.into(),
+                    dir: Some(format!("/synthetic/{label}")),
+                    ..Default::default()
+                })
+                .into(),
+        };
+        let enrolled = ["own".to_owned(), "selected".to_owned()].into();
+        let me = Me {
+            account: Some("own"),
+            left: None,
+            default_home: true,
+            stored_login: true,
+        };
+        let unrecorded = State {
+            machine: "0a0b".into(),
+            active: Some("selected".into()),
+            proven: true,
+            pinned: true,
+            unrecorded: true,
+            home_accounts: ["selected".to_owned()].into(),
+            ..Default::default()
+        };
+        let observe = |state: &State| {
+            let mut progress = AccountProgress::unknown(NOW);
+            progress.account = Some("own".into());
+            progress.phase = ProgressPhase::Waiting;
+            enrich_inventory(
+                &mut progress,
+                &roster,
+                state,
+                &Logins::default(),
+                &enrolled,
+                &me,
+                Some(&Point::TurnEnd),
+            );
+            progress
+        };
+        let cannot_record = observe(&unrecorded);
+        assert_eq!(
+            cannot_record.own_claim.unwrap().blocker,
+            OwnClaimBlocker::CannotRecord
+        );
+        assert!(
+            cannot_record.own_claim.unwrap().pinned,
+            "the pin is on the selected account, not the process's account"
+        );
+        let facts = progress_facts_at(Some(&cannot_record), Some(NOW));
+        let value = |facts: &[(String, String)], name: &str| {
+            facts
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert!(
+            value(&facts, "Own account claim")
+                .unwrap()
+                .contains("could not record")
+        );
+        assert!(value(&facts, "Switch blocker").is_some());
+        assert!(value(&facts, "Claim recorded until").is_none());
+
+        let mut leased = unrecorded.clone();
+        leased.unrecorded = false;
+        leased.pinned = false;
+        leased.note_lease("own", "private-holder-token", NOW + 60, NOW - 1);
+        let mut held = observe(&leased);
+        let original = held.clone();
+        let facts = progress_facts_at(Some(&held), Some(NOW + 1));
+        assert_eq!(
+            value(&facts, "Decision observed"),
+            Some(observed_seconds(NOW))
+        );
+        assert_eq!(
+            value(&facts, "Claim recorded until"),
+            Some(observed_seconds(NOW + 60))
+        );
+        assert!(
+            value(&facts, "Claim timing")
+                .unwrap()
+                .contains("not rechecked")
+        );
+        assert!(value(&facts, "Switch blocker").is_none());
+        let expired = progress_facts_at(Some(&held), Some(NOW + 60));
+        assert!(value(&expired, "Claim timing").unwrap().contains("expired"));
+        assert_eq!(
+            value(&expired, "Claim recorded until"),
+            value(&facts, "Claim recorded until")
+        );
+        assert_eq!(value(&expired, "Next event"), value(&facts, "Next event"));
+        assert_eq!(
+            held, original,
+            "reading expiry does not renew or erase the observation"
+        );
+        for (observed_at, now) in [(0, Some(NOW)), (NOW + 2, Some(NOW)), (NOW, None)] {
+            held.observed_at = observed_at;
+            let facts = progress_facts_at(Some(&held), now);
+            assert!(
+                value(&facts, "Claim timing")
+                    .unwrap()
+                    .contains("unconfirmed")
+            );
+            assert!(
+                value(&facts, "Own account claim")
+                    .unwrap()
+                    .contains("unconfirmed")
+            );
+            let mut unconfirmed_pin = cannot_record.clone();
+            unconfirmed_pin.observed_at = observed_at;
+            let facts = progress_facts_at(Some(&unconfirmed_pin), now);
+            assert!(
+                value(&facts, "Own account claim")
+                    .unwrap()
+                    .contains("unconfirmed")
+            );
+            assert!(
+                value(&facts, "Switch blocker")
+                    .unwrap()
+                    .contains("unconfirmed")
+            );
+        }
+        held = original;
+        held.own_claim.as_mut().unwrap().blocker = OwnClaimBlocker::HeldElsewhere { until: 0 };
+        let invalid = progress_facts_at(Some(&held), Some(NOW));
+        assert_eq!(
+            value(&invalid, "Claim recorded until"),
+            Some("Unknown".into())
+        );
+        assert!(
+            value(&invalid, "Claim timing")
+                .unwrap()
+                .contains("unconfirmed")
+        );
+
+        leased.clear_lease("own");
+        leased.note_lease("selected", "private-holder-token", NOW + 60, NOW - 1);
+        let mut other_account = observe(&leased);
+        assert!(other_account.own_claim.is_none());
+        other_account.details.push("own: another Mac holds it until private-claim-value; the pin on private-pin-value keeps the session from moving".into());
+        let facts = progress_facts_at(Some(&other_account), Some(NOW));
+        assert!(
+            value(&facts, "Own account claim")
+                .unwrap()
+                .contains("unknown")
+        );
+        assert!(value(&facts, "Claim recorded until").is_none());
+        assert!(value(&facts, "Switch blocker").is_none());
+        for facts in [facts, progress_facts_at(Some(&cannot_record), Some(NOW))] {
+            let words = format!("{facts:?}");
+            for private in [
+                "private-holder-token",
+                "private-claim-value",
+                "private-pin-value",
+                "/synthetic/",
+            ] {
+                assert!(!words.contains(private));
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_recovery_keeps_only_fixed_historical_findings_on_the_native_page() {
+        use aterm_agent::harness::account_progress::{
+            EXECUTION_PREPARED_FINDING, OBSERVER_BUSY_FINDING, RECOVERY_HISTORY_PREFIX,
+        };
+        let mut progress = AccountProgress::unknown(100);
+        progress.phase = ProgressPhase::Waiting;
+        progress.details = vec![
+            EXECUTION_PREPARED_FINDING.into(),
+            "private-route-value".into(),
+            format!("{RECOVERY_HISTORY_PREFIX}{EXECUTION_PREPARED_FINDING}: private-suffix"),
+            format!(
+                "{RECOVERY_HISTORY_PREFIX}{RECOVERY_HISTORY_PREFIX}{EXECUTION_PREPARED_FINDING}"
+            ),
+        ];
+        let facts = aterm_agent::harness::footer::FooterFacts {
+            account_progress: Some(progress),
+            account_progress_busy: true,
+            ..Default::default()
+        };
+        let view = facts.account_progress_view().unwrap();
+        let projected = progress_facts_at(Some(&view), Some(100));
+        assert!(
+            projected
+                .iter()
+                .any(|(_, value)| value == OBSERVER_BUSY_FINDING)
+        );
+        assert!(
+            projected.iter().any(|(_, value)| value
+                == &format!("{RECOVERY_HISTORY_PREFIX}{EXECUTION_PREPARED_FINDING}"))
+        );
+        let words = format!("{projected:?}");
+        assert!(!words.contains("private-route-value"));
+        assert!(!words.contains("private-suffix"));
+        assert!(!words.contains(&format!(
+            "{RECOVERY_HISTORY_PREFIX}{RECOVERY_HISTORY_PREFIX}"
+        )));
     }
 
     #[test]

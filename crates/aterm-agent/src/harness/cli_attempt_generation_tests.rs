@@ -527,81 +527,85 @@ fn queued_vendor_renewal_rechecks_its_original_parent_before_running_authenticat
 /// reads, lets theirs run. The refusal above holds only for whoever did not wait.
 #[test]
 fn a_vendor_sign_in_a_person_waited_for_goes_by_what_the_wait_left() {
-    for (renewed, runs) in [("main", false), ("other", true)] {
-        let cli = Cli::Kimi;
-        let tmp = tmp_dir("waited-parent");
-        let mut env = env_at(&tmp);
-        env.now = NOW;
-        let store = env.accounts_store_for(cli).unwrap();
-        let path = store.login_dir("main").unwrap();
-        let path = path.to_str().unwrap();
-        let raw = Roster {
-            rows: vec![accounts::Row {
-                label: "main".into(),
-                dir: Some(path.into()),
-                email: Some(OWNER.into()),
-                vendor: accounts::Vendor {
-                    region: Some(crate::ai::connector::Region::Global),
+    for cli in [Cli::Codex, Cli::Kimi] {
+        if !signs_in_here(cli) {
+            continue;
+        }
+        for (renewed, runs) in [("main", false), ("other", true)] {
+            let tmp = tmp_dir("waited-parent");
+            let mut env = env_at(&tmp);
+            env.now = NOW;
+            let store = env.accounts_store_for(cli).unwrap();
+            let path = store.login_dir("main").unwrap();
+            let path = path.to_str().unwrap();
+            let raw = Roster {
+                rows: vec![accounts::Row {
+                    label: "main".into(),
+                    dir: Some(path.into()),
+                    email: Some(OWNER.into()),
+                    vendor: accounts::Vendor {
+                        region: (cli == Cli::Kimi).then_some(crate::ai::connector::Region::Global),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            }],
-        };
-        let roster_path = env.accounts_roster_for(cli).unwrap();
-        std::fs::write(
-            &roster_path,
-            accounts::append_rows_for(cli, "", &raw.rows).unwrap(),
-        )
-        .unwrap();
-        let renew = |label: &str| {
-            store
-                .transact_logins(NOW, &mut None, |state, logins| {
-                    Ok(accounts::note_renewed(
-                        state,
-                        logins,
-                        label,
-                        Some(path),
-                        path,
-                        None,
-                        NOW,
-                    ))
-                })
+                }],
+            };
+            let roster_path = env.accounts_roster_for(cli).unwrap();
+            std::fs::write(
+                &roster_path,
+                accounts::append_rows_for(cli, "", &raw.rows).unwrap(),
+            )
+            .unwrap();
+            let renew = |label: &str| {
+                store
+                    .transact_logins(NOW, &mut None, |state, logins| {
+                        Ok(accounts::note_renewed(
+                            state,
+                            logins,
+                            label,
+                            Some(path),
+                            path,
+                            None,
+                            NOW,
+                        ))
+                    })
+                    .unwrap()
+            };
+            renew("main");
+            let captured = store.load_logins(NOW).unwrap().0;
+            let row = accounts::bound(&raw, &captured)
+                .row("main")
                 .unwrap()
-        };
-        renew("main");
-        let captured = store.load_logins(NOW).unwrap().0;
-        let row = accounts::bound(&raw, &captured)
-            .row("main")
-            .unwrap()
-            .clone();
-        let held = store.signin_now().unwrap().unwrap();
-        let host = AttemptHost {
-            cli,
-            case: 0,
-            store: &store,
-            raw: &raw,
-            old_dir: path,
-            changed: Cell::new(false),
-            after: RefCell::new(None),
-            staging: RefCell::new(None),
-            waited_for: RefCell::new(Some(Box::new(|| {
-                drop(held);
-                renew(renewed);
-            }))),
-        };
-        let renewal = renew_one_for(
-            cli,
-            NOW,
-            &host,
-            &store,
-            (&row, &roster_path, &captured),
-            Some(path),
-            &mut Vec::new(),
-            &mut Vec::new(),
-        );
-        assert_eq!(host.changed.get(), runs, "{renewed}: {renewal:?}");
-        if !runs {
-            assert_eq!(renewal, Renewal::Renewed);
+                .clone();
+            let held = store.signin_now().unwrap().unwrap();
+            let host = AttemptHost {
+                cli,
+                case: 0,
+                store: &store,
+                raw: &raw,
+                old_dir: path,
+                changed: Cell::new(false),
+                after: RefCell::new(None),
+                staging: RefCell::new(None),
+                waited_for: RefCell::new(Some(Box::new(|| {
+                    drop(held);
+                    renew(renewed);
+                }))),
+            };
+            let renewal = renew_one_for(
+                cli,
+                NOW,
+                &host,
+                &store,
+                (&row, &roster_path, &captured),
+                Some(path),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            assert_eq!(host.changed.get(), runs, "{cli:?}/{renewed}: {renewal:?}");
+            if !runs {
+                assert_eq!(renewal, Renewal::Renewed);
+            }
         }
     }
 }

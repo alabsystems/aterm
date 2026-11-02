@@ -2713,3 +2713,60 @@ fn a_spent_routine_decision_keeps_recovering_without_an_owner_alert() {
         now = at + 5 * MIN;
     }
 }
+
+#[test]
+fn a_semicolon_joined_landing_park_gets_go_ahead_under_cruise_and_land() {
+    let landing = "Ready to commit and push; waiting on your sign-off.";
+    let checks_only = "Ready to rerun the checks; waiting on your sign-off.";
+
+    let mut st = TurnEndState::default();
+    assert!(is_go_ahead(&act(
+        &mut st,
+        &idle(landing, Some(3 * MIN)),
+        t0()
+    )));
+    let mut st = TurnEndState::default();
+    assert!(is_go_ahead(&act(
+        &mut st,
+        &idle(checks_only, Some(3 * MIN)),
+        t0()
+    )));
+
+    let mut land_st = TurnEndState::default();
+    assert_eq!(
+        act(
+            &mut land_st,
+            &land(idle("Stage 1 landed.", Some(3 * MIN))),
+            t0()
+        ),
+        land_instruction()
+    );
+    let (action, _) = until_acted(
+        &mut land_st,
+        &land(idle(landing, Some(3 * MIN))),
+        t0() + 5 * MIN,
+    );
+    assert!(
+        is_go_ahead(&action),
+        "semicolon-joined commit/push park sets Park::lands under Land: {action:?}"
+    );
+
+    let mut non_landing_land_st = TurnEndState::default();
+    assert_eq!(
+        act(
+            &mut non_landing_land_st,
+            &land(idle("Stage 1 landed.", Some(3 * MIN))),
+            t0()
+        ),
+        land_instruction()
+    );
+    let a = act(
+        &mut non_landing_land_st,
+        &land(idle(checks_only, Some(3 * MIN))),
+        t0() + 5 * MIN,
+    );
+    assert!(
+        !is_go_ahead(&a),
+        "NEGATIVE CONTROL: checks-only semicolon park on a clean repo does not claim Park::lands: {a:?}"
+    );
+}

@@ -164,31 +164,56 @@ fn default_alias_move_keeps_state_without_a_live_profile_or_reused_source_label(
     }
 }
 
+/// A default relabel onto a label the old roster gives another account: where the source no
+/// longer lists that account on this Mac, it is refused before publication, naming the labels,
+/// with nothing written; where the source trades labels with it and its row holds that account's
+/// own login here (its profile names it), the trade publishes and that row keeps its login
+/// directory and login under its new label.
 #[test]
-fn alias_relabel_refuses_an_occupied_roster_target_before_publication() {
-    let mut bed = Bed::new();
-    let mut old = Roster::load(&bed.path).unwrap();
-    old.rows[0].email = Some("alias@example.test".into());
-    old.rows[0].identity_email = Some("owner@example.test".into());
-    old.rows.push(Row {
-        label: "m1-2".into(),
-        email: Some("replacement@example.test".into()),
-        dir: Some(
-            bed.root
-                .path()
-                .join("retained-login")
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        ..Row::default()
-    });
-    fs::write(&bed.path, format_roster_toml(&old).unwrap()).unwrap();
-    bed.fleet.accounts[1].email = "alias@example.test".into();
-    let before = bed.records();
-    let why = bed.sync().err().expect("old roster target is occupied");
-    assert!(why.contains("previous roster already uses"), "{why}");
-    assert_eq!(bed.records(), before);
-    assert!(!bed.store.sync_needs_recovery());
+fn alias_relabel_onto_an_occupied_roster_target_moves_its_occupant_or_refuses_where_it_left() {
+    for listed in [true, false] {
+        let mut bed = Bed::new();
+        let mut old = Roster::load(&bed.path).unwrap();
+        old.rows[0].email = Some("alias@example.test".into());
+        old.rows[0].identity_email = Some("owner@example.test".into());
+        let login = bed.root.path().join("retained-login");
+        fs::create_dir(&login).unwrap();
+        let profile = "{\"oauthAccount\":{\"emailAddress\":\"replacement@example.test\"}}\n";
+        fs::write(login.join(".claude.json"), profile).unwrap();
+        old.rows.push(Row {
+            label: "m1-2".into(),
+            email: Some("replacement@example.test".into()),
+            dir: Some(login.to_string_lossy().into_owned()),
+            ..Row::default()
+        });
+        fs::write(&bed.path, format_roster_toml(&old).unwrap()).unwrap();
+        bed.fleet.accounts[1].email = "alias@example.test".into();
+        if !listed {
+            bed.fleet.accounts[0].email = "third@example.test".into();
+            let before = bed.records();
+            let why = bed
+                .sync()
+                .err()
+                .expect("the occupant has no label on this Mac");
+            for named in ["`m1`", "`m1-2`"] {
+                assert!(why.contains(named), "{named}: {why}");
+            }
+            assert_eq!(bed.records(), before, "nothing was written");
+            assert!(!bed.store.sync_needs_recovery());
+            continue;
+        }
+        bed.sync()
+            .expect("a trade with a row holding a login publishes");
+        let roster = Roster::load(&bed.path).unwrap();
+        assert_eq!(roster.row_for_login(None).unwrap().label, "m1-2");
+        let moved = roster.row("m1").unwrap();
+        assert_eq!(moved.email.as_deref(), Some("replacement@example.test"));
+        assert_eq!(moved.dir.as_deref(), Some(login.to_string_lossy().as_ref()));
+        assert_eq!(
+            fs::read_to_string(login.join(".claude.json")).unwrap(),
+            profile
+        );
+    }
 }
 
 #[test]
@@ -241,6 +266,11 @@ fn alias_relabel_can_return_to_an_old_label_without_reviving_old_parents() {
     assert_eq!(bed.store.load(NOW).unwrap().0.active.as_deref(), Some("m1"));
 }
 
+/// The default login's account moves `m1` to `m1-2` with a binding that names `logins/m1` (its
+/// directory, or an earlier one); a later sync lists another account at `m1`, which is given a
+/// directory by its label alone. That account takes a new one, `logins/m1~1`, and the sync
+/// publishes: the directory the moved account's binding retains is given to no other row, and
+/// the binding still names it.
 #[test]
 fn a_later_sync_cannot_reassign_a_moved_accounts_retained_directory() {
     for historical in [false, true] {
@@ -265,13 +295,22 @@ fn a_later_sync_cannot_reassign_a_moved_accounts_retained_directory() {
         let replacement = bed.fleet.accounts.remove(0);
         bed.sync().unwrap();
         bed.fleet.accounts.insert(0, replacement);
-        let before = bed.records();
-        let why = bed
-            .sync()
-            .err()
-            .expect("a later source-label reuse retains directory ownership");
-        assert!(why.contains("directory is retained"), "{why}");
-        assert_eq!(bed.records(), before);
+        bed.sync()
+            .expect("a later source-label reuse publishes with a directory of its own");
+        let roster = Roster::load(&bed.path).unwrap();
+        let fresh = bed.store.logins_dir().join("m1~1");
+        assert_eq!(
+            roster.row("m1").and_then(|row| row.dir.as_deref()),
+            fresh.to_str(),
+            "historical {historical}"
+        );
+        assert_eq!(roster.row_for_login(None).unwrap().label, "m1-2");
+        let binding = &bed.store.load_logins(NOW).unwrap().0.labels["m1-2"];
+        assert!(
+            binding.dir.as_deref() == Some(path.as_str())
+                || binding.was.iter().flatten().any(|was| *was == path),
+            "historical {historical}: the moved account's binding still names it"
+        );
     }
 }
 
@@ -635,6 +674,11 @@ fn renamed_accounts_refuse_stale_completions_for_the_reused_label() {
     assert_eq!(current.active.as_deref(), Some("m1-2"));
 }
 
+/// The default login's account moves `m1` to `m1-2` while its binding names `logins/m1` (its
+/// directory, an earlier one, or through a link to a directory elsewhere), and the same sync lists
+/// another account at `m1`, which is given a directory by its label alone. That account takes a
+/// new one, `logins/m1~1`, and the sync publishes; `logins/m1` is left as it was and the binding
+/// still names what it named.
 #[test]
 fn a_rename_cannot_reuse_a_directory_kept_by_the_moved_login() {
     for kind in 0..3 {
@@ -665,17 +709,24 @@ fn a_rename_cannot_reuse_a_directory_kept_by_the_moved_login() {
                 Ok(Vec::new())
             })
             .unwrap();
-        let before = bed.records();
-        let why = bed
-            .sync()
-            .err()
-            .expect("a retained directory cannot be reassigned");
-        assert!(
-            why.contains("before roster publication") && why.contains("directory is retained"),
-            "{why}"
+        bed.sync()
+            .expect("the rename publishes, the new row with a directory of its own");
+        let roster = Roster::load(&bed.path).unwrap();
+        let fresh = bed.store.logins_dir().join("m1~1");
+        assert_eq!(
+            roster.row("m1").and_then(|row| row.dir.as_deref()),
+            fresh.to_str(),
+            "kind {kind}"
         );
-        assert_eq!(bed.records(), before);
-        assert_eq!(path.exists(), existed);
+        assert_eq!(roster.row_for_login(None).unwrap().label, "m1-2");
+        let binding = &bed.store.load_logins(NOW).unwrap().0.labels["m1-2"];
+        let kept = kept.to_str().unwrap();
+        assert!(
+            binding.dir.as_deref() == Some(kept)
+                || binding.was.iter().flatten().any(|was| was == kept),
+            "kind {kind}: the moved account's binding still names it"
+        );
+        assert_eq!(path.exists(), existed, "kind {kind}");
     }
 }
 

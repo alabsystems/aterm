@@ -23,10 +23,12 @@ path = "src/main.rs"
 # export's grep -E rows over decoded test captures (capture-privacy) and the
 # exported text (export-content), and the DEFLATE (astream-wire's CRC-32 its one
 # dependency) and Zstandard decoders, because the engine greps a gzip or zstd
-# file in the export by what it decodes to.
+# file in the export by what it decodes to. aterm-hash (astream-wire's FNV-1a its one
+# dependency) gives the offset and prime the seals and the mirror's digests fold with.
 aterm-regex = { workspace = true }
 aterm-codec = { workspace = true }
 aterm-zstd = { workspace = true }
+aterm-hash = { workspace = true }
 
 [dev-dependencies]
 # None: tests use only std (synthetic sources and trees under a temp dir).

@@ -677,3 +677,27 @@ fn signed_unknown_fields_cannot_smuggle_secrets_into_import_projection() {
         "refused local history requires recovery"
     );
 }
+
+/// An `accounts/imports` row 0.146 or 0.147 replicated keeps validating on this build: those
+/// builds read `m40-1234` as slot 1234 and machine numbers past six digits as machines, which
+/// the narrowed label grammar no longer does, so the validator keeps their grammar. A hint no
+/// build ever wrote is still refused.
+/// NEGATIVE CONTROL: with the validator reading the hint through `Slot::parse`, the 0.146 row
+/// is refused and this fails at `validate(&key, &row("m40-1234"))`: `` called
+/// `Result::unwrap()` on an `Err` value ``.
+#[test]
+fn rows_older_builds_replicated_keep_validating() {
+    let key = "ab".repeat(32);
+    let row = |hint: &str| {
+        json!({"schema": 1, "source_sha256": key, "records": 1, "rows": [{
+            "record": 2, "email": null, "email_column": 1, "machine_slot_hint": hint,
+            "machine_column": 2, "providers": [], "unclassified_columns": [],
+        }]})
+    };
+    for hint in ["m40-1234", "m1234567.2", "m3", "M27-2", "m3.2"] {
+        validate(&key, &row(hint)).unwrap();
+    }
+    for hint in ["m0", "m3.0", "m27-02", "m40-3fa2", "mac-3", "m3.2.1"] {
+        assert!(validate(&key, &row(hint)).is_err(), "{hint}");
+    }
+}

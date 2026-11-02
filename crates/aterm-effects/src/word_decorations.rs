@@ -12956,7 +12956,7 @@ mod tests {
             flip_x: false,
             z: FreeZ::UnderText,
         };
-        let h0 = 0xcbf2_9ce4_8422_2325u64;
+        let h0 = aterm_hash::FNV64_OFFSET;
         let base = fold_free(h0, &s);
         assert_ne!(
             base,

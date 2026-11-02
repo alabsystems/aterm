@@ -8,7 +8,7 @@ fn a_prepared_account_is_not_a_next_sign_in_target() {
     let row = Row {
         label: "work".into(),
         email: Some("work@example.test".into()),
-        dir: Some("/unmade/login".into()),
+        dir: Some(crate::harness::host_path::abs("/unmade/login")),
         ..Default::default()
     };
     let roster = Roster { rows: vec![row] };
@@ -246,7 +246,7 @@ fn legacy_source_sync_preserves_only_owned_shared_rows_without_rewriting_conflic
     let row = Row {
         label: "shared-one".into(),
         email: Some("one@example.test".into()),
-        dir: Some("/private/shared-one".into()),
+        dir: Some(crate::harness::host_path::abs("/private/shared-one")),
         ..Default::default()
     };
     let existing = Roster {
@@ -273,7 +273,7 @@ fn legacy_source_sync_preserves_only_owned_shared_rows_without_rewriting_conflic
                 request: [5; 16],
                 label: row.label.clone(),
                 identity: row.email.clone().unwrap(),
-                staging: "/private/staging".into(),
+                staging: crate::harness::host_path::abs("/private/staging"),
                 before_generation: None,
                 begun_at: 1,
             },

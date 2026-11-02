@@ -586,12 +586,7 @@ pub fn fingerprint(steps: &[Step]) -> String {
             s.stdin.as_deref().unwrap_or("")
         );
     }
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in text.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
+    format!("{:016x}", astream_wire::hash::fnv1a_64(text.as_bytes()))
 }
 
 /// The environment `cargo` gets for `arch`: the pinned stock toolchain, no incremental cache, the guest-local target dir, and for x86_64 the cross linker, C compiler and pkg-config search path (`CARGO_BUILD_TARGET` names x86_64, a cross triple here, only when `default_target` asks) and libtest's one-test-at-a-time (`RUST_TEST_THREADS=1`, which a CMD's own `--test-threads` overrides): the proof's rule for Rosetta ([`crate::linux_proof::ROSETTA_ONE_AT_A_TIME`]) for every x86_64 `exec`.
@@ -1513,6 +1508,18 @@ mod tests {
                 stanzas
             );
         }
+    }
+
+    /// A guest's [`STAMP`] holds this value: a fold that moved it would provision every guest
+    /// again.
+    #[test]
+    fn a_stamped_fingerprint_does_not_move() {
+        let steps = [
+            step("one", &["apt-get", "update"], None),
+            step("two", &["sh", "-c", "cat"], Some("é\n")),
+        ];
+        assert_eq!(fingerprint(&steps), "97746caca6ffb01a");
+        assert_eq!(fingerprint(&[]), "cbf29ce484222325");
     }
 
     #[test]

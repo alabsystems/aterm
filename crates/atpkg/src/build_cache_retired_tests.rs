@@ -41,10 +41,29 @@ impl Gate {
             .run(&self.checkout(), &["worktree", "list", "--porcelain"])
             .out
     }
+    /// Whether git lists `wt` as a worktree of the checkout.
+    fn has_worktree(&self, wt: &Path) -> bool {
+        super::listed(&GitCli, &self.checkout(), wt)
+            .expect("git worktree list")
+            .is_some()
+    }
     /// Set `path`'s modification time to `ago` before this test's now.
     fn written(&self, path: &Path, ago: Duration) {
-        std::fs::File::options()
-            .read(true)
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        #[cfg(not(windows))]
+        {
+            options.read(true);
+        }
+        options
             .open(path)
             .and_then(|f| f.set_modified(self.now - ago))
             .expect("the time set");
@@ -80,8 +99,7 @@ fn git(dir: &Path, args: &[&str]) {
 /// `path` as git reads a local path: a Windows verbatim path's `\\?\` prefix is one git reads
 /// as a host name, so it goes, naming the same place.
 fn for_git(path: &Path) -> String {
-    let path = path.to_string_lossy();
-    path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
+    super::git_path(path).to_string_lossy().into_owned()
 }
 
 /// Write and retain an unpushed commit directly in metadata whose worktree is gone.
@@ -125,9 +143,8 @@ fn gate() -> Gate {
         .prefix("retired-gate-")
         .tempdir()
         .expect("scratch");
-    let home = std::fs::canonicalize(dir.path())
-        .expect("resolved")
-        .join("home");
+    let resolved = std::fs::canonicalize(dir.path()).expect("resolved");
+    let home = super::git_path(&resolved).join("home");
     let sub = home.join("astream");
     let checkout = home.join("aterm");
     for repo in [&sub, &checkout] {
@@ -223,17 +240,13 @@ fn the_gates_leftovers_go_once_unused() {
         words.contains("clean") && words.contains("origin/main"),
         "{words}"
     );
-    assert!(g.worktrees().contains(&*g.snapshot().to_string_lossy()));
+    assert!(g.has_worktree(&g.snapshot()), "{}", g.worktrees());
     let done = retire(&g.roots, g.now, &GitCli);
     assert!(done.iter().all(|(_, r)| r.is_ok()), "{done:#?}");
     for p in [g.snapshot(), g.cells(), g.lock()] {
         assert!(p.symlink_metadata().is_err(), "{} is gone", p.display());
     }
-    assert!(
-        !g.worktrees().contains(&*g.snapshot().to_string_lossy()),
-        "{}",
-        g.worktrees()
-    );
+    assert!(!g.has_worktree(&g.snapshot()), "{}", g.worktrees());
     assert!(
         g.checkout().join("Cargo.toml").is_file(),
         "the checkout stays"
@@ -426,7 +439,7 @@ fn a_git_entry_acquired_after_the_tree_went_is_kept() {
     assert!(done[0].1.is_err() && done[1].1.is_err(), "{done:?}");
     assert!(!g.snapshot().exists());
     assert!(entry.join("gitdir").is_file() && g.cells().is_dir());
-    assert!(g.worktrees().contains(&*g.snapshot().to_string_lossy()));
+    assert!(g.has_worktree(&g.snapshot()), "{}", g.worktrees());
     assert!(
         super::pending::read(&g.checkout(), &g.snapshot())
             .unwrap()
@@ -840,10 +853,7 @@ fn a_used_snapshot_stays_and_says_why() {
             "{case}: {done:#?}"
         );
         assert!(g.snapshot().is_dir() && g.cells().is_dir(), "{case}");
-        assert!(
-            g.worktrees().contains(&*g.snapshot().to_string_lossy()),
-            "{case}"
-        );
+        assert!(g.has_worktree(&g.snapshot()), "{case}: {}", g.worktrees());
     }
 }
 
@@ -935,7 +945,7 @@ fn a_lock_taken_just_before_the_removal_keeps_the_snapshot() {
         "the snapshot stays"
     );
     assert!(done[1].1.is_err() && g.cells().is_dir(), "{done:#?}");
-    assert!(g.worktrees().contains(&*g.snapshot().to_string_lossy()));
+    assert!(g.has_worktree(&g.snapshot()), "{}", g.worktrees());
     let other_lane = g.home().join("other-verify-cells.noindex");
     let went = done.iter().find(|(l, _)| l.path == other_lane);
     assert_eq!(went.map(|(_, r)| r.clone()), Some(Ok(())), "{done:#?}");
@@ -1262,7 +1272,10 @@ fn a_snapshot_git_cannot_read_stays_and_names_the_remedy() {
         "read through its alternates: {planned:#?}"
     );
 
-    std::fs::remove_dir_all(&keeper).expect("the store gone");
+    assert!(
+        crate::build_cache::remove::tree(&keeper).whole(),
+        "the store gone"
+    );
     let status = GitCli.run(
         &g.snapshot(),
         &[

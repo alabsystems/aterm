@@ -2497,10 +2497,14 @@ pub fn command_read_only_at(
     readings_read_only_from(&[line.to_string()], python_allow, home, start)
 }
 
-/// The home the advisory word resolves `~` and the secret list against.
-fn advisory_home() -> Option<PathBuf> {
+/// The home the advisory word and `aterm drive classify` resolve `~` and the secret list
+/// against: `HOME`, or on Windows `USERPROFILE` when `HOME` is unset or empty.
+pub(crate) fn advisory_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::env::var_os(crate::harness::accounts::HOMEDIR_ENV).filter(|h| !h.is_empty())
+        })
         .map(PathBuf::from)
 }
 

@@ -2660,9 +2660,12 @@ fn a_used_messages_mark_stays_out_of_the_maildirs_message_folders() {
         timed_out,
         "CONTROL: the root's mark holds where the message lies"
     );
+    let info = if cfg!(windows) { ";2,S" } else { ":2,S" };
     std::fs::rename(
         maildir.join("new").join("1700000000.1_1.host"),
-        maildir.join("cur").join("1700000000.1_1.host:2,S"),
+        maildir
+            .join("cur")
+            .join(format!("1700000000.1_1.host{info}")),
     )
     .expect("a client reads it");
     assert_eq!(
@@ -3920,11 +3923,9 @@ fn the_headless_launch_hides_nothing_from_a_bot_check() {
             path: PathBuf::from("/opt/chrome-headless-shell"),
             is_headless_shell,
         };
-        // Linux's root alone adds `--no-sandbox`, which Chromium requires there.
         let args: Vec<String> = headless_launch_args(&browser, profile)
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
-            .filter(|a| a != "--no-sandbox")
             .collect();
         let want: Vec<&str> = lead.iter().chain(tail.iter()).copied().collect();
         assert_eq!(args, want);

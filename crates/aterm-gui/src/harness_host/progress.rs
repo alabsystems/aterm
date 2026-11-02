@@ -42,6 +42,7 @@ pub(super) struct BoundProgress {
     born: Option<u64>,
     state: Option<PathBuf>,
     labels: BTreeSet<String>,
+    policy: Arc<()>,
     /// The exact gate recheck, independent of displayed wall time. Normal decisions have none.
     pub(super) execution_until: Option<Instant>,
     pub(super) value: AccountProgress,
@@ -52,6 +53,7 @@ pub(super) struct ProgressRead {
     pub(super) progress: Option<AccountProgress>,
     pub(super) activity_contended: bool,
     pub(super) execution_until: Option<Instant>,
+    policy_revision: Option<u64>,
 }
 
 impl ProgressRead {
@@ -108,6 +110,34 @@ fn expire_execution(value: &mut AccountProgress) {
     value.details.insert(0, EXECUTION_REFRESH_FINDING.into());
 }
 
+fn pause_progress(value: &mut AccountProgress, off: bool, current_work: bool) {
+    use aterm_agent::harness::account_progress::{
+        EXECUTION_HISTORY_PREFIX, RECOVERY_HISTORY_PREFIX, RECOVERY_RESUME_FINDING,
+        SESSION_AUTOPILOT_OFF_FINDING,
+    };
+    if !current_work {
+        value.phase = ProgressPhase::Paused;
+    }
+    value.eligible = None;
+    value.next_at = None;
+    for detail in &mut value.details {
+        if !detail.starts_with(EXECUTION_HISTORY_PREFIX)
+            && !detail.starts_with(RECOVERY_HISTORY_PREFIX)
+        {
+            *detail = format!("{RECOVERY_HISTORY_PREFIX}{detail}");
+        }
+    }
+    value.details.insert(
+        0,
+        if off {
+            SESSION_AUTOPILOT_OFF_FINDING
+        } else {
+            RECOVERY_RESUME_FINDING
+        }
+        .into(),
+    );
+}
+
 fn replace_execution_progress(kept: &mut Kept, next: Option<BoundProgress>, now: Instant) -> bool {
     let same = match (&kept.account.execution_progress, &next) {
         (Some(old), Some(new)) => {
@@ -135,6 +165,10 @@ fn replace_execution_progress(kept: &mut Kept, next: Option<BoundProgress>, now:
 }
 
 impl BoundProgress {
+    pub(super) fn policy_is(&self, policy: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.policy, policy)
+    }
+
     /// Reuse only context already read by the gate; it is not an inventory judgment.
     pub(super) fn execution_context(&mut self, seat: &AccountSeat, roster: &accounts::Roster) {
         if self.born.is_some() {
@@ -309,8 +343,12 @@ impl WorkerIdle {
         if !observes(Some(self.agent)) {
             return None;
         }
-        let (snapshot, generation) = with_kept_of(&self.kept, |kept| {
-            (kept.snapshot.clone(), Arc::clone(&kept.account.landing))
+        let (snapshot, generation, policy) = with_kept_of(&self.kept, |kept| {
+            (
+                kept.snapshot.clone(),
+                Arc::clone(&kept.account.landing),
+                Arc::clone(&kept.account.progress_policy),
+            )
         });
         let snapshot = snapshot?;
         let born = snapshot.current_start_seconds();
@@ -323,6 +361,7 @@ impl WorkerIdle {
             born,
             state: None,
             labels: BTreeSet::new(),
+            policy,
             execution_until: None,
             value: AccountProgress::unknown(now),
         })
@@ -425,6 +464,7 @@ impl WorkerIdle {
             born,
             state: None,
             labels: BTreeSet::new(),
+            policy: Arc::clone(&request.turn.progress_policy),
             execution_until: None,
             value,
         };
@@ -509,6 +549,29 @@ impl WorkerIdle {
 }
 
 impl HostHandle {
+    fn progress_policy(&self, sid: &str) -> Result<(bool, u64), ()> {
+        let state = observe_lock(&self.shared.state)?;
+        Ok((state.off.contains(sid), state.off_revision))
+    }
+
+    fn progress_policy_current(&self, revision: Option<u64>) -> bool {
+        revision.is_none_or(|revision| {
+            observe_lock(&self.shared.state).is_ok_and(|state| state.off_revision == revision)
+        })
+    }
+
+    fn unobserved_progress(off: bool, policy_revision: u64) -> ProgressRead {
+        let mut progress = off.then(|| AccountProgress::unknown(0));
+        if let Some(progress) = &mut progress {
+            pause_progress(progress, true, false);
+        }
+        ProgressRead {
+            progress,
+            policy_revision: Some(policy_revision),
+            ..Default::default()
+        }
+    }
+
     /// Pure in-memory read. Contention is distinct from an absent observation.
     #[cfg(test)]
     pub(crate) fn account_progress(
@@ -597,9 +660,12 @@ impl HostHandle {
         // Sample before cloning any lease. A concurrent silent extension then either appears
         // in this read or leaves its earlier deadline armed, even if this read resumes late.
         let (mono, wall) = clock();
+        // This is the host's actual OffSessions verdict, not a missing-worker heuristic.
+        // Its guard is released before touching any session observation.
+        let (off, policy_revision) = self.progress_policy(sid)?;
         let map = observe_lock(&self.shared.kept)?;
         let Some(kept) = map.get(sid).cloned() else {
-            return Ok(ProgressRead::default());
+            return Ok(Self::unobserved_progress(off, policy_revision));
         };
         drop(map);
         let kept = observe_lock(&kept)?;
@@ -614,8 +680,9 @@ impl HostHandle {
             .as_ref()
             .filter(|bound| bound.matches(&kept, pid, started, conversation));
         let Some(bound) = execution.or(normal) else {
-            return Ok(ProgressRead::default());
+            return Ok(Self::unobserved_progress(off, policy_revision));
         };
+        let policy_retired = !bound.policy_is(&kept.account.progress_policy);
         let execution_active = execution.is_some();
         let execution_until = execution.and_then(|bound| bound.execution_until);
         let mut value = bound.value.clone();
@@ -669,7 +736,7 @@ impl HostHandle {
         }
         drop(kept);
         // Currentness is monotonic; the wall clock is only for displayed timestamps and activity.
-        let execution_until = execution_until.filter(|until| mono < *until);
+        let mut execution_until = execution_until.filter(|until| mono < *until);
         if execution_active && execution_until.is_none() {
             let phase = value.phase.clone();
             expire_execution(&mut value);
@@ -714,10 +781,19 @@ impl HostHandle {
                 "Waiting for a decision under the current account policy".into(),
             );
         }
+        if !execution_active && (off || policy_retired) {
+            // A separately observed operation may still finish while an Off worker yields.
+            // Its phase is evidence; another selection or gate retry is not promised.
+            let current_work =
+                current_work || matches!(value.phase, ProgressPhase::SigningIn { .. });
+            pause_progress(&mut value, off, current_work);
+            execution_until = None;
+        }
         Ok(ProgressRead {
             progress: Some(value),
             activity_contended,
             execution_until,
+            policy_revision: Some(policy_revision),
         })
     }
 }
@@ -741,7 +817,9 @@ impl crate::App {
     /// Each loop wake reads them, a [`HostNote::AccountProgress`](super::HostNote::AccountProgress)
     /// among them. Active work or contention polls a second on; a current execution receipt also
     /// arms one wake at its exact gate recheck so an unrefreshed refusal becomes history. A settled
-    /// expired receipt arms no timer, preserving the idle window's zero timer wakes.
+    /// expired receipt arms no timer, preserving the idle window's zero timer wakes. An unavailable
+    /// supervisor read marks retained facts historical until a same-binding read succeeds; it
+    /// retains the one-second observation retry without inventing a semantic next event.
     pub(crate) fn service_harness_account_progress(&mut self, now: Instant) {
         self.service_harness_account_progress_with_reader(
             now,
@@ -796,16 +874,28 @@ impl crate::App {
             let Some(sid) = self.session_sid(id) else {
                 continue;
             };
-            let Ok(read) = read(&host, &sid, pid, birth, conversation.as_deref()) else {
-                again = true;
-                continue;
-            };
-            next_poll = earlier(next_poll, read.next_poll(now));
+            let mut read = read(&host, &sid, pid, birth, conversation.as_deref());
+            if read
+                .as_ref()
+                .is_ok_and(|read| !host.progress_policy_current(read.policy_revision))
+            {
+                read = Err(());
+            }
+            match &read {
+                Ok(read) => next_poll = earlier(next_poll, read.next_poll(now)),
+                Err(()) => again = true,
+            }
             let Ok(mut held) = observe_lock(&timeline) else {
                 again = true;
                 continue;
             };
-            if held.set_account_progress(pid, birth, conversation.as_deref(), read.progress) {
+            let updated = match read {
+                Ok(read) => {
+                    held.set_account_progress(pid, birth, conversation.as_deref(), read.progress)
+                }
+                Err(()) => held.set_account_progress_busy(pid, birth, conversation.as_deref()),
+            };
+            if updated {
                 changed.push(id);
             }
         }

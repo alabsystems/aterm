@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Carries lost logins through Claude Code's `/login` dialog ([`super::turn_end`], [`aterm_phase::login`]).
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aterm_phase::wall::WallKind;
 use aterm_phase::{LoginMethod, LoginPicker, LoginScreen, Program, PromptV2};
@@ -10,7 +10,7 @@ use aterm_phase::{LoginMethod, LoginPicker, LoginScreen, Program, PromptV2};
 use super::super::config::SupervisorConfig;
 use super::approval::{Choice, Decision};
 use super::guard::row_guard;
-use super::turn_end::{TurnEndAction, TurnEndReading, TurnEndState};
+use super::turn_end::{TurnEndAction, TurnEndReading, TurnEndState, WaitKind};
 
 /// Rule ID the loop once selected the session's login method in `/login` under. It selects none
 /// now ([`pick_method`]: the pick opens the browser, which aterm never brings forward by itself);
@@ -22,6 +22,14 @@ pub const RULE_LOGIN_DONE: &str = "login-done@v1";
 
 /// Rule ID for backing out of the dialog of the loop's own `/login` with its Esc ([`backs_out`]).
 pub const RULE_LOGIN_BACK_OUT: &str = "login-back-out@v1";
+
+/// Rule ID for closing, with the dialog's own Esc, a person's own `/login` left standing over a
+/// usage limit whose act is due ([`over_limit_act`]).
+pub const RULE_LOGIN_OVER_LIMIT: &str = "login-over-limit@v1";
+
+/// How many Escs aterm presses at a person's `/login` it closes ([`over_limit_act`]) before a
+/// dialog still drawn is the person's to close, told to them now ([`over_limit_unclosed`]).
+pub const OVER_LIMIT_BACKS_MAX: u32 = 3;
 
 /// Why the `/login` method picker is the person's to answer ([`pick_method`]): which method the
 /// session signs in with, as far as aterm reads it, for the escalation's words.
@@ -179,6 +187,116 @@ pub fn dialog_act(state: &TurnEndState, screen: &LoginScreen) -> TurnEndAction {
         | LoginScreen::ConsoleMenu
         | LoginScreen::Failed => TurnEndAction::Nothing,
     }
+}
+
+/// HOW LONG A PERSON'S OWN `/login` DIALOG STANDS WITH NO KEY OF THEIRS BEFORE IT IS LEFT
+/// ([`over_limit_act`]): from their newest key in the tab, or where none is known from this loop's
+/// first read of the dialog. A browser sign-in nobody finished in that time is abandoned (the code
+/// it would paste has long expired), and a person still at the tab has seen the limit's reset pass.
+pub const OVER_LIMIT_UNUSED: Duration = Duration::from_secs(30 * 60);
+
+/// THE ACT AT A PERSON'S OWN `/login` DIALOG LEFT STANDING OVER A USAGE LIMIT
+/// (`login-over-limit@v1`): the dialog covers the composer, so neither aterm's resume nor Claude
+/// Code's own armed continue reaches the tab while it stands (measured 2026-10-31 on 2.1.302: a
+/// person's browser hand-off stood 33 h past its weekly reset, 55 h in all, Claude Code's countdown
+/// under it unfired). Where the act the limit owes comes due
+/// ([`super::turn_end::login_over_limit_due`]: the limit's reset and its grace, or at once where
+/// the roster advises a move or measured the limit cleared) and the dialog is [`OVER_LIMIT_UNUSED`]
+/// left, aterm closes it with its own fenced Esc, as it closes its own `/login` ([`backs_out`]),
+/// and the limit's act follows at the composer it uncovers. Until then the tab waits for that
+/// moment, so the reset is a wake and no limit is told as unhandled. The dialog's method picker,
+/// its browser hand-off and its error state alike ([`over_limit_screen`]); never aterm's own
+/// `/login` ([`backs_out`]'s), Console's menu (only a person's pick opens it) or the success state
+/// ([`dialog_act`]'s); after [`OVER_LIMIT_BACKS_MAX`] Escs that left it drawn, nothing more is
+/// pressed and the person is told now ([`over_limit_unclosed`]). `None`: the dialog is the
+/// person's, as before.
+#[must_use]
+pub fn over_limit_act(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    screen: &LoginScreen,
+    now: Instant,
+) -> Option<TurnEndAction> {
+    if !over_limit_screen(state, screen) {
+        return None;
+    }
+    let due = super::turn_end::login_over_limit_due(state, reading, cfg, now)?;
+    if let Some(until) = state.login_over_limit_closing(now) {
+        return Some(TurnEndAction::WaitUntil {
+            until,
+            why: "the /login dialog aterm closed to close".to_string(),
+            wait: WaitKind::Other,
+        });
+    }
+    if state.login_over_limit_backs() >= OVER_LIMIT_BACKS_MAX {
+        return None;
+    }
+    let left = unused_at(state, reading, now);
+    let until = left.max(due);
+    if now < until {
+        return Some(TurnEndAction::WaitUntil {
+            until,
+            why: if left > due {
+                "a person's own /login over the usage limit, to stand unused".to_string()
+            } else {
+                "the usage limit's act, which a person's own /login covers".to_string()
+            },
+            wait: WaitKind::Other,
+        });
+    }
+    Some(TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_OVER_LIMIT,
+    })
+}
+
+/// When the `/login` standing is [`OVER_LIMIT_UNUSED`] left: from the person's newest key or touch
+/// in the tab, or where neither is known from this loop's first read of the dialog.
+fn unused_at(state: &TurnEndState, reading: &TurnEndReading, now: Instant) -> Instant {
+    let touched = reading
+        .key
+        .into_iter()
+        .chain(reading.person)
+        .min()
+        .and_then(|ago| now.checked_sub(ago));
+    let from = touched.or_else(|| state.login_dialog_seen()).unwrap_or(now);
+    from.checked_add(OVER_LIMIT_UNUSED).unwrap_or(from)
+}
+
+/// Whether `screen` is a person's own `/login` dialog [`over_limit_act`] may close, under no
+/// `/login` of aterm's: its method picker (no method picked, so no sign-in has started; the
+/// approval loop still tells the person the pick is theirs, [`picker_gate`]), its browser
+/// hand-off, or its error state, each drawn with the dialog's own `Esc to cancel` row
+/// ([`cancel_row`]). A person one step from the hand-off left the tab as surely as one at it.
+/// Console's menu stays theirs: only their pick at the picker opens it.
+pub(in crate::supervise) fn over_limit_screen(state: &TurnEndState, screen: &LoginScreen) -> bool {
+    state.login_typed_at().is_none()
+        && matches!(
+            screen,
+            LoginScreen::Picker(_) | LoginScreen::Browser | LoginScreen::Failed
+        )
+}
+
+/// WHETHER A PERSON'S OWN `/login` LEFT OVER A USAGE LIMIT STAYS DRAWN after
+/// [`OVER_LIMIT_BACKS_MAX`] Escs of [`over_limit_act`]'s, the limit's act due
+/// ([`super::turn_end::login_over_limit_due`]): only a person can close it now, and their one key
+/// does (the exception's `Now`).
+#[must_use]
+pub fn over_limit_unclosed(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+) -> bool {
+    carried(reading.program)
+        && reading
+            .login_screen
+            .as_ref()
+            .is_some_and(|screen| over_limit_screen(state, screen))
+        && state.login_over_limit_backs() >= OVER_LIMIT_BACKS_MAX
+        && state.login_over_limit_closing(now).is_none()
+        && super::turn_end::login_over_limit_due(state, reading, cfg, now)
+            .is_some_and(|due| due <= now)
 }
 
 /// Ownership classification for a `/login` method picker ([`picker_gate`]).

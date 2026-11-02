@@ -403,6 +403,19 @@ fn a_route_no_launch_names_is_a_named_gap() {
         ),
         "non-boolean",
     );
+    gap(
+        endpoint_of(
+            Program::Agy,
+            &words("agy"),
+            Some(&lab_env(&[
+                "GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4100",
+                KEYED,
+                "AGY_LLM_GATEWAY_URL=http://127.0.0.1:4200",
+            ])),
+            unread_claude,
+        ),
+        "AGY_LLM_GATEWAY_URL",
+    );
     let proxied = lab_env(&["GOOGLE_GEMINI_BASE_URL=https://gw.example.test/v1", KEYED]);
     gap(
         endpoint_of(Program::Agy, &words("agy"), Some(&proxied), unread_claude),
@@ -541,14 +554,15 @@ fn a_witness_is_another_sessions_answer_on_the_same_route() {
     assert_eq!(muse.says(), "muse http://127.0.0.1:4100");
 }
 
-/// agy's `settings.json` decides whether an API key in its environment is its active backend:
-/// `"modelProvider": "gemini"` selects Gemini API (default `generativelanguage.googleapis.com` or
-/// `GOOGLE_GEMINI_BASE_URL`); an absent `settings.json`, omitted `modelProvider` (Google sign-in),
-/// another provider (`"gateway"`), or `--settings` on `argv` is a settled gap even when
-/// `GEMINI_API_KEY` sits in the environment; a truncated or unreadable `settings.json` is unread so
-/// the host re-reads it. NEGATIVE CONTROL (run): with `endpoint_of_with_agy` ignoring `agy()`, a
-/// signed-in agy with `GEMINI_API_KEY` in its environment reads as `Named(Base::gemini())` and this
-/// test fails.
+/// agy's `settings.json` and `--settings` session override decide whether an API key in its
+/// environment is its active backend: `"modelProvider": "gemini"` selects Gemini API (default
+/// `generativelanguage.googleapis.com` or `GOOGLE_GEMINI_BASE_URL`); an absent `settings.json`,
+/// omitted `modelProvider` (Google sign-in), another provider (`"gateway"`), or a relative
+/// `--settings` file path is a settled gap even when `GEMINI_API_KEY` sits in the environment; a
+/// truncated or unreadable `settings.json` or absolute `--settings` file is unread so the host
+/// re-reads it. NEGATIVE CONTROL (run): with `endpoint_of_with_agy` ignoring `agy()`, a signed-in
+/// agy with `GEMINI_API_KEY` in its environment reads as `Named(Base::gemini())` and this test
+/// fails.
 #[test]
 fn agy_settings_gate_whether_an_api_key_in_env_is_its_route() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -569,6 +583,19 @@ fn agy_settings_gate_whether_an_api_key_in_env_is_its_route() {
         matches!(route("agy"), Endpoint::Gap(ref why) if why.contains("settings.json is absent")),
         "{:?}",
         route("agy")
+    );
+
+    // Inline --settings selecting modelProvider: "gemini" overrides an absent settings.json.
+    assert_eq!(
+        route("agy --settings={\"modelProvider\":\"gemini\"}"),
+        Endpoint::Named(Base::gemini())
+    );
+    assert_eq!(
+        route(
+            "agy --settings={\"modelProvider\":\"other\"} --settings={\"modelProvider\":\"gemini\"}"
+        ),
+        Endpoint::Named(Base::gemini()),
+        "last --settings before -- wins"
     );
 
     // Present settings.json without modelProvider -> Google sign-in.
@@ -594,29 +621,61 @@ fn agy_settings_gate_whether_an_api_key_in_env_is_its_route() {
         AgyBackend::Unread("agy's settings.json could not be parsed".to_string())
     );
 
-    // modelProvider: "gemini" -> Named(Base::gemini()), unless --settings overrides argv.
+    // modelProvider: "gemini" -> Named(Base::gemini()); --settings={} preserves it, while an
+    // explicit null/empty/other modelProvider or relative --settings file overrides it to a gap.
     std::fs::write(&settings, "\u{feff}{\"modelProvider\":\"gemini\"}\n").expect("write gemini");
     assert_eq!(route("agy"), Endpoint::Named(Base::gemini()));
-    assert!(
-        matches!(
-            route("agy --settings={}"),
-            Endpoint::Gap(ref why) if why.contains("--settings")
-        ),
-        "session-only --settings override is not guessed"
+    assert_eq!(
+        route("agy --settings={}"),
+        Endpoint::Named(Base::gemini()),
+        "--settings omitting modelProvider inherits settings.json"
     );
+    for clearing in [
+        "agy --settings={\"modelProvider\":null}",
+        "agy --settings={\"modelProvider\":\"\"}",
+        "agy --settings={\"modelProvider\":\"gateway\"}",
+        "agy --settings=relative-override.json",
+    ] {
+        assert!(
+            matches!(route(clearing), Endpoint::Gap(ref why) if why.contains("--settings")),
+            "{clearing}: {:?}",
+            route(clearing)
+        );
+    }
 
-    // File-provider fence: never opened, settled as Other rather than Unread.
+    // Absolute --settings file: mid-write is Unread, omitted modelProvider inherits settings.json,
+    // and explicit modelProvider overrides settings.json.
+    let ovr = dir.path().join("session-override.json");
+    std::fs::write(&ovr, "").expect("truncate override");
+    let ovr_argv = vec![
+        "agy".to_string(),
+        "--settings".to_string(),
+        ovr.display().to_string(),
+    ];
+    assert_eq!(
+        agy_backend_on_disk(&ovr_argv, &env, None),
+        AgyBackend::Unread("agy's --settings file could not be parsed".to_string())
+    );
+    std::fs::write(&ovr, "{\"theme\":\"light\"}\n").expect("write theme override");
+    assert_eq!(
+        agy_backend_on_disk(&ovr_argv, &env, None),
+        AgyBackend::GeminiApi
+    );
+    std::fs::write(&ovr, "{\"modelProvider\":null}\n").expect("write clearing override");
+    assert!(matches!(
+        agy_backend_on_disk(&ovr_argv, &env, None),
+        AgyBackend::Other(ref why) if why.contains("--settings file clears modelProvider")
+    ));
+
+    // File-provider fence: never opened (for either --gemini_dir or --settings), settled as Other.
     let cloud = home
         .join("Library")
         .join("CloudStorage")
         .join("OneDrive")
         .join("gem");
     std::fs::create_dir_all(cloud.join("antigravity-cli")).expect("cloud dir");
-    std::fs::write(
-        cloud.join("antigravity-cli").join("settings.json"),
-        "{\"modelProvider\":\"gemini\"}\n",
-    )
-    .expect("cloud settings");
+    let cloud_settings = cloud.join("antigravity-cli").join("settings.json");
+    std::fs::write(&cloud_settings, "{\"modelProvider\":\"gemini\"}\n").expect("cloud settings");
     let fenced_argv = vec![
         "agy".to_string(),
         format!("--gemini_dir={}", cloud.display()),
@@ -628,4 +687,144 @@ fn agy_settings_gate_whether_an_api_key_in_env_is_its_route() {
         ),
         "fenced settings.json is settled without opening"
     );
+    let fenced_ovr_argv = vec![
+        "agy".to_string(),
+        format!("--settings={}", cloud_settings.display()),
+    ];
+    assert!(
+        matches!(
+            agy_backend_on_disk(&fenced_ovr_argv, &env, Some(&home)),
+            AgyBackend::Other(ref why) if why.contains("file-provider domain")
+        ),
+        "fenced --settings file is settled without opening"
+    );
+
+    // Relative --settings file resolved against cwd (`agy_backend_in_dir`), including a `..`
+    // traversal into a file-provider domain.
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    std::fs::write(&settings, "{\"theme\":\"dark\"}\n").expect("sign-in settings");
+    std::fs::write(
+        work.join("rel-ovr.json"),
+        "{\"modelProvider\":\"gemini\"}\n",
+    )
+    .expect("relative override");
+    let rel_argv = words("agy --settings=rel-ovr.json");
+    assert_eq!(
+        agy_backend_in_dir(&rel_argv, &env, Some(&work), Some(&home)),
+        AgyBackend::GeminiApi,
+        "relative --settings file resolved against cwd selects Gemini API"
+    );
+    let rel_fenced =
+        words("agy --settings=../Library/CloudStorage/OneDrive/gem/antigravity-cli/settings.json");
+    assert!(
+        matches!(
+            agy_backend_in_dir(&rel_fenced, &env, Some(&work), Some(&home)),
+            AgyBackend::Other(ref why) if why.contains("file-provider domain")
+        ),
+        "relative --settings traversing .. into a file-provider domain is fenced before opening"
+    );
+}
+
+#[test]
+fn muse_endpoint_follows_option_arity_provider_and_transport_overrides() {
+    let env = lab_env(&["MUSE_STUB=http://127.0.0.1:4102"]);
+    let ask = |argv: &[&str]| {
+        let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+        endpoint_of(Program::Muse, &argv, Some(&env), unread_claude)
+    };
+
+    // NEGATIVE CONTROL for naive token scanning: `--base-url` as another option's value is NOT a
+    // route flag.
+    assert!(matches!(
+        ask(&["muse", "--model", "--base-url"]),
+        Endpoint::Gap(ref why) if why.contains("names no --base-url")
+    ));
+    assert!(matches!(
+        ask(&["muse", "--model", "--base-url=http://127.0.0.1:4100"]),
+        Endpoint::Gap(ref why) if why.contains("names no --base-url")
+    ));
+
+    // `--provider local` and `resume` keep `--base-url`; `-c endpoint_transport.base_url` names the
+    // route when `--base-url` is absent, and `--base-url` outranks `-c endpoint_transport.base_url`.
+    assert_eq!(
+        ask(&[
+            "muse",
+            "--provider",
+            "local",
+            "--base-url",
+            "http://127.0.0.1:4100"
+        ]),
+        Endpoint::Named(base(4100))
+    );
+    assert_eq!(
+        ask(&[
+            "muse",
+            "resume",
+            "--base-url",
+            "http://127.0.0.1:4100",
+            "--last"
+        ]),
+        Endpoint::Named(base(4100))
+    );
+    assert_eq!(
+        ask(&[
+            "muse",
+            "-c",
+            "endpoint_transport.base_url=\"http://127.0.0.1:4101\""
+        ]),
+        Endpoint::Named(base(4101))
+    );
+    assert_eq!(
+        ask(&["muse", "-c", "endpoint_transport.base_url=\"${MUSE_STUB}\""]),
+        Endpoint::Named(base(4102))
+    );
+    assert_eq!(
+        ask(&[
+            "muse",
+            "--base-url",
+            "http://127.0.0.1:4100",
+            "-c",
+            "endpoint_transport.base_url=\"http://127.0.0.1:4101\"",
+        ]),
+        Endpoint::Named(base(4100)),
+        "--base-url outranks -c endpoint_transport.base_url"
+    );
+
+    // Non-HTTP provider (`echo`) or `-c endpoint_transport` proxy / CA bundle is a settled gap.
+    for non_direct in [
+        &[
+            "muse",
+            "--provider",
+            "echo",
+            "--base-url",
+            "http://127.0.0.1:4100",
+        ][..],
+        &[
+            "muse",
+            "-c",
+            "provider=\"echo\"",
+            "--base-url",
+            "http://127.0.0.1:4100",
+        ],
+        &[
+            "muse",
+            "--base-url",
+            "http://127.0.0.1:4100",
+            "-c",
+            "endpoint_transport.proxy=\"http://127.0.0.1:9\"",
+        ],
+        &[
+            "muse",
+            "--base-url",
+            "http://127.0.0.1:4100",
+            "-c",
+            "endpoint_transport.ca_bundle=\"/tmp/ca.pem\"",
+        ],
+    ] {
+        assert!(
+            matches!(ask(non_direct), Endpoint::Gap(_)),
+            "{non_direct:?} should be a gap"
+        );
+    }
 }

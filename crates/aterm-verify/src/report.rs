@@ -12,6 +12,28 @@ use crate::ladder::{Finding, Outcome, Report, Severity};
 /// How many findings a failed check lists before pointing at the log.
 pub const FINDINGS_SHOWN: usize = 10;
 
+/// A completed stage's decisions and timing, emitted before sibling stages finish.
+/// Waiting is time from the run's start until this stage actually starts executing;
+/// it includes dependencies and resource admission, not CPU time.
+#[must_use]
+pub fn stage_event(report: &Report, waiting: Duration, execution: Duration) -> String {
+    let decisions: Vec<_> = report
+        .outcomes()
+        .map(|(outcome, label)| aterm_json::json!({"outcome": word(outcome), "detail": label}))
+        .collect();
+    format!(
+        "verify-event: {}\n",
+        aterm_json::json!({
+            "schema": 1,
+            "event": "stage-finished",
+            "stage": report.title,
+            "waiting_s": waiting.as_secs_f64(),
+            "execution_s": execution.as_secs_f64(),
+            "decisions": decisions,
+        })
+    )
+}
+
 /// One check's result: what its stages' rows add up to.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckResult {
@@ -256,6 +278,20 @@ pub fn moved_checkout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_stage_event_keeps_findings_and_unavailable_checks_distinct() {
+        let mut report = Report::new("measurement");
+        report.fail("throughput below floor");
+        report.cannot_run("window never focused");
+        let line = stage_event(&report, Duration::from_secs(12), Duration::from_secs(3));
+        let event: aterm_json::Value =
+            aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
+        assert_eq!(event["waiting_s"].as_f64(), Some(12.0));
+        assert_eq!(event["execution_s"].as_f64(), Some(3.0));
+        assert_eq!(event["decisions"][0]["outcome"].as_str(), Some("FAIL"));
+        assert_eq!(event["decisions"][1]["outcome"].as_str(), Some("NOT RUN"));
+    }
 
     fn result(check: Check, outcome: Outcome) -> CheckResult {
         CheckResult {

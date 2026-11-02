@@ -3,6 +3,7 @@
 
 //! `aterm-release`: the release cutter behind the `targo --unverified ship` alias.
 
+mod accepted_measure;
 mod apple;
 
 mod artifact;
@@ -46,7 +47,9 @@ mod publish;
 
 mod release;
 mod release_keychain;
+mod release_status;
 mod release_steps;
+
 mod sign;
 
 mod site;

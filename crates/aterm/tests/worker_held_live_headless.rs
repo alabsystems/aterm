@@ -31,30 +31,37 @@ const STANDIN: &str = "#!/bin/sh\n\
 /// (on follow-up Enter: Claude Code's working frame, the prompt in the transcript over
 /// an empty composer, which `turn` reads as taken; the box once the test leaves the
 /// `held` cue ([`held_cue`]), drawn by a poll that ends with the fake, so the input
-/// loop never blocks) -> `back` (on Esc).
+/// loop never blocks) -> `back` (on Esc). Each frame is composed first
+/// (the transcript above the composer is held in `top`) and then written by one
+/// `printf` inside a DEC 2026 bracket, as Claude Code draws its own, so a read waits
+/// for it whole: a clear followed by the writes of processes started after it left
+/// the cleared rows standing as long as a loaded machine took to start them, the
+/// harness's echo settle read that as the frame, and its LAND instruction was
+/// escalated as typed, not submitted.
 const FAKE: &str = r#"#!/bin/sh
 dir="$1"
 stty raw -echo
 cr=$(printf '\r'); esc=$(printf '\033'); sc=$(printf '\0337'); rc=$(printf '\0338')
 rule=$(cat "$dir/rule"); check=$(cat "$dir/check.head")
+top=$(cat "$dir/ready.top"; printf .); top="${top%.}"
 screen() {
-  printf '\033[H\033[2J'; cat "$1"; printf '%s\r\n' "$rule"
-  if [ -z "$2" ]; then printf '\342\235\257 %s' "$sc"
-  else printf '%s\n' "$2" | fold -w 96 | awk -v sc="$sc" 'NR>1{printf "\r\n  %s",$0;next}{printf "\342\235\257 %s",$0} END{printf "%s",sc}'
+  if [ -z "$1" ]; then said="$sc"
+  else said=$(printf '%s\n' "$1" | fold -w 96 | awk -v sc="$sc" 'NR>1{printf "\r\n  %s",$0;next}{printf "%s",$0} END{printf "%s",sc}')
   fi
-  printf '\r\n%s\r\n  ? for shortcuts%s' "$rule" "$rc"
+  printf '\033[?2026h\033[H\033[2J%s%s\r\n\342\235\257 %s\r\n%s\r\n  ? for shortcuts%s\033[?2026l' \
+    "$top" "$rule" "$said" "$rule" "$rc"
 }
-draw() { printf '\033[H\033[2J'; cat "$dir/$1.scr"; }
+draw() { scr=$(cat "$dir/$1.scr"; printf .); printf '\033[?2026h\033[H\033[2J%s\033[?2026l' "${scr%.}"; }
 reply() {
-  { cat "$dir/$1.top"
+  top=$(printf '%s' "$top"
     printf '%s\n' "$buf" | fold -s -w 96 | awk 'NR>1{printf "  %s\r\n",$0;next}{printf "\342\235\257 %s\r\n",$0}'
-    printf '\r\n'; cat "$dir/$2.top"; } > "$dir/$3.top"
-  at=$3; buf=""; screen "$dir/$3.top" ""
+    printf '\r\n'; cat "$dir/$1.top"; printf .); top="${top%.}"
+  at=$2; buf=""; screen ""
 }
 enter() {
   case "$at:$buf" in
-    ready:*) reply ready defense landed ;;
-    landed:"$check"*) reply landed landed-word checked ;;
+    ready:*) reply defense landed ;;
+    landed:"$check"*) reply landed-word checked ;;
     *)
       at=box; buf=""; draw working
       ( while [ ! -e "$dir/held" ] && kill -0 $$ 2>/dev/null; do sleep 0.1; done
@@ -68,7 +75,7 @@ feed() {
       ready|landed|checked)
         case "$rest" in
           *"$cr"*) buf="$buf${rest%%"$cr"*}"; rest="${rest#*"$cr"}"; enter ;;
-          *) buf="$buf$rest"; rest=""; screen "$dir/$at.top" "$buf" ;;
+          *) buf="$buf$rest"; rest=""; screen "$buf" ;;
         esac ;;
       box)
         case "$rest" in *"$esc"*) at=back; draw back ;; esac; rest="" ;;
@@ -76,7 +83,7 @@ feed() {
     esac
   done
 }
-at=ready; buf=""; screen "$dir/ready.top" ""
+at=ready; buf=""; screen ""
 while :; do
   c=$(dd bs=4096 count=1 2>/dev/null; printf .); c="${c%.}"
   [ -z "$c" ] && exit 0

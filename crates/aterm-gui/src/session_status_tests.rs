@@ -1231,6 +1231,67 @@ fn the_status_record_says_lan_sharing_beside_fleet() {
     assert_eq!(fields(&observed), (units, after), "{observed}");
 }
 
+/// The network place's fields (`crate::net_place::status_fields`: `net= net_kind= net_since_ms=
+/// internet= internet_ms= members= away_since_ms=`) ride right after `setup=` on both arms of the
+/// record: every one `-` before a place was read, and a held place (a phone hotspot, away from the
+/// ALab LAN) as the place says it.
+/// NEGATIVE CONTROL: dropping `{net}` from the unobserved arm leaves the fields out of it, and this
+/// test fails at "the network fields follow setup= on the unobserved arm".
+#[test]
+fn the_status_record_says_where_this_mac_is_on_the_network() {
+    let mut app = crate::App::headless_for_test();
+    let after_setup = |record: &str| -> String {
+        let words: Vec<&str> = record.split_whitespace().collect();
+        let at = words
+            .iter()
+            .position(|word| word.starts_with("setup="))
+            .unwrap_or_else(|| panic!("setup= in {record}"));
+        words[at + 1..]
+            .iter()
+            .take(7)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    crate::net_place::hold(None);
+    let unread = app.session_status_record(0).expect("live session");
+    assert!(unread.contains(" observed=false "), "{unread}");
+    assert_eq!(
+        after_setup(&unread),
+        aterm_netplace::words::STATUS_UNKNOWN,
+        "the network fields follow setup= on the unobserved arm: {unread}"
+    );
+    let place = aterm_netplace::sample::hotspot(1_800_000_000_000, 1_799_999_000_000);
+    crate::net_place::hold(Some(place.clone()));
+    let away = app.session_status_record(0).expect("live session");
+    let fields = after_setup(&away);
+    assert_eq!(
+        fields,
+        aterm_netplace::words::status_fields(&place),
+        "{away}"
+    );
+    assert!(
+        fields.starts_with("net=remote net_kind=hotspot net_since_ms=1800000000000 "),
+        "{fields}"
+    );
+    assert!(fields.ends_with(" away_since_ms=1799999000000"), "{fields}");
+
+    settle_observer(
+        &mut app.session_status,
+        0,
+        &evidence(blank(1)),
+        Instant::now(),
+    );
+    let observed = app.session_status_record(0).expect("live session");
+    assert!(observed.contains(" observed=true "), "{observed}");
+    assert_eq!(
+        after_setup(&observed),
+        fields,
+        "the observed arm: {observed}"
+    );
+    crate::net_place::hold(None);
+}
+
 /// `goal=` is the active goal of the agent in front ([`crate::session_timeline::SessionTimeline::goal`]),
 /// percent-encoded; `-` with none.
 #[test]
@@ -1942,7 +2003,8 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
         format!(
             "schema sid subject subject_source observed phase since_ms outcome exit_code signal \
              detail confidence reasons attribution fs_consent conflict revision enabled hold \
-             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet units setup hand hand_pid \
+             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet units setup net net_kind \
+             net_since_ms internet internet_ms members away_since_ms hand hand_pid \
              level story why \
              needs needs_n needs_told hold_by typed_by typed_ms path program agent agent_detail agent_rev \
              agent_since_ms agent_gen agent_fp wait wait_gib wait_ahead program_state \

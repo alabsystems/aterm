@@ -859,6 +859,7 @@ pub const WHY_WORDS: &[&str] = &[
     "log-replaced",
     "signin",
     "install",
+    "restored",
     // A post the bridge retired undelivered (`mail-landed why=`, aterm_types'
     // `DeadReason`; `not-carried` and `log-replaced` above are aterm's own).
     "undeliverable",

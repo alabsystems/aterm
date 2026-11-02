@@ -63,6 +63,8 @@ pub struct LabKw {
     /// `LAB_INSTANCE_ENV` words the scenario's own lab adds to the caller's (a dev seam its
     /// instance reads; [`crate::lab::instance_env`] says which).
     pub instance_env: &'static str,
+    /// The lab's own stand-in in the agent's place ([`crate::occupancy_standin`]).
+    pub standin: bool,
 }
 
 const SUMMARY: Style = Style {
@@ -111,6 +113,7 @@ fn lab_opts(mut o: UpOpts, harness_keys: &str, kw: LabKw) -> UpOpts {
     o.lifeline = true;
     o.first_run = kw.first_run;
     o.survey = kw.survey || o.survey;
+    o.standin = kw.standin;
     o.harness_keys = harness_keys.to_string();
     if !kw.instance_env.is_empty() {
         o.instance_env = format!("{} {}", o.instance_env, kw.instance_env)
@@ -131,7 +134,8 @@ fn unset_on_attach(harness_keys: &str, kw: LabKw) -> Option<String> {
         || kw.first_run
         || kw.survey
         || kw.lines.is_some()
-        || !kw.instance_env.is_empty();
+        || !kw.instance_env.is_empty()
+        || kw.standin;
     asks.then(|| {
         "an attached lab keeps the [harness] lines and the instance it was made with; this run's \
          are not set"
@@ -210,6 +214,12 @@ impl Ctx {
     /// The stub's mode.
     pub fn mode(&self, m: &str) {
         let _ = crate::verbs::set_mode(&self.run, m);
+    }
+
+    /// Whether the lab's own stand-in is in the agent's place ([`LabKw::standin`]).
+    #[must_use]
+    pub const fn standin(&self) -> bool {
+        self.kw.standin
     }
 
     /// Brings the lab up (or attaches to it) and starts the frame stream and journal tail.
@@ -971,6 +981,9 @@ pub enum Plan {
     /// THE OCCUPANCY DOOR at a workflow's break, under `occupancy = "prompt"`
     /// ([`crate::occupancy_break`]).
     OccupancyBreak,
+    /// A DECLARED WAKE told at a workflow's break, under `occupancy = "prompt"`
+    /// ([`crate::occupancy_wake`]).
+    OccupancyWake,
     /// Land or Cruise played to the act or hold the corpus keeps
     /// ([`crate::autopilot_scenes`]).
     Autopilot(crate::autopilot_scenes::Scene),
@@ -1017,6 +1030,7 @@ pub fn scenarios() -> Vec<Scenario> {
         survey: true,
         lines: None,
         instance_env: "",
+        standin: false,
     };
     let lines = |n: u32| LabKw {
         lines: Some(n),
@@ -1115,6 +1129,7 @@ pub fn scenarios() -> Vec<Scenario> {
                 survey: true,
                 first_run: false,
                 instance_env: "",
+                standin: false,
             },
             Plan::Tall(n, true),
         );
@@ -1179,6 +1194,21 @@ pub fn scenarios() -> Vec<Scenario> {
             ..none
         },
         Plan::OccupancyBreak,
+    );
+    add(
+        crate::occupancy_wake::NAME.into(),
+        crate::occupancy_wake::HARNESS_KEYS,
+        none,
+        Plan::OccupancyWake,
+    );
+    add(
+        crate::occupancy_wake::STANDIN.into(),
+        crate::occupancy_wake::HARNESS_KEYS,
+        LabKw {
+            standin: true,
+            ..none
+        },
+        Plan::OccupancyWake,
     );
     v
 }
@@ -2357,6 +2387,7 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
             60.0,
         )?,
         Plan::OccupancyBreak => crate::occupancy_break::play(ctx)?,
+        Plan::OccupancyWake => crate::occupancy_wake::play(ctx)?,
         Plan::Autopilot(scene) => crate::autopilot_scenes::play(ctx, scene)?,
     }
     Ok(())
@@ -3113,6 +3144,11 @@ mod tests {
         };
         assert!(unset_on_attach("", words).is_some());
         assert!(unset_on_attach("continue = false", LabKw::default()).is_some());
+        let standin = LabKw {
+            standin: true,
+            ..LabKw::default()
+        };
+        assert!(unset_on_attach("", standin).is_some());
         assert_eq!(unset_on_attach("", LabKw::default()), None);
     }
 }

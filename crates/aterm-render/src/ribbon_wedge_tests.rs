@@ -146,14 +146,11 @@ struct Fold(u64);
 
 impl Fold {
     const fn new() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
+        Self(aterm_hash::FNV64_OFFSET)
     }
 
-    fn word(&mut self, w: u64) {
-        for b in w.to_le_bytes() {
-            self.0 ^= u64::from(b);
-            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
-        }
+    const fn word(&mut self, w: u64) {
+        self.0 = aterm_hash::fnv1a_64_u64_le(self.0, w);
     }
 
     fn quads(&mut self, quads: &[GlowQuad]) {

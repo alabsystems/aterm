@@ -252,6 +252,132 @@ fn uppercase_owners_keep_their_work_outside_the_standing_go_ahead() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+#[test]
+fn bot_branches_keep_their_work_outside_the_standing_go_ahead() {
+    let mut wrong = Vec::new();
+    for reply in [
+        "I'll merge renovate/lodash-4.x into main once you say so.",
+        "I'll merge `renovate/lodash-4.x` into main once you say so.",
+        "NEEDS YOU: say \"go\" so I can merge origin/dependabot/cargo/serde-1.0.210 into main.",
+        "Waiting for your go-ahead to merge snyk-fix-abc123 into main.",
+        "Waiting for your go-ahead to merge refs/heads/github-actions/bump-ci into main.",
+    ] {
+        assert!(
+            dropping(Part::SomeoneElse, || parked("", reply)).is_some(),
+            "negative control: dropping SomeoneElse parks {reply:?}"
+        );
+        for bare in [false, true] {
+            let reply = if bare {
+                rendered(reply)
+            } else {
+                reply.to_string()
+            };
+            for columns in DRAWN {
+                let text = drawn(&reply, columns);
+                if let Some(park) = parked("", &text) {
+                    wrong.push(format!(
+                        "bare {bare} at {columns:?}: {text:?} became {park:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+    for own in [
+        "I'll merge fix/lodash-4.x into main once you say so.",
+        "I left renovate/lodash-4.x alone.\n\nNEEDS YOU: say \"go\" so I can rebuild my branch.",
+    ] {
+        assert!(parked("", own).is_some(), "own work still parks: {own}");
+    }
+}
+
+#[test]
+fn bare_code_file_names_in_earlier_prose_plan_nothing_outward() {
+    let tail = "NEEDS YOU: say \"rerun the checks\" so I can rebuild and push my branch to main.";
+    let mut wrong = Vec::new();
+    for earlier in [
+        "Main's change touches `release.rs`, which my branch doesn't.",
+        "Checked `release.rs's` imports; my branch leaves it alone.",
+        "Updated (deploy.toml) and `launch.ts` on my branch.",
+    ] {
+        for bare in [false, true] {
+            let draw = |t: &str| if bare { rendered(t) } else { t.to_string() };
+            for columns in DRAWN {
+                let park = parked(
+                    &drawn(&draw(earlier), columns),
+                    &drawn(&draw(tail), columns),
+                );
+                if park.as_ref().and_then(|p| p.token.as_deref()) != Some("rerun the checks") {
+                    wrong.push(format!(
+                        "bare {bare} at {columns:?} ({earlier:?}): {park:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+    for outward_plan in [
+        "Tagged v1.4.0 for the crates.io release.",
+        "Next I'll push the build to docs.rs.",
+        "Next I'll tag the release.",
+    ] {
+        assert!(
+            parked(outward_plan, tail).is_none(),
+            "outward plan still blocks: {outward_plan}"
+        );
+    }
+    assert!(
+        parked("", "Waiting for your go-ahead to run deploy.sh.").is_none(),
+        "a park whose own work runs deploy.sh still gets no go-ahead"
+    );
+}
+
+#[test]
+fn claudes_own_task_notice_leaves_a_later_park_answered() {
+    use crate::supervise::prompt::fixtures::{composer, rows};
+    let tail = "NEEDS YOU: say \"rerun the checks\" so I can rebuild and push my branch to main.";
+    let mut screen = rows(&[
+        "✻ Worked for 2m 10s",
+        "",
+        "⏺ Background command \"Build and tag the release\" completed (exit code 0)",
+        "",
+        &format!("⏺ {tail}"),
+        "",
+    ]);
+    screen.extend(composer("  ? for shortcuts"));
+    let earlier = aterm_phase::turn_said_before(&screen);
+    let last = aterm_phase::said_tail(&screen).expect("the turn's last reply");
+    assert_eq!(earlier, None);
+    assert_eq!(
+        parked(earlier.as_deref().unwrap_or(""), &last)
+            .as_ref()
+            .and_then(|p| p.token.as_deref()),
+        Some("rerun the checks")
+    );
+
+    let mut planned = rows(&[
+        "✻ Worked for 2m 10s",
+        "",
+        "⏺ Next I'll build and tag the release.",
+        "",
+        &format!("⏺ {tail}"),
+        "",
+    ]);
+    planned.extend(composer("  ? for shortcuts"));
+    let earlier = aterm_phase::turn_said_before(&planned);
+    let last = aterm_phase::said_tail(&planned).expect("the turn's last reply");
+    assert_eq!(
+        earlier.as_deref(),
+        Some("Next I'll build and tag the release.")
+    );
+    assert!(
+        parked(earlier.as_deref().unwrap_or(""), &last).is_none(),
+        "an outward plan in the agent's own earlier prose still blocks the go-ahead"
+    );
+}
+
 /// Replies of each kind: ones that park, ones that park nothing, and one last message after
 /// earlier messages that change its reading.
 const REMEMBERED_READS: [(&str, &str); 6] = [
@@ -862,4 +988,86 @@ fn no_persons_line_is_ever_answered() {
         answered > 0,
         "NEGATIVE CONTROL: without the person-only exclusion some person's line is answered"
     );
+}
+
+#[test]
+fn a_semicolon_joined_pending_work_clause_parks_and_past_or_split_controls_do_not() {
+    for (reply, lands, room, token) in [
+        (
+            "Ready to commit and push; waiting on your sign-off.",
+            true,
+            false,
+            None,
+        ),
+        (
+            "Tests pass and the branch is ready to merge into main; waiting for your go-ahead.",
+            true,
+            false,
+            None,
+        ),
+        (
+            "The fix is uncommitted and needs a build; say \"go\" when ready.",
+            false,
+            false,
+            Some("go"),
+        ),
+        (
+            "I can merge the branch and remove the worktree; just say the word.",
+            true,
+            false,
+            None,
+        ),
+        (
+            "I'll build, test and push to main; waiting on your go-ahead.",
+            true,
+            false,
+            None,
+        ),
+        (
+            "I still need to rerun the checks; holding off until you give the go-ahead.",
+            false,
+            false,
+            None,
+        ),
+        (
+            "The branch has not been pushed yet; waiting on your approval.",
+            true,
+            false,
+            None,
+        ),
+        (
+            "The build was stopped for low memory; waiting for your go-ahead.",
+            false,
+            true,
+            None,
+        ),
+    ] {
+        for columns in DRAWN {
+            let text = drawn(reply, columns);
+            let park = parked("", &text).unwrap_or_else(|| panic!("missed at {columns:?}: {text}"));
+            assert_eq!(park.lands, lands, "{reply}: {park:?}");
+            assert_eq!(park.waits_room, room, "{reply}: {park:?}");
+            assert_eq!(park.token.as_deref(), token, "{reply}: {park:?}");
+        }
+    }
+
+    for control in [
+        "I built and tested the fix; waiting on your sign-off.",
+        "I ran the checks to verify the fix; waiting on your sign-off.",
+        "I built the fix and can confirm it works; waiting on your sign-off.",
+        "Built the crate and didn't touch unrelated files; waiting on your sign-off.",
+        "Nothing left to commit or push; waiting on your sign-off.",
+        "I will land slice 1 now; waiting for your go-ahead on the next stage.",
+        "Ready to commit and push. Waiting on your sign-off.",
+        "Ready to push the release tag; waiting on your sign-off.",
+        "Ready to merge Alice's branch; waiting on your sign-off.",
+        "Ready to sign in and push; waiting on your sign-off.",
+        "Ready to build; I'll continue the migration once you give the go-ahead.",
+    ] {
+        assert_eq!(
+            parked("", control),
+            None,
+            "control must not park: {control}"
+        );
+    }
 }

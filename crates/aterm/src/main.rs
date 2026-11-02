@@ -517,7 +517,7 @@ pub(crate) fn main() -> ExitCode {
             }
             aterm_cli::Verb::Update => update_verb(&forwarded),
             #[cfg(unix)]
-            aterm_cli::Verb::Db => aterm_db::cli::main_entry(forwarded),
+            aterm_cli::Verb::Db => alab_sheet::db_entry(forwarded),
             #[cfg(not(unix))]
             aterm_cli::Verb::Db => {
                 eprintln!("aterm db: not available on this platform (Unix only)");
@@ -1375,7 +1375,12 @@ fn claims_observation() -> Option<aterm_types::network_state::NetworkObservation
     if std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some() {
         return None;
     }
-    aterm_db::network_state::read_live_observation(&aterm_types::dirs::aterm_config_path()?).ok()
+    aterm_db::runtime::read_live_publication(
+        &aterm_secrets::client::Paths::live().ok()?,
+        &aterm_types::dirs::aterm_config_path()?,
+    )
+    .ok()
+    .map(account_claims::current_observation)
 }
 
 /// Start this process's Commons runtime once, for `host` (its LAN gate, [`commons_lan::gate`]),
@@ -14086,6 +14091,9 @@ fn routes_to_doctor(first: &str, rest: &[OsString]) -> bool {
     first == "doctor" && !rest.iter().any(|arg| arg == "-h" || arg == "--help")
 }
 
+/// `aterm db alab` with the harness's reading of the account sheet.
+#[cfg(unix)]
+mod alab_sheet;
 #[cfg(unix)]
 mod shared_accounts;
 #[cfg(unix)]

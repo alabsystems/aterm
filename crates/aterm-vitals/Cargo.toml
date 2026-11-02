@@ -19,6 +19,9 @@ description = "aterm's system-awareness model: what the machine, aterm and each 
 # (tests/conformance_explain.rs) replays each against its model.
 aterm-models-misc.workspace = true
 aterm-spec.workspace = true
+# `sys::delta::fnv` is spelled out, so the crate still depends on nothing; its test holds it to
+# the workspace's FNV-1a.
+aterm-hash.workspace = true
 
 [lints]
 workspace = true

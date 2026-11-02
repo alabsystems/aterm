@@ -105,6 +105,9 @@ aterm-types = { workspace = true }
 # The arena lanes' interrupt guard: block SIGINT/SIGTERM/SIGHUP, take them on
 # one thread with `sigwait`, and `killpg` the terminals under test.
 libc = { workspace = true }
+# `verify perf vte-engine`: close-on-exec PTY pairs (`open_pty_pair`), retrying
+# XNU's `EREDRIVEOPEN` race instead of calling raw `openpty`.
+aterm-pty = { workspace = true }
 aterm-update-core = { workspace = true }
 # `verify provision --linux`: Ubuntu's pinned image files for the lane's own VM
 # (`aterm_vz::pins`), the one place a pin bump edits, and the words for a

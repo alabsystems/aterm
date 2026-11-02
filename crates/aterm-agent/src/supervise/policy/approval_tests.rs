@@ -3631,13 +3631,10 @@ fn the_advisory_word_refuses_a_secret_and_a_proof_gap() {
     }
 }
 
-/// The advisory word resolves the home-rooted secret rules under the `HOME` it runs with.
+/// The advisory word resolves the home-rooted secret rules under the home it runs with.
 #[test]
 fn the_advisory_word_reads_this_process_home() {
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-        .expect("the test runs with a HOME");
+    let home = advisory_home().expect("the test runs with a home");
     let word = |line: &str| readings_read_only(&[line.to_string()], &[]);
     for line in [
         "cat ~/.config/gh/hosts.yml".to_string(),
@@ -4033,14 +4030,28 @@ fn a_non_secret_read_beside_it_stays_read_only() {
 /// this check cannot follow, are refused as unproven.
 #[test]
 fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
-    let home = Path::new("/Users/_owner");
+    let home_str = if cfg!(windows) {
+        "C:/Users/_owner"
+    } else {
+        "/Users/_owner"
+    };
+    let users_root = if cfg!(windows) { "C:/Users" } else { "/Users" };
+    let home = Path::new(home_str);
+    let host = ApprovalCtx {
+        secrets: default_secrets(Some(home)),
+        home: Some(home.to_path_buf()),
+        ..git_host(ctx())
+    };
     let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
     let word = |line: &str| readings_read_only_at(&[line.to_string()], &[], Some(home));
+    let cd_home = format!("cd {home_str} && cat .claude.json");
+    let grep_users = format!("grep -R token {users_root}");
+    let git_c_home = format!("git -C{home_str} show HEAD:.claude.json");
     for line in [
         "cd ~ && cat .claude.json",
         "cd ~/.config && cat gh/hosts.yml",
         "cd && cat Library/Preferences/x.plist",
-        "cd /Users/_owner && cat .claude.json",
+        cd_home.as_str(),
         "(cd ~ && cat .secrets/x)",
         "cd ~/.config/aterm; cat secrets/x",
         "cd ~/proj && cat ../.claude.json",
@@ -4058,17 +4069,17 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
         "grep -r token ~/.config",
         "grep -rn . ~",
         "rg token ~",
-        "grep -R token /Users",
+        grep_users.as_str(),
         "grep --recursive token ~",
         "grep -d recurse token ~",
         "find ~ -name hosts.yml -exec cat {} \\;",
         "git -C ~ show HEAD:.claude.json",
-        "git -C/Users/_owner show HEAD:.claude.json",
+        git_c_home.as_str(),
         "diff ~ .",
         "diff ~ /tmp/x",
     ] {
         for rows in boxes(line) {
-            let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+            let r = reason(&on_screen(&rows, &host)).to_string();
             assert!(r.contains("a read of a secret"), "{line}: {r}");
         }
         let r = word(line).expect_err(line);
@@ -4090,11 +4101,12 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
         ),
     ] {
         for rows in boxes(line) {
-            let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+            let r = reason(&on_screen(&rows, &host)).to_string();
             assert!(r.contains(why), "{line}: {r}");
         }
     }
     // NEGATIVE CONTROL
+    let diff_users = format!("diff {users_root} /tmp/x");
     for line in [
         "cd src && cat README.md",
         "cd ~/proj && cat README.md",
@@ -4108,17 +4120,17 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
         "git -C ~/proj show HEAD:README.md",
         "diff a.txt b.txt",
         "diff -u README.md /etc/hosts",
-        "diff /Users /tmp/x",
+        diff_users.as_str(),
     ] {
         for rows in boxes(line) {
-            let d = on_screen(&rows, &git_host(ctx()));
+            let d = on_screen(&rows, &host);
             assert!(approved(&d).is_some(), "{line}: {d:?}");
         }
         assert_eq!(word(line), Ok(()), "the word: {line}");
     }
     // A scratch cwd holds no secret; the word, which cannot place `.`, refuses it.
     for rows in boxes("grep -r token .") {
-        let d = on_screen(&rows, &git_host(ctx()));
+        let d = on_screen(&rows, &host);
         assert!(approved(&d).is_some(), "{d:?}");
     }
     assert!(word("grep -r token .").is_err());
@@ -4410,29 +4422,38 @@ fn a_read_that_prints_the_environment_proves_no_box() {
 /// each of these too.
 #[test]
 fn a_relative_read_starts_where_the_session_stands() {
-    let at = |cwd: &str| ApprovalCtx {
-        cwd: PathBuf::from(cwd),
+    let home_str = if cfg!(windows) {
+        "C:/Users/_owner"
+    } else {
+        "/Users/_owner"
+    };
+    let proj_str = format!("{home_str}/proj");
+    let home = Path::new(home_str);
+    let base = ApprovalCtx {
+        secrets: default_secrets(Some(home)),
+        home: Some(home.to_path_buf()),
         ..git_host(ctx())
     };
+    let at = |cwd: &str| ApprovalCtx {
+        cwd: PathBuf::from(cwd),
+        ..base.clone()
+    };
     for (c, line) in [
-        (at("/Users/_owner/proj"), "cat ../.claude.json"),
-        (at("/Users/_owner/proj"), "grep -r token .."),
-        (at("/Users/_owner"), "cat .claude.json"),
-        (at("/Users/_owner"), "rg token"),
-        (at("/Users/_owner"), "grep -r token ."),
-        (at("/Users/_owner"), "grep -r token"),
-        (at("/Users/_owner"), "grep -r -e token 2>/dev/null"),
-        (at("/Users/_owner"), "git grep token"),
-        (at("/Users/_owner"), "find -name x -exec cat {} +"),
-        (at("/Users/_owner"), "cat ~+/.claude.json"),
-        (
-            at("/Users/_owner/proj"),
-            "cd .. && cat .config/gh/hosts.yml",
-        ),
+        (at(&proj_str), "cat ../.claude.json"),
+        (at(&proj_str), "grep -r token .."),
+        (at(home_str), "cat .claude.json"),
+        (at(home_str), "rg token"),
+        (at(home_str), "grep -r token ."),
+        (at(home_str), "grep -r token"),
+        (at(home_str), "grep -r -e token 2>/dev/null"),
+        (at(home_str), "git grep token"),
+        (at(home_str), "find -name x -exec cat {} +"),
+        (at(home_str), "cat ~+/.claude.json"),
+        (at(&proj_str), "cd .. && cat .config/gh/hosts.yml"),
         (
             ApprovalCtx {
-                shell_cwds: vec![PathBuf::from("/Users/_owner")],
-                ..git_host(ctx())
+                shell_cwds: vec![PathBuf::from(home_str)],
+                ..base.clone()
             },
             "cat .claude.json",
         ),
@@ -4443,8 +4464,7 @@ fn a_relative_read_starts_where_the_session_stands() {
             "{line} in {:?}: {r}",
             c.cwd
         );
-        let word =
-            readings_read_only_at(&[line.to_string()], &[], Some(Path::new("/Users/_owner")));
+        let word = readings_read_only_at(&[line.to_string()], &[], Some(home));
         assert!(
             matches!(&word, Err(why) if why.contains("a read of a secret")),
             "the word: {line}: {word:?}"
@@ -4452,28 +4472,25 @@ fn a_relative_read_starts_where_the_session_stands() {
     }
     let unknown = ApprovalCtx {
         cwd_known: false,
-        ..git_host(ctx())
+        ..base.clone()
     };
     let r = reason(&on_screen(&folder_box_with("cat README.md"), &unknown)).to_string();
     assert!(r.contains("cwd unknown"), "{r}");
     // NEGATIVE CONTROL
     for (c, line) in [
-        (at("/Users/_owner/proj"), "cat README.md"),
-        (at("/Users/_owner/proj"), "grep -rn token src"),
-        (at("/Users/_owner"), "cat notes.txt"),
-        (at("/Users/_owner"), "grep -rn TODO src"),
-        (at("/Users/_owner"), "rg TODO src"),
-        (
-            at("/Users/_owner"),
-            "find src -name '*.rs' -exec wc -l {} +",
-        ),
-        (at("/Users/_owner"), "git grep TODO -- src"),
+        (at(&proj_str), "cat README.md"),
+        (at(&proj_str), "grep -rn token src"),
+        (at(home_str), "cat notes.txt"),
+        (at(home_str), "grep -rn TODO src"),
+        (at(home_str), "rg TODO src"),
+        (at(home_str), "find src -name '*.rs' -exec wc -l {} +"),
+        (at(home_str), "git grep TODO -- src"),
         (unknown.clone(), "cat /etc/hosts"),
     ] {
         let d = on_screen(&folder_box_with(line), &c);
         assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{line}: {d:?}");
         assert_eq!(
-            readings_read_only_at(&[line.to_string()], &[], Some(Path::new("/Users/_owner"))),
+            readings_read_only_at(&[line.to_string()], &[], Some(home)),
             Ok(()),
             "the word: {line}"
         );

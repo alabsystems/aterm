@@ -45,6 +45,28 @@ fn assert_same_run(what: &str, a: &LaneRun, b: &LaneRun) {
     assert_eq!(a.fnv(), b.fnv(), "{what}: digest");
 }
 
+/// The lane spells its fold out, and it is still the workspace's FNV-1a: each word through
+/// `aterm_hash`'s little-endian fold, each key through its byte loop.
+#[test]
+fn the_lanes_folds_are_aterm_hashs() {
+    let inputs: [&[u8]; 4] = [b"", b"a", b"foobar", &[0, 0xff, 0x80, 0x7f, 1, 2, 3, 4, 5]];
+    for bytes in inputs {
+        assert_eq!(
+            super::lane::glass_key(bytes),
+            aterm_hash::fnv1a_64(bytes),
+            "{bytes:?}"
+        );
+    }
+    let mut fnv = super::lane::Fnv::new();
+    let mut want = aterm_hash::FNV64_OFFSET;
+    assert_eq!(fnv.value(), want);
+    for word in [0, 1, u64::MAX, 0x0102_0304_0506_0708, 1 << 63] {
+        fnv.u64(word);
+        want = aterm_hash::fnv1a_64_u64_le(want, word);
+        assert_eq!(fnv.value(), want, "{word:#x}");
+    }
+}
+
 #[test]
 fn the_library_lane_reproduces_the_m3_story() {
     let t0 = Instant::now();

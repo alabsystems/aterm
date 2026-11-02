@@ -670,6 +670,126 @@ fn a_shallow_submodule_at_a_fetched_commit_is_no_work() {
     assert_eq!(w.sub_unpushed, 1, "{w:?}");
 }
 
+/// A SHALLOW SUBMODULE FETCHED MORE THAN ONE COMMIT DEEP IS NO WORK (`ATERM-KI-1020-2`):
+/// `git submodule update --init --depth 3` at a detached commit no remote-tracking ref reaches
+/// leaves `shallow` two commits below `HEAD`, while `FETCH_HEAD` records `HEAD` as fetched from
+/// `origin`; neither `HEAD` nor the fetched ancestor between `HEAD` and `shallow` is counted.
+/// NEGATIVE CONTROLS: a commit made on top of that shallow checkout is one unpushed commit (never
+/// clean when cut), and a commit fetched into `FETCH_HEAD` from an unconfigured local repository
+/// still counts as unpushed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_shallow_submodule_fetched_deeper_than_one_commit_is_no_work() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (lib, app) = app_with_lib(tmp.path());
+    pushed(&lib, "b.txt", "two\n");
+    pushed(&lib, "c.txt", "three\n");
+    let pinned = pushed(&lib, "d.txt", "four\n");
+    let sub_orig = app.join("vendor/lib");
+    scratch_git(&sub_orig, &["fetch", "-q", "origin"]);
+    scratch_git(&sub_orig, &["checkout", "-q", &pinned]);
+    bump_pushed(&app, "vendor/lib");
+    for n in 5..=10 {
+        pushed(&lib, &format!("f{n}.txt"), &format!("{n}\n"));
+    }
+    let lib_bare = tmp.path().join("lib/remote.git");
+    scratch_git(
+        &lib_bare,
+        &["config", "uploadpack.allowReachableSHA1InWant", "true"],
+    );
+    let url = format!("file://{}", tmp.path().join("app/remote.git").display());
+    scratch_git(
+        tmp.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "-q",
+            &url,
+            "clone",
+        ],
+    );
+    let clone = tmp.path().join("clone");
+    scratch_git(
+        &clone,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "-q",
+            "--init",
+            "--depth",
+            "3",
+        ],
+    );
+    let sub = clone.join("vendor/lib");
+    assert_eq!(
+        scratch_git(&sub, &["rev-parse", "--is-shallow-repository"]).trim(),
+        "true"
+    );
+    // `origin/main` (shallow at c10..c8) does not reach `pinned` (c4), and `shallow` holds c2, so
+    // `rev-list HEAD --not --remotes` lists c4, c3 and c2 before `FETCH_HEAD` is consulted.
+    let unreached: Vec<String> = scratch_git(&sub, &["rev-list", "HEAD", "--not", "--remotes"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(unreached.len(), 3, "{unreached:?}");
+    let at = probe(&clone, Some(&clone), PROBE_LIMIT);
+    assert!(at.checked().is_some(), "depth-3 shallow submodule: {at:?}");
+
+    // Negative control 1: a local commit on top of the depth-3 fetched commit holds as 1 unpushed.
+    local_commit(&sub, "local.txt");
+    bump_pushed(&clone, "vendor/lib");
+    let w = found(&clone).expect("a commit made on the depth-3 shallow record");
+    assert_eq!(w.sub_unpushed, 1, "{w:?}");
+    never_clean_when_cut(&clone, &Used::default(), "depth-3 local commit");
+
+    // Negative control 2: fetching a commit into `FETCH_HEAD` from an unconfigured local repo does
+    // not prove any configured remote of the submodule has it.
+    let rogue_dir = tmp.path().join("rogue");
+    std::fs::create_dir_all(&rogue_dir).expect("rogue");
+    let rogue = repo(&rogue_dir, false);
+    let rogue_url = rogue.display().to_string();
+    scratch_git(
+        &sub,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "fetch",
+            "-q",
+            &rogue_url,
+            "main",
+        ],
+    );
+    scratch_git(&sub, &["checkout", "-q", "FETCH_HEAD"]);
+    bump_pushed(&clone, "vendor/lib");
+    let w = found(&clone).expect("a commit fetched from an unconfigured local repo");
+    assert_eq!(w.sub_unpushed, 1, "{w:?}");
+}
+
+#[test]
+fn fetch_head_display_url_matches_git_store_updated_refs() {
+    assert_eq!(
+        fetch_head_display_url("https://token:x-oauth-basic@github.com/org/repo.git"),
+        "https://github.com/org/repo"
+    );
+    assert_eq!(
+        fetch_head_display_url("https://github.com/org/repo.git/"),
+        "https://github.com/org/repo"
+    );
+    assert_eq!(
+        fetch_head_display_url("git@github.com:org/repo.git"),
+        "git@github.com:org/repo"
+    );
+    assert_eq!(
+        fetch_head_display_url("file:///tmp/rem.git/"),
+        "file:///tmp/rem"
+    );
+    assert_eq!(fetch_head_display_url("/tmp/src/"), "/tmp/src");
+    assert_eq!(fetch_head_display_url("/tmp/src/.git/"), "/tmp/src/");
+}
+
 /// A NESTED SUBMODULE'S COMMIT ON NO REMOTE IS WORK (R-6): `app` holds `vendor/mid`, which holds
 /// `vendor/lib`; a commit made in the innermost, recorded by bumps pushed at both levels above it,
 /// is counted and named by its path from `app`. NEGATIVE CONTROL: everything pushed, and that

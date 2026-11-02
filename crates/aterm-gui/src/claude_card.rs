@@ -1930,7 +1930,7 @@ impl InkFrame {
 /// Fingerprint of Claude's mascot glyphs and colors used to phase-lock shimmer steps.
 fn mascot_ink(scratch: &RenderInput, pane: PaneGeom, place: &CardPlace) -> Option<u64> {
     let (_, wand_row) = place.wand()?;
-    let mut ink = 0xcbf2_9ce4_8422_2325_u64;
+    let mut ink = aterm_hash::FNV64_OFFSET;
     for row in wand_row..wand_row + 3 {
         let cells = scratch.cells.get(pane.frame_row(row));
         for col in 0..place.mascot_end {
@@ -1939,7 +1939,7 @@ fn mascot_ink(scratch: &RenderInput, pane: PaneGeom, place: &CardPlace) -> Optio
                 .map_or((' ', [0; 3]), |cell| (cell.ch, cell.fg));
             let word = u64::from(u32::from(ch))
                 ^ (u64::from(r) << 32 | u64::from(g) << 40 | u64::from(b) << 48);
-            ink = (ink ^ word).wrapping_mul(0x0100_0000_01b3);
+            ink = aterm_hash::fnv_mix_u64(ink, word);
         }
     }
     Some(ink)

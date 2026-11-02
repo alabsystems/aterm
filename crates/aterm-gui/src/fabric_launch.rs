@@ -11,10 +11,21 @@ use std::time::{Duration, Instant};
 
 const FABRIC_COMMAND_ENV: &str = "ATERM_FABRIC_COMMAND";
 
+/// The back-off's floor, for a bridge that died young or could not start: what keeps one that
+/// fails at startup from fork-bombing. A healthy run's bridge has none ([`next_backoff`]).
 const RELAUNCH_MIN: Duration = Duration::from_millis(200);
 const RELAUNCH_MAX: Duration = Duration::from_secs(30);
 
+/// A run this long was no startup failure: its bridge comes back at once, so a loop of
+/// healthy-then-dying runs launches about once per this.
 const RELAUNCH_HEALTHY: Duration = Duration::from_secs(5);
+
+/// How long a retired generation's lanes get to end ([`Launched::retire`]). They must: hung up,
+/// each has only a verb it is already in to finish, and then the loss to say.
+const LANES_END_WAIT: Duration = Duration::from_secs(60);
+
+/// What a served lane holds until its thread is done, its loss said ([`Launched::retire`]).
+pub(crate) type LaneEnded = std::sync::mpsc::Sender<std::convert::Infallible>;
 
 /// How long a QUIT waits for its bridge to take `bye quit` ([`bye`]).
 pub(crate) const BYE_WAIT: Duration = Duration::from_secs(1);
@@ -319,7 +330,12 @@ pub(crate) fn carry_attached(argv: Vec<String>) {
 }
 
 fn supervise(argv: &[String]) {
-    supervise_with(argv, launch_once, || RETIRED.load(Ordering::SeqCst));
+    supervise_with(
+        argv,
+        launch_once,
+        || RETIRED.load(Ordering::SeqCst),
+        std::thread::sleep,
+    );
 }
 
 /// The word aterm.log keeps of the bridge's program: its file name where that is a word
@@ -332,11 +348,12 @@ fn program_word(program: &str) -> &str {
         .map_or("?", aterm_log::words::word)
 }
 
-/// [`supervise`] over its `launch` and its `retired` word.
+/// [`supervise`] over its `launch`, its `retired` word and its `pause` between two launches.
 fn supervise_with(
     argv: &[String],
     launch: impl Fn(&[String]) -> std::io::Result<Launched>,
     retired: impl Fn() -> bool,
+    pause: impl Fn(Duration),
 ) {
     let mut backoff = RELAUNCH_MIN;
     loop {
@@ -345,15 +362,16 @@ fn supervise_with(
             return;
         }
         match launch(argv) {
-            Ok(launched) => {
+            Ok(mut launched) => {
                 aterm_log::info!(
                     "fabric bridge started: {} ({} args)",
                     argv.first().map_or("?", |program| program_word(program)),
                     argv.len().saturating_sub(1)
                 );
                 let started = Instant::now();
-                let status = launched.wait_and_retire();
+                let status = launched.wait();
                 let ran = started.elapsed();
+                launched.retire(LANES_END_WAIT);
                 backoff = next_backoff(backoff, Some(ran));
                 let how = match &status {
                     Ok(s) => s.to_string(),
@@ -378,29 +396,50 @@ fn supervise_with(
                 );
             }
         }
-        std::thread::sleep(backoff);
+        pause(backoff);
     }
 }
 
+/// The wait before the next launch: none after a healthy run, doubling from [`RELAUNCH_MIN`] up
+/// to [`RELAUNCH_MAX`] after a run that was not (`ran`) or a launch that failed (`None`).
 fn next_backoff(current: Duration, ran: Option<Duration>) -> Duration {
     match ran {
-        Some(ran) if ran >= RELAUNCH_HEALTHY => RELAUNCH_MIN,
-        _ => (current * 2).min(RELAUNCH_MAX),
+        Some(ran) if ran >= RELAUNCH_HEALTHY => Duration::ZERO,
+        _ => (current * 2).clamp(RELAUNCH_MIN, RELAUNCH_MAX),
     }
 }
 
 struct Launched {
     child: LaneChild,
     near: [std::os::unix::net::UnixStream; 2],
+    /// Disconnected once no lane holds a [`LaneEnded`] any more.
+    lanes_ended: std::sync::mpsc::Receiver<std::convert::Infallible>,
 }
 
 impl Launched {
-    fn wait_and_retire(mut self) -> std::io::Result<std::process::ExitStatus> {
-        let status = self.child.wait();
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+
+    /// Hang up the lanes of a bridge that has exited and wait for their threads to end.
+    ///
+    /// THE ORDER A RELAUNCH AT ONCE RESTS ON: each lane says the loss of its generation as it
+    /// ends (`BridgeLostGuard`), and a loss that lands after the next generation's attach is
+    /// the link's transition skipped and a `fabric-lost` sweep over sessions the new bridge
+    /// serves. A lane past `within` is a warning, not a bridge held off for good.
+    fn retire(self, within: Duration) {
         for lane in &self.near {
             aterm_uds::hangup::hang_up(lane);
         }
-        status
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            self.lanes_ended.recv_timeout(within)
+        {
+            aterm_log::warn!(
+                "fabric bridge lanes had not ended {:.1}s after its exit; the next bridge starts \
+                 without them, and their loss lands after its attach",
+                within.as_secs_f64()
+            );
+        }
     }
 }
 
@@ -410,7 +449,7 @@ fn launch_once(argv: &[String]) -> std::io::Result<Launched> {
 
 fn launch_serving(
     argv: &[String],
-    attach: impl Fn(std::os::unix::net::UnixStream, crate::fabric::BridgeGeneration) -> bool,
+    attach: impl Fn(std::os::unix::net::UnixStream, crate::fabric::BridgeGeneration, LaneEnded) -> bool,
 ) -> std::io::Result<Launched> {
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -437,13 +476,18 @@ fn launch_serving(
     )?;
 
     let generation = crate::fabric::next_bridge_generation();
-    if !attach(near_verb, generation) {
+    let (ended, lanes_ended) = std::sync::mpsc::channel();
+    if !attach(near_verb, generation, ended.clone()) {
         aterm_log::warn!("fabric bridge verb lane could not be served");
     }
-    if !attach(near_push, generation) {
+    if !attach(near_push, generation, ended) {
         aterm_log::warn!("fabric bridge push lane could not be served");
     }
-    Ok(Launched { child, near })
+    Ok(Launched {
+        child,
+        near,
+        lanes_ended,
+    })
 }
 
 fn filter_child_env(
@@ -500,9 +544,10 @@ mod tests {
                 &argv,
                 |argv| {
                     launches.set(launches.get() + 1);
-                    launch_serving(argv, |_, _| true)
+                    launch_serving(argv, |_, _, _| true)
                 },
                 || launches.get() > 0,
+                |_| {},
             );
         });
         assert_eq!(launches.get(), 1, "one launch, then retired");
@@ -584,7 +629,7 @@ mod tests {
         let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::<UnixStream>::new()));
         let recorder = {
             let served = std::sync::Arc::clone(&served);
-            move |near: UnixStream, _generation| {
+            move |near: UnixStream, _generation, _ended| {
                 served.lock().unwrap().push(near);
                 true
             }
@@ -593,7 +638,7 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        let launched = launch_serving(&argv, recorder).expect("launch the stand-in bridge");
+        let mut launched = launch_serving(&argv, recorder).expect("launch the stand-in bridge");
         let (mut verb, push) = {
             let mut near = served.lock().unwrap();
             assert_eq!(near.len(), 2, "both lanes served");
@@ -609,7 +654,8 @@ mod tests {
             .read_line(&mut line)
             .expect("the holder's pid");
         let holder: i32 = line.trim().parse().expect("a pid");
-        let status = launched.wait_and_retire().expect("reap the bridge");
+        let status = launched.wait().expect("reap the bridge");
+        launched.retire(LANES_END_WAIT);
         let mut byte = [0u8; 1];
         let read = verb.read(&mut byte);
         // SAFETY: sends a signal to the live holder pid started by this test's bridge.
@@ -635,7 +681,7 @@ mod tests {
         let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::<UnixStream>::new()));
         let recorder = {
             let served = std::sync::Arc::clone(&served);
-            move |near: UnixStream, _generation| {
+            move |near: UnixStream, _generation, _ended| {
                 served.lock().unwrap().push(near);
                 true
             }
@@ -649,7 +695,7 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        let launched = launch_serving(&argv, recorder).expect("launch the stand-in bridge");
+        let mut launched = launch_serving(&argv, recorder).expect("launch the stand-in bridge");
         let (verb, push) = {
             let mut near = served.lock().unwrap();
             assert_eq!(near.len(), 2, "both lanes served");
@@ -663,7 +709,8 @@ mod tests {
             .read_line(&mut line)
             .expect("the holder's pid");
         let holder: i32 = line.trim().parse().expect("a pid");
-        let status = launched.wait_and_retire().expect("reap the bridge");
+        let status = launched.wait().expect("reap the bridge");
+        launched.retire(LANES_END_WAIT);
         let wrote = (&verb).write(b"after the retire\n").map_err(|e| e.kind());
         // SAFETY: sends a signal to the live holder pid started by this test's bridge.
         unsafe {
@@ -771,8 +818,37 @@ mod tests {
         });
     }
     #[test]
-    fn a_bridge_that_exits_immediately_escalates_its_backoff() {
+    fn a_healthy_run_relaunches_at_once_and_a_young_death_escalates_from_the_floor() {
         let instant = Duration::from_millis(5);
+
+        assert_eq!(
+            next_backoff(RELAUNCH_MAX, Some(RELAUNCH_HEALTHY)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            next_backoff(RELAUNCH_MAX, Some(Duration::from_secs(3600))),
+            Duration::ZERO
+        );
+        assert_eq!(
+            next_backoff(
+                RELAUNCH_MIN,
+                Some(RELAUNCH_HEALTHY - Duration::from_millis(1))
+            ),
+            RELAUNCH_MIN * 2,
+            "just short of healthy is a young death"
+        );
+
+        assert_eq!(
+            next_backoff(Duration::ZERO, Some(instant)),
+            RELAUNCH_MIN,
+            "the relaunch that dies young waits again, or a healthy run could start a fork bomb"
+        );
+        assert_eq!(
+            next_backoff(next_backoff(RELAUNCH_MAX, Some(RELAUNCH_HEALTHY)), None),
+            RELAUNCH_MIN,
+            "so does the relaunch that cannot start"
+        );
+        assert_eq!(next_backoff(RELAUNCH_MIN, None), RELAUNCH_MIN * 2);
 
         let mut backoff = RELAUNCH_MIN;
         for _ in 0..3 {
@@ -784,25 +860,178 @@ mod tests {
             backoff = next_backoff(backoff, Some(instant));
         }
         assert_eq!(backoff, RELAUNCH_MAX);
+    }
 
-        assert_eq!(next_backoff(RELAUNCH_MIN, None), RELAUNCH_MIN * 2);
-
-        assert_eq!(
-            next_backoff(RELAUNCH_MAX, Some(RELAUNCH_HEALTHY)),
-            RELAUNCH_MIN
+    /// What the loop itself waits, not only what [`next_backoff`] answers: nothing between a
+    /// healthy run and the next launch, and the floor, doubling, after each that dies young.
+    #[test]
+    fn the_loop_waits_nothing_after_a_healthy_run_and_the_floor_after_a_young_death() {
+        let healthy = vec![
+            ["/bin/sleep", "/usr/bin/sleep"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+                .expect("a `sleep` binary")
+                .to_string(),
+            (RELAUNCH_HEALTHY + Duration::from_millis(100))
+                .as_secs_f64()
+                .to_string(),
+        ];
+        let young = vec![true_program()];
+        let launches = std::cell::Cell::new(0_u32);
+        let paused = std::cell::RefCell::new(Vec::new());
+        supervise_with(
+            &young,
+            |argv| {
+                let first = launches.get() == 0;
+                launches.set(launches.get() + 1);
+                launch_serving(if first { &healthy } else { argv }, |_, _, _| true)
+            },
+            || launches.get() == 3,
+            |waited| paused.borrow_mut().push(waited),
         );
         assert_eq!(
-            next_backoff(RELAUNCH_MAX, Some(Duration::from_secs(3600))),
-            RELAUNCH_MIN
+            paused.into_inner(),
+            [Duration::ZERO, RELAUNCH_MIN, RELAUNCH_MIN * 2]
         );
+    }
 
-        assert_eq!(
-            next_backoff(
-                RELAUNCH_MIN,
-                Some(RELAUNCH_HEALTHY - Duration::from_millis(1))
-            ),
-            RELAUNCH_MIN * 2
-        );
+    /// Two bridges one straight after the other, no wait between them, as a healthy run's
+    /// relaunch has it: the first retired within `within`, its lanes each staying up to `linger`
+    /// past their hang-up for the second to attach before they say their loss. Answers what the
+    /// link's hook told its hearer, the node log (`session_log_node::install`), as `(state,
+    /// generation)` in order.
+    fn the_link_over_a_relaunch(within: Duration, linger: Duration) -> Vec<(String, u64)> {
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let log = crate::session_log_node::node_log();
+        let before = log.last_seq();
+        let store = crate::session_store::new_store();
+        let argv = vec![true_program()];
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let next_attached = Arc::new(AtomicBool::new(false));
+        // What `control::attach_fabric_bridge` and its `serve_bridge` do of a lane, the serving
+        // and its guard reduced to reading to the hang-up and then saying the loss.
+        let lane = |linger: Duration, attaches_next: bool| {
+            let store = store.clone();
+            let threads = Arc::clone(&threads);
+            let next_attached = Arc::clone(&next_attached);
+            move |near: UnixStream,
+                  generation: crate::fabric::BridgeGeneration,
+                  ended: LaneEnded| {
+                let store = store.clone();
+                let next_attached = Arc::clone(&next_attached);
+                let thread = crate::qos::spawn_lane_thread(
+                    "aterm-fabric-bridge".to_string(),
+                    crate::qos::Role::Responsive,
+                    move || {
+                        let _ended = ended;
+                        crate::fabric::bridge_attached(generation);
+                        next_attached.fetch_or(attaches_next, Ordering::SeqCst);
+                        let _ = std::io::copy(&mut &near, &mut std::io::sink());
+                        let _ = aterm_spec::wait::within(linger, Duration::from_millis(1), || {
+                            next_attached.load(Ordering::SeqCst).then_some(())
+                        });
+                        crate::fabric::bridge_lost(&store, generation);
+                    },
+                )
+                .expect("a lane's thread");
+                threads.lock().unwrap().push(thread);
+                true
+            }
+        };
+        let mut first =
+            launch_serving(&argv, lane(linger, false)).expect("launch the first bridge");
+        first.wait().expect("reap the first bridge");
+        first.retire(within);
+        let mut second =
+            launch_serving(&argv, lane(Duration::ZERO, true)).expect("launch the second bridge");
+        second.wait().expect("reap the second bridge");
+        second.retire(LANES_END_WAIT);
+        for thread in std::mem::take(&mut *threads.lock().unwrap()) {
+            thread.join().expect("a lane's thread");
+        }
+        let word = |line: &str, key: &str| -> String {
+            line.split(key)
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .unwrap_or_else(|| panic!("no{key} in {line}"))
+                .to_string()
+        };
+        log.lines()
+            .into_iter()
+            .filter(|l| {
+                l.split(' ').next().and_then(|s| s.parse::<u64>().ok()) > Some(before)
+                    && l.contains(" mark n link ")
+            })
+            .map(|l| {
+                let generation = word(&l, " gen=").parse().expect("a generation");
+                (word(&l, " state="), generation)
+            })
+            .collect()
+    }
+
+    /// THE ORDER A RELAUNCH AT ONCE RESTS ON, and its negative control: the same two bridges with
+    /// a retire that does not wait for the lanes (planted by a `within` of zero) lose the first
+    /// one's `Lost` to the second one's attach.
+    #[test]
+    fn a_relaunched_generation_attaches_after_the_old_generations_loss() {
+        crate::session_log_node::install();
+        crate::fabric::with_link_reset(|| {
+            let heard = the_link_over_a_relaunch(LANES_END_WAIT, Duration::from_millis(100));
+            let states: Vec<&str> = heard.iter().map(|(state, _)| state.as_str()).collect();
+            assert_eq!(
+                states,
+                ["stalled", "disconnected", "stalled", "disconnected"],
+                "attach, loss, attach, loss: {heard:?}"
+            );
+            assert_eq!(heard[0].1, heard[1].1, "{heard:?}");
+            assert_eq!(heard[2].1, heard[3].1, "{heard:?}");
+            assert!(heard[1].1 < heard[2].1, "{heard:?}");
+        });
+        crate::fabric::with_link_reset(|| {
+            let heard = the_link_over_a_relaunch(Duration::ZERO, aterm_spec::wait::MUST_HAPPEN);
+            let lost: Vec<u64> = heard
+                .iter()
+                .filter(|(state, _)| state == "disconnected")
+                .map(|(_, generation)| *generation)
+                .collect();
+            let attached = heard.iter().rev().find(|(state, _)| state == "stalled");
+            assert_eq!(
+                Some(lost.as_slice()),
+                attached.map(|(_, generation)| std::slice::from_ref(generation)),
+                "unwaited for, the old generation's loss lands past the attach and is no \
+                 transition: {heard:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn lanes_that_do_not_end_are_warned_of_and_hold_no_relaunch_up() {
+        use std::os::unix::net::UnixStream;
+        let kept = std::sync::Arc::new(Mutex::new(Vec::<(UnixStream, LaneEnded)>::new()));
+        let recorder = {
+            let kept = std::sync::Arc::clone(&kept);
+            move |near: UnixStream,
+                  _generation: crate::fabric::BridgeGeneration,
+                  ended: LaneEnded| {
+                kept.lock().unwrap().push((near, ended));
+                true
+            }
+        };
+        let argv = vec![true_program()];
+        let warning = |logged: &[String]| logged.iter().any(|l| l.contains("had not ended"));
+
+        let mut wedged = launch_serving(&argv, &recorder).expect("launch the stand-in bridge");
+        wedged.wait().expect("reap the bridge");
+        let logged = crate::test_log::logged_while(|| wedged.retire(Duration::from_millis(1)));
+        assert!(warning(&logged), "{logged:?}");
+
+        let mut ended = launch_serving(&argv, |_, _, _| true).expect("launch the stand-in bridge");
+        ended.wait().expect("reap the bridge");
+        let logged = crate::test_log::logged_while(|| ended.retire(LANES_END_WAIT));
+        assert!(!warning(&logged), "{logged:?}");
     }
 
     #[test]

@@ -1109,7 +1109,7 @@ pub const AGY_ANCHORS: &[Anchor] = &[
     lit("agy.question.unchecked", "[ ] ", "1.4.0"),
     lit("agy.question.checked", "[x] ", "1.4.0"),
     lit("agy.question.written", "✓ ", "1.4.0"),
-    lit("agy.box.persisted", "(Persist to settings.json)", "1.4.0"),
+    composed("agy.box.persisted", "(Persist to ", "1.4.0"),
     lit("agy.box.conversation", "in this conversation", "1.4.0"),
     lit("agy.error.id", "Error ID:", "1.4.0"),
     lit(
@@ -1363,6 +1363,26 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
         "1.4.10-R6427.1",
     ),
     lit(
+        "muse.wall.saved_login",
+        "your saved login is no longer valid. Log in again or use a different account.",
+        "1.4.13-R6996.1",
+    ),
+    lit(
+        "muse.wall.still_unauthorized",
+        "still unauthorized after a token refresh; run `muse login` again",
+        "1.4.13-R6996.1",
+    ),
+    lit(
+        "muse.wall.not_logged_in_cli",
+        "not logged in: run `muse login` first",
+        "1.4.13-R6996.1",
+    ),
+    lit(
+        "muse.wall.not_logged_in_key",
+        "not logged in: run /login to add an API key",
+        "1.4.13-R6996.1",
+    ),
+    lit(
         "muse.wall.payment_api",
         "Model API requires a payment method on your account — add one at https://dev.meta.ai, then log in again.",
         "1.4.10-R6427.1",
@@ -1402,7 +1422,12 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
         "model failed after ",
         "1.4.13-R6996.1",
     ),
-    // What follows the count there (only the plural has been seen on a screen).
+    // What follows the count there (`1 attempt: …` or `N attempts: …`).
+    composed(
+        "muse.wall.model_failed_attempt",
+        "attempt: ",
+        "1.4.13-R6996.1",
+    ),
     composed(
         "muse.wall.model_failed_attempts",
         "attempts: ",
@@ -1493,7 +1518,8 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
 /// usage and credit upsells' titles and `Try Again` row, and the texts a sweep of 1.0.70's
 /// strings found for a login of its own that is missing, expired, rejected or could not be
 /// renewed (`grok.auth.*`, whose texts aterm-agent's Grok Build login-ended words are read from),
-/// as 1.0.70's carries them.
+/// as 1.0.70's carries them. The failure a 401 draws is composed on the screen (`Authentication
+/// required: …`, measured on 1.0.70), where the binary's own sentence says `grok login`.
 pub const GROK_ANCHORS: &[Anchor] = &[
     lit(
         "grok.signin.approve",
@@ -1593,6 +1619,16 @@ pub const GROK_ANCHORS: &[Anchor] = &[
     lit(
         "grok.auth.required",
         "Authentication required. Run `grok login` to re-authenticate.",
+        "1.0.70",
+    ),
+    composed(
+        "grok.auth.required.open",
+        "Authentication required:",
+        "1.0.70",
+    ),
+    composed(
+        "grok.auth.required.tail",
+        "Run /login to re-authenticate",
         "1.0.70",
     ),
     lit(

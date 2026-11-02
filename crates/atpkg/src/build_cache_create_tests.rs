@@ -61,6 +61,7 @@ fn stop_at(point: Point) -> Fault {
 fn every_creation_checkpoint_preserves_ownership_or_a_recoverable_exact_intent() {
     for point in [
         Point::Created,
+        Point::Tag,
         Point::Marker,
         Point::Intent,
         Point::Publishing,
@@ -75,7 +76,7 @@ fn every_creation_checkpoint_preserves_ownership_or_a_recoverable_exact_intent()
         );
         drop(fault);
         let before = read(&world.record());
-        if matches!(point, Point::Created | Point::Marker) {
+        if matches!(point, Point::Created | Point::Tag | Point::Marker) {
             assert!(before.is_none() && !world.target.exists());
         } else if point != Point::Committed {
             let pending = before.as_ref().unwrap();
@@ -91,6 +92,7 @@ fn every_creation_checkpoint_preserves_ownership_or_a_recoverable_exact_intent()
         let after = read(&world.record()).unwrap();
         assert_eq!(after.schema, 1);
         assert!(after.creating.is_none() && super::super::same(&world.home, &after));
+        assert!(valid_cache_tag(&pin(&world.target).unwrap()).unwrap());
         if let Some(before) = before {
             assert_eq!(
                 after.identity, before.identity,
@@ -125,6 +127,98 @@ fn a_failed_index_or_gate_sync_never_publishes_a_target() {
             &world.home,
             &read(&world.record()).unwrap()
         ));
+    }
+}
+
+#[test]
+fn an_existing_parent_chain_is_flushed_again_after_an_interrupted_creation() {
+    let mut world = World::new();
+    world.target = world.home.join("first/second/target.noindex");
+    let mut calls = 0;
+    faults::set(move |point| {
+        if point == Point::Parent {
+            calls += 1;
+            if calls == 3 {
+                return None;
+            }
+        }
+        Some(())
+    });
+    let fault = Fault;
+    assert!(world.admit().is_err());
+    drop(fault);
+    assert!(world.target.parent().unwrap().is_dir());
+    assert!(!world.target.exists() && read(&world.record()).is_none());
+
+    // The deepest parent now exists. Retrying must still reestablish every ancestor's
+    // durability instead of treating existence as proof that its earlier mkdir was flushed.
+    let fault = stop_at(Point::Parent);
+    assert!(world.admit().is_err());
+    drop(fault);
+    assert!(!world.target.exists() && read(&world.record()).is_none());
+    assert!(world.admit().unwrap());
+    assert!(super::super::same(
+        &world.home,
+        &read(&world.record()).unwrap()
+    ));
+}
+
+#[test]
+fn an_interrupted_creation_never_repairs_or_publishes_an_uncertain_cache_tag() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for change in [
+        "missing",
+        "bytes",
+        "trailing",
+        "link",
+        "directory",
+        "hardlink",
+        "writable",
+    ] {
+        let world = World::new();
+        let fault = stop_at(Point::Intent);
+        assert!(world.admit().is_err());
+        drop(fault);
+        let intent = std::fs::read(world.record()).unwrap();
+        let stage = read(&world.record()).unwrap().creating.unwrap().directory;
+        let tag = stage.join("CACHEDIR.TAG");
+        match change {
+            "missing" => std::fs::remove_file(&tag).unwrap(),
+            "bytes" => std::fs::write(&tag, b"not a cache tag\n").unwrap(),
+            "trailing" => std::fs::write(&tag, format!("{}extra", cache_tag_bytes())).unwrap(),
+            "link" => {
+                let original = world.home.join("original-tag");
+                std::fs::rename(&tag, &original).unwrap();
+                std::os::unix::fs::symlink(&original, &tag).unwrap();
+            }
+            "directory" => {
+                std::fs::remove_file(&tag).unwrap();
+                std::fs::create_dir(&tag).unwrap();
+            }
+            "hardlink" => std::fs::hard_link(&tag, world.home.join("shared-tag")).unwrap(),
+            "writable" => {
+                std::fs::set_permissions(&tag, std::fs::Permissions::from_mode(0o620)).unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let before = std::fs::symlink_metadata(&tag).ok();
+        let bytes = std::fs::read(&tag).ok();
+        assert!(world.admit().is_err(), "{change}");
+        assert!(!world.target.exists(), "{change}");
+        assert_eq!(std::fs::read(world.record()).unwrap(), intent, "{change}");
+        assert_eq!(
+            std::fs::read(&tag).ok(),
+            bytes,
+            "{change}: never repair a tag"
+        );
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(
+            std::fs::symlink_metadata(&tag)
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino())),
+            before.map(|meta| (meta.dev(), meta.ino())),
+            "{change}: never replace uncertain metadata"
+        );
     }
 }
 
@@ -237,6 +331,7 @@ fn an_explicit_managed_producer_refuses_unknown_output_but_queries_and_defaults_
     let tool = super::super::super::Tool::Targo;
     std::fs::create_dir(&world.target).unwrap();
     std::fs::write(world.target.join("kept"), b"unmanaged").unwrap();
+    std::fs::write(world.target.join("CACHEDIR.TAG"), cache_tag_bytes()).unwrap();
     assert!(
         super::super::observe_for_producer(&words("build"), tool, &world.home, &machine, true)
             .is_err()
@@ -448,6 +543,7 @@ fn a_killed_creator_never_leaves_a_public_unmanaged_cache() {
         Point::Index,
         Point::Gate,
         Point::Created,
+        Point::Tag,
         Point::Marker,
         Point::Intent,
         Point::Publishing,

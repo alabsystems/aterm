@@ -1522,6 +1522,10 @@ fn a_tape_from_a_build_with_no_tell_replays_without_the_tells() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The `[setup]` row of a build whose nudge names `wake` (`SessionSetup::occupancy_nudge_wake`),
+/// which every build before it, slice 1's and slice 2's before 2.10, lacked.
+const NUDGE_WAKE_ROW: &str = "occupancy.nudge_wake=";
+
 /// Slice 2's host doors, every one a build before them lacked.
 const SLICE2_DOORS: [&str; 5] = [
     "host.wakes",
@@ -1533,8 +1537,142 @@ const SLICE2_DOORS: [&str; 5] = [
 
 /// `items`, a recording of this build's with no wake in its book, as a slice-1 build recorded
 /// them: no effect at slice 2's doors (this build's loop reads the book at an open hold's settled
-/// reads), and each told word without the wake rule slice 2 lists last (`said::told_rules`).
+/// reads), each told word without the wake rule slice 2 lists last (`said::told_rules`), and the
+/// nudge as slice 1 typed it, naming no `wake` ([`nudged_as_slice_one`]).
 fn slice_one_items(
+    items: &[crate::supervise::tape::codec::Item],
+) -> Vec<crate::supervise::tape::codec::Item> {
+    nudged_as_slice_one(&doorless_items(items))
+}
+
+/// The sentence slice 2's nudge adds to slice 1's (`templates::wait_nudge` over
+/// `wait_nudge_slice1`), with the space before it.
+fn nudge_sentence() -> String {
+    use crate::supervise::occupancy::templates::{wait_nudge, wait_nudge_slice1};
+    let (taught, older) = (wait_nudge(0), wait_nudge_slice1(0));
+    let (taught, older) = (taught.text(), older.text());
+    let head = older
+        .bytes()
+        .zip(taught.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let head = older[..head]
+        .rfind(' ')
+        .expect("a space before the sentence");
+    let added = &taught[head..taught.len() - (older.len() - head)];
+    assert_eq!(
+        taught.replacen(added, "", 1),
+        older,
+        "slice 2's nudge is slice 1's with one sentence more"
+    );
+    added.to_string()
+}
+
+/// Ledger row `row` with its `cmd_sha256` over the command it holds, as a row of that command
+/// was written (`approvals::sha256_hex`). The command is one with no quote or escape in it.
+fn row_hashed_again(row: &str) -> String {
+    const HASH: &str = "\"cmd_sha256\":\"";
+    const COMMAND: &str = "\",\"command\":\"";
+    let (head, rest) = row.split_once(HASH).expect("a row's hash");
+    let (_, rest) = rest.split_once(COMMAND).expect("a row's command");
+    let (command, tail) = rest.split_once('"').expect("the command's end");
+    assert!(!command.contains('\\'), "{command}");
+    let hash = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(command.as_bytes()));
+    format!("{head}{HASH}{hash}{COMMAND}{command}\"{tail}")
+}
+
+/// `items` with every byte of slice 2's nudge sentence ([`nudge_sentence`]) cut: its typed
+/// write, its rows and its note, as a slice-1 build wrote them. A control request or reply is
+/// cut word by word and written again, so its lengths are a slice-1 build's too; a ledger row's
+/// hash follows its command ([`row_hashed_again`]); any other effect is cut as text, and one that
+/// is not text yet holds the sentence fails the helper.
+fn nudged_as_slice_one(
+    items: &[crate::supervise::tape::codec::Item],
+) -> Vec<crate::supervise::tape::codec::Item> {
+    use crate::supervise::tape::codec::{Item, ctl_args, ctl_reply, ctl_reply_of, ctl_request};
+    use astream_effects::EffectRecord;
+    let sentence = nudge_sentence();
+    let text = |door: &str, bytes: &[u8]| -> Vec<u8> {
+        match String::from_utf8(bytes.to_vec()) {
+            Ok(text) => text.replace(&sentence, "").into_bytes(),
+            Err(_) => {
+                assert!(
+                    !bytes
+                        .windows(sentence.len())
+                        .any(|w| w == sentence.as_bytes()),
+                    "{door}: the nudge in bytes this helper cannot cut"
+                );
+                bytes.to_vec()
+            }
+        }
+    };
+    let request = |door: &str, bytes: &[u8]| -> Vec<u8> {
+        match ctl_args(bytes) {
+            Ok(args)
+                if ctl_request(&args.iter().map(String::as_str).collect::<Vec<_>>()) == bytes =>
+            {
+                let cut: Vec<String> = args.iter().map(|a| a.replace(&sentence, "")).collect();
+                ctl_request(&cut.iter().map(String::as_str).collect::<Vec<_>>())
+            }
+            _ => text(door, bytes),
+        }
+    };
+    let reply = |door: &str, bytes: &[u8]| -> Vec<u8> {
+        match ctl_reply_of(bytes) {
+            Ok(Ok(r)) if ctl_reply(&Ok(r.clone())) == bytes => ctl_reply(&Ok(CtlReply {
+                code: r.code,
+                stdout: r.stdout.replace(&sentence, ""),
+                stderr: r.stderr.replace(&sentence, ""),
+            })),
+            Ok(Err(why)) if ctl_reply(&Err(why.clone())) == bytes => {
+                ctl_reply(&Err(why.replace(&sentence, "")))
+            }
+            _ => text(door, bytes),
+        }
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            Item::Effect {
+                record:
+                    EffectRecord::Exchange {
+                        door,
+                        request: asked,
+                        reply: answered,
+                    },
+                stamp,
+            } => Item::Effect {
+                record: EffectRecord::Exchange {
+                    door: door.clone(),
+                    request: request(door, asked),
+                    reply: reply(door, answered),
+                },
+                stamp: *stamp,
+            },
+            Item::Effect {
+                record: EffectRecord::Emit { door, bytes },
+                stamp,
+            } => Item::Effect {
+                record: EffectRecord::Emit {
+                    door: door.clone(),
+                    bytes: match text(door, bytes) {
+                        cut if door == "ledger" && cut != *bytes => {
+                            let row = String::from_utf8(cut).expect("a ledger row is text");
+                            row_hashed_again(&row).into_bytes()
+                        }
+                        cut => cut,
+                    },
+                },
+                stamp: *stamp,
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// `items` with no effect at slice 2's doors and each told word without the wake rule
+/// ([`slice_one_items`]), the nudge left as this build typed it.
+fn doorless_items(
     items: &[crate::supervise::tape::codec::Item],
 ) -> Vec<crate::supervise::tape::codec::Item> {
     use crate::supervise::tape::codec::Item;
@@ -1624,6 +1762,7 @@ fn a_slice_one_tape_replays_unchanged() {
     let slice_one = slice_one_items(&items);
     let older: String = header
         .lines()
+        .filter(|line| !line.starts_with(NUDGE_WAKE_ROW))
         .map(|line| match line.strip_prefix("host_doors=") {
             Some(doors) => {
                 let named: Vec<&str> = doors.split(' ').collect();
@@ -1856,13 +1995,17 @@ fn unraised_watch(tag: &str) -> (String, Vec<crate::supervise::tape::codec::Item
 }
 
 /// `header` with its `[setup] occupancy.k_looks` row `k` (`None`: taken out, as a build before
-/// the K clock wrote it) and, where `slice1`, slice 2's doors taken out of `host_doors`.
+/// the K clock wrote it) and, where `slice1`, slice 2's doors taken out of `host_doors` and its
+/// `occupancy.nudge_wake` row out ([`NUDGE_WAKE_ROW`]).
 fn as_recorded(header: &str, k: Option<i64>, slice1: bool) -> String {
     header
         .lines()
         .filter_map(|line| {
             if line.starts_with("occupancy.k_looks=") {
                 return k.map(|k| format!("occupancy.k_looks={k}\n"));
+            }
+            if slice1 && line.starts_with(NUDGE_WAKE_ROW) {
+                return None;
             }
             match line.strip_prefix("host_doors=") {
                 Some(doors) if slice1 => {
@@ -2100,9 +2243,12 @@ fn a_loop_that_unwinds_tells_its_host_no_hold() {
 /// prompt hold door's line written and its Enter refused, recorded as a build before 2.9b booked
 /// it (`ReleaseOnLeft`: the account keeps nothing, `skipped why=not-submitted`), replays on this
 /// build from a header without slice 2's doors, since the account keeps nothing left where the
-/// recording's build had no left lines (`Fx::slice2_recorded`). CONTROL: the same slice-1 tape
-/// with the fault armed. NEGATIVE CONTROL: the recording under this build's own header, slice 2's
-/// doors in it, replayed unarmed keeps the line left and diverges at its row.
+/// recording's build had no left lines (`Fx::slice2_recorded`), and its nudge is slice 1's, naming
+/// no `wake` (no [`NUDGE_WAKE_ROW`], `WakeSight::nudge_wake`, the slice-2 plan's 2.10). CONTROL: the
+/// same slice-1 tape
+/// with the fault armed. NEGATIVE CONTROLS: the recording under this build's own header, slice 2's
+/// doors in it, replayed unarmed keeps the line left and diverges at its row; and the slice-1 tape
+/// with this build's nudge in its write, naming `wake`, diverges at that write.
 #[test]
 fn a_slice_one_tape_whose_door_left_its_line_replays_unchanged() {
     use crate::supervise::occupancy::fault::{self, Fault};
@@ -2153,6 +2299,7 @@ fn a_slice_one_tape_whose_door_left_its_line_replays_unchanged() {
     let slice_one = slice_one_items(&items);
     let older: String = header
         .lines()
+        .filter(|line| !line.starts_with(NUDGE_WAKE_ROW))
         .map(|line| match line.strip_prefix("host_doors=") {
             Some(doors) => {
                 let kept: Vec<&str> = doors
@@ -2177,5 +2324,109 @@ fn a_slice_one_tape_whose_door_left_its_line_replays_unchanged() {
         matches!(slice2.verdict, Verdict::Diverged(_)),
         "NEGATIVE CONTROL: a slice-2 recording keeps its line left: {}",
         slice2.render()
+    );
+    let sentence = nudge_sentence();
+    assert!(
+        run.sent
+            .iter()
+            .any(|w| w.starts_with("send ") && w.contains(&sentence)),
+        "this build's nudge names `wake`: {:#?}",
+        run.sent
+    );
+    let taught = fault::with(Fault::ReleaseOnLeft, || {
+        replayed(&older, &doorless_items(&items))
+    });
+    assert!(
+        matches!(taught.verdict, Verdict::Diverged(_)),
+        "NEGATIVE CONTROL: a slice-1 build's loop types slice 1's nudge: {}",
+        taught.render()
+    );
+}
+
+/// A SLICE-2 TAPE FROM BEFORE THE NUDGE NAMED `wake` REPLAYS UNCHANGED (the 2.10 reviews' replay
+/// note): a prompt nudge typed by a build with slice 2's doors and no `[setup]
+/// occupancy.nudge_wake` row (main's 2.5 to 2.9b) replays as slice 1's line, which that build
+/// typed: the row, not the doors, says which line the recording's build typed. CONTROL: this
+/// build's recording under its own header. NEGATIVE CONTROL: the older recording under this
+/// build's header, the row in it, diverges at the write.
+#[test]
+fn a_slice_two_tape_from_before_the_nudge_named_wake_replays_unchanged() {
+    use crate::supervise::tape::recover::recover;
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+    use crate::supervise::tape::testing::written;
+
+    let (dir, ledger) = ledger_at("door-nudge-before-wake-tape");
+    let board = Board::reading(OccupancyReading::default());
+    let base = hosted(35 * 60);
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig {
+            occupancy: Occupancy::Prompt,
+            continue_policy: false,
+            ..base.policy.clone()
+        },
+        idle_host: Some(Arc::clone(&board) as Arc<dyn IdleHost>),
+        ledger: Some(ledger.clone()),
+        journal: Some(dir.join("journal.jsonl")),
+        ..base
+    };
+    let mut m = Mock::new(vec![break_screen()]);
+    m.stall_sleep = Some(Duration::from_secs(60));
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(7);
+    m.human_ms = Some(60 * MIN.unsigned_abs());
+    m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] [if-human=<n>] <name>: send a named \
+              key\nsend [id=<key>] [if=<re>] [if-gen=<e.s>] [if-human=<n>] <text>: write \
+              text\n"
+        .to_string();
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let sentence = nudge_sentence();
+    assert!(
+        run.sent
+            .iter()
+            .any(|w| w.starts_with("send ") && w.contains(&sentence)),
+        "this build typed its nudge, naming `wake`: {:#?}",
+        run.sent
+    );
+    let header = run.header.encode();
+    assert!(
+        header.lines().any(|l| l == "occupancy.nudge_wake=true"),
+        "{header}"
+    );
+    let items = recover(&run.tape.reframed(&header)).items;
+    let older_items = nudged_as_slice_one(&items);
+    let older: String = header
+        .lines()
+        .filter(|l| !l.starts_with(NUDGE_WAKE_ROW))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(
+        SLICE2_DOORS.iter().all(|d| older
+            .lines()
+            .any(|l| l.starts_with("host_doors=") && l.contains(d))),
+        "slice 2's doors stay in the older header"
+    );
+    let replayed = |header: &str, items: &[crate::supervise::tape::codec::Item]| {
+        replay(&written(header, items), &Options::default()).expect("replayed")
+    };
+    let control = replayed(&header, &items);
+    assert_eq!(control.verdict, Verdict::Reproduced, "{}", control.render());
+    let report = replayed(&older, &older_items);
+    assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
+    let taught = replayed(&header, &older_items);
+    let Verdict::Diverged(d) = &taught.verdict else {
+        panic!(
+            "NEGATIVE CONTROL: this build's header types the nudge naming `wake`: {}",
+            taught.render()
+        );
+    };
+    assert_eq!(
+        d.door.as_deref(),
+        Some(crate::supervise::tape::doors::CTL),
+        "at the write: {d:?}"
     );
 }

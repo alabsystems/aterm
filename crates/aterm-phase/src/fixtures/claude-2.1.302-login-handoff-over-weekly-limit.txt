@@ -1,0 +1,64 @@
+# claude-code 2.1.302 · MEASURED 2026-10-31, the `aterm ctl` temporal replay of a supervised tab (175 cols, fullscreen renderer) at its weekly limit's reset (Oct 31 12am PDT): a person's own /login left at its browser hand-off over the limit, the screen unchanged from 3.6 h into the session until the person's Esc 55 h later, 33 h past the reset; the OAuth URL's code_challenge and state are same-length stand-ins
+
+
+⏺ Monitor event: 09:12 [ 5/11] build start 09:12:08 · 0.146 release step progress
+  ⎿  You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)
+
+⏺ Goal paused · usage limit reached · continues automatically when it resets
+
+✻ Waiting for 4 dynamic workflows to finish
+
+⏺ Dynamic workflow "Accounts lane: carry only this machine's conflicts; report on empty exits; wording; walls; re-review; land if it passes" completed · 7h 22m 9s
+
+⏺ Dynamic workflow "Ring lane round 2 (half-move marker, vault-fill guard, flock, no-write checks, tests, docs) and the publication engine reading the ring path (prepared, not
+pushed)" completed · 2h 1m 12s
+
+⏺ Monitor event: [Monitor expired after 30m with 3 events delivered. Re-arm it if you still need the watch.] · 0.146 release step progress
+  ⎿  You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)
+
+✻ Waiting for 2 dynamic workflows to finish
+
+⏺ Dynamic workflow "aCaffiene lane: fix the two review lows, merge main (move its new sweeps), check, push to main, clean up" completed · 8h 27m 5s
+
+⏺ Dynamic workflow "Swap fix round 5: fix its own T8 regression, the unreadable-dir refusal and the two test gaps; focused review; land (renewal-binding medium is pre-existing
+and goes to a follow-up lane)" completed · 1h 19m 7s
+
+⏺ Monitor event: [Monitor expired after 30m with 1 event delivered. Re-arm it if you still need the watch.] · Lane commits and workflow stage results
+  ⎿  You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)
+
+✻ Cooked for 1d 18h 39m · done 9:29 AM
+
+⏺ Background command "Queue the 0.146 release behind its pre-checks" completed (exit code 0)
+  ⎿  You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)
+
+✻ Worked for 0s · done 10:24 AM
+
+⏺ Goal check-in: background work no longer running
+  ⎿  You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)
+
+✻ Churned for 0s · done 11:04 AM
+
+⏺ Goal check-in: background work no longer running
+  ⎿  You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)
+
+✻ Cooked for 0s · done 1:04 PM
+
+⏺ Goal check-in: background work no longer running · idle check-ins paused until your next message
+  ⎿  You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)
+
+✻ Crunched for 0s · done 3:04 PM
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Login
+
+   Browser didn't open? Use the url below to sign in (c to copy)
+
+https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcod
+e%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload+user%3Aplugins&code_challenge=XXXXX
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX&code_challenge_method=S256&state=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+   Hold Shift (Option in iTerm2, Fn in Terminal.app) while selecting to use your terminal's native copy
+
+
+   Paste code here if prompted >
+
+   Esc to cancel

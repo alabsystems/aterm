@@ -15,6 +15,7 @@ pub use mutex_ext::MutexExt;
 mod trust_fmt;
 
 pub mod dev_seam;
+pub mod wait_tally;
 
 pub mod argv0;
 pub mod channel;

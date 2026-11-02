@@ -4,7 +4,7 @@
 //! Shared screen-state projection for `aterm` and `astream-term` oracle comparison.
 
 use astream_term::Record;
-use astream_term::screen::{Color, Folder, attr};
+use astream_term::screen::{Color, Folder, MAX_COMBINING, attr};
 use aterm_core::grid::{CellFlags, Grid};
 use aterm_core::terminal::Terminal;
 use std::fmt::Write as _;
@@ -81,10 +81,49 @@ impl Ink {
     }
 }
 
-/// One cell: its character (a blank is `' '` on both sides) and rendition.
+/// What a cell holds after its character, in order: its zero-width marks and any glyph that
+/// joined its cluster, up to the cap both engines keep ([`MAX_COMBINING`], aterm's
+/// `CellExtra::MAX_COMBINING`, which the oracle's tests hold equal).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Marks {
+    held: [char; MAX_COMBINING],
+    len: u8,
+}
+
+impl Marks {
+    /// A cell with nothing attached.
+    pub const NONE: Marks = Marks {
+        held: ['\0'; MAX_COMBINING],
+        len: 0,
+    };
+
+    /// The marks `from` lists, past the cap dropped.
+    pub fn of(from: impl IntoIterator<Item = char>) -> Marks {
+        let mut marks = Marks::NONE;
+        for (slot, m) in marks.held.iter_mut().zip(from) {
+            *slot = m;
+            marks.len += 1;
+        }
+        marks
+    }
+
+    pub fn as_slice(&self) -> &[char] {
+        &self.held[..usize::from(self.len)]
+    }
+}
+
+impl std::fmt::Debug for Marks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
+/// One cell: its character (a blank is `' '` on both sides), what is attached to it, and its
+/// rendition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CellView {
     pub ch: char,
+    pub marks: Marks,
     pub ink: Ink,
 }
 
@@ -107,14 +146,17 @@ pub struct Snap {
 }
 
 impl Snap {
-    /// Row `r`'s text, trailing blanks trimmed: a wide glyph once, its spacer adding nothing.
+    /// Row `r`'s text, trailing blanks trimmed: a wide glyph once, its spacer adding nothing,
+    /// each cell's marks after its character.
     pub fn row_text(&self, r: u16) -> String {
         let start = usize::from(r) * usize::from(self.cols);
-        let line: String = self.cells[start..start + usize::from(self.cols)]
-            .iter()
-            .filter(|c| c.ink.half != Half::Spacer)
-            .map(|c| c.ch)
-            .collect();
+        let mut line = String::new();
+        for c in &self.cells[start..start + usize::from(self.cols)] {
+            if c.ink.half != Half::Spacer {
+                line.push(c.ch);
+                line.extend(c.marks.as_slice());
+            }
+        }
         line.trim_end().to_string()
     }
 
@@ -201,6 +243,7 @@ impl Astream {
                 let cell = s.cell(r, c).copied().unwrap_or(astream_term::Cell::BLANK);
                 cells.push(CellView {
                     ch: cell.ch,
+                    marks: Marks::of(cell.combining_marks().iter().copied()),
                     ink: Ink {
                         fg: paint_of(cell.fg, cell.fg_rgb),
                         bg: paint_of(cell.bg, cell.bg_rgb),
@@ -253,15 +296,45 @@ const MODELLED_BITS: u16 = CellFlags::BOLD.0
     | CellFlags::HIDDEN.0
     | UNDERLINE_BITS;
 
+/// Where the cursor stands for a mark: see [`Aterm::mark_placement`].
+#[derive(Clone, Copy, Debug)]
+pub struct MarkPlacement {
+    pub wrap: bool,
+    pub col: u16,
+    pub continued: bool,
+    pub at_left_margin: bool,
+}
+
 /// The production engine, advanced chunk by chunk.
 pub struct Aterm {
     term: Terminal,
+}
+
+/// What a screen shows attached to a cell, read as `Terminal::cell_grapheme` reads it: nothing on
+/// a spacer, the rest of a complex cell's text, then the marks of a cell flagged as holding extras.
+fn aterm_marks(grid: &Grid, r: u16, c: u16, half: Half) -> Marks {
+    let Some(cell) = grid.cell(r, c).filter(|_| half != Half::Spacer) else {
+        return Marks::NONE;
+    };
+    let mut tail = String::new();
+    if cell.is_complex() {
+        grid.push_complex_char_at(r, c, &mut tail);
+    }
+    let extra = grid.cell_extra(r, c).filter(|_| cell.has_extras());
+    Marks::of(
+        tail.chars().skip(1).chain(
+            extra
+                .into_iter()
+                .flat_map(|e| e.combining().iter().copied()),
+        ),
+    )
 }
 
 fn aterm_cell(grid: &Grid, r: u16, c: u16) -> CellView {
     let Some(cell) = grid.cell(r, c) else {
         return CellView {
             ch: ' ',
+            marks: Marks::NONE,
             ink: Ink::PLAIN,
         };
     };
@@ -307,6 +380,7 @@ fn aterm_cell(grid: &Grid, r: u16, c: u16) -> CellView {
     };
     CellView {
         ch,
+        marks: aterm_marks(grid, r, c, half),
         ink: Ink {
             fg,
             bg,
@@ -370,6 +444,7 @@ impl Aterm {
         }
         let blank = CellView {
             ch: ' ',
+            marks: Marks::NONE,
             ink: Ink::PLAIN,
         };
         (0..rows).any(|r| {
@@ -382,6 +457,19 @@ impl Aterm {
                 aterm_cell(after, r, c) != clipped
             })
         })
+    }
+
+    /// Where a mark fed now would land, in the terms the placements speak of.
+    pub fn mark_placement(&self) -> MarkPlacement {
+        let grid = self.term.grid();
+        let cur = self.term.cursor();
+        MarkPlacement {
+            wrap: grid.pending_wrap(),
+            col: cur.col,
+            continued: grid.row(cur.row).is_some_and(|row| row.is_wrapped()),
+            at_left_margin: grid.has_horizontal_margins()
+                && cur.col == grid.horizontal_margins().left,
+        }
     }
 
     /// Where the cursor stands, in the terms the resize rule speaks of: a wrap pending on the

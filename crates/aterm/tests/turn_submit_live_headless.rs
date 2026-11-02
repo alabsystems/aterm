@@ -135,6 +135,20 @@ fn composer(inst: &Instance, sid: &str) -> String {
         .to_string()
 }
 
+/// The composer row once it reads `want`, or what it last read when the one-minute hang
+/// detector ends: the stand-in reads its input in chunks, so a verdict can land while the
+/// rest of a line it keeps is still being drawn.
+fn composer_settles(inst: &Instance, sid: &str, want: &str) -> String {
+    let deadline = Instant::now() + HANG;
+    loop {
+        let row = composer(inst, sid);
+        if row == want || Instant::now() >= deadline {
+            return row;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn a_follow_up_into_claude_code_is_submitted_only_when_its_composer_takes_it() {
     let inst = headless_boot::boot_with(
@@ -161,7 +175,10 @@ fn a_follow_up_into_claude_code_is_submitted_only_when_its_composer_takes_it() {
                 "{verdict}\n{}",
                 ctl_ok(&inst, &[&format!("@{ignores}"), "text"])
             );
-            assert_eq!(composer(&inst, &ignores), "❯ carry on");
+            assert_eq!(
+                composer_settles(&inst, &ignores, "❯ carry on"),
+                "❯ carry on"
+            );
         });
 
         let taken = scope.spawn(|| {
@@ -187,7 +204,7 @@ fn a_follow_up_into_claude_code_is_submitted_only_when_its_composer_takes_it() {
                 ctl_ok(&inst, &[&format!("@{plain}"), "text"])
             );
             assert_eq!(
-                composer(&inst, &plain),
+                composer_settles(&inst, &plain, "❯ carry on"),
                 "❯ carry on",
                 "the repaint alone verified a line still in the composer"
             );

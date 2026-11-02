@@ -3860,6 +3860,9 @@ fn preparation_case(scope: i64, changed: i64) -> [bool; 4] {
     use crate::harness::accounts::Cli;
     let observed = preparation_case_for(Cli::Claude, scope, changed);
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        if cli == Cli::Kimi && !cfg!(unix) && (scope == 2 || changed == 1) {
+            continue;
+        }
         assert_eq!(
             preparation_case_for(cli, scope, changed),
             observed,
@@ -3937,6 +3940,9 @@ fn a_prepared_credential_needs_execution_authority_before_review_or_launch() {
         (Cli::Codex, Some(true)),
         (Cli::Codex, Some(false)),
     ] {
+        if !atpkg::vendor_direct::served_here(cli.id()) {
+            continue;
+        }
         for off in [false, true] {
             let pool = ReviewPool::new(cli, reads);
             pool.main_alone();
@@ -4001,6 +4007,9 @@ fn a_prepared_pin_never_falls_through_to_another_account() {
         (Cli::Grok, None),
         (Cli::Codex, Some(true)),
     ] {
+        if !atpkg::vendor_direct::served_here(cli.id()) || (cli == Cli::Kimi && !cfg!(unix)) {
+            continue;
+        }
         let pool = ReviewPool::new(cli, reads);
         pool.pin("work");
         let (answer, calls) = pool.review();
@@ -4038,6 +4047,9 @@ fn a_prepared_fallback_does_not_hide_an_authorized_accounts_health() {
         (Cli::Codex, Some(true)),
         (Cli::Codex, Some(false)),
     ] {
+        if !atpkg::vendor_direct::served_here(cli.id()) {
+            continue;
+        }
         for expired in [false, true] {
             let pool = ReviewPool::new(cli, reads);
             pool.state(|state| {
@@ -4080,6 +4092,9 @@ fn prepared_and_shared_accounts_are_not_local_sign_in_alternatives() {
         (Cli::Grok, None),
         (Cli::Codex, Some(true)),
     ] {
+        if !atpkg::vendor_direct::served_here(cli.id()) {
+            continue;
+        }
         for shared in [false, true] {
             let pool = ReviewPool::new(cli, reads);
             pool.wall("main");
@@ -4134,6 +4149,9 @@ fn a_prepared_expired_pin_explains_its_hold_without_offering_sign_in() {
         (Cli::Codex, Some(true)),
         (Cli::Codex, Some(false)),
     ] {
+        if !atpkg::vendor_direct::served_here(cli.id()) {
+            continue;
+        }
         let pool = ReviewPool::new(cli, reads);
         pool.state(|state| {
             state.prepared_accounts.insert("work".into());
@@ -4189,6 +4207,9 @@ fn healthy_shared_accounts_remain_healthy_without_local_sign_in() {
         (Cli::Grok, None),
         (Cli::Codex, Some(true)),
     ] {
+        if !atpkg::vendor_direct::served_here(cli.id()) {
+            continue;
+        }
         let pool = ReviewPool::new(cli, reads);
         pool.pin("work");
         pool.share_work();
@@ -4341,6 +4362,9 @@ fn a_pooled_review_takes_what_a_launch_takes() {
         (Cli::Codex, Some(true)),
         (Cli::Codex, Some(false)),
     ] {
+        if !atpkg::vendor_direct::served_here(cli.id()) {
+            continue;
+        }
         for off in [false, true] {
             for (case, set) in review_cases() {
                 let at = format!("{} on {reads:?}, off={off}, {case}", cli.id());

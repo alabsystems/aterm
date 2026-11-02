@@ -1715,7 +1715,7 @@ fn under_root_no_app_in_a_folder_another_account_can_change_backs_the_cli() {
     let mut lib = Lib::new();
     lib.step(format!(
         "{FOREIGN_FIND}\n{FAKE_ROOT}\nFOREIGN_LIST=\"$TMPDIR/foreign\"; : >\"$FOREIGN_LIST\"\n\
-         umask 022; W=\"$TMPDIR/w\"; VERIFY_WAIT_SECS=5\n\
+         umask 022; W=\"$TMPDIR/w\"\n\
          app() {{ mkdir -p \"$W/$1/aterm.app/Contents/MacOS\" && \
          printf '#!/bin/sh\\necho aterm 9.9.9\\n' >\"$W/$1/aterm.app/Contents/MacOS/aterm\" && \
          chmod 755 \"$W/$1/aterm.app/Contents/MacOS/aterm\"; }}\n\
@@ -1982,7 +1982,7 @@ folder_ids() {
 			[ "$p" -ef "$root" ] || ino=9
 			echo "$dev $ino"
 		elif [[ "$OSTYPE" == darwin* ]]; then
-			command stat -f '%d %i' -- "$p" || s=1
+			/usr/bin/perl -e 'my @s = lstat($ARGV[0]); @s or exit 1; print "$s[0] $s[1]\n"' -- "$p" || s=1
 		elif [ "$p" -ef / ]; then
 			echo "0:31 2"
 		else
@@ -2029,7 +2029,7 @@ disk_devices() {
 	local p d s=0
 	for p; do
 		d="$(awk -v p="$p" '$1 == p { print $2 }' "$W/nodes")"
-		if [ -n "$d" ]; then echo "$d"; else command stat -f %r -- "$p" || s=1; fi
+		if [ -n "$d" ]; then echo "$d"; else /usr/bin/perl -e 'my @s = lstat($ARGV[0]); @s or exit 1; print "$s[6]\n"' -- "$p" || s=1; fi
 	done
 	return "$s"
 }

@@ -1756,3 +1756,18 @@ fn a_non_administrator_is_told_and_no_tab_opens_by_itself() {
     app.workstation_setup.developer_tools = Install::Wanted(4);
     assert!(!app.developer_tools_install_due(true, false, false));
 }
+
+/// Tools installed in a tab this window did not open run no package pass, so a reading past the
+/// wait ends the digest's "missing" entry. Negative control: a reading still waiting keeps it.
+#[test]
+fn a_repositories_reading_past_the_tools_ends_the_missing_entry() {
+    use crate::toolchain_words::{CToolchain, c_toolchain_entry};
+    let (mut app, _wid) = page();
+    let missing = c_toolchain_entry(CToolchain::Missing);
+    app.except(&missing);
+    let waiting = tools_missing(&app);
+    app.developer_tools_install_step(&waiting);
+    assert!(app.owes_exception(&missing.key()), "still waiting: kept");
+    app.developer_tools_install_step(&tools_there(&waiting));
+    assert!(!app.owes_exception(&missing.key()), "past the wait: ended");
+}

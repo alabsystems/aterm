@@ -77,12 +77,25 @@ fn build_identity(agent: Agent, text: &str) -> Option<BuildIdentity> {
     }
 }
 
+/// Ordering of `a` and `b` within `agent`'s version grammar ([`Version`], or revision-aware
+/// [`atpkg::vendor_direct::Version`] for Muse and agy); `None` when either spelling is invalid
+/// or when they belong to different grammars.
+#[must_use]
+pub fn build_order(agent: Agent, a: &str, b: &str) -> Option<Ordering> {
+    match (build_identity(agent, a)?, build_identity(agent, b)?) {
+        (BuildIdentity::Numeric(a), BuildIdentity::Numeric(b)) => Some(a.cmp(&b)),
+        (BuildIdentity::Vendor(a), BuildIdentity::Vendor(b)) => Some(a.cmp(&b)),
+        (BuildIdentity::Numeric(_), BuildIdentity::Vendor(_))
+        | (BuildIdentity::Vendor(_), BuildIdentity::Numeric(_)) => None,
+    }
+}
+
 /// Whether `agent`'s version grammar validates `a` and `b` as one build. Dotted numeric aliases
 /// compare through [`Version`]; Muse and agy also accept their revision-aware vendor grammar.
 /// A leading `v` and outer blanks are ignored. Identical unvalidated strings are no build.
 #[must_use]
 pub fn same_build(agent: Agent, a: &str, b: &str) -> bool {
-    build_identity(agent, a).is_some_and(|a| Some(a) == build_identity(agent, b))
+    build_order(agent, a, b) == Some(Ordering::Equal)
 }
 
 impl Ord for Version {

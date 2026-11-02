@@ -2588,6 +2588,7 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
     use atpkg::build_cache::Unused;
     let span = sweep_span;
     match why {
+        Unused::Requested => "an explicit request retired this registered ordinary cache after identity, Cargo lock and process-use checks".to_owned(),
         Unused::Gone { idle, after } => format!(
             "its workspace is gone, and nothing wrote it for {} (the sweep takes one unwritten \
              {}); no build held its locks",
@@ -2671,6 +2672,7 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
 pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
     use atpkg::build_cache::Unused;
     match why {
+        Unused::Requested => "explicit registered-cache retirement".to_owned(),
         Unused::Gone { .. } => "its workspace is gone".to_owned(),
         Unused::Idle { idle } => format!("unwritten {}", sweep_span(idle)),
         Unused::Moved { idle, .. } => format!("in the old root, unwritten {}", sweep_span(idle)),

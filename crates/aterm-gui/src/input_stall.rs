@@ -1090,6 +1090,12 @@ pub(crate) fn host_hand_refusal(ctx: &crate::SessionCtx, now_us: u64) -> Option<
     if !claimed {
         return Some("not-supervised");
     }
+    other_hand(ctx, now_us)
+}
+
+/// Whose hand other than the host's is on session `ctx` at `now_us`: a hold, or a driver's turn or
+/// lease.
+pub(crate) fn other_hand(ctx: &crate::SessionCtx, now_us: u64) -> Option<&'static str> {
     if ctx.fabric.hold().is_some() {
         return Some("halted");
     }
@@ -3494,7 +3500,14 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "macos")]
     fn spinning_job() -> (i32, i32, ReapJob, i32) {
-        let (master, slave, job, leader) = pty_job("trap '' TERM; printf R; while :; do :; done");
+        ready_job("trap '' TERM; printf R; while :; do :; done")
+    }
+
+    /// [`pty_job`] for a `script` whose first byte out is `R`, once what it sets up before it
+    /// (a trap) stands: returned after that byte is read.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ready_job(script: &str) -> (i32, i32, ReapJob, i32) {
+        let (master, slave, job, leader) = pty_job(script);
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut ready = [0u8; 1];
         loop {
@@ -3511,7 +3524,7 @@ pub(crate) mod tests {
                     break;
                 }
             }
-            assert!(Instant::now() < deadline, "the job never set its trap");
+            assert!(Instant::now() < deadline, "the job never said it was ready");
         }
         assert_eq!(&ready, b"R", "the job's first byte is its readiness mark");
         (master, slave, job, leader)
@@ -3552,8 +3565,9 @@ pub(crate) mod tests {
         (master, slave, job, leader)
     }
 
+    /// A [`pty_job`]'s process, killed and reaped when dropped.
     #[cfg(target_os = "macos")]
-    struct ReapJob(std::process::Child);
+    pub(crate) struct ReapJob(pub(crate) std::process::Child);
 
     #[cfg(target_os = "macos")]
     impl Drop for ReapJob {

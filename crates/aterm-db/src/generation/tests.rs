@@ -380,6 +380,74 @@ fn successor_replay_refuses_withdrawal_before_return_or_tail_finalization() {
 }
 
 #[test]
+fn account_service_observation_never_repairs_a_selected_generations_ancestor() {
+    use aterm_types::network_state::ServiceAvailability;
+
+    for name in ["commons.lock", "commons.claim"] {
+        let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+        let original = lab.paths[0].clone();
+        let proposals = crate::accounts::proposals::Proposals::at(original.clone());
+        proposals.initialize().unwrap();
+        let mut selection = reserved(&lab);
+        move_admitted_candidate(&mut lab);
+        import(&mut selection).unwrap();
+        assert_eq!(
+            crate::service_state::observe(&original, &selection.config, 1000)
+                .accounts
+                .availability,
+            ServiceAvailability::Cached
+        );
+        let path = original.dir.join(name);
+        std::fs::rename(&path, path.with_extension("preserved")).unwrap();
+        let before = files(lab._home.path());
+
+        let observed = crate::service_state::observe(&original, &selection.config, 2000).accounts;
+        assert!(
+            files(lab._home.path()) == before,
+            "account observation repaired ancestor {name}"
+        );
+        assert_eq!(observed.availability, ServiceAvailability::Unknown);
+        assert!(observed.refresh_failed);
+        assert_eq!(observed.last_success_ms, None);
+    }
+}
+
+#[test]
+fn recovery_diagnostics_preserve_missing_custody() {
+    type Read = fn(&Paths) -> Result<Value>;
+    let readers: [(&str, Read); 2] = [
+        ("status", |paths| status(paths, admission_deadline())),
+        ("inspect", inspect),
+    ];
+    let mut violations = Vec::new();
+    for (name, read) in readers {
+        for predecessor in [false, true] {
+            for file in ["commons.lock", "commons.claim"] {
+                let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+                data(&lab);
+                let mut selection = reserved(&lab);
+                let next = move_admitted_candidate(&mut lab);
+                import(&mut selection).unwrap();
+                let paths = &lab.paths[0];
+                read(paths).unwrap();
+                let target = if predecessor { paths } else { &next };
+                let path = target.dir.join(file);
+                std::fs::rename(&path, path.with_extension("preserved")).unwrap();
+                let before = files(lab._home.path());
+                let _ = read(paths);
+                if files(lab._home.path()) != before {
+                    violations.push((name, predecessor, file));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "(diagnostic, predecessor, file): {violations:?}"
+    );
+}
+
+#[test]
 fn observed_lineage_never_repairs_custody_or_runs_recovery() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
@@ -1423,7 +1491,10 @@ fn lost_selector_keeps_original_fenced_and_reuses_the_completed_candidate() {
     let retained = Session::open(&original).unwrap();
     std::fs::remove_file(root(&lab.paths[0]).join(STATE)).unwrap();
     assert!(fenced(&lab.paths[0]).unwrap());
-    assert_eq!(status(&lab.paths[0]).unwrap()["state"], json!("pending"));
+    assert_eq!(
+        status(&lab.paths[0], admission_deadline()).unwrap()["state"],
+        json!("pending")
+    );
     assert!(retained.writer().is_err());
     assert!(allow_mutation(&lab.paths[0]).is_err());
     assert!(

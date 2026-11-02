@@ -45,7 +45,7 @@ fn failure(_: impl std::fmt::Display) -> Error {
 // Secrets errors name failures without exposing secret values. Preserve that
 // local evidence at the batch boundary; remote witness failures stay generic.
 fn journal_failure(operation: &str, error: aterm_secrets::Error) -> Error {
-    Error(format!("Commons control {operation}: {error}"))
+    Error::from(error).context(&format!("Commons control {operation}"))
 }
 
 /// The connection's fixed ordering. This avoids simultaneous large writes.
@@ -631,8 +631,8 @@ impl Endpoint {
     pub fn from_bootstrap(
         bootstrap: &aterm_secrets::commons::bootstrap::Bootstrap,
     ) -> Result<Option<Self>> {
-        let journal =
-            Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
+        let journal = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust())
+            .map_err(|error| journal_failure("admission", error))?;
         Self::from_bootstrap_in(bootstrap, &journal)
     }
 
@@ -645,7 +645,7 @@ impl Endpoint {
     ) -> Result<Option<Self>> {
         let journal =
             Journal::open_existing_until(bootstrap.journal_dir(), bootstrap.trust(), deadline)
-                .map_err(failure)?;
+                .map_err(|error| journal_failure("admission", error))?;
         bootstrap.revalidate_custody().map_err(failure)?;
         Self::from_bootstrap_in(bootstrap, &journal)
     }
@@ -787,7 +787,7 @@ impl Endpoint {
         seed: &[u8; 32],
     ) -> Result<Self> {
         let endpoint = Self::configured(dir, trust, request, witness, seed)?;
-        drop(Journal::open(dir, trust).map_err(failure)?);
+        drop(Journal::open(dir, trust).map_err(|error| journal_failure("admission", error))?);
         Ok(endpoint)
     }
 
@@ -1053,13 +1053,13 @@ impl Endpoint {
         if side == Side::Responder && hello.starts_with(b"ACE1") {
             return enrollment::serve(self, stream, proof, &hello, repair);
         }
-        let (actor, peer_log) = authenticate(self.trust, self.actor, proof, &hello)?;
+        let peer = authenticate(self.trust, self.actor, proof, &hello)?;
+        let actor = peer.actor;
         verify_peer_against_local_log(
             self.paths.as_ref(),
             self.trust,
-            actor,
-            &hello,
-            peer_log.as_deref(),
+            &peer.request,
+            peer.log.as_deref(),
         )?;
         let authenticated_at = Instant::now();
         repair.prepare(self.trust, actor);
@@ -1548,31 +1548,171 @@ fn admit_by_log_witness(
     Ok(())
 }
 
-/// Check the authenticated peer of `hello` against this device's own membership log and
+/// How many vault folders [`LastRead`] keeps an answer for: a process reads one; tests read many.
+const LAST_READ_FOLDERS: usize = 8;
+
+/// The last answer this process read from each vault folder's roster or deny list, so a peer
+/// check during a vault sync (the deny list reads `Ok(None)` while a writer applies) or after a
+/// failed read uses the one read before it, and refuses only while none was ever read.
+pub(crate) struct LastRead<T>(Mutex<Vec<(PathBuf, T)>>);
+
+impl<T: Clone> LastRead<T> {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    /// `fresh`, kept as `dir`'s answer, when this read gave one; otherwise the last one kept for
+    /// `dir`, and `None` while there is none.
+    pub(crate) fn keep(&self, dir: &Path, fresh: Option<T>) -> Option<T> {
+        let mut kept = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = kept.iter().position(|(folder, _)| folder == dir);
+        let Some(value) = fresh else {
+            return at.map(|at| kept[at].1.clone());
+        };
+        if let Some(at) = at {
+            kept.remove(at);
+        } else if kept.len() >= LAST_READ_FOLDERS {
+            kept.remove(0);
+        }
+        kept.push((dir.to_path_buf(), value.clone()));
+        Some(value)
+    }
+
+    /// The last answer kept for `dir`; `value`, kept as its answer, while there is none.
+    pub(crate) fn keep_unless_kept(&self, dir: &Path, value: T) -> T {
+        let mut kept = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, held)) = kept.iter().find(|(folder, _)| folder == dir) {
+            return held.clone();
+        }
+        if kept.len() >= LAST_READ_FOLDERS {
+            kept.remove(0);
+        }
+        kept.push((dir.to_path_buf(), value.clone()));
+        value
+    }
+}
+
+/// This vault's roster ([`aterm_secrets::client::swarm_roster_now`]), as [`roster_after`] keeps
+/// it for this process.
+pub(crate) fn roster_or_last(
+    paths: &aterm_secrets::client::Paths,
+) -> Option<Option<aterm_secrets::swarm_roster::SwarmRoster>> {
+    static LAST: LastRead<Option<aterm_secrets::swarm_roster::SwarmRoster>> = LastRead::new();
+    roster_after(
+        &LAST,
+        &paths.dir,
+        aterm_secrets::client::swarm_roster_now(paths),
+    )
+}
+
+/// The roster to check a peer by after `read`, a read of `dir`'s (`Some(None)`: no roster): a
+/// roster read now, kept in `last`; while a read gives none (`Ok(None)`: a vault sync applying,
+/// which saves `pending` ahead of its writes, or a vault that holds no roster entry) the last
+/// answer kept, and no roster, kept as the answer, while there was none; after a failed read the
+/// last answer kept, and `None` while there was none.
+///
+/// The roster is only ever checked for whom it denies, so keeping the last one through an
+/// `Ok(None)` never admits anyone it would not: a read that gives none never replaces a roster
+/// that names a removed Mac.
+pub(crate) fn roster_after(
+    last: &LastRead<Option<aterm_secrets::swarm_roster::SwarmRoster>>,
+    dir: &Path,
+    read: aterm_secrets::Result<Option<aterm_secrets::swarm_roster::SwarmRoster>>,
+) -> Option<Option<aterm_secrets::swarm_roster::SwarmRoster>> {
+    match read {
+        Ok(Some(roster)) => last.keep(dir, Some(Some(roster))),
+        Ok(None) => Some(last.keep_unless_kept(dir, None)),
+        Err(_) => last.keep(dir, None),
+    }
+}
+
+/// This vault's deny list ([`aterm_secrets::client::swarm_denied_nodes_now`]), as
+/// [`denied_after`] keeps it for this process.
+fn denied_or_last(paths: &aterm_secrets::client::Paths) -> Option<Vec<String>> {
+    static LAST: LastRead<Vec<String>> = LastRead::new();
+    denied_after(
+        &LAST,
+        &paths.dir,
+        aterm_secrets::client::swarm_denied_nodes_now(paths),
+    )
+}
+
+/// The deny list to add to the roster after `read`, a read of `dir`'s: a list read now, kept in
+/// `last`; while a read gives none the last one kept; and `None` after a failed read while none
+/// was.
+///
+/// `Ok(None)` with none read before adds nothing: the read gives it only where the vault holds no
+/// roster entry (while a writer applies, or a state that yields no list, such as a member the log
+/// admitted that holds no copy yet), so its list would come from the membership log alone, which
+/// [`verify_peer_against_local_log`] judges the peer by itself. A failed read could hide a roster
+/// entry's rows, so it refuses ([`roster_to_check`]).
+fn denied_after(
+    last: &LastRead<Vec<String>>,
+    dir: &Path,
+    read: aterm_secrets::Result<Option<Vec<String>>>,
+) -> Option<Vec<String>> {
+    match read {
+        Ok(Some(denied)) => last.keep(dir, Some(denied)),
+        Ok(None) => last.keep(dir, None).or_else(|| Some(Vec::new())),
+        Err(_) => last.keep(dir, None),
+    }
+}
+
+/// The roster a Commons peer is checked by: `roster` ([`roster_after`]) with `denied`
+/// ([`denied_after`]) added, whatever the roster read gave, so a node only the vault roster's
+/// `deny_nodes` removed is refused while the roster itself cannot be read. `None` (nothing to
+/// check here) where neither names anyone, and where neither was ever read: this device's
+/// membership records are unreadable, which every vault read refuses, and this exchange is how it
+/// recovers them
+/// (`unreadable_membership_recovery_preserves_control_but_never_reports_application_success`), so
+/// the peer is left to the membership log, as it always was.
+///
+/// # Errors
+/// The deny list failed to read, none was read before, and the roster was: the list could name
+/// this peer.
+fn roster_to_check(
+    roster: Option<Option<aterm_secrets::swarm_roster::SwarmRoster>>,
+    denied: Option<Vec<String>>,
+) -> Result<Option<aterm_secrets::swarm_roster::SwarmRoster>> {
+    let Some(denied) = denied else {
+        return match roster {
+            None => Ok(None),
+            Some(_) => Err(Error::new("this device has not read its deny list yet")),
+        };
+    };
+    let mut roster = match roster.flatten() {
+        Some(roster) => roster,
+        None if denied.is_empty() => return Ok(None),
+        None => aterm_secrets::swarm_roster::SwarmRoster::default(),
+    };
+    roster.deny_nodes.extend(denied);
+    roster.canonicalize();
+    Ok(Some(roster))
+}
+
+/// Check the authenticated `peer_req` against this device's own membership log and
 /// roster. `peer_log` is the log its `ACX2` witness decoded to when [`authenticate`] checked it
 /// in this same round, so the witness is hashed and looked up once per round.
 fn verify_peer_against_local_log(
     paths: Option<&aterm_secrets::client::Paths>,
     trust: Trust,
-    actor: Actor,
-    hello: &[u8],
+    peer_req: &Request,
     peer_log: Option<&aterm_secrets::membership_log::Log>,
 ) -> Result<()> {
-    let peer_req = Request::decode(&hello[84..HELLO_FIXED]).map_err(failure)?;
+    let actor = peer_req.binding().actor();
     let Some(paths) = paths else {
         return Ok(());
     };
     let recipient = peer_req.binding().recipient();
-    let roster = aterm_secrets::client::swarm_roster_now(paths)
-        .ok()
-        .flatten()
-        .map(|mut r| {
-            if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes_now(paths) {
-                r.deny_nodes.extend(denied);
-                r.canonicalize();
-            }
-            r
-        });
+    // A roster or deny list this device fails to read now is the last one it read
+    // (`roster_after`, `denied_after`); the deny list is checked even while no roster is.
+    let roster = roster_to_check(roster_or_last(paths), denied_or_last(paths))?;
     if let Some(ref roster) = roster
         && crate::table::binding_denied_in_roster(roster, peer_req.binding())
     {
@@ -1659,8 +1799,15 @@ fn check_witness(trust: Trust, request: &Request, wire: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The peer actor `hello` proves on this channel, and the membership log its `ACX2` witness decoded
-/// to (none for `ACX1`).
+/// The identity and request verified on this channel, with the decoded `ACX2` witness.
+struct AuthenticatedPeer {
+    actor: Actor,
+    request: Request,
+    log: Option<Arc<aterm_secrets::membership_log::Log>>,
+}
+
+/// Verify `hello`, retaining its signed request for the local policy checks instead of
+/// decoding and verifying the same immutable bytes again.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1722,7 +1869,7 @@ fn authenticate(
     own: Actor,
     proof: Option<&NodeProof>,
     hello: &[u8],
-) -> Result<(Actor, Option<Arc<aterm_secrets::membership_log::Log>>)> {
+) -> Result<AuthenticatedPeer> {
     if hello.len() <= HELLO_FIXED
         || hello[4..20] != trust.network
         || hello[20..52] != trust.authority
@@ -1737,7 +1884,11 @@ fn authenticate(
             }
             let request = Request::decode(&hello[84..HELLO_FIXED]).map_err(failure)?;
             check_witness(trust, &request, &hello[HELLO_FIXED..])?;
-            Ok((authenticate_identity(own, proof, &request)?, None))
+            Ok(AuthenticatedPeer {
+                actor: authenticate_identity(own, proof, &request)?,
+                request,
+                log: None,
+            })
         }
         b"ACX2" => {
             if hello.len() > MAX_ACX2_HELLO {
@@ -1745,7 +1896,11 @@ fn authenticate(
             }
             let request = Request::decode(&hello[84..HELLO_FIXED]).map_err(failure)?;
             let log = check_log_witness(trust, &request, &hello[HELLO_FIXED..])?;
-            Ok((authenticate_identity(own, proof, &request)?, Some(log)))
+            Ok(AuthenticatedPeer {
+                actor: authenticate_identity(own, proof, &request)?,
+                request,
+                log: Some(log),
+            })
         }
         _ => Err(Error::new("Commons peer protocol or trust pins differ")),
     }

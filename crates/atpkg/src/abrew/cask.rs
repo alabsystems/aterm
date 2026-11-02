@@ -1490,6 +1490,284 @@ fn artifact_paths(
     Ok(paths)
 }
 
+fn link_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source, target);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlinks are not supported",
+        ))
+    }
+}
+
+/// One symlink-installed cask artifact (brew's `Symlinked`
+/// kinds: binaries, command wrappers, manpages, completions).
+pub(super) struct CaskLink {
+    pub(super) source: PathBuf,
+    pub(super) target: PathBuf,
+    english: &'static str,
+}
+
+/// The cask's linkable artifacts staged at `version`.
+pub(super) fn linkable_artifacts(
+    prefix: &Prefix,
+    cask: &Cask,
+    version: &str,
+) -> Result<Vec<CaskLink>, InstallError> {
+    let paths = artifact_paths(prefix, cask)?;
+    let staged = prefix.cask_dir(&cask.token, version);
+    let mut out = Vec::new();
+    for (artifact, (relative, target, _, _)) in cask.artifacts.iter().zip(paths) {
+        let english = match artifact {
+            Artifact::Binary(..) => "Binary",
+            Artifact::Wrapper(..) => "Command Wrapper",
+            Artifact::Manpage(..) => "Manpage",
+            Artifact::Library(_, _, dir) if dir == "share/bash-completion/completions" => {
+                "Bash Completion"
+            }
+            Artifact::Library(_, _, dir) if dir == "share/zsh/site-functions" => "Zsh Completion",
+            Artifact::Library(_, _, dir) if dir == "share/fish/vendor_completions.d" => {
+                "Fish Completion"
+            }
+            _ => continue,
+        };
+        out.push(CaskLink {
+            source: staged.join(&relative),
+            target,
+            english,
+        });
+    }
+    Ok(out)
+}
+
+fn target_links_to_source(target: &Path, source: &Path) -> bool {
+    if !target
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return false;
+    }
+    if std::fs::read_link(target).is_ok_and(|read| read == source) {
+        return true;
+    }
+    std::fs::canonicalize(target).ok() == std::fs::canonicalize(source).ok()
+}
+
+/// The target is a symlink into the same-named formula's keg.
+fn conflicting_formula(prefix: &Prefix, token: &str, target: &Path) -> bool {
+    if !target
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return false;
+    }
+    let resolved = target
+        .parent()
+        .zip(std::fs::read_link(target).ok())
+        .map(|(dir, read)| dir.join(read));
+    resolved.is_some_and(|path| path.starts_with(prefix.cellar().join(token)))
+}
+
+enum LinkAction {
+    Link,
+    Overwrite,
+    AlreadyLinked,
+    SkipFormula,
+    Conflict,
+}
+
+fn link_action(
+    prefix: &Prefix,
+    token: &str,
+    item: &CaskLink,
+    force: bool,
+    overwrite: bool,
+) -> LinkAction {
+    if !item.target.exists() {
+        return LinkAction::Link;
+    }
+    let same_cask = target_links_to_source(&item.target, &item.source)
+        || std::fs::canonicalize(&item.target)
+            .is_ok_and(|p| p.starts_with(prefix.caskroom().join(token)));
+    if overwrite || (force && item.target.is_symlink() && same_cask) {
+        LinkAction::Overwrite
+    } else if target_links_to_source(&item.target, &item.source) {
+        LinkAction::AlreadyLinked
+    } else if conflicting_formula(prefix, token, &item.target) {
+        LinkAction::SkipFormula
+    } else {
+        LinkAction::Conflict
+    }
+}
+
+fn english_article(english: &str) -> &'static str {
+    if english
+        .chars()
+        .next()
+        .is_some_and(|c| "aeiou".contains(c.to_ascii_lowercase()))
+    {
+        "an"
+    } else {
+        "a"
+    }
+}
+
+/// `brew link --cask`: pre-check conflicts the way brew does,
+/// then link each artifact with brew's lines.
+pub(super) fn link_cask(
+    prefix: &Prefix,
+    token: &str,
+    items: &[CaskLink],
+    force: bool,
+    overwrite: bool,
+    dry_run: bool,
+) -> Result<(), InstallError> {
+    if let Some(item) = items.iter().find(|item| {
+        matches!(
+            link_action(prefix, token, item, force, overwrite),
+            LinkAction::Conflict
+        )
+    }) {
+        return Err(InstallError::Failed(format!(
+            "Error: Could not link {token}: {} already exists.\nTo force the link and overwrite all conflicting files:\n  brew link --cask --overwrite {token}",
+            item.target.display()
+        )));
+    }
+    if dry_run {
+        println!(
+            "{}",
+            if overwrite {
+                "Would remove:"
+            } else {
+                "Would link:"
+            }
+        );
+    }
+    for item in items {
+        let base = item
+            .source
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let message = format!(
+            "It seems there is already {} {} at '{}'",
+            english_article(item.english),
+            item.english,
+            item.target.display()
+        );
+        match link_action(prefix, token, item, force, overwrite) {
+            LinkAction::Overwrite => {
+                if dry_run {
+                    println!("{}", item.target.display());
+                    continue;
+                }
+                super::tty::opoo!("Warning: {message}; overwriting.");
+                std::fs::remove_file(&item.target)
+                    .map_err(|e| format!("abrew: cannot remove {}: {e}", item.target.display()))?;
+            }
+            LinkAction::AlreadyLinked => {
+                if !dry_run {
+                    println!(
+                        "{}",
+                        super::tty::ohai(&format!(
+                            "{} '{base}' is already linked to '{}'",
+                            item.english,
+                            item.target.display()
+                        ))
+                    );
+                }
+                continue;
+            }
+            LinkAction::SkipFormula => {
+                super::tty::opoo!("Warning: {message} from formula {token}; skipping link.");
+                continue;
+            }
+            LinkAction::Conflict => {
+                return Err(InstallError::Failed(format!("Error: {message}.")));
+            }
+            LinkAction::Link => {}
+        }
+        if dry_run {
+            if !overwrite || item.target.is_symlink() {
+                println!("{}", item.target.display());
+            }
+            continue;
+        }
+        if !item.source.exists() {
+            return Err(InstallError::Failed(format!(
+                "Error: It seems the {} source '{}' is not there.",
+                item.english.to_ascii_lowercase(),
+                item.source.display()
+            )));
+        }
+        println!(
+            "{}",
+            super::tty::ohai(&format!(
+                "Linking {} '{base}' to '{}'",
+                item.english,
+                item.target.display()
+            ))
+        );
+        if let Some(parent) = item.target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("abrew: cannot create {}: {e}", parent.display()))?;
+        }
+        // brew creates the link with `ln --force`: a dangling
+        // symlink at the target is replaced.
+        if item.target.is_symlink() {
+            std::fs::remove_file(&item.target)
+                .map_err(|e| format!("abrew: cannot remove {}: {e}", item.target.display()))?;
+        }
+        link_file(&item.source, &item.target)
+            .map_err(|e| format!("abrew: cannot link {}: {e}", item.target.display()))?;
+    }
+    Ok(())
+}
+
+/// `brew unlink --cask`: remove prefix links that point at
+/// this cask's staged artifacts.
+pub(super) fn unlink_cask(
+    prefix: &Prefix,
+    token: &str,
+    items: &[CaskLink],
+    dry_run: bool,
+) -> Result<(), InstallError> {
+    if dry_run {
+        println!("Would remove:");
+    }
+    for item in items {
+        if !item
+            .target
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+            || conflicting_formula(prefix, token, &item.target)
+            || !target_links_to_source(&item.target, &item.source)
+        {
+            continue;
+        }
+        if dry_run {
+            println!("{}", item.target.display());
+            continue;
+        }
+        println!(
+            "{}",
+            super::tty::ohai(&format!(
+                "Unlinking {} '{}'",
+                item.english,
+                item.target.display()
+            ))
+        );
+        std::fs::remove_file(&item.target)
+            .map_err(|e| format!("abrew: cannot remove {}: {e}", item.target.display()))?;
+    }
+    Ok(())
+}
+
 /// Remove links into receipt-admitted versions and only those payloads.
 /// When the cask definition is known, its `uninstall` stanza's
 /// file-only directives run in brew's order: `trash:` before the
@@ -2295,6 +2573,50 @@ mod tests {
             zap(&prefix, "demo", &cask, false, false),
             Err(InstallError::Unsupported(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cask_link_round_trip_and_conflict_pre_scan() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        let staged = prefix.cask_dir("demo", "1");
+        std::fs::create_dir_all(staged.join("Demo.app")).unwrap();
+        std::fs::write(staged.join("demotool"), b"tool").unwrap();
+        let cask = Cask {
+            token: "demo".to_string(),
+            version: "1".to_string(),
+            artifacts: vec![
+                Artifact::App("Demo.app".to_string(), None),
+                Artifact::Binary("demotool".to_string(), None),
+            ],
+            ..Cask::default()
+        };
+        // Only the binary is linkable; the app never counts.
+        let items = linkable_artifacts(&prefix, &cask, "1").unwrap();
+        assert_eq!(items.len(), 1);
+        let target = items[0].target.clone();
+        link_cask(&prefix, "demo", &items, false, false, false).unwrap();
+        assert!(target.is_symlink());
+        // Already linked is a no-op success.
+        link_cask(&prefix, "demo", &items, false, false, false).unwrap();
+        unlink_cask(&prefix, "demo", &items, false).unwrap();
+        assert!(!target.exists() && !target.is_symlink());
+        // A regular file conflicts and the pre-scan mutates nothing.
+        std::fs::write(&target, b"mine").unwrap();
+        assert!(matches!(
+            link_cask(&prefix, "demo", &items, false, false, false),
+            Err(InstallError::Failed(m)) if m.contains("brew link --cask --overwrite demo")
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"mine");
+        // --overwrite replaces it; unlink never removes foreign files.
+        link_cask(&prefix, "demo", &items, false, true, false).unwrap();
+        assert!(target.is_symlink());
+        unlink_cask(&prefix, "demo", &items, false).unwrap();
+        std::fs::write(&target, b"mine").unwrap();
+        unlink_cask(&prefix, "demo", &items, false).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"mine");
     }
 
     /// Unix only: abrew tells a cask directory's identity only there

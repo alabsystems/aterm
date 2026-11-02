@@ -2949,7 +2949,7 @@ mod tests {
     /// retained values, bounded reads, a last will, a proof-of-possession attach, an
     /// exactly-once inbox, request/reply, barriers, presence, negotiated liveness and a
     /// producer's view of its own subject budget, a conditional retire, a tail told what
-    /// retention gave up, broker-stamped wall times (`bt=`), and attach-gated operator
+    /// retention gave up, broker-stamped wall times (`bt=`), and read-grant-gated operator
     /// `Stats` — rides on NINETEEN request tags and EIGHT response tags. This
     /// test is the budget: it enumerates every byte and fails if a twentieth request tag
     /// or a ninth response tag ever decodes, and it pins each tag's NUMBER, so a

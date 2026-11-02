@@ -2015,6 +2015,56 @@ fn gpu_client_time_fills_the_lanes_slots_in_text_and_json() {
     assert!(matches!(g.get("clients"), Some(Jv::Arr(rows)) if rows.len() == 1));
 }
 
+/// The net view prints the host's network place as it came: its words on a `place` line ahead
+/// of the counters, and its fields as the top-level `place` object of the JSON (nested objects
+/// kept), so `sys` cannot word the place apart from every other reporter. With no place the
+/// text has no `place` line and the JSON says it was not sampled.
+/// NEGATIVE CONTROL: dropping the `place` line from `net_text` fails the first assertion.
+#[test]
+fn sys_net_prints_the_hosts_network_place_as_it_came() {
+    use crate::model::{PlaceValue, PlaceView};
+    let w = world();
+    let mut s = snapshot();
+    let words = "words the host was handed";
+    s.place = Some(PlaceView {
+        line: words.to_owned(),
+        fields: vec![
+            ("state", PlaceValue::Text("remote".to_owned())),
+            ("expensive", PlaceValue::Flag(true)),
+            ("since_ms", PlaceValue::Count(42)),
+            ("gateway", PlaceValue::Absent("not_sampled")),
+            (
+                "internet",
+                PlaceValue::Object(vec![("state", PlaceValue::Text("path-up".to_owned()))]),
+            ),
+        ],
+    });
+    let c = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&query(View::Net, false), &c));
+    let place: Vec<&str> = text.lines().filter(|l| l.starts_with("place ")).collect();
+    assert_eq!(place.len(), 1, "{text}");
+    assert!(place[0].ends_with(words), "{text}");
+    for view in [View::Net, View::Global] {
+        let j = render_json(&query(view, true), &c);
+        assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+        let place = j.get("place").expect("place");
+        assert_eq!(place.get("state"), Some(&Jv::s("remote")));
+        assert_eq!(place.get("expensive"), Some(&Jv::Bool(true)));
+        assert_eq!(place.get("since_ms"), Some(&Jv::u(42)));
+        assert_eq!(place.get("gateway"), Some(&Jv::why("not_sampled")));
+        assert_eq!(
+            place.get("internet").and_then(|i| i.get("state")),
+            Some(&Jv::s("path-up"))
+        );
+    }
+    let bare = snapshot();
+    let c = ctx(&w, Some(&bare), true, true);
+    let text = all_text(&render_text(&query(View::Net, false), &c));
+    assert!(!text.lines().any(|l| l.starts_with("place ")), "{text}");
+    let j = render_json(&query(View::Net, true), &c);
+    assert_eq!(j.get("place"), Some(&Jv::why("not_sampled")));
+}
+
 #[test]
 fn sys_net_reports_links_rates_and_tcp_connections_in_both_shapes() {
     let s = snapshot();

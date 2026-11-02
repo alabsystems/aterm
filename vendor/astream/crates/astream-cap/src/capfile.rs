@@ -350,7 +350,9 @@ pub fn parse_text(path: &str, text: &str) -> Result<Vec<Line>, Malformed> {
 }
 
 /// Read a whole ring from the file at `path` — [`parse_text`] over its contents,
-/// with errors naming the path as [`Path::display`] shows it.
+/// with errors naming the path as [`Path::display`] shows it. This is a plain read: the
+/// secret-file rule below does not reach it, so a ring at 0644 is read, and a FIFO at
+/// `path` waits for a writer. Whoever keeps a ring keeps it private.
 ///
 /// # Errors
 /// [`ReadError::Io`] when the file cannot be read as UTF-8 text at all;

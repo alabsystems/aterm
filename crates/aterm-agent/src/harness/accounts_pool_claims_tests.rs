@@ -49,6 +49,14 @@ fn launch_claims_before_the_first_tap() {
     let pick = claims::with_table(t1.clone(), || {
         launch_env(&m1.seat(), Cli::Claude, &no_usage)
     });
+    if cfg!(not(unix)) {
+        // Off Unix no owner-only claim activity can be kept (`claims_activity::Held::take`), so
+        // the claim is unrecorded and a non-home lease is refused with no claim row written.
+        assert_eq!(pick, None);
+        assert!(m1.load(Cli::Claude).unrecorded);
+        assert_eq!(t1.row("aa01"), None);
+        return;
+    }
     assert_eq!(pick.expect("a pick").label, "main");
     let main = LeaseKey::new("claude", "main@example.test").expect("a key");
     let row = t1.row("aa01").expect("m1's launch wrote its row");
@@ -153,6 +161,27 @@ fn rotation_off_never_starts_on_a_pin_another_mac_holds() {
     let pick = claims::with_table(t1.clone(), || {
         super::super::launch_env(&m1.seat(), Cli::Claude, &no_usage)
     });
+    if cfg!(not(unix)) {
+        // Off Unix no owner-only claim activity can be kept (`claims_activity::Held::take`), so
+        // a non-home pin is refused until marked home, with no claim row written.
+        let why = pick.expect_err("off Unix a non-home pin's claim is unrecorded");
+        assert!(why.contains("cannot record a claim"), "{why}");
+        assert_eq!(t1.row("aa01"), None);
+        let mut note = None;
+        m1.seat()
+            .store(Cli::Claude)
+            .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
+                state.home_accounts.insert("work".to_owned());
+                Ok(Vec::new())
+            })
+            .expect("a home account");
+        let home_pick = claims::with_table(t1.clone(), || {
+            super::super::launch_env(&m1.seat(), Cli::Claude, &no_usage)
+        });
+        assert_eq!(home_pick.expect("a launch").expect("a pick").label, "work");
+        assert_eq!(t1.row("aa01"), None);
+        return;
+    }
     assert_eq!(pick.expect("a launch").expect("a pick").label, "work");
     let row = t1.row("aa01").expect("m1's launch wrote its row");
     assert_eq!(
@@ -218,6 +247,27 @@ fn cold_relaunch_claims_kept_row_and_moves_off_a_row_another_mac_holds() {
     let pick = claims::with_table(t1.clone(), || {
         cold_launch_env(&m1.seat(), Cli::Claude, &[], &no_usage, None)
     });
+    if cfg!(not(unix)) {
+        // Off Unix no owner-only claim activity can be kept (`claims_activity::Held::take`), so
+        // no claim row is written and cold relaunch moves only onto a home account.
+        assert_eq!(pick, None);
+        assert!(m1.load(Cli::Claude).unrecorded);
+        assert_eq!(t1.row("aa01"), None);
+        let mut note = None;
+        m1.seat()
+            .store(Cli::Claude)
+            .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
+                state.home_accounts.insert("work".to_owned());
+                Ok(Vec::new())
+            })
+            .expect("a home account");
+        let moved = claims::with_table(t1.clone(), || {
+            cold_launch_env(&m1.seat(), Cli::Claude, &[], &no_usage, None)
+        });
+        assert_eq!(moved.expect("moved onto home work").label, "work");
+        assert_eq!(t1.row("aa01"), None);
+        return;
+    }
     assert_eq!(
         pick, None,
         "main still serves, so the cold relaunch keeps it"

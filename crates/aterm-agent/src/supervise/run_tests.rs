@@ -534,6 +534,15 @@ struct PanelWorld {
     menu: bool,
     probes: Vec<PanelProbe>,
     shared: Arc<PanelShared>,
+    /// A write the program holds unread ([`Mock::unmoved_after_send`]): the composer it draws and
+    /// the cursor's column there, shown once the screen moves again ([`Mock::panel_late_draw`]).
+    late: Option<(Vec<String>, usize)>,
+    /// When, on the run's clock, a write held unread was drawn.
+    drawn_late_at: Option<Instant>,
+    /// This long after the first `send`, while the program still holds that write undrawn
+    /// ([`Self::late`]), its screen repaints once with nothing of the write shown: its last row
+    /// redrawn, as a footer is while the input stands unread ([`Mock::panel_late_repaint`]).
+    repaint_late_at: Option<Duration>,
 }
 
 impl PanelWorld {
@@ -562,6 +571,9 @@ impl PanelWorld {
             menu: false,
             probes: Vec::new(),
             shared: Arc::clone(shared),
+            late: None,
+            drawn_late_at: None,
+            repaint_late_at: None,
         }
     }
 }
@@ -2172,6 +2184,7 @@ impl Mock {
         if self.exiting() {
             return err("exited");
         }
+        self.panel_late_draw();
         let asked = tail
             .iter()
             .position(|a| *a == "timeout")
@@ -2242,8 +2255,58 @@ impl Mock {
             typed.truncate(bottom + 1);
             typed.extend(measured[under + 1..].iter().cloned());
         }
-        self.cursor_col = Some(2 + body.chars().count());
+        let col = 2 + body.chars().count();
+        if self.unmoved_for().is_some() {
+            // The program holds the write unread: drawn once its screen moves again.
+            if let Some(p) = self.panel.as_mut() {
+                p.late = Some((typed, col));
+            }
+            return;
+        }
+        self.cursor_col = Some(col);
         self.panel_show(typed);
+    }
+
+    /// A write the program held unread ([`PanelWorld::late`]), drawn once the screen it stood on
+    /// moves again ([`Self::unmoved_for`]).
+    fn panel_late_draw(&mut self) {
+        self.panel_late_repaint();
+        if self.unmoved_for().is_some() {
+            return;
+        }
+        let Some((rows, col)) = self.panel.as_mut().and_then(|p| p.late.take()) else {
+            return;
+        };
+        let now = run_now(self.waits.as_deref());
+        if let Some(p) = self.panel.as_mut() {
+            p.drawn_late_at = Some(now);
+        }
+        self.cursor_col = Some(col);
+        self.panel_show(rows);
+    }
+
+    /// The screen a write held unread stands on, repainted once with nothing of it drawn
+    /// ([`PanelWorld::repaint_late_at`]): the screen moves, the composer still empty.
+    fn panel_late_repaint(&mut self) {
+        let due = self
+            .panel
+            .as_ref()
+            .filter(|p| p.late.is_some())
+            .and_then(|p| p.repaint_late_at);
+        let Some((at, sent)) = due.zip(self.first_send_at) else {
+            return;
+        };
+        if run_since(self.waits.as_deref(), sent) < at {
+            return;
+        }
+        if let Some(p) = self.panel.as_mut() {
+            p.repaint_late_at = None;
+        }
+        let mut rows = self.screens[self.screens.len() - 1].clone();
+        if let Some(row) = rows.iter_mut().rev().find(|r| !r.trim().is_empty()) {
+            row.push(' ');
+        }
+        self.panel_show(rows);
     }
 
     fn panel_key(&mut self, key: &str) {
@@ -2665,6 +2728,7 @@ impl Mock {
                 {
                     p.quiet = false;
                 }
+                self.panel_late_draw();
                 if self.panel_read() {
                     return Ok(closed());
                 }

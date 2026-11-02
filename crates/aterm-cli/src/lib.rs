@@ -1710,6 +1710,7 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
             spotlight: spotlight.and_then(join),
             services: services.and_then(join),
             shim_cache: reads("services:").then(shim_cache_fact).flatten(),
+            network: reads("network:").then(network_fact).flatten(),
             program_check,
             ..MachineFacts::absent()
         };
@@ -1822,6 +1823,9 @@ struct MachineFacts {
     services: Option<Result<aterm_uds::services::Reading, String>>,
     /// macOS: the cache root plain `targo` builds in ([`shim_cache_fact`]).
     shim_cache: Option<std::path::PathBuf>,
+    /// Unix: this Mac's network place in the words every reporter uses ([`network_fact`]):
+    /// whether it is away from the ALab LAN, and the place's summary.
+    network: Option<(bool, String)>,
     /// macOS: whether aCaffiene keeps this Mac awake now ([`awake_fact`]).
     awake: Option<aterm_acaffiene::held::Held>,
 }
@@ -1837,8 +1841,45 @@ impl MachineFacts {
             program_check: None,
             services: None,
             shim_cache: None,
+            network: None,
         }
     }
+}
+
+/// This Mac's network place for doctor's `network:` row: whether it is off the ALab LAN (on
+/// another network or offline: `aterm_netplace::words::off_the_alab_lan`; not while checking or
+/// with no fleet to learn a home from, which need no note), and
+/// `aterm_netplace::words::summary`. None in a unit test (the state root and route are the
+/// person's), off Unix, or with no state directory.
+fn network_fact() -> Option<(bool, String)> {
+    #[cfg(all(unix, not(test)))]
+    {
+        let place = aterm_netplace::read(&aterm_types::dirs::state_dir()?);
+        Some((
+            aterm_netplace::words::off_the_alab_lan(&place),
+            aterm_netplace::words::summary(&place, &aterm_netplace::words::Words::now()),
+        ))
+    }
+    #[cfg(not(all(unix, not(test))))]
+    {
+        None
+    }
+}
+
+/// Doctor's `network:` row: the place's summary, a note anywhere but the ALab LAN (being
+/// elsewhere needs nobody; it says why the fleet does not answer).
+fn network_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
+    facts
+        .network
+        .as_ref()
+        .map(|(away, summary)| DoctorRow {
+            label: "network:",
+            mark: if *away { Mark::Note } else { Mark::Ok },
+            fact: summary.clone(),
+            unmeasured: false,
+        })
+        .into_iter()
+        .collect()
 }
 
 /// macOS: whether aCaffiene keeps this Mac awake now, as macOS lists its assertion
@@ -3354,6 +3395,7 @@ fn doctor_rows(
     checks.extend(spotlight_rows(machine));
     checks.extend(program_check_rows(machine));
     checks.extend(services_rows(machine));
+    checks.extend(network_rows(machine));
     checks.extend(awake_rows(machine));
     checks.extend(console_host_rows(machine));
     let (instances_mark, instances_fact) = instances_row(instances);
@@ -4175,6 +4217,50 @@ mod tests {
             unreached: Vec::new(),
             programs: Vec::new(),
         })
+    }
+
+    /// Doctor's `network:` row is the place's summary as it came, a note away from the ALab LAN
+    /// and ok on it, and being away needs nobody: the plan's outcome for it is no failure and
+    /// the brief report stays healthy.
+    /// NEGATIVE CONTROL: leaving `network_rows` out of `doctor_rows` drops the row, and this test
+    /// fails at "the place's row".
+    #[test]
+    fn doctor_names_where_this_mac_is_on_the_network_and_away_needs_nobody() {
+        let row_of = |away: bool| {
+            let machine = MachineFacts {
+                network: Some((away, "remote (phone hotspot) since 08:00".to_owned())),
+                ..MachineFacts::absent()
+            };
+            super::doctor_rows(
+                "/bin/sh",
+                ShellCheck::Runs,
+                None,
+                &unmeasured(),
+                &no_debugger(),
+                &no_devtools(),
+                &Err("not read".to_owned()),
+                &no_recovery(),
+                &no_exceptions(),
+                &machine,
+            )
+            .into_iter()
+            .find(|row| row.label == "network:")
+        };
+        let away = row_of(true).expect("the place's row");
+        assert_eq!(
+            (away.mark, away.fact.as_str()),
+            (Mark::Note, "remote (phone hotspot) since 08:00")
+        );
+        assert_eq!(row_of(false).map(|row| row.mark), Some(Mark::Ok));
+        assert!(super::doctor::names("base.machine.network"));
+        let gathered = super::doctor::Gathered::of_facts(&[
+            ("shell:", Mark::Ok, "/bin/zsh (executable)"),
+            ("network:", Mark::Note, "remote (phone hotspot) since 08:00"),
+        ]);
+        let rows = gathered.plan();
+        let readiness = aterm_converge::Readiness::of(&rows, &[]);
+        let text = super::doctor::render_brief(&gathered, &rows, &[], &readiness, &[]);
+        assert!(text.starts_with("aterm doctor: healthy"), "{text}");
     }
 
     #[test]
@@ -6650,6 +6736,7 @@ mod tests {
             program_check: None,
             services: None,
             shim_cache: None,
+            network: None,
             awake: None,
         };
         let report = |d: &DevtoolsFacts| {

@@ -29,7 +29,7 @@ pub enum Setting {
     Desktop = 3,
     /// Desktop, Stage Manager, and Notification Center widgets.
     Widgets = 4,
-    /// Dock pins, extras, recent applications and minimization.
+    /// Dock auto-hide, pins, extras, recent applications and minimization.
     Dock = 5,
     /// Durable Messages account sign-out.
     Messages = 6,
@@ -82,7 +82,7 @@ impl Setting {
                 "Hide desktop and Stage Manager widgets; clear Notification Center widgets once aterm has Full Disk Access"
             }
             Self::Dock => {
-                "Dock: only aterm, System Settings and Safari; no stacks or recents; minimize into app icons"
+                "Dock: automatically hide; only aterm, System Settings and Safari; no stacks or recents; minimize into app icons"
             }
             Self::Messages => "Sign out of Messages",
             Self::FaceTime => "Sign out of FaceTime",

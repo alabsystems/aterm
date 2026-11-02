@@ -119,6 +119,18 @@ impl RemovedNote {
     }
 }
 
+/// What the Mac `label` could read while it was out (F21 rule 8), `names` as `[audience] name`,
+/// as a line a person reads: "m40 could read [everyone] deploy-key, [everyone] shared: written
+/// while it was out; rotate them where they came from". `None` where it could read nothing new.
+fn could_read_line(label: &str, names: &[String]) -> Option<String> {
+    (!names.is_empty()).then(|| {
+        format!(
+            "{label} could read {}: written while it was out; rotate them where they came from",
+            names.join(", ")
+        )
+    })
+}
+
 /// Every Mac the log removed, by its age recipient (bech32), by its writer key, and by its fleet
 /// node key, so a removed Mac that asks again under a new device key with the same machine key,
 /// a new machine key with the same writer key, or a fresh secrets identity with its existing
@@ -954,6 +966,25 @@ pub fn removed_notes(paths: &Paths) -> crate::Result<RemovedNotes> {
     Ok(notes_of(log))
 }
 
+/// Each removed Mac's [`Log::read_after_cutoff_in`] names over `opened`, as `[audience] name`.
+fn reads_after_cutoff(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+) -> BTreeMap<MemberId, Vec<String>> {
+    log.membership()
+        .removed()
+        .keys()
+        .map(|actor| {
+            let names = log
+                .read_after_cutoff_in(opened, actor)
+                .into_iter()
+                .map(|(audience, name)| format!("{} {name}", audience.header()))
+                .collect();
+            (*actor, names)
+        })
+        .collect()
+}
+
 pub(super) fn notes_of(log: &Log) -> RemovedNotes {
     let membership = log.membership();
     let is_active_member = |m: &crate::membership_log::Member| {
@@ -1221,6 +1252,118 @@ fn epoch_mark_file(paths: &Paths) -> PathBuf {
     paths.dir.join("epoch-tend")
 }
 
+/// F21 rule 8's journal record: what each removed Mac could read while it was out, as the last
+/// reseal on this Mac found it, one line per Mac (`<label>` then each `[audience] name`,
+/// tab-separated), never a value. A fact for later, read on demand by `aterm secrets status`;
+/// never an alert.
+fn read_after_cutoff_file(paths: &Paths) -> PathBuf {
+    paths.dir.join("read-after-cutoff")
+}
+
+/// Write [`read_after_cutoff_file`] from `log` as `identity` opens it after a reseal; with
+/// nothing to name, remove it.
+fn record_read_after_cutoff(paths: &Paths, log: &Log, identity: &Identity) -> crate::Result<()> {
+    let Some(opened) = log.open_audience_entries(identity)? else {
+        return Ok(());
+    };
+    let membership = log.membership();
+    let mut rows: Vec<String> = reads_after_cutoff(log, &opened)
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(actor, names)| {
+            std::iter::once(label_of(log, &membership, &actor))
+                .chain(names)
+                .map(|field| field.replace(['\t', '\n'], " "))
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect();
+    rows.sort();
+    let file = read_after_cutoff_file(paths);
+    if rows.is_empty() {
+        match std::fs::remove_file(&file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    } else {
+        fsx::write_atomic(&file, format!("{}\n", rows.join("\n")).as_bytes(), 0o600)?;
+        Ok(())
+    }
+}
+
+/// F21 rule 8's journal record on this Mac ([`read_after_cutoff_file`]), as lines a person reads:
+/// "m40 could read [everyone] shared: written while it was out; rotate them where they came
+/// from". Empty where no reseal here found anything to name.
+///
+/// # Errors
+/// The record exists and cannot be read.
+pub fn read_after_cutoff_lines(paths: &Paths) -> crate::Result<Vec<String>> {
+    let Some(bytes) = fsx::read_private(&read_after_cutoff_file(paths), 1 << 20)? else {
+        return Ok(Vec::new());
+    };
+    let text = String::from_utf8_lossy(bytes.as_slice()).into_owned();
+    Ok(text
+        .lines()
+        .filter_map(|row| {
+            let mut fields = row.split('\t');
+            let label = fields.next()?;
+            let names: Vec<String> = fields.map(str::to_owned).collect();
+            could_read_line(label, &names)
+        })
+        .collect())
+}
+
+/// F21 rule 7's waiting line for `aterm secrets status`: for each uncovered keyed epoch that a
+/// current member holds and this Mac cannot open, "3 writes m7 made while m40 was out wait for a
+/// Mac that holds their key", one per signer of its dependents (this Mac cannot read their
+/// names). Empty where this Mac waits on none.
+///
+/// # Errors
+/// The records file or this Mac's identity cannot be read, or a record addressed to it does not
+/// open.
+pub fn reseal_waits(paths: &Paths) -> crate::Result<Vec<String>> {
+    let Some(store) = trusted_store(paths)? else {
+        return Ok(Vec::new());
+    };
+    let Some(log) = store.log() else {
+        return Ok(Vec::new());
+    };
+    let Some(identity) = read_identity(paths)? else {
+        return Ok(Vec::new());
+    };
+    let Some(opened) = log.open_audience_entries(&identity)? else {
+        return Ok(Vec::new());
+    };
+    let membership = log.membership();
+    let mut lines = Vec::new();
+    for keyed in log.keyed_epochs() {
+        if keyed.covered
+            || opened.keyed_keys.contains_key(&keyed.epoch)
+            || !keyed.holders.iter().any(|h| membership.contains(h))
+        {
+            continue;
+        }
+        let minter = log.get(&keyed.epoch).map_or_else(
+            || "a Mac".to_owned(),
+            |r| label_of(log, &membership, r.actor()),
+        );
+        let mut by_signer: BTreeMap<MemberId, usize> = BTreeMap::new();
+        for dependent in &keyed.dependents {
+            if let Some(record) = log.get(dependent) {
+                *by_signer.entry(*record.actor()).or_default() += 1;
+            }
+        }
+        for (signer, n) in by_signer {
+            lines.push(format!(
+                "{n} {} {} made while {minter} was out wait for a Mac that holds their key",
+                if n == 1 { "write" } else { "writes" },
+                label_of(log, &membership, &signer),
+            ));
+        }
+    }
+    Ok(lines)
+}
+
 const EPOCH_RANK_DOMAIN: &[u8] = b"aterm/members/epoch-rank/1\0";
 
 /// [`tend_epochs_at`] at the wall clock, and what it signed posted to every server this Mac
@@ -1240,8 +1383,11 @@ pub fn tend_epochs(paths: &Paths) -> crate::Result<Vec<Record>> {
 /// ([`Log::rotation_due`]), the member ranked `k` among those that hold the newest epochs (by
 /// `SHA-256(domain ‖ actor ‖ the newest epochs)`) mints one higher epoch covering them once `k`
 /// [`log_entries::GAP_STEP_MS`] have passed since this Mac first saw them due, as wrap gaps are
-/// spread. It looks without the state lock and takes it only to sign. Returns the records it
-/// signed, already in this Mac's records.
+/// spread. F21's reseal (rule 5) runs the same way: where an audience has an uncovered keyed epoch,
+/// its holders join the ranked Macs, the signers of its dependents first, and its id joins the
+/// key; a ranked Mac that cannot open every epoch involved signs nothing, and the next rank acts.
+/// It looks without the state lock and takes it only to sign. Returns the records it signed,
+/// already in this Mac's records.
 ///
 /// # Errors
 /// Local state cannot be read or written, or a record fails to open or sign.
@@ -1289,39 +1435,26 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
     let Some(opened) = log.open_audience_entries(&identity)? else {
         return Ok(Vec::new());
     };
-    let mut newest: Vec<RecordId> = [EpochAudience::Everyone, EpochAudience::Commons]
+    let audiences: Vec<EpochAudience> = [EpochAudience::Everyone, EpochAudience::Commons]
         .into_iter()
         .chain(hosts_due.into_iter().map(EpochAudience::Hosts))
-        .flat_map(|aud| opened.maximal_epochs.get(&aud).cloned().unwrap_or_default())
         .collect();
-    newest.sort_unstable();
-    let key = Sha256::digest(newest.concat());
-    let membership = log.membership();
-    let mut holders: Vec<([u8; 32], MemberId)> = membership
-        .members()
+    // §3.3.7's coverage rule, apart from F21 rule 5's reseal: only then do the Macs that hold a
+    // newest epoch but no uncovered keyed one take ranks. A host list due with no uncovered keyed
+    // epoch of its own is due by the coverage rule.
+    let coverage = log.coverage_due(&me_recipient, &active)
+        || audiences.iter().any(|aud| {
+            matches!(aud, EpochAudience::Hosts(_)) && !opened.uncovered_keyed.contains_key(aud)
+        });
+    let TendRanks {
+        key,
+        uncovered,
+        order,
+    } = tend_ranks(log, &opened, &audiences, &active, coverage);
+    let rank = order
         .iter()
-        .filter(|(actor, m)| {
-            active.contains(&m.binding.recipient())
-                && !log.audience_left_out(&EpochAudience::Everyone, actor)
-                && newest.iter().any(|id| {
-                    opened
-                        .wrapped_recipients
-                        .get(id)
-                        .is_some_and(|set| set.contains(&m.binding.recipient()))
-                })
-        })
-        .map(|(actor, _)| {
-            let mut buf = EPOCH_RANK_DOMAIN.to_vec();
-            buf.extend_from_slice(actor);
-            buf.extend_from_slice(&key);
-            (Sha256::digest(&buf), *actor)
-        })
-        .collect();
-    holders.sort();
-    let rank = holders
-        .iter()
-        .position(|(_, actor)| *actor == me)
-        .unwrap_or(holders.len());
+        .position(|actor| *actor == me)
+        .unwrap_or(order.len());
     let first = read_epoch_mark(paths)
         .filter(|(seen, _)| *seen == key)
         .map_or(now_ms, |(_, at)| at.min(now_ms));
@@ -1368,6 +1501,7 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
                     &author,
                     &active,
                     &mut minted,
+                    true,
                 )?;
             }
             log_entries::rotate_host_lists(
@@ -1383,8 +1517,99 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
     })?;
     if !minted.is_empty() {
         let _ = std::fs::remove_file(epoch_mark_file(paths));
+        // F21 rule 8: a reseal of an uncovered keyed epoch records what each removed Mac could
+        // read while it was out, for a person to rotate at its provider.
+        if !uncovered.is_empty()
+            && let Some(store) = trusted_store(paths)?
+            && let Some(log) = store.log()
+        {
+            record_read_after_cutoff(paths, log, &identity)?;
+        }
     }
     Ok(minted)
+}
+
+/// Who acts first on a tend ([`tend_ranks`]): the rank key, the uncovered keyed epochs in it, and
+/// the members ranked, first to act first.
+pub(super) struct TendRanks {
+    /// `SHA-256` of the newest epochs of the audiences tended, then their uncovered keyed epochs.
+    pub(super) key: [u8; 32],
+    /// The uncovered keyed epochs (F21 rule 4) of those audiences a current member holds.
+    pub(super) uncovered: Vec<RecordId>,
+    /// The members ranked: the active members not left out of `[everyone]` that hold one of
+    /// `uncovered` (F21 rule 5), and where `coverage` (§3.3.7's rule is due too) those that hold
+    /// a newest epoch there; the signers of `uncovered`'s dependents first, then by
+    /// `SHA-256(EPOCH_RANK_DOMAIN ‖ actor ‖ key)`.
+    pub(super) order: Vec<MemberId>,
+}
+
+/// The ranks of a tend of `audiences` on `log` as `opened` reads it, among `active`. A Mac that
+/// holds no key of an uncovered keyed epoch never takes a rank a reseal alone made: it could not
+/// reseal, and each rank ahead of the first holder delays the reseal one `GAP_STEP_MS`.
+pub(super) fn tend_ranks(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    audiences: &[EpochAudience],
+    active: &BTreeSet<Recipient>,
+    coverage: bool,
+) -> TendRanks {
+    let mut newest: Vec<RecordId> = audiences
+        .iter()
+        .flat_map(|aud| opened.maximal_epochs.get(aud).cloned().unwrap_or_default())
+        .collect();
+    newest.sort_unstable();
+    // F21 rule 5: the uncovered keyed epochs of those audiences join the rank key, and their
+    // holders the Macs ranked, the signers of their dependents first.
+    let membership = log.membership();
+    let keyed: Vec<crate::membership_log::Keyed> = log
+        .keyed_epochs()
+        .into_iter()
+        .filter(|k| {
+            !k.covered
+                && audiences.contains(&k.audience)
+                && k.holders.iter().any(|h| membership.contains(h))
+        })
+        .collect();
+    let mut uncovered: Vec<RecordId> = keyed.iter().map(|k| k.epoch).collect();
+    uncovered.sort_unstable();
+    let keyed_holders: BTreeSet<MemberId> = keyed
+        .iter()
+        .flat_map(|k| k.holders.iter().copied())
+        .collect();
+    let signers: BTreeSet<MemberId> = keyed
+        .iter()
+        .flat_map(|k| k.dependents.iter())
+        .filter_map(|d| log.get(d).map(|r| *r.actor()))
+        .collect();
+    let key = Sha256::digest([newest.concat(), uncovered.concat()].concat());
+    let mut holders: Vec<(bool, [u8; 32], MemberId)> = membership
+        .members()
+        .iter()
+        .filter(|(actor, m)| {
+            active.contains(&m.binding.recipient())
+                && !log.audience_left_out(&EpochAudience::Everyone, actor)
+                && (keyed_holders.contains(*actor)
+                    || coverage
+                        && newest.iter().any(|id| {
+                            opened
+                                .wrapped_recipients
+                                .get(id)
+                                .is_some_and(|set| set.contains(&m.binding.recipient()))
+                        }))
+        })
+        .map(|(actor, _)| {
+            let mut buf = EPOCH_RANK_DOMAIN.to_vec();
+            buf.extend_from_slice(actor);
+            buf.extend_from_slice(&key);
+            (!signers.contains(actor), Sha256::digest(&buf), *actor)
+        })
+        .collect();
+    holders.sort();
+    TendRanks {
+        key,
+        uncovered,
+        order: holders.into_iter().map(|(_, _, actor)| actor).collect(),
+    }
 }
 
 fn read_epoch_mark(paths: &Paths) -> Option<([u8; 32], u64)> {
@@ -1398,6 +1623,28 @@ fn read_epoch_mark(paths: &Paths) -> Option<([u8; 32], u64)> {
         && at.bytes().all(|b| b.is_ascii_digit()))
     .then_some(())?;
     Some((out, at.parse().ok()?))
+}
+
+/// A person's `aterm members remove <who>` on this Mac, kept on this Mac: [`remove_member`] with
+/// nothing posted to a server and no envelope mirrored. The stand-in F8's lane removes with on one
+/// side of a split the lab holds itself (its Macs' subscribers would carry a post across), as
+/// [`test_put_everyone`] puts. Returns how many records it signed.
+///
+/// # Errors
+/// When this Mac's vault has no membership log or this Mac has no secrets identity, when `who`
+/// names no Mac to remove (or two), and when the records cannot be signed or committed.
+#[cfg(any(test, debug_assertions))]
+pub fn test_remove_unposted(paths: &Paths, who: &str) -> crate::Result<usize> {
+    if trusted_store(paths)?.is_none() {
+        return Err(Error::new("this Mac's vault has no membership log"));
+    }
+    let identity =
+        read_identity(paths)?.ok_or_else(|| Error::new("this Mac has no secrets identity"))?;
+    let (minted, _, report) = log_entries::author_and_commit_records(paths, |store| {
+        draft_removal(paths, store, &identity, Target::Word(who), false)
+    })?;
+    report?;
+    Ok(minted.len())
 }
 
 /// A member's write of the `[everyone]` entry `name` through the log, sealed under the one newest

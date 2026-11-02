@@ -18,11 +18,11 @@
 //! not time. The ARENA lanes ([`arena`]) open real
 //! windows and take minutes; they run only when named, and what they measure
 //! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
-//! ([`fabric`], [`restore_e2e`], [`aos`]) are headless but just as unjudgeable —
+//! ([`fabric`], [`restore_e2e`], [`aos`], [`commons`]) are headless but just as unjudgeable —
 //! their numbers are a disk's fsync, or a shared desk's scheduler, before they
 //! are aterm's — so they too run only when named and report MEASURED (fabric
 //! writing a ledger entry under `docs/measured/fabric/`, restore-e2e one under
-//! `docs/measured/restore/`, aos a summary, and its JSON with `--json-out`).
+//! `docs/measured/restore/`, aos and commons-quiet a summary, and JSON with `--json-out`).
 //!
 //! `--no-windows` (the house switch for an agent sharing the owner's desktop)
 //! turns every lane that opens a window into a named skip and runs the rest.
@@ -42,6 +42,8 @@ mod aos;
 pub(crate) mod arena;
 #[cfg(unix)]
 mod bench_build;
+#[cfg(unix)]
+mod commons;
 mod deck;
 mod driver;
 #[cfg(unix)]
@@ -123,6 +125,7 @@ pub(crate) enum Lane {
     Fabric,
     RestoreE2e,
     Aos,
+    CommonsQuiet,
 }
 
 /// Which kind of lane, and so whether a bare run includes it.
@@ -138,7 +141,7 @@ pub(crate) enum Kind {
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 22] = [
+    pub(crate) const ALL: [Lane; 23] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
@@ -161,6 +164,7 @@ impl Lane {
         Lane::Fabric,
         Lane::RestoreE2e,
         Lane::Aos,
+        Lane::CommonsQuiet,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -187,6 +191,7 @@ impl Lane {
             Lane::Fabric => "fabric",
             Lane::RestoreE2e => "restore-e2e",
             Lane::Aos => "aos",
+            Lane::CommonsQuiet => "commons-quiet",
         }
     }
 
@@ -207,7 +212,7 @@ impl Lane {
             | Lane::Wasm
             | Lane::VteEngine => Kind::Floor,
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => Kind::Arena,
-            Lane::Fabric | Lane::RestoreE2e | Lane::Aos => Kind::Measured,
+            Lane::Fabric | Lane::RestoreE2e | Lane::Aos | Lane::CommonsQuiet => Kind::Measured,
         }
     }
 
@@ -286,6 +291,9 @@ impl Lane {
                  on the engine, the unattached host and the attached host, checkpoint, event \
                  log, shadow replay and repair, warm and cold"
             }
+            Lane::CommonsQuiet => {
+                "process CPU per converged loopback Commons repair round, both peers together"
+            }
         }
     }
 
@@ -331,8 +339,8 @@ impl Lane {
                 "macOS on the M4 Max bench box (or --dev-smoke), targo (release build of aterm)"
             }
             Lane::Fabric => {
-                "unix, targo (builds aterm and its fabric_bench bench: test, or opt-test with \
-                 --profile opt)"
+                "unix, targo (builds aterm and its fabric_bench bench: test, opt-test with \
+                 --profile opt, or fabric-shipped with --profile shipped)"
             }
             Lane::RestoreE2e => {
                 "macOS, targo (builds aterm and its restore_bench bench: test, or opt-test with \
@@ -342,6 +350,7 @@ impl Lane {
                 "unix, targo (builds aterm-bench's aos_harness twice: release, and opt-test \
                  for the stranded repair); macOS for its instruction, fault and syscall counters"
             }
+            Lane::CommonsQuiet => "unix, targo (opt-test build of aterm-db's isolated repair test)",
         }
     }
 
@@ -476,6 +485,7 @@ const JSON_LANES: &[Lane] = &[
     Lane::Fabric,
     Lane::RestoreE2e,
     Lane::Aos,
+    Lane::CommonsQuiet,
 ];
 const BUILT_LANES: &[Lane] = &[Lane::Fabric, Lane::RestoreE2e];
 const GHOSTTY_LANES: &[Lane] = &[Lane::Cat, Lane::Vte];
@@ -540,7 +550,7 @@ const OPTIONS: &[OptSpec] = &[
         flag: "--json-out",
         value: Some("PATH"),
         lanes: JSON_LANES,
-        help: "write every raw sample and the summary as JSON",
+        help: "write measurements and provenance as JSON",
     },
     OptSpec {
         flag: "--allow-identical",
@@ -730,10 +740,11 @@ const OPTIONS: &[OptSpec] = &[
     },
     OptSpec {
         flag: "--profile",
-        value: Some("dev|opt"),
+        value: Some("dev|opt|shipped"),
         lanes: BUILT_LANES,
-        help: "the build measured: dev (default) or opt (cargo profile opt-test: opt-level 3, \
-               debug assertions on)",
+        help: "the build measured: dev (default), opt (cargo profile opt-test: opt-level 3, \
+               debug assertions on) or, on the fabric lane, shipped (cargo profile \
+               fabric-shipped with dev-seams: fat LTO, 1 codegen unit, debug assertions off)",
     },
     OptSpec {
         flag: "--sessions",
@@ -927,7 +938,7 @@ fn list() -> String {
             Kind::Measured => {
                 "MEASURED lanes (only when named; headless, real processes, minutes; measured, \
                  not judged: fabric writes a docs/measured/fabric entry, restore-e2e a \
-                 docs/measured/restore entry, aos prints a summary, and JSON with --json-out)\n"
+                 docs/measured/restore entry, aos and commons-quiet print a summary, and JSON with --json-out)\n"
             }
         });
         for lane in Lane::ALL.into_iter().filter(|l| l.kind() == kind) {
@@ -1113,6 +1124,13 @@ fn main(args: &[String]) -> ExitCode {
             #[cfg(not(unix))]
             Lane::Aos => LaneRun::skip(
                 "the aos lane spawns its harness through the unix process helpers",
+                "run it on macOS or Linux",
+            ),
+            #[cfg(unix)]
+            Lane::CommonsQuiet => commons::run(cli.options.get("--json-out").map(Path::new)),
+            #[cfg(not(unix))]
+            Lane::CommonsQuiet => LaneRun::skip(
+                "the Commons measurement uses unix process and loopback helpers",
                 "run it on macOS or Linux",
             ),
         };
@@ -1369,6 +1387,17 @@ mod tests {
     }
 
     #[test]
+    fn commons_quiet_is_an_explicit_measured_lane_with_one_json_destination() {
+        let cli = parse(&args("commons-quiet --json-out /tmp/commons.json")).unwrap();
+        assert_eq!(cli.lanes, [Lane::CommonsQuiet]);
+        assert_eq!(Lane::CommonsQuiet.kind(), Kind::Measured);
+        assert!(!Lane::CommonsQuiet.opens_windows());
+        assert!(!parse(&[]).unwrap().lanes.contains(&Lane::CommonsQuiet));
+        assert!(parse(&args("commons-quiet aos --json-out /tmp/out.json")).is_err());
+        assert!(parse(&args("commons-quiet --burst 9")).is_err());
+    }
+
+    #[test]
     fn list_names_every_lane_once_under_its_kind() {
         let listed = list();
         for lane in Lane::ALL {
@@ -1444,6 +1473,7 @@ mod tests {
         for line in [
             "restore-e2e --sessions 4,2",
             "restore-e2e --json-out /tmp/r.json",
+            "restore-e2e --profile shipped",
         ] {
             let cli = parse(&args(line)).expect(line);
             assert!(lane_args(&cli).is_err(), "{line}");

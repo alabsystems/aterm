@@ -2103,7 +2103,8 @@ mod tests {
         const NAME: &str = "holders::paths::tests::\
             a_child_that_execd_another_program_is_a_user_with_this_process_skipped";
         if std::env::var_os(PARK_ENV).is_some() {
-            println!("{PARKED}");
+            // Keep the readiness proof on its own line even after libtest's single-thread prefix.
+            println!("\n{PARKED}");
             let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
             return;
         }

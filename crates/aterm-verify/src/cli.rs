@@ -32,6 +32,8 @@ pub struct Args {
     /// every cell but this machine's own.
     pub cells: Vec<String>,
     pub no_windows: bool,
+    /// Only the GUI cursor-pacing burst, with no release-only AOS assertion.
+    pub cursor_pacing: bool,
     /// `--admit now|wait`: whether the run waits for room for the disk it will write, each stage
     /// for room for its memory, and its timed stages for a quiet machine (the default), or starts
     /// at once, saying what it lacks. Neither lifts the run's own memory budget
@@ -118,6 +120,7 @@ where
             "--fix" => a.fix = true,
             "--cell" => a.cells.push(value("--cell")?),
             "--no-windows" => a.no_windows = true,
+            "--cursor-pacing" => a.cursor_pacing = true,
             "--admit" => {
                 let v = value("--admit")?;
                 match aterm_capacity::Admit::parse(&v) {
@@ -195,6 +198,11 @@ where
     }
     if a.base.is_some() && (a.all || !a.packages.is_empty()) {
         return usage("--base picks the change cone's base; -p and --all replace the cone".into());
+    }
+    if a.cursor_pacing && (a.release || a.checks != [Check::Measure] || a.app.is_none()) {
+        return usage(
+            "--cursor-pacing requires only measure and --app; it cannot qualify a release".into(),
+        );
     }
     if a.release {
         if !a.packages.is_empty() || a.base.is_some() || !a.cells.is_empty() {
@@ -301,6 +309,7 @@ Options:
       --app <APP>         the release bundle `measure` judges
       --fix               with fmt alone: rewrite the files it finds unformatted
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
+      --cursor-pacing     with measure --app: run only the GUI pacing burst
       --no-windows        skip each stage that opens a window (a named skip)
       --admit <wait|now>  wait for room for the disk the run will write, for
                           each stage's memory before it starts (held until
@@ -459,5 +468,21 @@ mod tests {
             ok(&["test", "--admit", "now"]).admit,
             atpkg::admit_disk::Admit::Now
         );
+    }
+}
+
+#[cfg(test)]
+mod cursor_pacing_tests {
+    #[test]
+    fn focused_measurement_cannot_replace_release_qualification() {
+        let good = super::parse(["measure", "--app", "/test.app", "--cursor-pacing"]).unwrap();
+        assert!(good.cursor_pacing);
+        for bad in [
+            vec!["release", "--app", "/test.app", "--cursor-pacing"],
+            vec!["test", "--app", "/test.app", "--cursor-pacing"],
+            vec!["measure", "--cursor-pacing"],
+        ] {
+            assert!(super::parse(bad).is_err());
+        }
     }
 }

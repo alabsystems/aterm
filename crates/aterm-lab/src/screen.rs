@@ -105,29 +105,34 @@ pub fn editor_row(screen: &str) -> Option<String> {
 /// The first row of the composer on a screen `ctl text` gave.
 #[must_use]
 pub fn composer_row(agent: &str, screen: &str) -> Option<String> {
+    composer_at(agent, screen).map(|(_, row)| row)
+}
+
+/// [`composer_row`] with the screen row it stands on (the line of the screen `ctl text` gave, so
+/// the row a `ctl cell <row> <col>` read names).
+#[must_use]
+pub fn composer_at(agent: &str, screen: &str) -> Option<(usize, String)> {
     let rows: Vec<String> = screen
         .replace(NBSP, " ")
         .split('\n')
         .map(str::to_string)
         .collect();
+    let first = |(at, lines): (usize, Vec<String>)| Some((at, lines.into_iter().next()?));
     if agent == "muse" {
-        let (_, lines) = aterm_phase::muse::composer_draft(&rows)?;
-        return lines.into_iter().next();
+        return first(aterm_phase::muse::composer_draft(&rows)?);
     }
     if agent == "codex" {
         let at = rows.iter().rposition(|r| r.starts_with('›'))?;
         if rows[at + 1..].iter().any(|r| r.starts_with("  › ")) {
             return None;
         }
-        return Some(rows[at].trim_start_matches('›').trim().to_string());
+        return Some((at, rows[at].trim_start_matches('›').trim().to_string()));
     }
     if agent == "agy" {
-        let (_, lines) = aterm_phase::agy::composer_draft(&rows)?;
-        return lines.into_iter().next();
+        return first(aterm_phase::agy::composer_draft(&rows)?);
     }
     if agent == "kimi" {
-        let (_, lines) = aterm_phase::kimi::composer(&rows)?;
-        return lines.into_iter().next();
+        return first(aterm_phase::kimi::composer(&rows)?);
     }
     let idx: Vec<usize> = rows
         .iter()
@@ -144,7 +149,7 @@ pub fn composer_row(agent: &str, screen: &str) -> Option<String> {
         .cloned()
         .unwrap_or_default();
     let t = first.strip_prefix('❯').unwrap_or(&first);
-    Some(t.trim().to_string())
+    Some((top + 1, t.trim().to_string()))
 }
 
 /// The spinner's busy row (`✻ Verb… (Ns · …)`), if any.

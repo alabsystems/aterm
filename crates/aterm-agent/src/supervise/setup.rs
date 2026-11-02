@@ -124,6 +124,8 @@ pub struct SessionSetup {
     pub(super) occupancy_nudge_after: Duration,
     /// How many looks a due line of the door's stands untold before the loop says it ready-idle ([`crate::supervise::occupancy::due::K_LOOKS`]; a test shortens it): read once, here, so a tape replays under the K it was recorded under, and one recorded before the K clock under [`crate::supervise::occupancy::due::K_NEVER`].
     pub(super) occupancy_k_looks: i64,
+    /// Whether the door's `wait-nudge` names `wake` (`templates::WAKE`): true in every live loop, and false on a tape whose header has no `occupancy.nudge_wake` row, which a build before the nudge named it recorded, so its replay types the nudge that build typed.
+    pub(super) occupancy_nudge_wake: bool,
 }
 
 impl SessionSetup {
@@ -165,6 +167,7 @@ impl SessionSetup {
                 rules::wait_nudge_after_ms().unsigned_abs(),
             ),
             occupancy_k_looks: due::K_LOOKS,
+            occupancy_nudge_wake: true,
         }
     }
 
@@ -243,6 +246,7 @@ impl SessionSetup {
             beside_idle_min,
             occupancy_nudge_after,
             occupancy_k_looks,
+            occupancy_nudge_wake,
         } = self;
         w.section("setup");
         w.opt_text("sid", sid.as_deref());
@@ -352,6 +356,7 @@ impl SessionSetup {
         w.duration("beside_idle_min", *beside_idle_min);
         w.duration("occupancy.nudge_after", *occupancy_nudge_after);
         w.shown("occupancy.k_looks", occupancy_k_looks);
+        w.shown("occupancy.nudge_wake", occupancy_nudge_wake);
         let ApprovalEnv {
             home,
             uid,
@@ -496,6 +501,10 @@ impl SessionSetup {
         // was ever said ready-idle, so it replays under a K no line reaches.
         let occupancy_k_looks =
             r.or_shipped("occupancy.k_looks", due::K_NEVER, Reader::parsed::<i64>)?;
+        // A tape without the row was recorded before the nudge named `wake`: it typed slice 1's.
+        let occupancy_nudge_wake = r
+            .optional_parsed::<bool>("occupancy.nudge_wake")?
+            .unwrap_or(false);
         r.section("env");
         let approval_env = ApprovalEnv {
             home: r.opt_path("home", &VERBATIM)?,
@@ -536,6 +545,7 @@ impl SessionSetup {
             beside_idle_min,
             occupancy_nudge_after,
             occupancy_k_looks,
+            occupancy_nudge_wake,
         })
     }
 }

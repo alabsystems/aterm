@@ -44,6 +44,9 @@ mod log_wake_loop;
 #[path = "woken_turn_loop_tests.rs"]
 pub(super) mod woken_turn_loop;
 
+#[path = "probe_own_line_tests.rs"]
+mod probe_own_line;
+
 #[path = "point_key_loop_tests.rs"]
 mod point_key_loop;
 
@@ -10504,6 +10507,7 @@ fn a_reprinted_wall_is_not_sent_to_tomorrow_at_once() {
             true,
             false,
             false,
+            false,
             &frame(clock),
         );
         let now = s.now_unix();
@@ -10562,6 +10566,7 @@ fn a_bare_footer_does_not_bridge_different_named_reset_zones() {
                 aterm_phase::WallKind::UsageWeekly,
                 false,
                 reprinted,
+                false,
                 false,
                 false,
                 &frame,
@@ -11784,7 +11789,7 @@ fn an_undated_cancelled_limit_is_placed_within_a_session_window() {
     let mut placed = |text: &str, undated: bool| -> i64 {
         s.set_clock(TEST_NOW, PDT);
         s.wall_reset = None;
-        let _ = s.wall_reset_at(Some(text), kind, false, false, true, undated, &rows);
+        let _ = s.wall_reset_at(Some(text), kind, false, false, true, undated, false, &rows);
         s.wall_reset
             .as_ref()
             .and_then(|(_, u)| *u)
@@ -12036,6 +12041,7 @@ fn tier1_the_real_loop_remembers_a_hidden_wall_exactly_where_the_model_does() {
             ("Leaves", 0),
             ("OwnAct", 0),
             ("Tapped", 0),
+            ("Dialog", 0),
             ("Cap", 5),
             ("Skew", 3),
         ],
@@ -12472,7 +12478,7 @@ fn an_undated_clock_folded_across_a_change_is_the_morning_it_names() {
         s.set_clock(now, la_local(now).unwrap());
         s.set_local_lookup(la_local);
         s.wall_reset = None;
-        let _ = s.wall_reset_at(Some(text), kind, false, false, true, true, &[]);
+        let _ = s.wall_reset_at(Some(text), kind, false, false, true, true, false, &[]);
         assert_eq!(
             s.wall_reset.as_ref().and_then(|(_, u)| *u),
             Some(want),
@@ -13606,6 +13612,78 @@ fn the_dialog_canary_names_claude_codes_own_settings_panel() {
         assert_eq!(raised, [Exception::dialog()], "{renderer}");
         assert_eq!(typed, 0, "{renderer}: the canary types nothing");
     }
+}
+
+/// THE DIALOG CANARY NAMES CLAUDE CODE'S OWN `/login` (the measured 2.1.302 hand-off of
+/// 2026-10-31, which the canary called "a dialog this build does not read" for 33 h): `STUCK` and
+/// `STALLED` name the sign-in, no record of an unread screen reaches the host, and the third rung
+/// raises the sign-in's own words, in the digest's shape; the canary types nothing.
+#[test]
+fn the_dialog_canary_names_claude_codes_own_login() {
+    use super::super::wall_memory::{LOGIN_DIALOG, StuckRung, UNREAD_DIALOG};
+    use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
+    use crate::supervise::policy::exception::Exception;
+    use aterm_messages::need::{REASON_CAP, Reason, STEP_CAP, Step};
+    use aterm_phase::prompt::fixtures as fx;
+    for words in [Exception::login_dialog(), Exception::login_over_limit()] {
+        assert!(
+            words.why.chars().count() <= REASON_CAP
+                && Reason::new(&words.why).fault().is_none()
+                && words.action.chars().count() <= STEP_CAP
+                && Step::new(&words.action).fault().is_none(),
+            "the digest's words: {words:?}"
+        );
+    }
+    let rows = fx::screen(fx::LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302);
+    assert!(
+        aterm_phase::login_screen(&rows).is_some(),
+        "the reader names it"
+    );
+    let unit = Duration::from_secs(30 * 60);
+    let host = Arc::new(LadderHost::default());
+    let mut m = Mock::new(vec![busy_screen()]);
+    m.title = Some("✳ Claude Code".to_string());
+    m.program = "claude";
+    let mut s = session(&mut m, None);
+    s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+    s.set_fx(Fx::over(ClockSource::Virtual(Arc::new(VirtualClock::new(
+        Instant::now(),
+        1_790_000_000_000,
+    )))));
+    s.setup.stuck_after = unit;
+    let shown = Screen {
+        rows,
+        ..Screen::default()
+    };
+    let mut heard = Heard::default();
+    s.dialog_note(&shown, &mut heard);
+    for _ in 0..7 {
+        s.fx.sleep(unit / 3);
+        s.dialog_note(&shown, &mut heard);
+    }
+    let rung = s.stuck_rung;
+    drop(s);
+    assert_eq!(rung, StuckRung::Raised, "{:#?}", heard.noted);
+    let said: Vec<&String> = heard
+        .noted
+        .iter()
+        .filter(|l| l.starts_with("STUCK") || l.starts_with("STALLED"))
+        .collect();
+    assert!(
+        said.len() == 2
+            && said
+                .iter()
+                .all(|l| l.contains(LOGIN_DIALOG) && !l.contains(UNREAD_DIALOG)),
+        "STUCK and STALLED name the sign-in: {:#?}",
+        heard.noted
+    );
+    assert_eq!(*host.told.lock().unwrap(), ["exception:dialog"]);
+    assert_eq!(*host.raised.lock().unwrap(), [Exception::login_dialog()]);
+    let typed: usize = ["turn", "key", "send"]
+        .map(|verb| count(&m, verb))
+        .iter()
+        .sum();
+    assert_eq!(typed, 0, "the canary types nothing");
 }
 
 /// A host whose probe of the session's repository answers from a script
@@ -16766,6 +16844,613 @@ fn the_dialogs_cancel_is_one_fenced_esc() {
     assert!(pressed.is_empty(), "no key without its fence: {pressed:?}");
     let (pressed, _) = direct(login_expired(), true);
     assert!(pressed.is_empty(), "no dialog to cancel: {pressed:?}");
+}
+
+/// THE MEASURED HAND-OFF OF A PERSON'S OWN `/login` OVER A WEEKLY LIMIT (2.1.302, 2026-10-31), IN
+/// THE LOOP: the loop takes the tab over with the dialog standing, its predecessor's ledger
+/// holding the weekly wall it waited on (the panel draws no notice of its own). An hour before
+/// the reset the tab waits for the reset and its grace, no limit told as unhandled (`limited:`)
+/// and nothing pressed; an hour past it, the dialog's last key two hours old, one Esc fenced on
+/// the read, its person count and the panel's own `Esc to cancel` row closes it
+/// (`login-over-limit@v1`). CONTROL: a key of the person's a minute old holds the Esc.
+#[test]
+fn a_persons_login_over_a_weekly_limit_is_waited_out_then_closed_with_one_fenced_esc() {
+    use crate::supervise::approvals::{self, Outcome, Row};
+    const NOTICE: &str =
+        "You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)";
+    // 2026-10-31 00:00 PDT, the reset the notice names; the wall waited on from 22:00 PDT.
+    const RESET: i64 = 1_793_430_000;
+    let dialog = aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302,
+    );
+    let waited = Row {
+        rule_id: approvals::RULE_WALL_WAIT,
+        outcome: Outcome::Waiting,
+        command: "",
+        reason: &approvals::wall_wait_reason(
+            Some(RESET),
+            Some("Oct 31 at 12am (America/Los_Angeles)"),
+            aterm_phase::WallKind::UsageWeekly,
+            NOTICE,
+        ),
+        box_seq: 100,
+    }
+    .to_json((RESET - 2 * 3600) * 1000, None);
+    // `human`: the age of the person's last key in ms, as `status` and every read report it.
+    let run = |tag: &str, clock: i64, human: &'static str| {
+        let (dir, path) = journal_file(tag);
+        let ledger = dir.join("s-1.jsonl");
+        std::fs::write(&ledger, format!("{waited}\n")).expect("the ledger");
+        let mut m = fenced(vec![dialog.clone()]);
+        m.vanish_after = Some(6);
+        m.human = vec![human];
+        m.human_ms = human.parse().ok();
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..hosted(30)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_clock(clock, PDT);
+            s.set_zone_lookup(test_zones);
+            s.set_approval_ledger(Some(ledger.clone()));
+        });
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let escs: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key ") && r.ends_with(" esc"))
+            .cloned()
+            .collect();
+        (m, lines, records, escs)
+    };
+    // 2026-10-30 23:00 PDT, an hour before the weekly reset.
+    let (m, lines, records, escs) = run("te-login-over-limit-before", 1_793_426_400, "7200000");
+    assert!(
+        escs.is_empty(),
+        "nothing pressed before the reset: {escs:?}"
+    );
+    assert_eq!(m.attention, None, "no limit told unhandled: {lines:#?}");
+    let waits: Vec<&str> = records
+        .iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.line.as_str())
+        .collect();
+    assert!(
+        waits
+            .iter()
+            .any(|l| l.contains("until=2026-10-31T07:02:30Z")),
+        "the reset and its grace are the wake: {waits:#?}\n{lines:#?}\n{:#?}",
+        m.requests
+    );
+    // 2026-10-31 01:00 PDT, an hour past it.
+    let (m, lines, records, escs) = run("te-login-over-limit-after", 1_793_433_600, "7200000");
+    assert_eq!(escs.len(), 1, "{lines:#?}\n{records:#?}\n{:#?}", m.requests);
+    assert!(
+        escs[0].contains("if-human=7 ")
+            && escs[0].contains(" if-gen=")
+            && escs[0].contains(" if=^\\x20{3}Esc\\x20to\\x20cancel"),
+        "fenced on the read and the panel's own row: {escs:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("TYPED ") && l.contains(" rule=login-over-limit@v1 esc at ")),
+        "{lines:#?}"
+    );
+    let (_, lines, _, escs) = run("te-login-over-limit-person", 1_793_433_600, "60000");
+    assert!(escs.is_empty(), "a key a minute old holds it: {lines:#?}");
+}
+
+/// One loop over the measured screens `screens` of a person's own `/login` over the weekly limit
+/// of 2026-10-31 (whose reset, 00:00 PDT, its predecessor's ledger names), from `clock` (unix
+/// seconds) for at most `max_s`, the person's last key `human` ms old on every read, each wait's
+/// step `step` of virtual time: the mock, its lines, its journal records and its Escs.
+fn over_weekly_limit(
+    tag: &str,
+    screens: Vec<Vec<String>>,
+    clock: i64,
+    human: &'static str,
+    max_s: u64,
+    step: Option<Duration>,
+) -> (
+    Mock,
+    Vec<String>,
+    Vec<crate::supervise::journal::JournalRecord>,
+    Vec<String>,
+) {
+    use crate::supervise::approvals::{self, Outcome, Row};
+    const NOTICE: &str =
+        "You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)";
+    const RESET: i64 = 1_793_430_000;
+    let waited = Row {
+        rule_id: approvals::RULE_WALL_WAIT,
+        outcome: Outcome::Waiting,
+        command: "",
+        reason: &approvals::wall_wait_reason(
+            Some(RESET),
+            Some("Oct 31 at 12am (America/Los_Angeles)"),
+            aterm_phase::WallKind::UsageWeekly,
+            NOTICE,
+        ),
+        box_seq: 100,
+    }
+    .to_json((RESET - 2 * 3600) * 1000, None);
+    let (dir, path) = journal_file(tag);
+    let ledger = dir.join("s-1.jsonl");
+    std::fs::write(&ledger, format!("{waited}\n")).expect("the ledger");
+    let mut m = fenced(screens);
+    m.vanish_after = Some(if step.is_some() { 900 } else { 6 });
+    m.stall_sleep = step;
+    m.human = vec![human];
+    m.human_ms = human.parse().ok();
+    let opts = SuperviseOpts {
+        journal: Some(path.clone()),
+        ..hosted(max_s)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_clock(clock, PDT);
+        s.set_zone_lookup(test_zones);
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    let (records, _) = journal_records(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    let escs: Vec<String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("key ") && r.ends_with(" esc"))
+        .cloned()
+        .collect();
+    (m, lines, records, escs)
+}
+
+/// Whether `records` hold a wait whose wake is the weekly reset of 2026-10-31 00:00 PDT and its
+/// grace (07:02:30Z), within the minute a drawn notice's jitter spreads it (`reset_jitter`).
+fn waits_for_the_reset(records: &[crate::supervise::journal::JournalRecord]) -> bool {
+    records.iter().any(|r| {
+        r.kind == "waiting"
+            && r.line
+                .split(" until=")
+                .nth(1)
+                .and_then(|l| l.split(' ').next())
+                .is_some_and(|until| {
+                    ("2026-10-31T07:02:30Z"..="2026-10-31T07:03:29Z").contains(&until)
+                })
+    })
+}
+
+/// Whether the loop set the badge that tells a limit as unhandled (`limited: <notice>`) at any
+/// time of its run: the watch's end clears whatever badge stands.
+fn told_limited(m: &Mock) -> bool {
+    m.requests
+        .iter()
+        .any(|r| r.starts_with("meta set attention") && r.contains(super::super::ATTENTION_PREFIX))
+}
+
+/// A PERSON'S OWN `/login` LEFT AT ITS METHOD PICKER OR ITS ERROR STATE OVER THE WEEKLY LIMIT, IN
+/// THE LOOP (the measured 2.1.310 picker and 2.1.303 error frames, drawn over the weekly limit by
+/// `login_over_weekly_limit`; the error state's words name no program, so the loop's first point
+/// reads `status` first): as at the hand-off, an hour
+/// before the reset the tab waits for the reset and its grace, nothing pressed and no limit told
+/// as unhandled (`limited:`); an hour past it, the dialog's last key two hours old, one Esc fenced
+/// on the read, its person count and the dialog's own `Esc to cancel` row closes it
+/// (`login-over-limit@v1`). CONTROL: a key of the person's a minute old holds the Esc.
+#[test]
+fn a_persons_picker_or_error_over_a_weekly_limit_is_waited_out_then_closed_with_one_fenced_esc() {
+    use aterm_phase::prompt::fixtures as fx;
+    for (what, text) in [
+        ("picker", fx::LOGIN_PICKER_2_1_310),
+        ("error", fx::LOGIN_ERROR),
+    ] {
+        let dialog = fx::screen(&fx::login_over_weekly_limit(text));
+        let tag = |when: &str| format!("te-login-over-limit-{what}-{when}");
+        // 2026-10-30 23:00 PDT, an hour before the weekly reset.
+        let (m, lines, records, escs) = over_weekly_limit(
+            &tag("before"),
+            vec![dialog.clone()],
+            1_793_426_400,
+            "7200000",
+            30,
+            None,
+        );
+        assert!(
+            escs.is_empty(),
+            "{what}: nothing pressed before the reset: {escs:?}"
+        );
+        assert!(
+            !told_limited(&m),
+            "{what}: no limit told unhandled: {lines:#?}\n{:#?}",
+            m.requests
+        );
+        assert!(
+            waits_for_the_reset(&records),
+            "{what}: the reset and its grace are the wake: {lines:#?}\n{records:#?}\n{:#?}",
+            m.requests
+        );
+        // 2026-10-31 01:00 PDT, an hour past it.
+        let (m, lines, records, escs) = over_weekly_limit(
+            &tag("after"),
+            vec![dialog.clone()],
+            1_793_433_600,
+            "7200000",
+            30,
+            None,
+        );
+        assert_eq!(
+            escs.len(),
+            1,
+            "{what}: {lines:#?}\n{records:#?}\n{:#?}",
+            m.requests
+        );
+        assert!(
+            escs[0].contains("if-human=7 ")
+                && escs[0].contains(" if-gen=")
+                && escs[0].contains(" if=^\\x20{2}Esc\\x20to\\x20cancel"),
+            "{what}: fenced on the read and the dialog's own row: {escs:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("TYPED ") && l.contains(" rule=login-over-limit@v1 esc at ")),
+            "{what}: {lines:#?}"
+        );
+        let (_, lines, _, escs) = over_weekly_limit(
+            &tag("person"),
+            vec![dialog],
+            1_793_433_600,
+            "60000",
+            30,
+            None,
+        );
+        assert!(
+            escs.is_empty(),
+            "{what}: a key a minute old holds it: {lines:#?}"
+        );
+    }
+}
+
+/// THE RESET WAKES A PERSON'S OWN `/login` THAT NOTHING ELSE MOVES: one loop from 23:00 PDT on
+/// the method picker over the limit (its box handed to the person by the approval loop) and on
+/// the measured hand-off, each drawn whatever is pressed (as a dialog an Esc does not close) and
+/// each waiting on the reset its predecessor's ledger names. (The error state draws its notice
+/// inline, placed again at each read, and under this mock's stepped virtual time that placement
+/// stayed ahead of the loop's clock, measured 2026-11-02: it crosses no reset here, and the loop
+/// test above reads it before and after one.) The wait for the reset and its grace ends with no
+/// screen change and the first Esc goes in; each Esc that leaves it drawn is decided again once its pause is over (the point
+/// already handed, which no look decides again), the Escs end at `OVER_LIMIT_BACKS_MAX`, and the
+/// person is told now, once: no second notice tells the limit as unhandled (`limited:`).
+#[test]
+fn a_persons_login_left_over_a_weekly_limit_is_closed_by_the_resets_wake_and_told_once() {
+    use crate::supervise::policy::login::OVER_LIMIT_BACKS_MAX;
+    use aterm_phase::prompt::fixtures as fx;
+    for (what, text) in [
+        (
+            "picker",
+            fx::login_over_weekly_limit(fx::LOGIN_PICKER_2_1_310),
+        ),
+        (
+            "hand-off",
+            fx::LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302.to_string(),
+        ),
+    ] {
+        let (m, lines, records, escs) = over_weekly_limit(
+            &format!("te-login-over-limit-wake-{what}"),
+            vec![fx::screen(&text)],
+            1_793_426_400,
+            "7200000",
+            3 * 3600,
+            Some(Duration::from_secs(60)),
+        );
+        let journal: Vec<&str> = records.iter().map(|r| r.line.as_str()).collect();
+        let log = format!("{what}: {lines:#?}\n{journal:#?}\n{:#?}", m.requests);
+        assert!(
+            waits_for_the_reset(&records),
+            "the reset and its grace are the wake: {log}"
+        );
+        assert_eq!(
+            escs.len(),
+            usize::try_from(OVER_LIMIT_BACKS_MAX).unwrap(),
+            "the reset's wake, then the paced Escs, and no more: {log}"
+        );
+        assert!(
+            journal
+                .iter()
+                .any(|l| l.starts_with("EXCEPTION ") && l.contains(" kind=login when=now ")),
+            "the person told now: {log}"
+        );
+        assert!(
+            !told_limited(&m),
+            "no second notice tells the limit as unhandled: {log}"
+        );
+    }
+}
+
+/// THE POST-ESC FRAME READ LATE ON THE RESET DAY (2026-10-31 20:00 PDT, 20 h past the weekly
+/// reset): Claude Code's footer still draws the bare `12am` beside `Continuing shortly`, and its
+/// transcript's newest done row (`done 3:04 PM`, of the day before) reads as today's, so that
+/// `12am` alone would be placed at the coming midnight, four hours off. `Continuing shortly` says
+/// the countdown ran out: the reset is placed no later than `SHORTLY` from the read, and the tab
+/// waits only Claude Code's own continue's grace, not the night.
+#[test]
+fn the_post_esc_footers_continuing_shortly_is_a_reset_at_hand_late_on_its_day() {
+    use aterm_phase::prompt::fixtures as fx;
+    let after = fx::screen(fx::LOGIN_INTERRUPTED_OVER_WEEKLY_LIMIT_2_1_302);
+    let (m, lines, records, _) = over_weekly_limit(
+        "te-post-esc-late",
+        vec![after],
+        1_793_502_000,
+        "7200000",
+        30,
+        None,
+    );
+    let waits: Vec<&str> = records
+        .iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.line.as_str())
+        .collect();
+    let until = waits
+        .iter()
+        .find_map(|l| l.split(" until=").nth(1)?.split(' ').next())
+        .unwrap_or_else(|| panic!("a wait: {waits:#?}\n{lines:#?}\n{:#?}", m.requests));
+    assert!(
+        ("2026-11-01T03:00:00Z".."2026-11-01T03:30:00Z").contains(&until),
+        "the countdown's reset at hand and its grace, not the coming midnight: {waits:#?}"
+    );
+}
+
+/// A LOOP STARTED 33 HOURS AFTER THE WEEKLY RESET (2026-11-01 08:00 PST, across the daylight
+/// fallback from 2026-10-31 00:00 PDT) STILL CLOSES A PERSON'S OWN `/login` OVER THE LIMIT
+/// (`ATERM-KI-1102-4`):
+/// 1. With NO ledger at all, `aterm_phase::login_over_limit` reads the weekly limit above the
+///    fullscreen hand-off (`LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302`), the inline method picker
+///    and the inline error state, waits for the reset an hour before it (`2026-10-30 23:00 PDT`),
+///    and presses one fenced Esc (`login-over-limit@v1`) 33 h past it (`2026-11-01 08:00 PST`);
+///    across the Nov 1, 2026 daylight fallback, a reset named on the PST side (`Nov 2 at 12am`)
+///    read from the PDT side wakes at `08:02:30Z` (PST), not `07:02:30Z` (PDT).
+/// 2. With a 33-hour-old ledger `wall-wait@v1` (`> MEMORY_TTL`) and a `/login` picker drawing NO
+///    limit notice above it (`LOGIN_PICKER_NO_LOGIN_2_1_310`, as when `/login` covered a
+///    footer-only limit), `adopt_stale_wall_on_login_dialog` adopts the ledger wall and closes the
+///    dialog with one fenced Esc.
+/// 3. CONTROLS: the same 33-hour-old ledger `wall-wait@v1` on a normal composer screen stays
+///    expired (`waited_limit() == None`, `wall_memory == None`), and `LOGIN_PICKER_NO_LOGIN_2_1_310`
+///    with no ledger wall at 33 h past the reset stays the person's (no Esc).
+#[test]
+fn a_loop_started_33_hours_after_the_reset_still_closes_a_login_over_a_limit() {
+    use crate::supervise::approvals::{self, Outcome, Row};
+    use aterm_phase::prompt::fixtures as fx;
+    const RESET: i64 = 1_793_430_000; // 2026-10-31 00:00 PDT (07:00Z)
+    const PST_33H_PAST: i64 = RESET + 33 * 3600; // 2026-11-01 08:00 PST (16:00Z)
+    const PST: i64 = -8 * 3600;
+    fn la_dst_zones(zone: &str, unix: i64) -> Option<i64> {
+        match zone {
+            // US DST fallback on 2026-11-01 at 02:00 local (09:00Z = 1_793_523_600).
+            "America/Los_Angeles" => Some(if unix < 1_793_523_600 { PDT } else { PST }),
+            "UTC" => Some(0),
+            _ => None,
+        }
+    }
+    let run_with_ledger = |tag: &str,
+                           screens: Vec<Vec<String>>,
+                           clock: i64,
+                           local_offset: i64,
+                           ledger_body: Option<String>| {
+        let (dir, path) = journal_file(tag);
+        let ledger = ledger_body.map(|body| {
+            let p = dir.join("s-1.jsonl");
+            std::fs::write(&p, body).expect("the ledger");
+            p
+        });
+        let mut m = fenced(screens);
+        m.vanish_after = Some(6);
+        m.human = vec!["7200000"];
+        m.human_ms = Some(7_200_000);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..hosted(30)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_clock(clock, local_offset);
+            s.set_zone_lookup(la_dst_zones);
+            s.set_approval_ledger(ledger.clone());
+        });
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let escs: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key ") && r.ends_with(" esc"))
+            .cloned()
+            .collect();
+        (m, lines, records, escs)
+    };
+
+    // 1a. Empty ledger, an hour before the reset: hand-off and picker wait for 07:02:30Z.
+    for (what, text) in [
+        (
+            "hand-off",
+            fx::LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302.to_string(),
+        ),
+        (
+            "picker",
+            fx::login_over_weekly_limit(fx::LOGIN_PICKER_2_1_310),
+        ),
+    ] {
+        let (m, lines, records, escs) = run_with_ledger(
+            &format!("te-login-empty-before-{what}"),
+            vec![fx::screen(&text)],
+            1_793_426_400,
+            PDT,
+            None,
+        );
+        assert!(
+            escs.is_empty(),
+            "{what} before reset: nothing pressed: {escs:?}"
+        );
+        assert!(
+            !told_limited(&m),
+            "{what} before reset: no limit told unhandled: {lines:#?}"
+        );
+        assert!(
+            waits_for_the_reset(&records),
+            "{what} before reset: wakes at reset + grace: {records:#?}\n{lines:#?}"
+        );
+    }
+
+    // 1b. Empty ledger, 33 h past the reset (on PST after daylight fallback): all three dialog
+    // states close with one fenced Esc.
+    for (what, text) in [
+        (
+            "hand-off",
+            fx::LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302.to_string(),
+        ),
+        (
+            "picker",
+            fx::login_over_weekly_limit(fx::LOGIN_PICKER_2_1_310),
+        ),
+        ("error", fx::login_over_weekly_limit(fx::LOGIN_ERROR)),
+    ] {
+        let (m, lines, records, escs) = run_with_ledger(
+            &format!("te-login-empty-33h-{what}"),
+            vec![fx::screen(&text)],
+            PST_33H_PAST,
+            PST,
+            None,
+        );
+        assert_eq!(
+            escs.len(),
+            1,
+            "{what} 33h past reset: {lines:#?}\n{records:#?}\n{:#?}",
+            m.requests
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("TYPED ") && l.contains(" rule=login-over-limit@v1 esc at ")),
+            "{what} 33h past reset: {lines:#?}"
+        );
+    }
+
+    // 1c. Daylight-change placement: read on Oct 30 23:00 PDT with a reset across fallback on
+    // Nov 2 at 12am (America/Los_Angeles) wakes at 2026-11-02T08:02:30Z (PST, -08:00), not 07:02:30Z.
+    let across_dst = fx::LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302.replace(
+        "Oct 31 at 12am (America/Los_Angeles)",
+        "Nov 2 at 12am (America/Los_Angeles)",
+    );
+    let (_, lines, records, escs) = run_with_ledger(
+        "te-login-across-dst",
+        vec![fx::screen(&across_dst)],
+        1_793_426_400,
+        PDT,
+        None,
+    );
+    assert!(escs.is_empty(), "across dst: {escs:?}");
+    assert!(
+        records.iter().any(|r| {
+            r.kind == "waiting"
+                && r.line
+                    .split(" until=")
+                    .nth(1)
+                    .and_then(|l| l.split(' ').next())
+                    .is_some_and(|u| ("2026-11-02T08:02:30Z"..="2026-11-02T08:03:29Z").contains(&u))
+        }),
+        "across dst: placed on PST (08:02:30Z): {records:#?}\n{lines:#?}"
+    );
+
+    // 2. 33-hour-old ledger `wall-wait@v1` (> MEMORY_TTL) over a `/login` dialog with NO drawn
+    // limit notice above it (`LOGIN_PICKER`): adopts the stale wall and closes it.
+    let stale_row = Row {
+        rule_id: approvals::RULE_WALL_WAIT,
+        outcome: Outcome::Waiting,
+        command: "",
+        reason: &approvals::wall_wait_reason(
+            Some(RESET),
+            Some("Oct 31 at 12am (America/Los_Angeles)"),
+            aterm_phase::WallKind::UsageWeekly,
+            "You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)",
+        ),
+        box_seq: 100,
+    }
+    .to_json((RESET - 2 * 3600) * 1000, None);
+    let (_, lines, _, escs) = run_with_ledger(
+        "te-login-stale-ledger-33h",
+        vec![fx::screen(fx::LOGIN_PICKER)],
+        PST_33H_PAST,
+        PST,
+        Some(format!("{stale_row}\n")),
+    );
+    assert_eq!(escs.len(), 1, "stale ledger on /login: {lines:#?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("TYPED ") && l.contains(" rule=login-over-limit@v1 esc at ")),
+        "stale ledger on /login: {lines:#?}"
+    );
+
+    // 2b. CONTROL: the same 33-hour-old ledger row over a `/login` dialog typed at a lost login
+    // (`LOGIN_PICKER_NO_LOGIN_2_1_310`, `Not logged in · Please run /login`) is NOT adopted.
+    let (_, lines, _, escs) = run_with_ledger(
+        "te-login-stale-ledger-at-auth-wall-ctrl",
+        vec![fx::screen(fx::LOGIN_PICKER_NO_LOGIN_2_1_310)],
+        PST_33H_PAST,
+        PST,
+        Some(format!("{stale_row}\n")),
+    );
+    assert!(
+        escs.is_empty(),
+        "stale ledger at a lost-login picker stays the person's: {escs:?}\n{lines:#?}"
+    );
+
+    // 3a. CONTROL: the same 33-hour-old ledger row on a normal composer screen stays expired.
+    {
+        let (dir, _) = journal_file("te-login-stale-composer-ctrl");
+        let ledger = dir.join("s-1.jsonl");
+        std::fs::write(&ledger, format!("{stale_row}\n")).expect("the ledger");
+        let normal = rows(&[
+            " ▐▛███▛█   Claude Code v2.1.310",
+            "▝▜██████▀  Opus 5.5 · Claude Max",
+            " ▝▝   ▝▝   /tmp/proj",
+            "",
+            "❯ carry on",
+            "⏺ Working through the checklist.",
+            "────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────",
+        ]);
+        let mut m = Mock::new(vec![]);
+        let opts = hosted(30);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(PST_33H_PAST, PST);
+        s.set_zone_lookup(la_dst_zones);
+        s.seed_wall_memory(approvals::open_wall(&ledger, None));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            s.turn_end.waited_limit().is_none() && s.wall_memory.is_none(),
+            "not seeded before screen read"
+        );
+        let screen = Screen {
+            seq: 1,
+            ..read_screen(normal)
+        };
+        let _ = s.turn_end_reading(&screen, None, &opts);
+        assert!(
+            s.turn_end.waited_limit().is_none() && s.wall_memory.is_none(),
+            "MEMORY_TTL still expires the wall on a non-dialog screen"
+        );
+    }
+
+    // 3b. CONTROL: `LOGIN_PICKER` with an empty ledger at 33 h past RESET stays the person's and
+    // presses nothing.
+    let (_, lines, _, escs) = run_with_ledger(
+        "te-login-no-limit-ctrl",
+        vec![fx::screen(fx::LOGIN_PICKER)],
+        PST_33H_PAST,
+        PST,
+        None,
+    );
+    assert!(
+        escs.is_empty(),
+        "no limit under /login stays the person's: {escs:?}\n{lines:#?}"
+    );
 }
 
 /// THE PICKER OF THE `/login` ATERM TYPED IS THE PERSON'S, WHATEVER THE LOGIN'S METHOD (v6 §14.17
@@ -25413,6 +26098,8 @@ fn usage_left_typed_is_a_record_that_raises_nothing_and_the_panel_stays_owed() {
     let host = ProbeHost::probing(true);
     let mut m = probe_world(&[panel_fx::USAGE_SETTLED], &host);
     m.tick_at_key = 1;
+    // Read as it stands, before the next decision sends it as the probe's own line (slice pl1).
+    m.exit_when = Some(|m| m.keys >= 1);
     let (lines, journal) = probe_run_for(
         "te-probe-left-typed",
         &mut m,
@@ -25502,97 +26189,107 @@ fn usage_left_typed_is_a_record_that_raises_nothing_and_the_panel_stays_owed() {
 
 #[test]
 fn usage_left_typed_is_sent_as_the_probes_own_and_its_panel_is_closed() {
-    let (dir, ledger) = ledger_at("probe-left-sent");
-    let host = ProbeHost::probing(true);
-    let mut m = probe_world(&[panel_fx::USAGE_SETTLED], &host);
-    m.tick_at_key = 1;
-    m.vanish_after = Some(200);
-    let (lines, journal) = probe_run(
-        "te-probe-left-sent",
-        &mut m,
-        &host,
-        &ledger,
-        probe_policy(0),
-        |_| {},
-    );
-    assert_eq!(
-        m.writes(),
-        [
-            "text:/usage",
-            "enter",
-            "enter",
-            "esc",
-            "text:keep going",
-            "enter"
-        ],
-        "{lines:#?}\n{journal:#?}"
-    );
-    let keys: Vec<&String> = m
-        .requests
-        .iter()
-        .filter(|r| verb_of(r) == "key" && (r.contains("/usage") || r.ends_with(" esc")))
-        .collect();
-    assert_eq!(keys.len(), 3, "{keys:#?}");
-    assert_eq!(
-        keys[0], "key if-human=0 if-gen=1.104 if=^❯\\x20/usage\\s*$ enter",
-        "the probe's Enter, which the moved screen skipped"
-    );
-    assert!(
-        keys[1].starts_with("key if-human=0 if-gen=1.")
-            && keys[1].ends_with(" if=^❯\\x20/usage\\s*$ enter")
-            && keys[1] != keys[0],
-        "the Enter of the text left typed: fenced three ways on a later read: {keys:#?}"
-    );
-    assert_eq!(
-        keys[2],
-        "key if-human=0 if=^...Settings..Status...Config...Usage esc"
-    );
-    assert_eq!(count(&m, "turn"), 0, "never the unfenced fallback");
-    assert_eq!(
-        probe_writes(&m),
-        ["/usage", "esc"],
-        "one `/usage`, one Escape"
-    );
-    assert_eq!(
-        host.said("probe"),
-        ["probe:claimed", "probed:not-written"],
-        "no second claim, and nothing sampled"
-    );
-    assert_eq!(host.said("inform").len(), 1, "told once: a record");
-    assert!(
-        !journal
+    // Under no grace and the shipped one alike: the probe's own line waits no person's grace,
+    // which the run's 60 s could not outlast (slice pl1's review).
+    for grace in [0, 120] {
+        let tag = format!("probe-left-sent-{grace}");
+        let (dir, ledger) = ledger_at(&tag);
+        let host = ProbeHost::probing(true);
+        let mut m = probe_world(&[panel_fx::USAGE_SETTLED], &host);
+        m.tick_at_key = 1;
+        m.vanish_after = Some(200);
+        let (lines, journal) = probe_run(
+            &format!("te-{tag}"),
+            &mut m,
+            &host,
+            &ledger,
+            probe_policy(grace),
+            |_| {},
+        );
+        assert!(
+            !journal.iter().any(|l| l.starts_with("WAITING ")
+                && l.contains(crate::supervise::policy::turn_end::PERSON_TYPING)),
+            "{grace}: no person's grace on the probe's own line: {journal:#?}"
+        );
+        assert_eq!(
+            m.writes(),
+            [
+                "text:/usage",
+                "enter",
+                "enter",
+                "esc",
+                "text:keep going",
+                "enter"
+            ],
+            "{lines:#?}\n{journal:#?}"
+        );
+        let keys: Vec<&String> = m
+            .requests
             .iter()
-            .any(|l| l.starts_with("CONTINUED ") && l.contains("/usage")),
-        "`/usage` is no continuation: {journal:#?}"
-    );
-    let typed: Vec<&String> = journal.iter().filter(|l| l.starts_with("TYPED ")).collect();
-    assert!(
-        typed.len() == 1 && typed[0].starts_with("TYPED seq=106 rule=usage-probe@v1 "),
-        "{journal:#?}"
-    );
-    assert_eq!(
-        probe_rows(&ledger),
-        ["typed /usage the accounts probe", "waiting /usage closed"]
-    );
-    let body = std::fs::read_to_string(&ledger).expect("the ledger");
-    assert_eq!(
-        body.lines()
-            .filter(|l| l.contains("\"command\":\"/usage\""))
-            .count(),
-        2,
-        "no row of `/usage` under the act's rule: {body}"
-    );
-    assert_eq!(
-        crate::supervise::approvals::typed_at(&ledger, None).len(),
-        1,
-        "the budget's reader counts the continuation alone"
-    );
-    assert!(!crate::supervise::approvals::probe_owed(
-        &std::fs::read_to_string(&ledger).unwrap_or_default(),
-        None
-    ));
-    assert_eq!(usage_probe_violations(&m, &host), Vec::<String>::new());
-    let _ = std::fs::remove_dir_all(&dir);
+            .filter(|r| verb_of(r) == "key" && (r.contains("/usage") || r.ends_with(" esc")))
+            .collect();
+        assert_eq!(keys.len(), 3, "{keys:#?}");
+        assert_eq!(
+            keys[0], "key if-human=0 if-gen=1.104 if=^❯\\x20/usage\\s*$ enter",
+            "the probe's Enter, which the moved screen skipped"
+        );
+        assert!(
+            keys[1].starts_with("key if-human=0 if-gen=1.")
+                && keys[1].ends_with(" if=^❯\\x20/usage\\s*$ enter")
+                && keys[1] != keys[0],
+            "the Enter of the text left typed: fenced three ways on a later read: {keys:#?}"
+        );
+        assert_eq!(
+            keys[2],
+            "key if-human=0 if=^...Settings..Status...Config...Usage esc"
+        );
+        assert_eq!(count(&m, "turn"), 0, "never the unfenced fallback");
+        assert_eq!(
+            probe_writes(&m),
+            ["/usage", "esc"],
+            "one `/usage`, one Escape"
+        );
+        assert_eq!(
+            host.said("probe"),
+            ["probe:claimed", "probed:not-written"],
+            "no second claim, and nothing sampled"
+        );
+        assert_eq!(host.said("inform").len(), 1, "told once: a record");
+        assert!(
+            !journal
+                .iter()
+                .any(|l| l.starts_with("CONTINUED ") && l.contains("/usage")),
+            "`/usage` is no continuation: {journal:#?}"
+        );
+        let typed: Vec<&String> = journal.iter().filter(|l| l.starts_with("TYPED ")).collect();
+        assert!(
+            typed.len() == 1 && typed[0].starts_with("TYPED seq=107 rule=usage-probe@v1 "),
+            "{journal:#?}"
+        );
+        assert_eq!(
+            probe_rows(&ledger),
+            ["typed /usage the accounts probe", "waiting /usage closed"]
+        );
+        let body = std::fs::read_to_string(&ledger).expect("the ledger");
+        assert_eq!(
+            body.lines()
+                .filter(|l| l.contains("\"command\":\"/usage\""))
+                .count(),
+            2,
+            "no row of `/usage` under the act's rule: {body}"
+        );
+        assert_eq!(
+            crate::supervise::approvals::typed_at(&ledger, None).len(),
+            1,
+            "the budget's reader counts the continuation alone"
+        );
+        assert!(!crate::supervise::approvals::probe_owed(
+            &std::fs::read_to_string(&ledger).unwrap_or_default(),
+            None
+        ));
+        assert_eq!(usage_probe_violations(&m, &host), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     let (dir, ledger) = ledger_at("probe-left-not-ours");
     let host = ProbeHost::probing(true);
@@ -25666,7 +26363,7 @@ fn usage_left_typed_over_its_own_menu_entry_is_still_the_probes_to_send() {
             .filter(|l| l.starts_with("TYPED "))
             .collect::<Vec<_>>(),
         [
-            "TYPED seq=106 rule=usage-probe@v1 /usage left typed, its Enter written now: no act \
+            "TYPED seq=107 rule=usage-probe@v1 /usage left typed, its Enter written now: no act \
           of the policy's, and the panel it opens is closed unsampled"
         ],
         "{journal:#?}"
@@ -25776,6 +26473,9 @@ fn the_probe_is_not_typed_again_over_its_own_text_left_typed() {
             &host,
         );
         m.tick_at_key = 1;
+        // The first loop ends with its `/usage` left typed, before a decision sends it as its
+        // own line (slice pl1): the next loop is the restart that finds it standing.
+        m.exit_when = Some(|m| m.keys >= 1);
         let _ = probe_run_for(
             &format!("te-{tag}"),
             &mut m,
@@ -25784,6 +26484,7 @@ fn the_probe_is_not_typed_again_over_its_own_text_left_typed() {
             probe_policy(120),
             |_| {},
         );
+        m.exit_when = None;
         assert_eq!(probe_writes(&m), ["/usage"], "{tag}");
         assert_eq!(world(&mut m).at, PanelAt::Typed("/usage".to_string()));
         let rest = world(&mut m).rest.clone().expect("the composer");
@@ -25804,7 +26505,7 @@ fn the_probe_is_not_typed_again_over_its_own_text_left_typed() {
         m.stalls = 0;
         let next = ProbeHost::probing(true);
         let run_tag = format!("te-{tag}-next");
-        let (lines, _) = if cleared {
+        let (lines, journal) = if cleared {
             probe_run(&run_tag, &mut m, &next, &ledger, probe_policy(120), |_| {})
         } else {
             probe_run_for(&run_tag, &mut m, &next, &ledger, probe_policy(120), |_| {})
@@ -25815,14 +26516,21 @@ fn the_probe_is_not_typed_again_over_its_own_text_left_typed() {
             Some("turn-ran"),
             "{tag}: the turn was read live: {lines:#?}"
         );
-        (probe_writes(&m), next.said(""), m.writes())
+        (probe_writes(&m), next.said(""), m.writes(), journal)
     };
-    let (probes, said, writes) = second_turn_end("probe-left-again", false);
+    let (probes, said, writes, journal) = second_turn_end("probe-left-again", false);
     assert_eq!(probes, ["/usage"], "the first loop's alone");
     assert_eq!(said, ["turn-ran"], "asked for no advice and no claim");
     assert_eq!(writes, ["text:/usage", "enter"], "nothing written over it");
+    // The probe the ledger seeds owes the panel and claims no draft (slice pl1): the `/usage` it
+    // finds standing is no line this process wrote, so it holds for a person's grace.
+    assert!(
+        journal.iter().any(|l| l.starts_with("WAITING ")
+            && l.contains(crate::supervise::policy::turn_end::PERSON_TYPING)),
+        "{journal:#?}"
+    );
 
-    let (probes, said, _) = second_turn_end("probe-left-cleared", true);
+    let (probes, said, _, _) = second_turn_end("probe-left-cleared", true);
     assert_eq!(probes, ["/usage", "/usage", "esc"]);
     assert_eq!(
         said[..4],

@@ -754,17 +754,21 @@ pub(super) fn overlay_log_commons_onto_document(
     log: &Log,
     identity: &Identity,
     doc: &mut Document,
+    readmit: Option<&BTreeSet<Recipient>>,
 ) -> crate::Result<bool> {
     let Some(opened) = log.open_audience_entries(identity)? else {
         return Ok(false);
     };
-    overlay_log_commons_with_opened(log, &opened, doc)
+    overlay_log_commons_with_opened(log, &opened, doc, readmit)
 }
 
+/// [`overlay_log_commons_onto_document`] with the audiences already opened; a Mac `readmit` names
+/// ([`Base::readmit`]) stays in `doc` and in Commons control although the log left it out.
 fn overlay_log_commons_with_opened(
     log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     doc: &mut Document,
+    readmit: Option<&BTreeSet<Recipient>>,
 ) -> crate::Result<bool> {
     let mut changed = false;
     let roster = roster_from_doc_or_opened(Some(doc), Some(opened), Some(log));
@@ -780,7 +784,7 @@ fn overlay_log_commons_with_opened(
         }
         if let Ok(recipient) = Recipient::parse(&machine.recipient)
             && (log.recipient_is_removed(&recipient)
-                || log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
+                || kept_out(log, &EpochAudience::Everyone, &recipient, readmit)
                 || machine_denied_by_roster_or_log(roster.as_ref(), log, &machine.name, &recipient))
             && doc.remove_machine(&machine.name, true) == Ok(true)
         {
@@ -879,8 +883,8 @@ fn overlay_log_commons_with_opened(
                     return false;
                 };
                 !log.recipient_is_removed(&r)
-                    && !log.audience_left_out_recipient(&EpochAudience::Commons, &r)
-                    && !log.audience_left_out_recipient(&EpochAudience::Everyone, &r)
+                    && !kept_out(log, &EpochAudience::Commons, &r, readmit)
+                    && !kept_out(log, &EpochAudience::Everyone, &r, readmit)
                     && !machine_denied_by_roster_or_log(roster.as_ref(), log, &m.name, &r)
                     && (cur_host_set.contains(&m.name) || log_commons_recipients.contains(&r))
             })
@@ -903,16 +907,18 @@ fn overlay_log_commons_with_opened(
 }
 
 /// Overlay the winning entries from `log` across every [`Audience`] fully unwrapped by `identity`
-/// onto `doc`, leaving audiences `identity` cannot unwrap untouched. Returns whether `doc` changed.
+/// onto `doc`, leaving audiences `identity` cannot unwrap untouched; a Mac `readmit` names
+/// ([`Base::readmit`]) stays in `doc` although the log left it out. Returns whether `doc` changed.
 pub(super) fn overlay_log_onto_document(
     log: &Log,
     identity: &Identity,
     doc: &mut Document,
+    readmit: Option<&BTreeSet<Recipient>>,
 ) -> crate::Result<bool> {
     let Some(opened) = log.open_audience_entries(identity)? else {
         return Ok(false);
     };
-    let mut changed = overlay_log_commons_with_opened(log, &opened, doc)?;
+    let mut changed = overlay_log_commons_with_opened(log, &opened, doc, readmit)?;
 
     if opened.fully_unwrapped_audiences.is_empty() {
         return Ok(changed);
@@ -1619,10 +1625,11 @@ pub(super) fn keep_drafted_until(
 }
 
 /// The recipients of each locker `doc` seals, by audience, less any `log` removed or left out of
-/// `[everyone]`.
+/// `[everyone]` (unless `readmit` lets it back in).
 fn plan_recipients_of(
     doc: &Document,
     log: &Log,
+    readmit: Option<&BTreeSet<Recipient>>,
 ) -> crate::Result<BTreeMap<Audience, BTreeSet<Recipient>>> {
     let mut out = BTreeMap::new();
     for plan in doc.lockers() {
@@ -1630,7 +1637,7 @@ fn plan_recipients_of(
         for text in &plan.recipients {
             let recipient = Recipient::parse(text).map_err(|_| Error::new("bad machine key"))?;
             if !log.recipient_is_removed(&recipient)
-                && !log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
+                && !kept_out(log, &EpochAudience::Everyone, &recipient, readmit)
                 && !recipient_denied_by_roster_or_log(None, log, &recipient)
             {
                 recipients.insert(recipient);
@@ -1659,9 +1666,69 @@ fn entries_by_audience(
     out
 }
 
+/// Whether a writer puts the Commons control descriptor `doc` its text carries (F21 rule 7). Where
+/// it opens all of Commons (`whole`), its overlay keeps the text's descriptor current, so it puts
+/// it under a fresh epoch (`fresh`) and otherwise when it differs from the one it reads (`view`).
+/// Where it does not, its overlay leaves the text's descriptor as it was, which can be older than
+/// the one every Mac reads; re-putting it, with theirs in its past, would revert theirs. So it
+/// puts it only when the person changed it: it differs from `base`'s, the descriptor the edit
+/// started from (`None` for a text imported with no base, where no change can be told), and from
+/// `view`.
+pub(super) fn commons_descriptor_due(
+    whole: bool,
+    fresh: bool,
+    view: Option<&[u8]>,
+    doc: &[u8],
+    base: Option<Option<&[u8]>>,
+) -> bool {
+    let differs = |other: Option<&[u8]>| other.is_none_or(|cur| !aterm_digest::ct_eq(cur, doc));
+    if whole {
+        fresh || differs(view)
+    } else {
+        base.is_some_and(differs) && differs(view)
+    }
+}
+
+/// What a writer that seals an audience under a fresh epoch puts there (F21 rule 7): each entry of
+/// `next`, what it means the audience to hold, where it opens the whole audience (`whole`); else
+/// only those that differ from `view`, what it reads there. A re-put of what it reads, with writes
+/// it cannot open in its past, would read as a deliberate write on every Mac that opens them and
+/// revert them there. Beside them, each name of `view` that `next` dropped, for a
+/// [`Body::Delete`].
+fn reput<'a>(
+    whole: bool,
+    view: Option<&'a BTreeMap<String, Entry>>,
+    next: &'a BTreeMap<String, Entry>,
+) -> (Vec<&'a Entry>, Vec<&'a String>) {
+    let puts = next
+        .iter()
+        .filter(|(name, entry)| {
+            whole
+                || view
+                    .and_then(|v| v.get(*name))
+                    .is_none_or(|cur| !same_entry(cur, entry))
+        })
+        .map(|(_, entry)| entry)
+        .collect();
+    let dropped = view
+        .into_iter()
+        .flat_map(BTreeMap::keys)
+        .filter(|name| !next.contains_key(*name))
+        .collect();
+    (puts, dropped)
+}
+
 /// What a writer that holds no key of `audience` drafts there, against `base`, the text the edit
 /// started from: a fresh epoch wrapped to `recipients`, a [`Body::Put`] of each of `puts` and a
 /// [`Body::Delete`] of each of `dropped` under it.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "KeyedEpochs",
+        action = "PartialMint",
+        project = "aterm_secrets::client::remove::tests::keyed_epochs_transition"
+    )
+)]
 #[expect(
     clippy::too_many_arguments,
     reason = "one epoch's records: the writer, its seed, the audience and what goes under it"
@@ -1724,6 +1791,22 @@ pub(super) struct Base<'a> {
     /// values for is written again even where its value is the one every Mac already writes. No
     /// other write settles a conflict: the losing value stays a candidate.
     pub(super) resolve: Option<&'a BTreeSet<(Audience, String)>>,
+    /// Macs this write lets back in although the log left them out of `[everyone]` or Commons:
+    /// approvals this Mac made on the lower-seq side of a partition, which every server dropped
+    /// at the heal ([`super::own_head`]). The log's removals and denials still keep them out.
+    pub(super) readmit: Option<&'a BTreeSet<Recipient>>,
+}
+
+/// Whether `log` leaves `recipient` out of `audience` on purpose, unless `readmit` lets it back
+/// in ([`Base::readmit`]).
+fn kept_out(
+    log: &Log,
+    audience: &EpochAudience,
+    recipient: &Recipient,
+    readmit: Option<&BTreeSet<Recipient>>,
+) -> bool {
+    readmit.is_none_or(|readmit| !readmit.contains(recipient))
+        && log.audience_left_out_recipient(audience, recipient)
 }
 
 /// Diff `doc` against `paths`'s seeded [`Log`] and draft the [`Body::Epoch`], [`Body::Wrap`],
@@ -1813,6 +1896,14 @@ pub(super) fn draft_document_diff_until(
         .entries()
         .into_iter()
         .find(|e| e.name == crate::commons::ENTRY);
+    // The descriptor the edit started from: `None` with no `base.doc`, `Some(None)` where it had
+    // none.
+    let base_commons_value: Option<Option<SecretBytes>> = base.doc.map(|text| {
+        text.entries()
+            .into_iter()
+            .find(|e| e.name == crate::commons::ENTRY)
+            .map(|e| e.value)
+    });
     let entries_by_aud = entries_by_audience(doc, has_commons_aud);
 
     let plans = doc.lockers();
@@ -1857,9 +1948,19 @@ pub(super) fn draft_document_diff_until(
             && opened.maximal_epochs.contains_key(&ep_aud)
             && !opened.fully_unwrapped_audiences.contains(&ep_aud)
     };
+    // The audiences this Mac opens at least one epoch of, counting or keyed.
+    let opened_audiences: BTreeSet<EpochAudience> = opened
+        .unwrapped_keys
+        .keys()
+        .chain(opened.keyed_keys.keys())
+        .filter_map(|id| match log.get(id).map(Record::body) {
+            Some(Body::Epoch { audience, .. }) => Some(audience.clone()),
+            _ => None,
+        })
+        .collect();
     let mut base_recipients = base
         .doc
-        .map(|base_doc| plan_recipients_of(base_doc, &log))
+        .map(|base_doc| plan_recipients_of(base_doc, &log, base.readmit))
         .transpose()?
         .unwrap_or_default();
     // The same union as each plan's below (F15), so the log's members alone never read as a
@@ -1895,7 +1996,7 @@ pub(super) fn draft_document_diff_until(
                 let recipient =
                     Recipient::parse(text).map_err(|_| Error::new("bad machine key"))?;
                 if !log.recipient_is_removed(&recipient)
-                    && !log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
+                    && !kept_out(&log, &EpochAudience::Everyone, &recipient, base.readmit)
                     && !recipient_denied_by_roster_or_log(None, &log, &recipient)
                 {
                     plan_recipients.insert(recipient);
@@ -1915,11 +2016,18 @@ pub(super) fn draft_document_diff_until(
             if sealed_away(&plan.audience) {
                 let before = base_entries.get(&plan.audience).unwrap_or(&no_entries);
                 let now = doc_map.unwrap_or(&no_entries);
-                // New or departed machines: every entry is sealed again for the list as it is.
+                // New or departed machines: a fresh epoch for the list as it is. Only an outsider
+                // of a host list, which opens none of its epochs and whose new machines no wrap
+                // gap reaches, seals every entry again there; a Mac that opens some reads a view
+                // that can miss writes it cannot open, and seals again only what the edit changed
+                // (F21 rule 7).
                 let resealed = base_recipients.get(&plan.audience) != Some(&plan_recipients);
+                let whole = resealed
+                    && matches!(plan.audience, Audience::Hosts(_))
+                    && !opened_audiences.contains(&EpochAudience::from(&plan.audience));
                 let puts: Vec<&Entry> = now
                     .values()
-                    .filter(|e| resealed || before.get(&e.name).is_none_or(|b| !same_entry(b, e)))
+                    .filter(|e| whole || before.get(&e.name).is_none_or(|b| !same_entry(b, e)))
                     .collect();
                 let dropped: Vec<&String> =
                     before.keys().filter(|n| !now.contains_key(*n)).collect();
@@ -2060,6 +2168,10 @@ pub(super) fn draft_document_diff_until(
                     .unwrap_or(0)
                     .saturating_add(1)
                     .max(1);
+                // Every entry goes under the fresh epoch only where this Mac opens the whole
+                // audience and every keyed epoch there; else what differs from what it reads
+                // (F21 rule 7, `reput`).
+                let whole = opened.reputs_whole(&ep_aud);
                 let (draft_ep, epoch_key) =
                     log.draft_epoch(&actor, authored_ms, ep_aud, next_gen)?;
                 let ep_rec = draft_ep.sign(writer_seed, incarnation)?;
@@ -2076,12 +2188,21 @@ pub(super) fn draft_document_diff_until(
                 }
                 if let Some(doc_entries) = doc_map {
                     for (name, entry) in doc_entries {
-                        if resolving(&plan.audience, name) {
+                        let resolve = resolving(&plan.audience, name);
+                        if resolve {
                             let del_rec = log
                                 .draft_delete(&actor, authored_ms, epoch_id, &epoch_key, name)?
                                 .sign(writer_seed, incarnation)?;
                             let _ = log.insert(del_rec.clone())?;
                             minted.push(del_rec);
+                        }
+                        let unchanged = !whole
+                            && !resolve
+                            && log_map
+                                .and_then(|m| m.get(name))
+                                .is_some_and(|cur| same_entry(cur, entry));
+                        if unchanged {
+                            continue;
                         }
                         let put_rec = log
                             .draft_put(&actor, authored_ms, epoch_id, &epoch_key, entry)?
@@ -2138,8 +2259,8 @@ pub(super) fn draft_document_diff_until(
                 for host in hosts {
                     if let Some(&r) = by_name.get(host)
                         && !log.recipient_is_removed(&r)
-                        && !log.audience_left_out_recipient(&EpochAudience::Commons, &r)
-                        && !log.audience_left_out_recipient(&EpochAudience::Everyone, &r)
+                        && !kept_out(&log, &EpochAudience::Commons, &r, base.readmit)
+                        && !kept_out(&log, &EpochAudience::Everyone, &r, base.readmit)
                         && !machine_denied_by_roster_or_log(roster.as_ref(), &log, host, &r)
                     {
                         commons_recipients.insert(r);
@@ -2201,9 +2322,17 @@ pub(super) fn draft_document_diff_until(
                             }
                         }
                     }
-                    if opened.commons_control.as_ref().is_none_or(|cur| {
-                        !aterm_digest::ct_eq(cur.as_slice(), ctrl_entry.value.as_slice())
-                    }) {
+                    if commons_descriptor_due(
+                        opened
+                            .fully_unwrapped_audiences
+                            .contains(&EpochAudience::Commons),
+                        false,
+                        opened.commons_control.as_ref().map(SecretBytes::as_slice),
+                        ctrl_entry.value.as_slice(),
+                        base_commons_value
+                            .as_ref()
+                            .map(|value| value.as_ref().map(SecretBytes::as_slice)),
+                    ) {
                         let put_rec = log
                             .draft_commons_put(
                                 &actor,
@@ -2237,17 +2366,31 @@ pub(super) fn draft_document_diff_until(
                         let _ = log.insert(wrap_rec.clone())?;
                         minted.push(wrap_rec);
                     }
-                    let put_rec = log
-                        .draft_commons_put(
-                            &actor,
-                            authored_ms,
-                            ep_id,
-                            &ep_key,
-                            ctrl_entry.value.as_slice(),
-                        )?
-                        .sign(writer_seed, incarnation)?;
-                    let _ = log.insert(put_rec.clone())?;
-                    minted.push(put_rec);
+                    // The descriptor again only where this Mac opens all of Commons, or where
+                    // the person changed it (F21 rule 7, `commons_descriptor_due`).
+                    if commons_descriptor_due(
+                        opened
+                            .fully_unwrapped_audiences
+                            .contains(&EpochAudience::Commons),
+                        true,
+                        opened.commons_control.as_ref().map(SecretBytes::as_slice),
+                        ctrl_entry.value.as_slice(),
+                        base_commons_value
+                            .as_ref()
+                            .map(|value| value.as_ref().map(SecretBytes::as_slice)),
+                    ) {
+                        let put_rec = log
+                            .draft_commons_put(
+                                &actor,
+                                authored_ms,
+                                ep_id,
+                                &ep_key,
+                                ctrl_entry.value.as_slice(),
+                            )?
+                            .sign(writer_seed, incarnation)?;
+                        let _ = log.insert(put_rec.clone())?;
+                        minted.push(put_rec);
+                    }
                 }
                 // Close any missing wraps on historical `EpochAudience::Commons` epochs for active
                 // bound members so they can decrypt Commons table rows sealed under earlier epochs.
@@ -2316,7 +2459,7 @@ pub(super) fn draft_document_diff_until(
             .filter_map(|m| Recipient::parse(&m.recipient).ok())
             .filter(|r| {
                 !log.recipient_is_removed(r)
-                    && !log.audience_left_out_recipient(&EpochAudience::Everyone, r)
+                    && !kept_out(&log, &EpochAudience::Everyone, r, base.readmit)
                     && !recipient_denied_by_roster_or_log(None, &log, r)
             })
             .collect();
@@ -3115,11 +3258,20 @@ pub(super) struct Rotation<'a> {
 /// Mint a new epoch for `[everyone]` (where the log has one), for Commons (where the log has
 /// Commons epochs) and, with `rotation.hosts`, for each host list this Mac opens whose newest
 /// epoch wraps a removed Mac; wrap each to the members who remain in it and reseal its current
-/// entries under it (§3.3.7). Returns the audiences it rotated, as `everyone`, `commons` or the
-/// host list's header.
+/// entries under it (§3.3.7). An audience this Mac does not open whole (an uncovered keyed epoch it
+/// lacks, F21 rule 7, or another side's newest epoch) gets only what `rotation` changed there.
+/// Returns the audiences it rotated, as `everyone`, `commons` or the host list's header.
 ///
 /// # Errors
 /// A record fails to draft, sign or insert.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "KeyedEpochs",
+        action = "BlindReput",
+        project = "aterm_secrets::client::remove::tests::keyed_epochs_transition"
+    )
+)]
 pub(super) fn rotate_after_removal(
     log: &mut Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
@@ -3187,16 +3339,25 @@ pub(super) fn rotate_after_removal(
             let _ = log.insert(wrap_rec.clone())?;
             minted.push(wrap_rec);
         }
-        let everyone_entries = rotation
-            .everyone
-            .or_else(|| opened.by_audience.get(&Audience::Everyone));
-        if let Some(everyone_entries) = everyone_entries {
-            for entry in everyone_entries.values() {
+        // Every entry is resealed only where this Mac opens all of `[everyone]` and every keyed
+        // epoch there; else only what `rotation.everyone` changed (F21 rule 7, `reput`).
+        let view = opened.by_audience.get(&Audience::Everyone);
+        if let Some(next) = rotation.everyone.or(view) {
+            let whole = opened.reputs_whole(&EpochAudience::Everyone);
+            let (puts, dropped) = reput(whole, view, next);
+            for entry in puts {
                 let put_rec = log
                     .draft_put(author.actor, author.authored_ms, ep_id, &ep_key, entry)?
                     .sign(author.writer_seed, author.incarnation)?;
                 let _ = log.insert(put_rec.clone())?;
                 minted.push(put_rec);
+            }
+            for name in dropped {
+                let del_rec = log
+                    .draft_delete(author.actor, author.authored_ms, ep_id, &ep_key, name)?
+                    .sign(author.writer_seed, author.incarnation)?;
+                let _ = log.insert(del_rec.clone())?;
+                minted.push(del_rec);
             }
         }
         rotated.push("everyone".to_owned());
@@ -3239,7 +3400,12 @@ pub(super) fn rotate_after_removal(
         let _ = log.insert(wrap_rec.clone())?;
         minted.push(wrap_rec);
     }
-    if let Some(ctrl) = &opened.commons_control {
+    // The descriptor this Mac reads is resealed only where it opens all of Commons (rule 7).
+    if let Some(ctrl) = &opened.commons_control
+        && opened
+            .fully_unwrapped_audiences
+            .contains(&EpochAudience::Commons)
+    {
         let put_rec = log
             .draft_commons_put(
                 author.actor,
@@ -3257,9 +3423,10 @@ pub(super) fn rotate_after_removal(
 }
 
 /// Mint the next epoch of every host list this Mac opens whose newest epoch is still wrapped to a
-/// Mac the log removed, or that has two or more newest epochs (the coverage rule, §3.3.7): wrapped
-/// to the recipients it carries over and resealing the list's current entries. Returns each
-/// rotated list's header. A list this Mac cannot open is left to its own members
+/// Mac the log removed, or that has two or more newest epochs (the coverage rule, §3.3.7), or that
+/// this Mac reseals under F21's rule 5 ([`reseal_ready`]): wrapped to the recipients it carries
+/// over and resealing the list's current entries ([`reseal_audience`]). Returns each rotated list's
+/// header. A list this Mac cannot open is left to its own members
 /// ([`super::tend_epochs`]).
 ///
 /// # Errors
@@ -3291,10 +3458,10 @@ pub(super) fn rotate_host_lists(
                 .get(id)
                 .is_some_and(|set| !set.is_disjoint(&removed))
         });
-        if !opens_all || !(wraps_removed || max_ids.len() > 1) {
+        let audience = EpochAudience::Hosts(hosts.clone());
+        if !opens_all || !(wraps_removed || max_ids.len() > 1 || reseal_ready(opened, &audience)) {
             continue;
         }
-        let audience = EpochAudience::Hosts(hosts.clone());
         let recipients = carried_audience_recipients(
             log,
             opened,
@@ -3302,37 +3469,8 @@ pub(super) fn rotate_host_lists(
             &BTreeSet::new(),
             exclude_recipients,
         );
-        let next_gen = opened
-            .max_generation
-            .get(&audience)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1)
-            .max(1);
-        let (ep_draft, ep_key) =
-            log.draft_epoch(author.actor, author.authored_ms, audience, next_gen)?;
-        let ep_rec = ep_draft.sign(author.writer_seed, author.incarnation)?;
-        let ep_id = *ep_rec.id();
-        let _ = log.insert(ep_rec.clone())?;
-        minted.push(ep_rec);
-        for &recipient in &recipients {
-            let wrap_rec = log
-                .draft_wrap(author.actor, author.authored_ms, ep_id, &ep_key, recipient)?
-                .sign(author.writer_seed, author.incarnation)?;
-            let _ = log.insert(wrap_rec.clone())?;
-            minted.push(wrap_rec);
-        }
-        let text_audience = Audience::Hosts(hosts);
-        if let Some(entries) = opened.by_audience.get(&text_audience) {
-            for entry in entries.values() {
-                let put_rec = log
-                    .draft_put(author.actor, author.authored_ms, ep_id, &ep_key, entry)?
-                    .sign(author.writer_seed, author.incarnation)?;
-                let _ = log.insert(put_rec.clone())?;
-                minted.push(put_rec);
-            }
-        }
-        rotated.push(text_audience.header());
+        reseal_audience(log, opened, author, &audience, &recipients, minted)?;
+        rotated.push(Audience::Hosts(hosts).header());
     }
     Ok(rotated)
 }
@@ -3443,6 +3581,7 @@ fn draft_reconcile_commons_log(
                 &author,
                 &active_recipients,
                 &mut minted,
+                false,
             )?;
             if !minted.is_empty() {
                 if !log.needs_commons_reconcile(&identity.recipient(), &active_recipients, false) {
@@ -3497,13 +3636,216 @@ fn draft_reconcile_commons_log(
     Ok(minted)
 }
 
+/// The text [`Audience`] an epoch of `audience` seals entries for; `None` for Commons, whose one
+/// value is the control descriptor.
+fn text_audience(audience: &EpochAudience) -> Option<Audience> {
+    match audience {
+        EpochAudience::Everyone => Some(Audience::Everyone),
+        EpochAudience::Hosts(hosts) => Some(Audience::Hosts(hosts.clone())),
+        EpochAudience::Commons => None,
+    }
+}
+
+/// Whether this Mac reseals `audience` under F21's rule 5: the audience has an uncovered keyed
+/// epoch a current member holds, and this Mac opens every one of them and every newest epoch of
+/// the audience, so its counting view holds every winner there.
+pub(super) fn reseal_ready(
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    audience: &EpochAudience,
+) -> bool {
+    opened
+        .uncovered_keyed
+        .get(audience)
+        .is_some_and(|epochs| !epochs.is_empty())
+        && !opened.awaits_reseal(audience)
+        && opened.fully_unwrapped_audiences.contains(audience)
+}
+
+/// Mint `audience`'s next epoch, wrapped to `recipients`, serving both §3.3.7's coverage rule and
+/// F21's reseal (rule 5) in one pass:
+/// - first, where this Mac opens the whole audience, its attestation of each uncovered keyed epoch
+///   of `audience` it opens: a [`Body::Wrap`] of it to this Mac itself, which [`Log::draft_wrap`]
+///   checks against the epoch's commitment, and which rule 4 reads as this Mac having that key. A
+///   Mac that does not open it whole (one a host list names but `[everyone]` left out) carries no
+///   values, so it attests nothing and its epoch covers nothing;
+/// - one [`Body::Epoch`] at `max_generation + 1` with every dependent of those epochs in its past
+///   ([`Log::draft_epoch_following`]);
+/// - where this Mac opens the whole audience, a re-put of each winner from the counting view
+///   (`opened.by_audience`, or Commons' control descriptor), never from a document, which may
+///   still hold a removed Mac's split-time values. Where it attests nothing, only where it also
+///   opens every keyed epoch there ([`OpenedAudienceEntries::reputs_whole`]); where it attests
+///   but lacks a covered keyed epoch's key, only the winners whose op sits under an epoch it
+///   attests, the values its reseal carries;
+/// - a [`Body::Delete`] of each name whose winner is a `Delete` under a keyed epoch.
+///
+/// # Errors
+/// A record fails to draft, sign or insert.
+pub(super) fn reseal_audience(
+    log: &mut Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    author: &AuthorCtx<'_>,
+    audience: &EpochAudience,
+    recipients: &BTreeSet<Recipient>,
+    minted: &mut Vec<Record>,
+) -> crate::Result<()> {
+    let full = opened.fully_unwrapped_audiences.contains(audience);
+    let attest: Vec<RecordId> = opened
+        .uncovered_keyed
+        .get(audience)
+        .into_iter()
+        .flatten()
+        .filter(|epoch| full && opened.keyed_keys.contains_key(*epoch))
+        .copied()
+        .collect();
+    let follow: Vec<RecordId> = if attest.is_empty() {
+        Vec::new()
+    } else {
+        log.keyed_epochs()
+            .into_iter()
+            .filter(|keyed| attest.contains(&keyed.epoch))
+            .flat_map(|keyed| keyed.dependents)
+            .collect()
+    };
+    let me = log
+        .membership()
+        .get(author.actor)
+        .map(|m| m.binding.recipient());
+    if let Some(me) = me {
+        for epoch in &attest {
+            let wrap_rec = log
+                .draft_wrap(
+                    author.actor,
+                    author.authored_ms,
+                    *epoch,
+                    &opened.keyed_keys[epoch],
+                    me,
+                )?
+                .sign(author.writer_seed, author.incarnation)?;
+            let _ = log.insert(wrap_rec.clone())?;
+            minted.push(wrap_rec);
+        }
+    }
+    let next_gen = opened
+        .max_generation
+        .get(audience)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1);
+    let (ep_draft, ep_key) = log.draft_epoch_following(
+        author.actor,
+        author.authored_ms,
+        audience.clone(),
+        next_gen,
+        &follow,
+    )?;
+    let ep_rec = ep_draft.sign(author.writer_seed, author.incarnation)?;
+    let ep_id = *ep_rec.id();
+    let _ = log.insert(ep_rec.clone())?;
+    minted.push(ep_rec);
+    for &recipient in recipients {
+        let wrap_rec = log
+            .draft_wrap(author.actor, author.authored_ms, ep_id, &ep_key, recipient)?
+            .sign(author.writer_seed, author.incarnation)?;
+        let _ = log.insert(wrap_rec.clone())?;
+        minted.push(wrap_rec);
+    }
+    let whole = if attest.is_empty() {
+        opened.reputs_whole(audience)
+    } else {
+        full
+    };
+    // A resealer without some covered keyed epoch's key carries only what its reseal covers.
+    let carried = |text: &Audience, name: &String| {
+        !opened.keyless_keyed.contains(audience)
+            || opened
+                .winning_ops
+                .get(&(text.clone(), name.clone()))
+                .and_then(|op| log.get(op))
+                .is_some_and(|record| match record.body() {
+                    Body::Put { epoch, .. } => attest.contains(epoch),
+                    _ => false,
+                })
+    };
+    let Some(text) = text_audience(audience) else {
+        if let Some(ctrl) = &opened.commons_control
+            && whole
+        {
+            let put_rec = log
+                .draft_commons_put(
+                    author.actor,
+                    author.authored_ms,
+                    ep_id,
+                    &ep_key,
+                    ctrl.as_slice(),
+                )?
+                .sign(author.writer_seed, author.incarnation)?;
+            let _ = log.insert(put_rec.clone())?;
+            minted.push(put_rec);
+        }
+        return Ok(());
+    };
+    if whole && let Some(entries) = opened.by_audience.get(&text) {
+        let entries: Vec<&Entry> = entries
+            .iter()
+            .filter(|(name, _)| carried(&text, name))
+            .map(|(_, entry)| entry)
+            .collect();
+        for entry in entries {
+            let put_rec = log
+                .draft_put(author.actor, author.authored_ms, ep_id, &ep_key, entry)?
+                .sign(author.writer_seed, author.incarnation)?;
+            let _ = log.insert(put_rec.clone())?;
+            minted.push(put_rec);
+        }
+    }
+    for name in opened.keyed_deletes.get(&text).into_iter().flatten() {
+        let del_rec = log
+            .draft_delete(author.actor, author.authored_ms, ep_id, &ep_key, name)?
+            .sign(author.writer_seed, author.incarnation)?;
+        let _ = log.insert(del_rec.clone())?;
+        minted.push(del_rec);
+    }
+    Ok(())
+}
+
+/// The coverage rule of §3.3.7 for `[everyone]` and Commons: where an audience has two or more
+/// newest epochs, or a newest epoch still wrapped to a Mac the log removed, mint one higher epoch
+/// that covers them, wrapped to the recipients it carries over. Its entries are resealed under it
+/// only where this Mac opens the whole audience, and an audience with an uncovered keyed epoch this
+/// Mac does not open is left to a holder's reseal (F21 rule 7). With `reseal` (the vault pass's
+/// ranked tender, `tend_epochs_at`), where this Mac holds every uncovered keyed epoch of an
+/// audience and every newest epoch there, it reseals the audience ([`reseal_audience`], F21 rule
+/// 5), and one epoch serves both rules. Without it (the Commons repair, which runs unranked on
+/// every exchange), an audience with an uncovered keyed epoch is left to the tender, so Macs do
+/// not reseal at once at a heal and the resealer records rule 8.
+///
+/// # Errors
+/// A record fails to draft, sign or insert.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "KeyedEpochs",
+        action = "Reseal",
+        project = "aterm_secrets::client::remove::tests::keyed_epochs_transition"
+    )
+)]
 pub(super) fn coalesce_concurrent_commons_epochs(
     log: &mut Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     author: &AuthorCtx<'_>,
     active_recipients: &BTreeSet<Recipient>,
     minted: &mut Vec<Record>,
+    reseal: bool,
 ) -> crate::Result<()> {
+    // Without `reseal`, an audience with an uncovered keyed epoch waits for the ranked tender.
+    let tender_only = |audience: &EpochAudience| {
+        !reseal
+            && opened
+                .uncovered_keyed
+                .get(audience)
+                .is_some_and(|epochs| !epochs.is_empty())
+    };
     let removed = log.removed_recipients();
     let max_everyone = opened
         .maximal_epochs
@@ -3536,7 +3878,15 @@ pub(super) fn coalesce_concurrent_commons_epochs(
                 .is_some_and(|set| !set.is_disjoint(&removed))
         });
     let empty_exclude = BTreeSet::new();
-    if can_open_all_max_everyone && (max_everyone.len() > 1 || everyone_wraps_removed) {
+    // F21 rule 7: an audience with an uncovered keyed epoch this Mac does not open waits for a
+    // holder's reseal, and only an audience it opens whole is resealed entry by entry; rule 5:
+    // a holder of every uncovered keyed epoch reseals it.
+    if !tender_only(&EpochAudience::Everyone)
+        && (reseal_ready(opened, &EpochAudience::Everyone)
+            || (can_open_all_max_everyone
+                && !opened.awaits_reseal(&EpochAudience::Everyone)
+                && (max_everyone.len() > 1 || everyone_wraps_removed)))
+    {
         let everyone_recipients = carried_audience_recipients(
             log,
             opened,
@@ -3544,39 +3894,14 @@ pub(super) fn coalesce_concurrent_commons_epochs(
             active_recipients,
             &empty_exclude,
         );
-        let next_gen = opened
-            .max_generation
-            .get(&EpochAudience::Everyone)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1)
-            .max(1);
-        let (ep_draft, ep_key) = log.draft_epoch(
-            author.actor,
-            author.authored_ms,
-            EpochAudience::Everyone,
-            next_gen,
+        reseal_audience(
+            log,
+            opened,
+            author,
+            &EpochAudience::Everyone,
+            &everyone_recipients,
+            minted,
         )?;
-        let ep_rec = ep_draft.sign(author.writer_seed, author.incarnation)?;
-        let ep_id = *ep_rec.id();
-        let _ = log.insert(ep_rec.clone())?;
-        minted.push(ep_rec);
-        for &recipient in &everyone_recipients {
-            let wrap_rec = log
-                .draft_wrap(author.actor, author.authored_ms, ep_id, &ep_key, recipient)?
-                .sign(author.writer_seed, author.incarnation)?;
-            let _ = log.insert(wrap_rec.clone())?;
-            minted.push(wrap_rec);
-        }
-        if let Some(everyone_entries) = opened.by_audience.get(&Audience::Everyone) {
-            for entry in everyone_entries.values() {
-                let put_rec = log
-                    .draft_put(author.actor, author.authored_ms, ep_id, &ep_key, entry)?
-                    .sign(author.writer_seed, author.incarnation)?;
-                let _ = log.insert(put_rec.clone())?;
-                minted.push(put_rec);
-            }
-        }
     }
 
     let max_commons = opened
@@ -3600,7 +3925,12 @@ pub(super) fn coalesce_concurrent_commons_epochs(
                 .get(ep_id)
                 .is_some_and(|set| !set.is_disjoint(&removed))
         });
-    if !holds_any_commons || (max_commons.len() <= 1 && !commons_wraps_removed) {
+    if tender_only(&EpochAudience::Commons)
+        || (!reseal_ready(opened, &EpochAudience::Commons)
+            && (!holds_any_commons
+                || opened.awaits_reseal(&EpochAudience::Commons)
+                || (max_commons.len() <= 1 && !commons_wraps_removed)))
+    {
         return Ok(());
     }
     let commons_recipients = carried_audience_recipients(
@@ -3610,44 +3940,14 @@ pub(super) fn coalesce_concurrent_commons_epochs(
         active_recipients,
         &empty_exclude,
     );
-    let next_gen = opened
-        .max_generation
-        .get(&EpochAudience::Commons)
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(1)
-        .max(1);
-    let (ep_draft, ep_key) = log.draft_epoch(
-        author.actor,
-        author.authored_ms,
-        EpochAudience::Commons,
-        next_gen,
-    )?;
-    let ep_rec = ep_draft.sign(author.writer_seed, author.incarnation)?;
-    let ep_id = *ep_rec.id();
-    let _ = log.insert(ep_rec.clone())?;
-    minted.push(ep_rec);
-    for &recipient in &commons_recipients {
-        let wrap_rec = log
-            .draft_wrap(author.actor, author.authored_ms, ep_id, &ep_key, recipient)?
-            .sign(author.writer_seed, author.incarnation)?;
-        let _ = log.insert(wrap_rec.clone())?;
-        minted.push(wrap_rec);
-    }
-    if let Some(ctrl) = &opened.commons_control {
-        let put_rec = log
-            .draft_commons_put(
-                author.actor,
-                author.authored_ms,
-                ep_id,
-                &ep_key,
-                ctrl.as_slice(),
-            )?
-            .sign(author.writer_seed, author.incarnation)?;
-        let _ = log.insert(put_rec.clone())?;
-        minted.push(put_rec);
-    }
-    Ok(())
+    reseal_audience(
+        log,
+        opened,
+        author,
+        &EpochAudience::Commons,
+        &commons_recipients,
+        minted,
+    )
 }
 
 enum LogEnrollPlan {
@@ -4175,21 +4475,92 @@ pub(super) fn mirror_log_to_servers(
     if heads.is_empty() {
         return Ok(None);
     }
-    let mut merged = ledger_publish::merge_diverged_heads(&heads)?;
     let identity = super::machine_identity(paths)?;
+    // This Mac's own last version, where it carries a Mac every server's version lost at a heal
+    // (`own_head`): the mirror lets exactly those Macs back in. A carry that fails before anything
+    // went out (the merge cannot take a Mac back, the log refuses the draft) is dropped, and the
+    // servers' heads are mirrored as they stand.
+    let mut tried = MirrorTry::default();
+    if let Some(own) = super::own_head::own_head(paths, &config, &identity) {
+        match mirror_heads(
+            paths,
+            extra_urls,
+            &config,
+            &candidate_urls,
+            &heads,
+            &identity,
+            Some(&own),
+            &mut tried,
+        ) {
+            Err(_) if tried.carried && !tried.put => tried = MirrorTry::default(),
+            outcome => return outcome,
+        }
+    }
+    mirror_heads(
+        paths,
+        extra_urls,
+        &config,
+        &candidate_urls,
+        &heads,
+        &identity,
+        None,
+        &mut tried,
+    )
+}
+
+/// What one [`mirror_heads`] did: whether it carried a Mac back from this Mac's own last version,
+/// and whether it sent an envelope to any server.
+#[derive(Default)]
+struct MirrorTry {
+    carried: bool,
+    put: bool,
+}
+
+/// [`mirror_log_to_servers`] over the servers' `heads`, read already: merge them, carry back the
+/// Macs `own` (this Mac's own last version) holds that they lost (`own_head`), overlay the log,
+/// draft what changed into it, and publish the merged version where it differs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one mirror pass: the vault, its servers, the heads read and this Mac's own version"
+)]
+fn mirror_heads(
+    paths: &Paths,
+    extra_urls: &[String],
+    config: &Config,
+    candidate_urls: &[String],
+    heads: &[ledger_publish::ObservedHead],
+    identity: &Identity,
+    own: Option<&ledger_publish::ObservedHead>,
+    tried: &mut MirrorTry,
+) -> crate::Result<Option<u64>> {
+    let mut merged = ledger_publish::merge_diverged_heads(heads)?;
     if heads
         .iter()
-        .any(|h| super::admin_removed_in_log(paths, &config, &h.envelope, &identity, &merged.doc))
+        .any(|h| super::admin_removed_in_log(paths, config, &h.envelope, identity, &merged.doc))
     {
         return Ok(None);
     }
     let signer_pub = envelope::signer_public(&merged.seed)?;
+    let seeded = trusted_seeded_store(paths, config, &signer_pub, &merged.handoff)?;
+    let seeded_log = seeded.as_ref().and_then(|(store, _)| store.log());
+    // The servers' heads alone are merged, and judged against the log below; from this Mac's own
+    // version only the Macs they lost come back, nothing else it held.
+    let readmit = match own {
+        Some(own) => {
+            let lost = super::own_head::judge(paths, own, heads, seeded_log, &identity.recipient());
+            if !lost.is_empty() {
+                tried.carried = true;
+                super::own_head::carry_lost(&mut merged, own, &lost)?;
+            }
+            lost
+        }
+        None => BTreeSet::new(),
+    };
+    let readmitting = (!readmit.is_empty()).then_some(&readmit);
     let mut log_changed_doc = false;
     let mut import = false;
     let mut old_macs_gone = false;
-    if let Some((store, _)) = trusted_seeded_store(paths, &config, &signer_pub, &merged.handoff)?
-        && let Some(log) = store.log()
-    {
+    if let Some(log) = seeded_log {
         if log.removes(&identity.recipient())
             || recipient_denied_by_roster_or_log(None, log, &identity.recipient())
             || log.audience_left_out_recipient(&EpochAudience::Everyone, &identity.recipient())
@@ -4200,14 +4571,14 @@ pub(super) fn mirror_log_to_servers(
         // records it lacks waits for them: mirroring then would publish the older values it
         // holds. A head a writer with no seat in the log published is imported as it stands.
         let mut covers = true;
-        for head in &heads {
-            match log_base(Some(log), &head.envelope, &identity)? {
+        for head in heads {
+            match log_base(Some(log), &head.envelope, identity)? {
                 LogBase::Behind => {
                     // A version this Mac published, whose records it held back when the publish
                     // was cut short: taken in, they let this pass mirror (and send them).
                     let adopted = {
                         let _lock = StateLock::take(paths)?;
-                        adopt_held_draft(paths, &head.envelope, &identity)?
+                        adopt_held_draft(paths, &head.envelope, identity)?
                     };
                     if adopted {
                         return mirror_log_to_servers(paths, extra_urls);
@@ -4225,13 +4596,24 @@ pub(super) fn mirror_log_to_servers(
                 .into_iter()
                 .map(|m| m.recipient)
                 .collect();
-            log_changed_doc = overlay_log_onto_document(log, &identity, &mut merged.doc)?;
+            log_changed_doc =
+                overlay_log_onto_document(log, identity, &mut merged.doc, readmitting)?;
             if log_changed_doc {
+                // The overlay wrote the log's roster over the merge. Where the side that dropped
+                // an approval wrote it last, it has no row for a Mac carried back, which gets its
+                // own row from this Mac's version again, before the merge of heads below would
+                // assign it a fresh label.
+                if let Some(own) = own
+                    && !readmit.is_empty()
+                {
+                    super::own_head::carry_rows(&mut merged.doc, own, &readmit)?;
+                }
                 if merged.diverged {
                     ledger_publish::reconcile_merged_metadata_with_log(
                         &mut merged.doc,
-                        &heads,
+                        heads,
                         Some(log),
+                        &readmit,
                     )?;
                 }
                 merged.admissions = merged.admissions.retained(&merged.doc)?;
@@ -4247,32 +4629,36 @@ pub(super) fn mirror_log_to_servers(
                     != machines_before;
                 if !machines_changed {
                     let now = aterm_time::unix_millis().unwrap_or(0) / 1000;
-                    let heard = heard_across(&candidate_urls, now);
+                    let heard = heard_across(candidate_urls, now);
                     old_macs_gone = !mirror_still_needed(log, heard.as_ref(), now);
                 }
             }
         } else {
             import = true;
-            if overlay_log_commons_onto_document(log, &identity, &mut merged.doc)? {
+            if overlay_log_commons_onto_document(log, identity, &mut merged.doc, readmitting)? {
                 log_changed_doc = true;
                 if merged.diverged {
                     ledger_publish::reconcile_merged_metadata_with_log(
                         &mut merged.doc,
-                        &heads,
+                        heads,
                         Some(log),
+                        &readmit,
                     )?;
                 }
                 merged.admissions = merged.admissions.retained(&merged.doc)?;
             }
         }
     }
-    if !merged.diverged && !log_changed_doc && !import {
+    // A Mac carried back that every server lists already may still lack a wrap of the newest
+    // epochs (`own_head::lost_to`): the draft below writes it, so the pass goes on.
+    if !merged.diverged && !log_changed_doc && !import && readmit.is_empty() {
         return Ok(None);
     }
     // F20: once no Mac without a device-key proof in the log was heard within
     // [`OLD_MAC_WINDOW_SECS`], nothing reads a version that only mirrors the log, so none is
-    // published. Diverged heads and imported text still go out: they carry what admins wrote.
-    if old_macs_gone && !merged.diverged && !import {
+    // published. Diverged heads, imported text and a carried Mac still go out: they carry what
+    // admins wrote.
+    if old_macs_gone && !merged.diverged && !import && readmit.is_empty() {
         return Ok(None);
     }
 
@@ -4291,14 +4677,15 @@ pub(super) fn mirror_log_to_servers(
         .collect();
     let drafted = append_document_diff_to_log(
         paths,
-        &config,
+        config,
         &signer_pub,
         &merged.handoff,
-        &identity,
+        identity,
         &merged.doc,
         Base {
             doc: (!import).then_some(&merged.doc),
             resolve: Some(&ruled),
+            readmit: readmitting,
         },
     )?;
     let my_recipient = identity.recipient().to_bech32();
@@ -4320,7 +4707,7 @@ pub(super) fn mirror_log_to_servers(
         && !drafted.records.is_empty()
     {
         let wire = encode_records(&drafted.records);
-        for url in &candidate_urls {
+        for url in candidate_urls {
             let _ = transport::post_records(url, &wire);
         }
     }
@@ -4331,22 +4718,26 @@ pub(super) fn mirror_log_to_servers(
         .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
         .collect();
     for u in candidate_urls {
-        if !urls.contains(&u) {
-            urls.push(u);
+        if !urls.contains(u) {
+            urls.push(u.clone());
         }
     }
+    // The highest head stands for the merge only where it already holds all of it; one that lacks
+    // a Mac carried back does not.
     if merged.diverged
+        && readmit.is_empty()
         && !log_changed_doc
         && !needs_stamp
         && drafted.as_ref().is_none_or(|d| d.records.is_empty())
-        && ledger_publish::leader_subsumes_heads(&heads, &merged)
+        && ledger_publish::leader_subsumes_heads(heads, &merged)
         && let Some(leader) = heads
             .iter()
             .max_by_key(|h| (h.envelope.seq, h.envelope.digest()))
     {
+        tried.put = true;
         if !urls.is_empty() {
             let outcomes =
-                ledger_publish::publish_to_servers_for_admin(paths, &config, &urls, &leader.raw)?;
+                ledger_publish::publish_to_servers_for_admin(paths, config, &urls, &leader.raw)?;
             if !outcomes.iter().any(|(_, r)| r.is_ok()) {
                 let first_err = outcomes
                     .into_iter()
@@ -4357,7 +4748,7 @@ pub(super) fn mirror_log_to_servers(
                 return Err(first_err);
             }
         } else if matches!(config.source, Source::Path(_)) {
-            let _lock = super::configured_admin(paths, &config)?;
+            let _lock = super::configured_admin(paths, config)?;
             transport::publish(&config.source, &leader.raw)?;
         }
         return Ok(Some(leader.envelope.seq));
@@ -4375,8 +4766,9 @@ pub(super) fn mirror_log_to_servers(
         drafted.as_ref().and_then(Drafted::stamp).as_deref(),
     )?;
 
+    tried.put = true;
     if !urls.is_empty() {
-        let outcomes = ledger_publish::publish_to_servers_for_admin(paths, &config, &urls, &bytes)?;
+        let outcomes = ledger_publish::publish_to_servers_for_admin(paths, config, &urls, &bytes)?;
         if !outcomes.iter().any(|(_, r)| r.is_ok()) {
             let first_err = outcomes
                 .into_iter()
@@ -4385,9 +4777,25 @@ pub(super) fn mirror_log_to_servers(
             return Err(first_err);
         }
     } else if matches!(config.source, Source::Path(_)) {
-        let _lock = super::configured_admin(paths, &config)?;
+        let _lock = super::configured_admin(paths, config)?;
         transport::publish(&config.source, &bytes)?;
     }
+    // A server took a version this Mac sealed: it is this Mac's own last version now, unless the
+    // one kept still carries a Mac this one lacks.
+    let log_after = trusted_seeded_store(paths, config, &signer_pub, &merged.handoff)
+        .ok()
+        .flatten();
+    if !readmit.is_empty() {
+        super::own_head::note_carried(paths, &readmit);
+    }
+    super::own_head::keep(
+        paths,
+        config,
+        identity,
+        &bytes,
+        &merged.doc,
+        log_after.as_ref().and_then(|(store, _)| store.log()),
+    );
     Ok(Some(merged.seq))
 }
 
@@ -4481,6 +4889,14 @@ fn write_gap_mark(
 ///
 /// # Errors
 /// Local state cannot be read or written, or a record fails to open or sign.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "KeyedEpochs",
+        action = "CloseGap",
+        project = "aterm_secrets::client::remove::tests::keyed_epochs_transition"
+    )
+)]
 pub(super) fn close_wrap_gaps(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> {
     if !wrap_gaps_pass(paths, now_ms, false)?.0 {
         return Ok(Vec::new());
@@ -4489,6 +4905,27 @@ pub(super) fn close_wrap_gaps(paths: &Paths, now_ms: u64) -> crate::Result<Vec<R
     let _lock = StateLock::take(paths)?;
     Ok(wrap_gaps_pass(paths, now_ms, true)?.1)
 }
+
+/// Host for `KeyedEpochs`' environment markers (F21), so `spec_xref_closure` accounts for every
+/// model action: the heal and a person's edit are what the Macs around the library do.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "KeyedEpochs",
+        action = "Heal",
+        reason = "Environment: the split heals and every Mac takes every other's records"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "KeyedEpochs",
+        action = "Edit",
+        reason = "Environment: a person edits an entry under an epoch every member holds"
+    )
+)]
+#[doc(hidden)]
+pub fn keyed_epochs_environment() {}
 
 /// One look at the wrap gaps for [`close_wrap_gaps`]: whether one is due for this member now,
 /// and, where `sign` (the caller holds the state lock), the `Wrap`s it signed and kept. Each look

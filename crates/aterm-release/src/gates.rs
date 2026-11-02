@@ -1033,6 +1033,11 @@ pub fn record_verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) ->
 /// # Errors
 /// git cannot name the tree, or the record cannot be read at all: no answer either way.
 pub fn verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) -> Result<(bool, String)> {
+    if let Some(accepted) =
+        crate::accepted_measure::accepted(git, commit, macho_sha256).map_err(Error::new)?
+    {
+        return Ok((true, accepted));
+    }
     let (path, tree) = verified_path(git, commit)?;
     let text = match crate::durable::read_regular_text(&path, 1024 * 1024) {
         Ok(text) => text,
@@ -1911,6 +1916,13 @@ pub fn own_cutter_with(
     if stamp == commit {
         return Ok(format!(
             "cutter identity: built from {} itself",
+            short(commit)
+        ));
+    }
+    if crate::accepted_measure::policy_cutter(git, commit, stamp) {
+        return Ok(format!(
+            "cutter {} carries only release-policy changes for owner-accepted source {}",
+            short(stamp),
             short(commit)
         ));
     }

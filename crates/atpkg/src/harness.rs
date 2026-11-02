@@ -53,6 +53,183 @@ pub const fn twin_harness(vendor: &str) -> Option<(&'static str, &'static str)> 
     }
 }
 
+/// The receipt a local harness artifact directory carries (`atpkg-publish build-local`).
+pub const LOCAL_BUILD_JSON: &str = "local-build.json";
+
+/// Bound on a [`LOCAL_BUILD_JSON`] receipt read.
+const MAX_LOCAL_BUILD_JSON_BYTES: usize = 64 * 1024;
+
+/// Whether `version` is a canonical harness version (`MAJOR.MINOR.0` or `MAJOR.MINOR.0+g<hex9..40>`,
+/// or strictly `+g`-stamped when `require_stamp` is true) and matches `source` when provided.
+fn harness_version_valid(version: &str, source: Option<&str>, require_stamp: bool) -> bool {
+    if version.is_empty() || version.len() > 128 || !version.bytes().all(|b| b.is_ascii_graphic()) {
+        return false;
+    }
+    let (base, stamp) = match version.split_once("+g") {
+        Some((base, stamp)) => (base, Some(stamp)),
+        None if require_stamp || source.is_some() => return false,
+        None => (version, None),
+    };
+    let parts: Vec<&str> = base.split('.').collect();
+    if parts.len() != 3
+        || parts[2] != "0"
+        || !parts[..2].iter().all(|s| {
+            !s.is_empty()
+                && s.bytes().all(|b| b.is_ascii_digit())
+                && (s.len() == 1 || !s.starts_with('0'))
+                && s.parse::<u64>().is_ok()
+        })
+    {
+        return false;
+    }
+    if let Some(stamp) = stamp {
+        if !(9..=40).contains(&stamp.len())
+            || !stamp
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return false;
+        }
+        if let Some(src) = source
+            && (src.len() != 40
+                || !src
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || !src.starts_with(stamp))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// A local harness artifact's validated `(version, bin/<command>)` from [`LOCAL_BUILD_JSON`].
+fn local_build_manifest(
+    root: &std::path::Path,
+    program: &str,
+) -> Option<(String, std::path::PathBuf)> {
+    if !is_harness(program) {
+        return None;
+    }
+    let text = crate::metadata_io::read_bounded_regular_utf8(
+        &root.join(LOCAL_BUILD_JSON),
+        MAX_LOCAL_BUILD_JSON_BYTES,
+    )
+    .ok()?;
+    let v: aterm_json::Value = aterm_json::from_str(&text).ok()?;
+    if v.get("schema").and_then(aterm_json::Value::as_u64) != Some(2)
+        || v.get("origin").and_then(aterm_json::Value::as_str) != Some("local-build")
+        || v.get("program").and_then(aterm_json::Value::as_str) != Some(program)
+    {
+        return None;
+    }
+    let command = v.get("command").and_then(aterm_json::Value::as_str)?;
+    crate::store::ToolName::new(command)?;
+    if let Some(policy) = v.get("source_policy")
+        && policy.as_str() != Some("clean-main")
+    {
+        return None;
+    }
+    if let Some(exposes) = v.get("exposes") {
+        let [only] = exposes.as_array()?.as_slice() else {
+            return None;
+        };
+        if only.as_str() != Some(command) {
+            return None;
+        }
+    }
+    let entry = std::path::Path::new("bin").join(command);
+    let meta = std::fs::symlink_metadata(root.join(&entry)).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    if let Some(executables) = v.get("executables") {
+        let [exe] = executables.as_array()?.as_slice() else {
+            return None;
+        };
+        let expected_path = format!("bin/{command}");
+        let size = exe.get("size").and_then(aterm_json::Value::as_u64)?;
+        let sha256 = exe.get("sha256").and_then(aterm_json::Value::as_str)?;
+        if exe.get("path").and_then(aterm_json::Value::as_str) != Some(expected_path.as_str())
+            || size == 0
+            || size != meta.len()
+            || sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+    }
+    let version = v.get("version").and_then(aterm_json::Value::as_str)?;
+    let source = match v.get("source") {
+        Some(src) => Some(src.as_str()?),
+        None => None,
+    };
+    harness_version_valid(version, source, true).then(|| (version.to_string(), entry))
+}
+
+/// The producer-stamped version a local harness artifact root `root` records in
+/// [`LOCAL_BUILD_JSON`] for `program`, or `None` for a bare checkout or mismatched record.
+#[must_use]
+pub fn local_build_version(root: &std::path::Path, program: &str) -> Option<String> {
+    local_build_manifest(root, program).map(|(version, _)| version)
+}
+
+/// The recorded local-build version whose validated `bin/<command>` entrypoint is `exe` for
+/// `program`, independent of the currently selected store build or development link.
+#[must_use]
+pub fn local_build_version_of_exe(exe: &std::path::Path, program: &str) -> Option<String> {
+    let exe = std::fs::canonicalize(exe).ok()?;
+    exe.ancestors().skip(1).take(2).find_map(|root| {
+        let (version, entry) = local_build_manifest(root, program)?;
+        (std::fs::canonicalize(root.join(entry)).ok().as_deref() == Some(exe.as_path()))
+            .then_some(version)
+    })
+}
+
+/// The recorded store version for a ready harness build of `program` whose exposed executable is
+/// `exe`, independent of the currently selected store build or development link.
+#[must_use]
+pub fn store_build_version_of_exe(
+    layout: &crate::store::Layout,
+    program: &str,
+    exe: &std::path::Path,
+) -> Option<String> {
+    if !is_harness(program) {
+        return None;
+    }
+    let exe = std::fs::canonicalize(exe).ok()?;
+    let store = std::fs::canonicalize(layout.prefix.join("store").join(program)).ok()?;
+    let rest = exe.strip_prefix(&store).ok()?;
+    let mut parts = rest.components();
+    let build = parts.next()?.as_os_str().to_str()?;
+    let build = build
+        .parse::<u64>()
+        .ok()
+        .filter(|b| b.to_string() == build)?;
+    if parts.next()?.as_os_str() != "bin" {
+        return None;
+    }
+    let tool = crate::store::ToolName::new(parts.next()?.as_os_str().to_str()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let dir = layout.build_dir(program, build);
+    if !crate::store::build_is_complete(&dir) {
+        return None;
+    }
+    if let Some(exposes) = crate::store::recorded_exposes(&dir) {
+        if !exposes.contains(&tool) {
+            return None;
+        }
+    } else if tool.as_str() != program {
+        return None;
+    }
+    let version = crate::store::recorded_version(&dir)?;
+    harness_version_valid(&version, None, false).then_some(version)
+}
+
 /// One harness package installed in a store, as `aterm harness versions` lists it
 /// (`docs/DESIGN-harness-repos-2026-10-24.md` §5): an `-alab` harness program, or an agent
 /// ALab builds itself whose active build is an ALab build ([`crate::alab::ALAB_AGENTS`],
@@ -94,7 +271,11 @@ pub fn installed(layout: &crate::store::Layout) -> Vec<Installed> {
             let agent = crate::alab::agent(program);
             let harness = agent.map_or(program, |a| a.repo).to_string();
             if let Some(checkout) = crate::linkmode::linked_checkout(layout, program) {
-                let version = agent.and_then(|_| crate::alab::package_version(&checkout));
+                let version = if agent.is_some() {
+                    crate::alab::package_version(&checkout)
+                } else {
+                    local_build_version(&checkout, program)
+                };
                 return Some(Installed {
                     harness,
                     program: program.to_string(),
@@ -111,6 +292,7 @@ pub fn installed(layout: &crate::store::Layout) -> Vec<Installed> {
                 crate::alab::package_version(&layout.build_dir(program, build))
             } else {
                 crate::store::recorded_version(&layout.build_dir(program, build))
+                    .filter(|v| harness_version_valid(v, None, false))
             };
             Some(Installed {
                 harness,
@@ -307,5 +489,43 @@ mod tests {
             Some("codex-alab"),
             "the same build with the ALab record is (control)"
         );
+
+        // A dev-linked local harness artifact with a valid local-build.json reports its version.
+        std::fs::write(
+            checkout.join(LOCAL_BUILD_JSON),
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","version":"0.1.0+gaa5d5fe00"}"#,
+        )
+        .unwrap();
+        let kimi_stamped = installed(&l)
+            .into_iter()
+            .find(|r| r.harness == "kimi-alab")
+            .unwrap();
+        assert_eq!(kimi_stamped.version.as_deref(), Some("0.1.0+gaa5d5fe00"));
+        assert_eq!(
+            local_build_version_of_exe(&checkout.join("bin/kimi-alab"), "kimi-alab").as_deref(),
+            Some("0.1.0+gaa5d5fe00")
+        );
+        assert_eq!(
+            local_build_version_of_exe(&checkout.join("bin/kimi-alab"), "grok-alab"),
+            None,
+            "mismatched program is refused"
+        );
+        for bad in [
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","version":"0.1.0"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","version":"0.1.0 evil"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","version":"0.1.2+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","source":"1111111111111111111111111111111111111111","version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","source":123,"version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","source_policy":"dirty","version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","exposes":["other"],"version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","executables":[{"path":"bin/kimi-alab","size":999,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}],"version":"0.1.0+gaa5d5fe00"}"#,
+        ] {
+            std::fs::write(checkout.join(LOCAL_BUILD_JSON), bad).unwrap();
+            assert_eq!(
+                local_build_version(&checkout, "kimi-alab"),
+                None,
+                "malformed version or source mismatch is refused: {bad}"
+            );
+        }
     }
 }

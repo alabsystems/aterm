@@ -3,7 +3,7 @@
 
 //! Running the stages' children.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Write as _};
@@ -44,6 +44,8 @@ pub struct Cmd {
     /// Whether the child's waits for admission or a lock count against its ceiling as work
     /// ([`Cmd::counting_waits`]); otherwise its tree marks them and the ceiling leaves them out.
     pub waits_count: bool,
+    /// Observe libtest failures before this binary completes; diagnostic only.
+    pub test_progress: Option<String>,
 }
 
 impl Cmd {
@@ -60,6 +62,7 @@ impl Cmd {
             preamble: None,
             term_grace: None,
             waits_count: false,
+            test_progress: None,
         }
     }
 
@@ -385,6 +388,8 @@ fn bounded_wait<T: Send + 'static>(
 
 #[path = "exec_output.rs"]
 mod output;
+#[path = "exec_test_progress.rs"]
+mod test_progress;
 
 const MAX_CEILING_SECS: f64 = 3_153_600_000.0;
 
@@ -729,10 +734,10 @@ struct Clock<'a> {
     starved: Duration,
     /// The waits the last look found.
     waits: Vec<aterm_toolchain::waits::Waiting>,
-    /// How many looks in a row, the last included, found a wait its waiter called stuck. A mark
-    /// is rewritten in place, so one read can catch the tail of the record it replaces: a stuck
-    /// wait is believed on its second look ([`Clock::stuck`]).
-    stuck_looks: u32,
+    /// The waits the preceding look found. A mark is rewritten in place, so one read can catch
+    /// the tail of the record it replaces: only the same live mark and holder set found stuck
+    /// on both looks can end the child ([`Clock::stuck`]).
+    waits_before: Vec<aterm_toolchain::waits::Waiting>,
     /// `None` once its host has no reading of the tree: every span with no marked wait is work.
     usage: Option<Usage<'a>>,
     /// The stage meter its reads of the tree book into, and the tree's process group.
@@ -765,7 +770,7 @@ impl<'a> Clock<'a> {
             waited: Duration::ZERO,
             starved: Duration::ZERO,
             waits: Vec::new(),
-            stuck_looks: 0,
+            waits_before: Vec::new(),
             usage: Some(Usage {
                 host,
                 pgid,
@@ -892,26 +897,30 @@ impl<'a> Clock<'a> {
             if !waits.is_empty() {
                 ends::saw();
             }
-            self.waits = waits;
-            self.stuck_looks = if self.waits.iter().any(|w| w.stuck.is_some()) {
-                self.stuck_looks.saturating_add(1)
-            } else {
-                0
-            };
+            self.waits_before = std::mem::replace(&mut self.waits, waits);
         }
     }
 
     /// Why the child must end now, when the last look found its tree waiting behind holders its
     /// waiter found stuck ([`aterm_toolchain::waits::Stuck`]), none of them in the child's own
     /// process group `pgid` (the group its end signals, so a holder is never signalled), on two
-    /// looks in a row: what it waited for, the holder named, and how long that has made no
-    /// progress.
+    /// looks in a row at the same mark and holder set: what it waited for, the holder named,
+    /// and how long that has made no progress. Another mark or a replacement holder lends no
+    /// confirmation, and changing diagnostic text or elapsed span does not discard it.
     fn stuck(&self, pgid: u32) -> Option<String> {
-        if self.stuck_looks < 2 {
-            return None;
-        }
         let (w, stuck) = self.waits.iter().find_map(|w| {
             let stuck = w.stuck.as_ref()?;
+            let holders: BTreeSet<_> = stuck.holders.iter().copied().collect();
+            if holders.is_empty()
+                || !self.waits_before.iter().any(|before| {
+                    w.same_mark(before)
+                        && before.stuck.as_ref().is_some_and(|stuck| {
+                            stuck.holders.iter().copied().collect::<BTreeSet<_>>() == holders
+                        })
+                })
+            {
+                return None;
+            }
             (!stuck.holders.iter().any(|&h| in_group(h, pgid))).then_some((w, stuck))
         })?;
         let now = aterm_time::unix_secs().unwrap_or(0);
@@ -1157,10 +1166,29 @@ fn finish(
     #[cfg(unix)]
     drop(spawning);
 
+    let mut progress = cmd
+        .test_progress
+        .as_ref()
+        .and_then(|_| log.and_then(|path| test_progress::Progress::open(path).ok()));
+    let begun = Instant::now();
     let mut clock = Clock::new(marks, env.host, child.id(), crate::memory::current());
     let mut told = false;
     let mut nap = Duration::from_millis(1);
     loop {
+        if let Some(progress) = &mut progress {
+            progress.poll(|case| {
+                eprintln!(
+                    "verify-event: {}",
+                    aterm_json::json!({
+                        "schema": 1, "event": "test-case-failed", "outcome": "FAIL",
+                        "test": cmd.test_progress, "case": case,
+                        "elapsed_s": begun.elapsed().as_secs_f64(),
+                        "binary_completed": false,
+                        "detail": "libtest reported a failed case; final binary result is pending",
+                    })
+                );
+            });
+        }
         #[cfg(unix)]
         let status = live.reap_stage_sweeping(&mut child, false, sweep, record);
         #[cfg(not(unix))]
@@ -2978,6 +3006,146 @@ mod tests {
         );
         assert_eq!(clock.stuck(group), None, "a holder in the child's group");
         drop(mark);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A second stuck mark cannot borrow the first mark's confirmation. Dropping the mark or
+    /// observing it without a stuck tail also ends its confirmation, while fresh diagnostic
+    /// text and a growing elapsed span on the same wait do not.
+    #[cfg(unix)]
+    #[test]
+    fn stuck_confirmation_belongs_to_the_same_live_mark() {
+        use aterm_toolchain::waits::{Mark, Stuck};
+        let tmp = crate::mktemp_dir("atv-stuck-mark").expect("mktemp");
+        let marks = tmp.join("waits");
+        std::fs::create_dir(&marks).expect("the marks' dir");
+        let holder = std::process::id();
+        let stuck = Stuck {
+            holders: vec![holder],
+            span: Duration::from_secs(900),
+        };
+        let mut first = Mark::at(&marks, "waiting").expect("first mark");
+        let mut second = Mark::at(&marks, "waiting").expect("second mark");
+        let mut clock = Clock::new(Some(&marks), &INERT, holder, None);
+        first.say_stuck("waiting", Some(&stuck));
+        clock.look();
+        assert_eq!(clock.stuck(u32::MAX), None, "first mark's first look");
+        first.say("waiting");
+        second.say_stuck("waiting", Some(&stuck));
+        clock.look();
+        assert_eq!(clock.stuck(u32::MAX), None, "second mark's first look");
+        second.say_stuck(
+            "diagnostic changed",
+            Some(&Stuck {
+                span: Duration::from_secs(901),
+                ..stuck.clone()
+            }),
+        );
+        clock.look();
+        assert!(clock.stuck(u32::MAX).is_some(), "same mark's second look");
+        second.say("waiting");
+        clock.look();
+        assert_eq!(clock.stuck(u32::MAX), None, "not stuck this look");
+        second.say_stuck("waiting", Some(&stuck));
+        clock.look();
+        assert_eq!(clock.stuck(u32::MAX), None, "confirmation must start again");
+        clock.look();
+        assert!(clock.stuck(u32::MAX).is_some());
+        drop(first);
+        drop(second);
+        clock.look();
+        assert_eq!(clock.stuck(u32::MAX), None, "no live mark");
+        let mut third = Mark::at(&marks, "waiting").expect("third mark");
+        third.say_stuck("waiting", Some(&stuck));
+        clock.look();
+        assert_eq!(
+            clock.stuck(u32::MAX),
+            None,
+            "empty look cleared confirmation"
+        );
+        clock.look();
+        assert!(clock.stuck(u32::MAX).is_some());
+        drop(third);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A wait's replacement or expanded holder set needs its own second look. Ordering,
+    /// duplicates, diagnostic words and a growing span are not changes to that holder set.
+    #[cfg(unix)]
+    #[test]
+    fn stuck_confirmation_belongs_to_the_same_holder_set() {
+        use aterm_toolchain::waits::{Mark, Stuck};
+        let tmp = crate::mktemp_dir("atv-stuck-holders").expect("mktemp");
+        let marks = tmp.join("waits");
+        std::fs::create_dir(&marks).expect("the marks' dir");
+        let holder = std::process::id();
+        let other = u32::MAX - 1;
+        let mut mark = Mark::at(&marks, "waiting").expect("a mark");
+        let mut clock = Clock::new(Some(&marks), &INERT, holder, None);
+        let mut say = |holders, span| {
+            mark.say_stuck("waiting", Some(&Stuck { holders, span }));
+        };
+        say(vec![holder], Duration::from_secs(900));
+        clock.look();
+        say(vec![other], Duration::from_secs(900));
+        clock.look();
+        assert_eq!(clock.stuck(u32::MAX), None, "a different holder");
+        clock.look();
+        assert!(clock.stuck(u32::MAX).is_some(), "holder confirmed");
+        say(vec![holder, other], Duration::from_secs(901));
+        clock.look();
+        assert_eq!(clock.stuck(u32::MAX), None, "a new holder joined");
+        say(vec![other, holder, holder], Duration::from_secs(902));
+        clock.look();
+        assert!(clock.stuck(u32::MAX).is_some(), "same normalized set");
+        say(vec![holder], Duration::from_secs(903));
+        clock.look();
+        assert_eq!(clock.stuck(u32::MAX), None, "one holder left");
+        clock.look();
+        assert!(clock.stuck(u32::MAX).is_some());
+        drop(mark);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// An established wait inside the child's group cannot prime a new external wait. This
+    /// checks selection when a confirmed but excluded record remains beside the new record.
+    #[cfg(unix)]
+    #[test]
+    fn an_excluded_mark_cannot_confirm_a_new_external_wait() {
+        use aterm_toolchain::waits::{Mark, Stuck};
+        let tmp = crate::mktemp_dir("atv-stuck-excluded").expect("mktemp");
+        let marks = tmp.join("waits");
+        std::fs::create_dir(&marks).expect("the marks' dir");
+        let holder = std::process::id();
+        // SAFETY: `getpgid(0)` reads this process's group; it signals nothing.
+        let group = u32::try_from(unsafe { libc::getpgid(0) }).expect("this process's group");
+        let mut internal = Mark::at(&marks, "internal wait").expect("internal mark");
+        internal.say_stuck(
+            "internal wait",
+            Some(&Stuck {
+                holders: vec![holder],
+                span: Duration::from_secs(900),
+            }),
+        );
+        let mut clock = Clock::new(Some(&marks), &INERT, holder, None);
+        clock.look();
+        clock.look();
+        assert_eq!(clock.stuck(group), None, "its holder would be signalled");
+        let mut external = Mark::at(&marks, "external wait").expect("external mark");
+        // A synthetic PID outside any representable process group, not a process to signal.
+        external.say_stuck(
+            "external wait",
+            Some(&Stuck {
+                holders: vec![u32::MAX - 1],
+                span: Duration::from_secs(900),
+            }),
+        );
+        clock.look();
+        assert_eq!(clock.stuck(group), None, "new external wait seen only once");
+        clock.look();
+        assert!(clock.stuck(group).is_some(), "external wait seen twice");
+        drop(internal);
+        drop(external);
         std::fs::remove_dir_all(&tmp).ok();
     }
 

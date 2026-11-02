@@ -11132,32 +11132,116 @@ impl Renewal {
     }
 }
 
-/// The opener's link, `<accounts store>/bin/aterm-open-url` → this program ([`AccountsHost::current_exe`]), made again on every renewal that opens a profile or runs over SSH (a temp link, then a rename), so it names a moved or updated binary.
-pub(super) fn opener_link(store: &accounts::Store, host: &dyn AccountsHost) -> Option<PathBuf> {
-    let exe = host.current_exe()?;
-    let bin = store.dir.join("bin");
-    aterm_types::fs_restricted::ensure_private_dir(&store.dir).ok()?;
-    aterm_types::fs_restricted::ensure_private_dir(&bin).ok()?;
-    let link = bin.join(super::open_url::OPENER);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OpenerStage {
+    #[cfg(unix)]
+    Executable,
+    #[cfg(unix)]
+    AccountDirectory,
+    #[cfg(unix)]
+    HelperDirectory,
+    #[cfg(unix)]
+    TemporaryLink,
+    #[cfg(unix)]
+    Publication,
+    #[cfg(not(unix))]
+    Platform,
+}
+
+/// Public setup metadata only; paths, provider URLs and credentials are never retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OpenerError {
+    stage: OpenerStage,
+    kind: Option<io::ErrorKind>,
+}
+
+impl OpenerError {
+    const fn new(stage: OpenerStage, kind: io::ErrorKind) -> Self {
+        Self {
+            stage,
+            kind: Some(kind),
+        }
+    }
+}
+
+impl std::fmt::Display for OpenerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stage = match self.stage {
+            #[cfg(unix)]
+            OpenerStage::Executable => "executable",
+            #[cfg(unix)]
+            OpenerStage::AccountDirectory => "account directory",
+            #[cfg(unix)]
+            OpenerStage::HelperDirectory => "helper directory",
+            #[cfg(unix)]
+            OpenerStage::TemporaryLink => "temporary link",
+            #[cfg(unix)]
+            OpenerStage::Publication => "link publication",
+            #[cfg(not(unix))]
+            OpenerStage::Platform => "platform",
+        };
+        match self.kind {
+            Some(kind) => write!(f, "sign-in opener setup failed: {stage} ({kind:?})"),
+            None => write!(f, "sign-in opener setup failed: {stage} unavailable"),
+        }
+    }
+}
+
+/// Publish `<accounts store>/bin/aterm-open-url` after checking its target is an executable
+/// regular file. Callers hold the machine's sign-in lock through setup and the provider run.
+/// This checks filesystem readiness, not the success of a later exec; failures retain the old link.
+pub(super) fn opener_link(
+    store: &accounts::Store,
+    host: &dyn AccountsHost,
+) -> Result<PathBuf, OpenerError> {
     #[cfg(unix)]
     {
+        use std::os::unix::ffi::OsStrExt as _;
+        let fail = |stage| move |error: io::Error| OpenerError::new(stage, error.kind());
+        let exe = host.current_exe().ok_or(OpenerError {
+            stage: OpenerStage::Executable,
+            kind: None,
+        })?;
+        let exe = std::fs::canonicalize(exe).map_err(fail(OpenerStage::Executable))?;
+        let metadata = std::fs::metadata(&exe).map_err(fail(OpenerStage::Executable))?;
+        if !metadata.is_file() {
+            return Err(OpenerError::new(
+                OpenerStage::Executable,
+                io::ErrorKind::InvalidInput,
+            ));
+        }
+        let name = std::ffi::CString::new(exe.as_os_str().as_bytes())
+            .map_err(|_| OpenerError::new(OpenerStage::Executable, io::ErrorKind::InvalidInput))?;
+        // SAFETY: `name` is a live, NUL-terminated path; access only reads it.
+        if unsafe { libc::access(name.as_ptr(), libc::X_OK) } != 0 {
+            return Err(fail(OpenerStage::Executable)(io::Error::last_os_error()));
+        }
+        let bin = store.dir.join("bin");
+        aterm_types::fs_restricted::ensure_private_dir(&store.dir)
+            .map_err(fail(OpenerStage::AccountDirectory))?;
+        aterm_types::fs_restricted::ensure_private_dir(&bin)
+            .map_err(fail(OpenerStage::HelperDirectory))?;
+        let link = bin.join(super::open_url::OPENER);
         let temp = bin.join(format!(
             ".{}.{}",
             super::open_url::OPENER,
             std::process::id()
         ));
         let _ = std::fs::remove_file(&temp);
-        std::os::unix::fs::symlink(&exe, &temp).ok()?;
-        if std::fs::rename(&temp, &link).is_err() {
+        std::os::unix::fs::symlink(&exe, &temp).map_err(fail(OpenerStage::TemporaryLink))?;
+        if let Err(error) = std::fs::rename(&temp, &link) {
             let _ = std::fs::remove_file(&temp);
-            return None;
+            return Err(OpenerError::new(OpenerStage::Publication, error.kind()));
         }
-        Some(link)
+        Ok(link)
     }
     #[cfg(not(unix))]
     {
-        let _ = (exe, link);
-        None
+        let _ = (store, host);
+        Err(OpenerError::new(
+            OpenerStage::Platform,
+            io::ErrorKind::Unsupported,
+        ))
     }
 }
 
@@ -11883,7 +11967,7 @@ fn run_accounts_renew(
         ok = false;
         chosen.clear();
     }
-    let mut opener: Option<Option<PathBuf>> = None;
+    let mut opener: Option<Result<PathBuf, OpenerError>> = None;
     for label in &chosen {
         // Each row starts a separate attempt. The preceding row may have allocated a
         // generation, so capture this row and its parent together before taking the lock, which
@@ -11926,15 +12010,15 @@ fn run_accounts_renew(
         };
         let own_dir = file_roster.row(label).and_then(|r| r.dir.as_deref());
         let interactive_browser =
-            |opener: &mut Option<Option<PathBuf>>| match row.browser.as_deref() {
-                None => RenewBrowser::Default,
-                Some(profile) => match opener.get_or_insert_with(|| opener_link(&store, host)) {
-                    Some(link) => RenewBrowser::Profile {
-                        opener: link.clone(),
+            |opener: &mut Option<Result<PathBuf, OpenerError>>| match row.browser.as_deref() {
+                None => Ok(RenewBrowser::Default),
+                Some(profile) => opener
+                    .get_or_insert_with(|| opener_link(&store, host))
+                    .clone()
+                    .map(|opener| RenewBrowser::Profile {
+                        opener,
                         profile: profile.to_string(),
-                    },
-                    None => RenewBrowser::Default,
-                },
+                    }),
             };
         // A person is here for a row whose page stopped its automatic sign-in: a headless run
         // would only meet that page again, so the sign-in is theirs, in the row's own browser
@@ -11947,17 +12031,22 @@ fn run_accounts_renew(
         let used_headless_profile_only =
             !stopped && !host.under_ssh() && !row_has_mailbox(label) && headless;
         let browser = if stopped {
-            match interactive_browser(&mut opener) {
+            interactive_browser(&mut opener).map(|browser| match browser {
                 RenewBrowser::Profile { opener, profile } => {
                     RenewBrowser::OwnProfile { opener, profile }
                 }
                 browser => browser,
-            }
+            })
         } else if host.under_ssh() || headless {
-            RenewBrowser::Remote {
-                opener: opener
-                    .get_or_insert_with(|| opener_link(&store, host))
-                    .clone(),
+            match opener
+                .get_or_insert_with(|| opener_link(&store, host))
+                .clone()
+            {
+                Ok(opener) => Ok(RenewBrowser::Remote {
+                    opener: Some(opener),
+                }),
+                Err(_) if host.under_ssh() && person => Ok(RenewBrowser::Remote { opener: None }),
+                Err(error) => Err(error),
             }
         } else if person {
             interactive_browser(&mut opener)
@@ -11969,6 +12058,17 @@ fn run_accounts_renew(
             );
             ok = false;
             continue;
+        };
+        let browser = match browser {
+            Ok(browser) => browser,
+            Err(error) => {
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: {label}: {error}; nothing was run"
+                );
+                ok = false;
+                continue;
+            }
         };
         let policy = || accounts::RenewalPolicy {
             roster_path: &path,
@@ -11988,7 +12088,17 @@ fn run_accounts_renew(
             err,
         );
         if renewal.can_retry_authentication() && used_headless_profile_only && person {
-            let fallback = interactive_browser(&mut opener);
+            let fallback = match interactive_browser(&mut opener) {
+                Ok(browser) => browser,
+                Err(error) => {
+                    let _ = writeln!(
+                        err,
+                        "aterm harness accounts renew: {label}: {error}; fallback was not run"
+                    );
+                    ok = false;
+                    continue;
+                }
+            };
             renewal = renew_one(
                 env,
                 host,
@@ -14751,9 +14861,12 @@ fn package_build_version(
     program: &str,
     exe: &Path,
 ) -> Option<String> {
-    if atpkg::alab::agent(program).is_some()
-        && let Some(version) = atpkg::alab::package_version_of_exe(exe)
-    {
+    if atpkg::harness::is_harness(program) {
+        return atpkg::harness::local_build_version_of_exe(exe, program)
+            .or_else(|| atpkg::harness::store_build_version_of_exe(layout, program, exe));
+    }
+    atpkg::alab::agent(program)?;
+    if let Some(version) = atpkg::alab::package_version_of_exe(exe) {
         return Some(version);
     }
     if let Ok(store) = std::fs::canonicalize(layout.prefix.join("store").join(program))

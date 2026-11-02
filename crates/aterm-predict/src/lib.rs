@@ -158,11 +158,7 @@ impl EditorContext {
         cursor_keys_application: bool,
         escaped_chords: bool,
     ) -> Self {
-        let nonce = nonce.map_or(0, |bytes| {
-            bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
-                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-            })
-        });
+        let nonce = nonce.map_or(0, |bytes| aterm_hash::fnv1a_64(bytes));
         Self {
             session,
             nonce,

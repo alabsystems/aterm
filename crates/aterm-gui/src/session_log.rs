@@ -455,14 +455,7 @@ struct FgRun {
 }
 
 fn name_fp(name: Option<&str>) -> u64 {
-    name.map_or(0, |n| {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in n.bytes() {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h.max(1)
-    })
+    name.map_or(0, |n| aterm_hash::fnv1a_64(n.as_bytes()).max(1))
 }
 
 #[derive(Debug)]
@@ -743,6 +736,7 @@ pub(crate) fn exit_actor(actor: &crate::session_store::ExitActor) -> Actor {
         ExitActor::Sid(sid) => sid_actor(sid).unwrap_or(Actor::Nobody),
         ExitActor::Human => Actor::Human,
         ExitActor::Ctl => Actor::Ctl,
+        ExitActor::Harness => Actor::Harness,
         #[cfg(any(unix, test))]
         ExitActor::Bridge => Actor::Bridge,
         ExitActor::Unknown => Actor::Nobody,

@@ -192,9 +192,7 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
 }
 
 fn classify_verb(args: &[String]) -> Result<Reply, String> {
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from);
+    let home = crate::supervise::policy::approval::advisory_home();
     let cwd = std::env::current_dir().ok();
     classify_verb_at(args, home.as_deref(), cwd.as_deref())
 }
@@ -397,7 +395,11 @@ fn ledger_verb(opts: &Opts, args: &[String]) -> Result<Reply, String> {
         tz_offset_s: tz_offset_s(),
     };
     let ledger = supervise::gather(&mut client, &lopts, &host);
-    let text = supervise::render_ledger(&ledger, sub.format.unwrap_or_default());
+    let text = supervise::render_ledger_local(
+        &ledger,
+        sub.format.unwrap_or_default(),
+        &supervise::limit::local_offset_at,
+    );
     match &sub.out {
         None => Ok(Reply::text(text)),
         Some(path) => {
@@ -911,9 +913,19 @@ mod tests {
         v.iter().map(std::ffi::OsString::from).collect()
     }
 
+    /// [`classify_verb_at`] under this test's `HOME`, asked from a folder no secret rule names: a
+    /// checkout may sit under one (`~/Library/Caches`), where a relative path is a read of a secret.
+    fn classified(args: &[String]) -> Result<Reply, String> {
+        classify_verb_at(
+            args,
+            crate::supervise::policy::approval::advisory_home().as_deref(),
+            Some(std::path::Path::new("/var/empty")),
+        )
+    }
+
     #[test]
     fn classify_parses_the_command_and_exits_on_the_verdict() {
-        let r = classify_verb(&args(&["git status --short && git pull | tail"])).expect("ok");
+        let r = classified(&args(&["git status --short && git pull | tail"])).expect("ok");
         assert_eq!(
             r,
             Reply {
@@ -921,7 +933,7 @@ mod tests {
                 code: 1
             }
         );
-        let r = classify_verb(&args(&["git", "log", "-3"])).expect("joined words");
+        let r = classified(&args(&["git", "log", "-3"])).expect("joined words");
         assert_eq!(
             r,
             Reply {
@@ -929,7 +941,7 @@ mod tests {
                 code: 0
             }
         );
-        let r = classify_verb(&args(&["git", "log", "--oneline"])).expect("a flag in the command");
+        let r = classified(&args(&["git", "log", "--oneline"])).expect("a flag in the command");
         assert_eq!(r.code, 0, "{r:?}");
         let sub = parse_sub("classify", &args(&["git", "log", "--oneline", "-5"])).expect("parses");
         assert_eq!(sub.rest, args(&["git", "log", "--oneline", "-5"]));
@@ -942,16 +954,16 @@ mod tests {
             (sub.sid.as_deref(), sub.rest),
             (Some("@s-1"), args(&["--weird"]))
         );
-        let r = classify_verb(&args(&["python3 tools/audit.py"])).expect("ok");
+        let r = classified(&args(&["python3 tools/audit.py"])).expect("ok");
         assert_eq!(r.code, 1);
-        let r = classify_verb(&args(&[
+        let r = classified(&args(&[
             "--allow-python",
             "tools/*.py",
             "python3 tools/audit.py",
         ]))
         .expect("ok");
         assert_eq!(r.code, 0, "{r:?}");
-        assert!(classify_verb(&args(&[])).is_err(), "no command");
+        assert!(classified(&args(&[])).is_err(), "no command");
         let o = parse(vec!["classify".into(), "ls -la".into()]).expect("parses");
         assert_eq!(o.cmd, args(&["classify", "ls -la"]));
         assert_eq!(run(&o).expect("pure verb needs no host").code, 0);
@@ -1024,10 +1036,8 @@ mod tests {
     /// line to the proof gaps the advisory word holds it to, so the two agree on every line.
     #[test]
     fn classify_reads_the_shell_home_and_the_proof_gaps() {
-        let home = std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map(PathBuf::from)
-            .expect("the test runs with a HOME");
+        let home =
+            crate::supervise::policy::approval::advisory_home().expect("the test runs with a home");
         for line in [
             "cat ~/.config/gh/hosts.yml".to_string(),
             // Quoted: a Windows home's `\` is the shell's escape outside quotes.
@@ -1036,7 +1046,7 @@ mod tests {
             "cat ~/.config/g?/hosts.yml".to_string(),
             "grep -r token ~".to_string(),
         ] {
-            let r = classify_verb(&args(&[&line])).expect("ok");
+            let r = classified(&args(&[&line])).expect("ok");
             assert_eq!(r.code, 1, "{line}: {r:?}");
             assert!(
                 r.text.starts_with("not-read-only a read of a secret"),
@@ -1055,17 +1065,26 @@ mod tests {
             ("cat $(<files.txt)", "builds at run time"),
             ("echo $GITHUB_TOKEN", "may be a secret"),
         ] {
-            let r = classify_verb(&args(&[line])).expect("ok");
+            let r = classified(&args(&[line])).expect("ok");
             assert_eq!(r.code, 1, "{line}: {r:?}");
             assert!(r.text.contains(why), "{line}: {r:?}");
         }
+        // A relative path is read from where the line runs.
+        let library = home.join("Library").join("Caches");
+        let r =
+            classify_verb_at(&args(&["cat README.md"]), Some(&home), Some(&library)).expect("ok");
+        assert_eq!(r.code, 1, "{r:?}");
+        assert!(
+            r.text.starts_with("not-read-only a read of a secret"),
+            "{r:?}"
+        );
         // NEGATIVE CONTROLS
         for line in [
             "cat ~/.config/notes.txt",
             "ls src/*.rs | sort",
             "cat README.md",
         ] {
-            let r = classify_verb(&args(&[line])).expect("ok");
+            let r = classified(&args(&[line])).expect("ok");
             assert_eq!(r, Reply::text("read-only\n".to_string()), "{line}");
         }
     }

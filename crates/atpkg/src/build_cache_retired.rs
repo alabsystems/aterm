@@ -109,11 +109,19 @@ pub trait Git {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GitCli;
 
+/// `path` without a Windows verbatim drive prefix (`\\?\C:\…`), which git reads as a host name.
+fn git_path(path: &Path) -> &Path {
+    path.to_str()
+        .and_then(|s| s.strip_prefix(r"\\?\"))
+        .filter(|s| !s.starts_with(r"UNC\"))
+        .map_or(path, Path::new)
+}
+
 impl Git for GitCli {
     fn run(&self, dir: &Path, args: &[&str]) -> Answer {
         let out = aterm_uds::spawnfd::command("git")
             .arg("-C")
-            .arg(dir)
+            .arg(git_path(dir))
             .args(args)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -353,7 +361,7 @@ fn entry_named(checkout: &Path, wt: &Path, text: &[u8]) -> Option<PathBuf> {
     }
     let common = std::fs::canonicalize(worktrees.parent()?).ok()?;
     (common == std::fs::canonicalize(checkout.join(".git")).ok()?)
-        .then(|| common.join("worktrees").join(id))
+        .then(|| git_path(&common).join("worktrees").join(id))
 }
 
 /// Git's entry for the worktree `wt` of `checkout`, as `text`, `wt`'s `.git`, names it, while
@@ -816,7 +824,7 @@ fn remove_snapshot(
         {
             Some(reason)
         } else if left.whole() {
-            let wt_arg = wt.to_string_lossy();
+            let wt_arg = git_path(wt).to_string_lossy();
             let dropped = git.run(checkout, &["worktree", "remove", "--force", &wt_arg]);
             (dropped.code != Some(0)).then_some(dropped.err)
         } else if entry.join("locked").symlink_metadata().is_ok() {

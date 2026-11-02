@@ -136,13 +136,13 @@ mod planner;
 // deterministic fabric simulation, its item B05). Never behind a cargo feature.
 #[cfg(any(test, debug_assertions))]
 pub use planner::{
-    carried_since, clamp_stamps, counted_from, oldest, plan, prune_stamps, stamp, Held, Ledger,
-    Plan, Stamps, View, Why,
+    carried_since, clamp_stamps, counted_from, oldest, plan, plan_with, prune_stamps, stamp, Held,
+    Ledger, Plan, Planned, Stamps, View, Why,
 };
 #[cfg(not(any(test, debug_assertions)))]
 pub(crate) use planner::{
-    carried_since, clamp_stamps, counted_from, oldest, plan, prune_stamps, stamp, Held, Ledger,
-    Plan, Stamps, View, Why,
+    carried_since, clamp_stamps, counted_from, oldest, plan, plan_with, prune_stamps, stamp, Held,
+    Ledger, Plan, Planned, Stamps, View, Why,
 };
 #[cfg(test)]
 use planner::{stamped_at, STAMPS_MAX};
@@ -341,17 +341,18 @@ impl Rule {
         }
     }
 
-    /// Whether every reader group this rule names for `rec` has committed past it.
+    /// Whether every reader group this rule names for the record of `subject` at
+    /// `offset` has committed past it.
     /// `false` with no reader that applies: such a record is held for its age alone.
-    fn read(&self, rec: &BrokerRecord, groups: &HashMap<String, u64>) -> bool {
+    fn read(&self, subject: &str, offset: u64, groups: &HashMap<String, u64>) -> bool {
         let mut any = false;
         for t in &self.read_by {
-            let Some(group) = expand(t, &rec.subject) else {
+            let Some(group) = expand(t, subject) else {
                 continue;
             };
             any = true;
             match groups.get(&group) {
-                Some(&upto) if upto >= rec.seq.0 => {}
+                Some(&upto) if upto >= offset => {}
                 _ => return false,
             }
         }
@@ -422,16 +423,7 @@ pub(crate) fn filters_overlap(a: &str, b: &str) -> bool {
 /// the batch mark. A sealed log stores a fixed overhead more per record.
 #[must_use]
 pub fn record_bytes(rec: &BrokerRecord) -> u64 {
-    let commit = match &rec.commit {
-        Some(c) => c.group.len().saturating_add(12),
-        None => 0,
-    };
-    let n = astream_wire::HEADER_SIZE
-        .saturating_add(crate::brecord::RECORD_FIXED_LEN)
-        .saturating_add(rec.subject.len())
-        .saturating_add(rec.body.len())
-        .saturating_add(commit);
-    n as u64
+    crate::brecord::plaintext_frame_bytes(rec)
 }
 
 /// A broker's retention rules: every [`Rule`] in order, then the default one.

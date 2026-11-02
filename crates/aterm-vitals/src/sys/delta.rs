@@ -12,7 +12,8 @@ pub struct Fingerprints {
     pub lines: Vec<(String, u64)>,
 }
 
-/// FNV-1a 64-bit hash, stable across builds.
+/// FNV-1a 64-bit hash, stable across builds: `aterm_hash::fnv1a_64`, spelled out because this
+/// crate depends on nothing. `fnv_is_aterm_hashs_fold` holds it to that.
 #[must_use]
 pub fn fnv(text: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -131,8 +132,15 @@ mod tests {
     }
 
     #[test]
-    fn fnv_is_stable() {
-        assert_eq!(fnv(""), 0xcbf2_9ce4_8422_2325);
-        assert_ne!(fnv("a"), fnv("b"));
+    fn fnv_is_aterm_hashs_fold() {
+        for text in [
+            "",
+            "a",
+            "foobar",
+            "global 3.0 of 8 cores busy",
+            "é \u{1F600}",
+        ] {
+            assert_eq!(fnv(text), aterm_hash::fnv1a_64(text.as_bytes()), "{text:?}");
+        }
     }
 }

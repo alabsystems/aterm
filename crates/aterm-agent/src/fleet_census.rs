@@ -1295,14 +1295,22 @@ impl SwarmCensus {
         use std::fmt::Write as _;
         let mut out = String::new();
         let steward = self.steward.as_deref().unwrap_or("-");
-        let p2_pct = f64::from(self.summary.p2_ratio_bps) / 100.0;
+        // With nobody heard there is no ratio: `p2_ratio_bps` holds its 10_000 default, which
+        // would print a Mac in no fleet as 100% joined.
+        let joined = if self.summary.distinct_heard_7d == 0 {
+            "none heard".to_owned()
+        } else {
+            format!(
+                "{:.1}% joined",
+                f64::from(self.summary.p2_ratio_bps) / 100.0
+            )
+        };
         let _ = writeln!(
             out,
-            "swarm census (steward {steward}, at {}): {} members ({} heard 7d, {:.1}% joined), fleet={}, commons={}",
+            "swarm census (steward {steward}, at {}): {} members ({} heard 7d, {joined}), fleet={}, commons={}",
             self.generated_at,
             self.summary.members_total,
             self.summary.distinct_heard_7d,
-            p2_pct,
             self.summary.fleet_members,
             self.summary.commons_members,
         );

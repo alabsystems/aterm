@@ -16026,6 +16026,76 @@ fn a_screen_read_around_a_new_answer_is_no_word_of_it() {
 }
 
 #[test]
+fn footer_usage_resets_across_a_daylight_change_take_the_resets_offset() {
+    use aterm_phase::credits::{Credits, Started, Warning, Window};
+    const PDT: i64 = -7 * 3600;
+    const PST: i64 = -8 * 3600;
+    let fall_local = |unix: i64| Some(if unix < 1_793_523_600 { PDT } else { PST });
+    let fall_at = 1_793_514_600; // 2026-10-31T23:30:00-07:00 (day 20_757, 4.5 h before 3am PST)
+    let fall_seen = UsageSeen {
+        credits: Some(Credits {
+            started: Some(Started {
+                window: Some(Window::Session),
+                reset: Some("3am".to_string()),
+            }),
+            model: None,
+        }),
+        warning: Some(Warning {
+            window: Window::Weekly,
+            pct: 85,
+            reset: Some("Nov 2 at 9am".to_string()),
+        }),
+    };
+    let said = usage_said_local(&fall_seen, fall_at, &fall_local);
+    assert_eq!(said.day, 20_757);
+    assert_eq!(
+        said.credits.as_ref().and_then(|c| c.until),
+        Some(1_793_530_800), // 2026-11-01T03:00:00-08:00 (PST)
+    );
+    assert_eq!(
+        said.warning.as_ref().and_then(|w| w.reset),
+        Some(1_793_638_800), // 2026-11-02T09:00:00-08:00 (PST)
+    );
+    // Negative control: a flat answer-time offset places both an hour early on PDT.
+    let flat = usage_said(&fall_seen, fall_at, PDT);
+    assert_eq!(
+        flat.credits.as_ref().and_then(|c| c.until),
+        Some(1_793_530_800 - 3600)
+    );
+    assert_eq!(
+        flat.warning.as_ref().and_then(|w| w.reset),
+        Some(1_793_638_800 - 3600)
+    );
+
+    let spring_local = |unix: i64| Some(if unix < 1_772_964_000 { PST } else { PDT });
+    let spring_at = 1_772_951_400; // 2026-03-07T22:30:00-08:00 (day 20_519, 4.5 h before 4am PDT)
+    let spring_seen = UsageSeen {
+        credits: Some(Credits {
+            started: Some(Started {
+                window: Some(Window::Session),
+                reset: Some("4am".to_string()),
+            }),
+            model: None,
+        }),
+        warning: Some(Warning {
+            window: Window::Weekly,
+            pct: 90,
+            reset: Some("Mar 9 at 9am".to_string()),
+        }),
+    };
+    let said = usage_said_local(&spring_seen, spring_at, &spring_local);
+    assert_eq!(said.day, 20_519);
+    assert_eq!(
+        said.credits.as_ref().and_then(|c| c.until),
+        Some(1_772_967_600), // 2026-03-08T04:00:00-07:00 (PDT)
+    );
+    assert_eq!(
+        said.warning.as_ref().and_then(|w| w.reset),
+        Some(1_773_072_000), // 2026-03-09T09:00:00-07:00 (PDT)
+    );
+}
+
+#[test]
 fn the_window_is_told_of_the_accounts_once_per_change() {
     let a = Accts::new();
     let (hooks, notes) = noting(a.hooks());
@@ -18179,7 +18249,12 @@ fn agy_settings_are_reread_when_unread_and_settled_when_signed_in() {
         }),
         agy_backend: Arc::new(move |snap, env| {
             *reads.lock().unwrap().entry(snap.pid).or_default() += 1;
-            witness::agy_backend_on_disk(&snap.argv, env, None)
+            witness::agy_backend_in_dir(
+                &snap.argv,
+                env,
+                Some(std::path::Path::new(&snap.cwd)),
+                None,
+            )
         }),
         ..Acts::inert()
     };
@@ -18234,6 +18309,26 @@ fn agy_settings_are_reread_when_unread_and_settled_when_signed_in() {
         backend_reads.lock().unwrap().get(&6061),
         Some(&1),
         "settled sign-in gap is cached for the process"
+    );
+
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    std::fs::write(
+        work.join("rel-ovr.json"),
+        "{\"modelProvider\":\"gemini\"}\n",
+    )
+    .expect("relative override");
+    let rel_host = idle_host("s-agy-rel", Program::Agy, Arc::clone(&switches), hooks);
+    rel_host.kept.lock().unwrap().snapshot = Some(Snapshot {
+        pid: 6062,
+        argv: vec!["agy".to_string(), "--settings=rel-ovr.json".to_string()],
+        cwd: work.display().to_string(),
+        ..snap("s-agy-rel")
+    });
+    assert_eq!(
+        rel_host.endpoint(),
+        Some(witness::Endpoint::Named(witness::Base::gemini())),
+        "relative --settings file resolved against snapshot cwd selects Gemini API"
     );
 }
 
@@ -19591,6 +19686,47 @@ fn a_wait_on_something_new_starts_the_pauses_over() {
     assert_eq!(run.after("announced:1", 120), After::NextIdle);
     assert_eq!((run.waits, run.same), (0, 0));
     assert_eq!(run.after("wait:settling", 120), After::Later(LATER[0]));
+}
+
+/// A CARRY-ON A PERSON'S KEYS HOLD IS LOOKED AT ON THE HOLD'S OWN CADENCE (real Claude Code under the
+/// lab's stub, runs ml4 and mc4 of 2026-11-02: a draft cleared three minutes past the relaunch, then
+/// `wait:held` at +3 s, +23 s and +83 s, and neither the restart prompt nor the loop's own came in
+/// the four minutes the run went on). Each look is read off what the worker's own step at a point
+/// sets, so what is held is the step's choice of cadence as well as the cadence. NEGATIVE CONTROL:
+/// the same word from a held upgrade, at the same point, climbs the ladder to five minutes, and the
+/// carry-on's other words keep theirs.
+#[test]
+fn a_carry_on_a_persons_keys_hold_does_not_climb_the_ladder() {
+    use upgrade_drive::{HOLD_LOOK, LATER};
+    let looks = |carrying: bool, word: &'static str, wants: &[Duration]| {
+        let world = Arc::new(World::default());
+        let mut hooks = hooks(&world, parking_body(&world));
+        hooks.pause = Arc::new(|pause| pause);
+        hooks.acts = Acts {
+            due: Arc::new(|_| Due::Yes),
+            owed: Arc::new(move |_, _| carrying),
+            resume: Arc::new(move |_, _, _| word.to_string()),
+            step: Arc::new(move |_, _, _| word.to_string()),
+            ..Acts::inert()
+        };
+        let idle = idle_host("s-keys", Program::Claude, switched(&on()), hooks);
+        let what = if carrying { "carry-on" } else { "upgrade" };
+        for want in wants {
+            let before = Instant::now();
+            let step = idle.at_idle_on(IdlePoint::default()).expect("a step");
+            let after = Instant::now();
+            assert_eq!(step.line, format!("{what} step={word}"));
+            let at = idle.look_at.lock().unwrap().take().expect("a look named");
+            assert!(
+                before + *want <= at && at <= after + *want,
+                "{what} {word}: a look {want:?} on, not {:?}",
+                at.duration_since(before)
+            );
+        }
+    };
+    looks(true, "wait:held", &[HOLD_LOOK; 4]);
+    looks(false, "wait:held", &LATER[..3]);
+    looks(true, "wait:off", &LATER[..2]);
 }
 
 #[test]
@@ -34355,7 +34491,9 @@ fn the_store_lists_each_task_record_and_reads_a_judged_workers_screen() {
         mark(&spawned, TaskState::Working, None);
         let mut tl = spawned.ctx.timeline.lock().unwrap();
         tl.set_task_worker(Program::Agy, None);
-        tl.task().expect("a record").carry_row()
+        tl.task()
+            .expect("a record")
+            .carry_row(std::time::Instant::now())
     };
     let carried = crate::session_store::test_handle(11);
     crate::task_record::seed_carried(&carried.ctx, Some(&row));
@@ -35627,6 +35765,8 @@ fn a_slow_upgrade_read_never_holds_the_idle_point() {
     assert_eq!(p.at(), unread, "the next point reads again");
     held.let_go();
     until("the newer read lands", || p.landed());
+    // It lands before it ends: a point while it is still out joins it rather than reading anew.
+    until("the newer read ends", || p.out().is_none());
     assert_eq!(p.at(), None, "the newer answer decides");
     assert_eq!(p.counts(), (5, 1));
 

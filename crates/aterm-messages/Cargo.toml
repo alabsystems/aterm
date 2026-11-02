@@ -27,6 +27,9 @@ aterm-types = { workspace = true }
 # (`str_grid_columns`), which hosts inject as `presence::Host::columns`.
 # Wasm-clean (aterm-core, which aterm-wasm ships, depends on it).
 aterm-grapheme = { workspace = true }
+# FNV-1a/64 (astream-wire's) for keys and fingerprints. Wasm-clean, and already in the graph
+# through aterm-types.
+aterm-hash = { workspace = true }
 # The motion vocabulary (`aterm_scene::motion`: the duration tokens, Q16 easings, the glide,
 # springs and cadences) the band draws with and re-exports, shared with every animated surface.
 # Dependency-free and wasm-clean.

@@ -14,7 +14,13 @@
 //!   whose concurrent siblings break ties by lowest [`RecordId`], then merges `[everyone]` under
 //!   host audiences identically to envelope lockers. A `Put` that carries the register's value
 //!   unchanged (an epoch's reseal) loses to a concurrent sibling that changes it, and replaces
-//!   only ops writing that value.
+//!   only ops writing that value; so does a `Delete` issued where every live op in its past is a
+//!   `Delete` (a reseal re-issuing one, F21 rule 6).
+//! - Keyed epochs (F21, the evaluator's "Keyed epochs"): a counting `Put` or `Delete` that
+//!   depends on an epoch that stopped counting opens through that epoch's key
+//!   ([`OpenedAudienceEntries::keyed_keys`]), and the winners it seals stay apart from the
+//!   counting ones ([`OpenedAudienceEntries::keyed_winning`]), so no writer reuses the epoch and
+//!   no member hands it on.
 
 use super::{
     Body, Draft, EpochAudience, Kind, Log, MAX_FOUNDERS, MemberId, Reader, Record, RecordId, eval,
@@ -57,6 +63,27 @@ pub struct CommonsEpochView {
     pub key: Zeroizing<[u8; 32]>,
 }
 
+/// One keyed epoch (F21 rule 4), as [`Log::keyed_epochs`] reads it from the records alone: an
+/// epoch that stopped counting, which an honest counting write relied on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Keyed {
+    /// The keyed [`Body::Epoch`].
+    pub epoch: RecordId,
+    /// Its audience.
+    pub audience: EpochAudience,
+    /// The counting `Put`s and `Delete`s that depend on it, in record order.
+    pub dependents: Vec<RecordId>,
+    /// Who holds its key: its dependents' signers, and each current member that a
+    /// [`Body::Wrap`] of it which may open it (one that counts, or one in a dependent's past) is
+    /// addressed to.
+    pub holders: BTreeSet<MemberId>,
+    /// A full reseal of its audience has every dependent in its past: a counting epoch whose
+    /// signer, there, held the key of every newest counting epoch of the audience and had attested
+    /// (wrapped to itself, in a counting `Wrap`) every keyed epoch of the audience with a
+    /// dependent in its past.
+    pub covered: bool,
+}
+
 /// Per-audience state opened from a [`Log`] for one [`Identity`], preserving distinct audiences
 /// before `[everyone]` / host merging so writers and envelope-mirror builders can diff per
 /// [`Audience`].
@@ -69,8 +96,14 @@ pub struct OpenedAudienceEntries {
     /// Winning [`Audience::Hosts`] section per entry name across all host audiences unwrapped by
     /// this [`Identity`] (resolved by causal order and then lowest [`RecordId`]).
     pub winning_host_audience: BTreeMap<String, Audience>,
-    /// Epochs that currently seal at least one winning live entry, grouped by [`EpochAudience`].
+    /// Epochs that count and currently seal at least one winning live entry (or the winning
+    /// Commons control descriptor), grouped by [`EpochAudience`]. A keyed epoch never enters it.
     pub winning_epochs: BTreeMap<EpochAudience, BTreeSet<RecordId>>,
+    /// Keyed epochs (F21: an epoch that stopped counting, which an honest counting write relied
+    /// on) that seal at least one winning live entry or the winning Commons control descriptor,
+    /// grouped by [`EpochAudience`]. They carry no authority: no writer reuses one and no member
+    /// hands one on.
+    pub keyed_winning: BTreeMap<EpochAudience, BTreeSet<RecordId>>,
     /// Causally maximal effective [`Body::Epoch`] record ids per [`EpochAudience`].
     pub maximal_epochs: BTreeMap<EpochAudience, Vec<RecordId>>,
     /// Highest effective `generation` observed per [`EpochAudience`].
@@ -80,14 +113,56 @@ pub struct OpenedAudienceEntries {
     /// `(Audience, name)` registers holding two or more concurrent sibling writes that write
     /// different things (a reseal, which carries a value unchanged, is none).
     pub conflicts: BTreeSet<(Audience, String)>,
-    /// Unwrapped symmetric keys keyed by `epoch` [`RecordId`].
+    /// Unwrapped symmetric keys of epochs that count, keyed by `epoch` [`RecordId`]. Every path
+    /// that decides what to wrap or reuse reads this, so it never holds a keyed epoch.
     pub unwrapped_keys: BTreeMap<RecordId, Zeroizing<[u8; 32]>>,
+    /// Unwrapped symmetric keys of keyed epochs (F21 rule 2), keyed by `epoch` [`RecordId`]: they
+    /// open the dependents sealed under those epochs, and nothing else.
+    pub keyed_keys: BTreeMap<RecordId, Zeroizing<[u8; 32]>>,
+    /// Uncovered keyed epochs (F21 rule 4) that a current member holds, by audience, in record
+    /// order: each waits for a holder's reseal, whether or not this [`Identity`] opens it.
+    pub uncovered_keyed: BTreeMap<EpochAudience, Vec<RecordId>>,
+    /// Names whose winning op is a `Delete` sealed under a keyed epoch, by [`Audience`]: a Mac
+    /// without that epoch's key still reads the value it deleted, so a reseal issues each again
+    /// under its fresh epoch (F21 rule 5).
+    pub keyed_deletes: BTreeMap<Audience, BTreeSet<String>>,
+    /// The op each winning live entry of [`OpenedAudienceEntries::by_audience`] stands for, by
+    /// `(Audience, name)`: its winning `Put`, or for a carry the op whose value it carries. F21
+    /// rule 8 reads who signed it, when, and under which epoch ([`Log::read_after_cutoff`]).
+    pub winning_ops: BTreeMap<(Audience, String), RecordId>,
     /// Audiences that have at least one effective [`Body::Epoch`] and whose maximal epochs were all
-    /// unwrapped by this [`Identity`].
+    /// unwrapped by this [`Identity`], less each audience with an uncovered keyed epoch it did not
+    /// open (F21 rule 7), whose writes this Mac cannot read yet.
     pub fully_unwrapped_audiences: BTreeSet<EpochAudience>,
     /// Whether any effective vault [`Audience`]'s maximal [`Body::Epoch`] was not unwrapped by
-    /// `identity`.
+    /// `identity`, or a vault audience has an uncovered keyed epoch `identity` did not open.
     pub hidden_epochs: bool,
+    /// Audiences with a keyed epoch a current member holds, covered or not, that this
+    /// [`Identity`] did not open ([`OpenedAudienceEntries::reputs_whole`]).
+    pub keyless_keyed: BTreeSet<EpochAudience>,
+}
+
+impl OpenedAudienceEntries {
+    /// Whether `audience` has an uncovered keyed epoch (F21 rule 4) this [`Identity`] did not
+    /// open: writes it cannot read wait there for a holder's reseal (rule 7).
+    #[must_use]
+    pub fn awaits_reseal(&self, audience: &EpochAudience) -> bool {
+        self.uncovered_keyed
+            .get(audience)
+            .is_some_and(|epochs| epochs.iter().any(|e| !self.keyed_keys.contains_key(e)))
+    }
+
+    /// Whether a writer here may seal every entry of `audience` again under a fresh epoch (F21
+    /// rule 7): it opens the whole audience, and every keyed epoch a current member holds there,
+    /// covered or not. Where it lacks one, a reseal's re-put of an honest write it cannot open
+    /// reads here as a write, not a carry, so this Mac's view can differ from a holder's (an
+    /// edit made between the heal and the reseal can lose a tie-break here and win there); a
+    /// full re-put of that view would revert the edit on every Mac that opens the epoch. Such a
+    /// Mac writes only what changed, for good.
+    #[must_use]
+    pub fn reputs_whole(&self, audience: &EpochAudience) -> bool {
+        self.fully_unwrapped_audiences.contains(audience) && !self.keyless_keyed.contains(audience)
+    }
 }
 
 /// Entries opened for one [`Identity`] from a [`Log`], alongside concurrent sibling conflicts and
@@ -652,7 +727,10 @@ fn drop_dangling_anchors(
 /// One register's ops (in causal order, as `CandidateOp`s) and which of them are carries: a `Put`
 /// of the value the register already held in that `Put`'s own causal past, as an epoch's reseal
 /// writes when a Mac departs (the writer re-puts every entry under a fresh epoch, changing no
-/// value). A carry stands for the op whose value it carries (`reps`); every other op for itself.
+/// value), or a `Delete` where every live op of the register in its own causal past is a
+/// `Delete`, as a reseal re-issues one (F21 rule 6). A `Delete` that settles a `Put`/`Delete`
+/// conflict is no carry: it writes. A carry stands for the op whose value it carries (`reps`);
+/// every other op for itself.
 struct Register<'a> {
     cands: &'a [CandidateOp],
     carries: Vec<bool>,
@@ -667,9 +745,6 @@ impl<'a> Register<'a> {
             reps: (0..cands.len()).collect(),
         };
         for k in 0..cands.len() {
-            if !matches!(cands[k].op, DecodedOp::Put(_)) {
-                continue;
-            }
             // What the writer held: the register over `k`'s causal past (`before` is the whole
             // past, so scanning from the newest, an op is maximal unless it lies before one
             // already found maximal).
@@ -684,9 +759,16 @@ impl<'a> Register<'a> {
                 }
             }
             let held = register.live(maximal, effective);
-            if let Some(w) = register.winner(&held)
-                && same_op(&cands[w].op, &cands[k].op)
-            {
+            let carried = match cands[k].op {
+                DecodedOp::Put(_) => register
+                    .winner(&held)
+                    .filter(|&w| same_op(&cands[w].op, &cands[k].op)),
+                DecodedOp::Delete => register.winner(&held).filter(|_| {
+                    held.iter()
+                        .all(|&h| matches!(cands[h].op, DecodedOp::Delete))
+                }),
+            };
+            if let Some(w) = carried {
                 register.carries[k] = true;
                 register.reps[k] = register.reps[w];
             }
@@ -817,6 +899,23 @@ impl Log {
         audience: impl Into<EpochAudience>,
         generation: u64,
     ) -> Result<(Draft, Zeroizing<[u8; 32]>)> {
+        self.draft_epoch_following(actor, authored_ms, audience, generation, &[])
+    }
+
+    /// [`Log::draft_epoch`], with each held record of `follow` in the epoch's causal past: F21's
+    /// reseal follows every dependent of the keyed epochs it retires ([`Log::draft`] pins the head
+    /// that reaches each, as it pins a `Put`'s epoch).
+    ///
+    /// # Errors
+    /// As [`Log::draft_epoch`].
+    pub fn draft_epoch_following(
+        &self,
+        actor: &MemberId,
+        authored_ms: u64,
+        audience: impl Into<EpochAudience>,
+        generation: u64,
+        follow: &[RecordId],
+    ) -> Result<(Draft, Zeroizing<[u8; 32]>)> {
         let audience = audience.into();
         check_audience(&audience)?;
         if generation == 0 {
@@ -825,7 +924,7 @@ impl Log {
         let mut epoch_key = Zeroizing::new([0u8; 32]);
         aterm_uds::rand::fill(epoch_key.as_mut())?;
         let commitment = epoch_commitment(self.network(), &audience, generation, &epoch_key);
-        let draft = self.draft(
+        let draft = self.draft_following(
             actor,
             authored_ms,
             Body::Epoch {
@@ -833,6 +932,7 @@ impl Log {
                 generation,
                 commitment,
             },
+            follow,
         );
         Ok((draft, epoch_key))
     }
@@ -1171,6 +1271,104 @@ impl Log {
         Ok(unwrapped)
     }
 
+    /// Unwrap every keyed epoch (F21 rule 2) of an audience `wanted` names whose key reaches
+    /// `identity`, keyed by `epoch` [`RecordId`]: through a counting [`Body::Wrap`] addressed to
+    /// `identity` first, whose failure is an error as in [`Log::unwrap_epochs`], else through a
+    /// non-counting one that lies in the past of one of the epoch's dependents, where a `Wrap`
+    /// that fails to open, or whose header, generation or commitment does not match, is skipped.
+    /// Empty when `identity` has been removed or no epoch is keyed.
+    ///
+    /// # Errors
+    /// A counting [`Body::Wrap`] of a keyed epoch addressed to `identity` fails decryption or
+    /// its epoch commitment check.
+    fn unwrap_keyed_epochs(
+        &self,
+        identity: &Identity,
+        effective: &eval::Effective,
+        wanted: impl Fn(&EpochAudience) -> bool,
+    ) -> Result<BTreeMap<RecordId, Zeroizing<[u8; 32]>>> {
+        let mut keys: BTreeMap<RecordId, Zeroizing<[u8; 32]>> = BTreeMap::new();
+        let mut epochs: BTreeMap<RecordId, (&EpochAudience, u64, &[u8; 32])> = BTreeMap::new();
+        for (i, record) in self.order.iter().enumerate().skip(1) {
+            if let Body::Epoch {
+                audience,
+                generation,
+                commitment,
+            } = record.body()
+                && effective.keyed(i)
+                && wanted(audience)
+            {
+                epochs.insert(*record.id(), (audience, *generation, commitment));
+            }
+        }
+        let my_recipient = identity.recipient();
+        if epochs.is_empty() || self.recipient_is_removed(&my_recipient) {
+            return Ok(keys);
+        }
+        for counting in [true, false] {
+            for (i, record) in self.order.iter().enumerate().skip(1) {
+                if effective.counts(i) != counting || !effective.opens_wrap(i) {
+                    continue;
+                }
+                let Body::Wrap {
+                    epoch,
+                    recipient,
+                    capsule,
+                } = record.body()
+                else {
+                    continue;
+                };
+                if *recipient != my_recipient || keys.contains_key(epoch) {
+                    continue;
+                }
+                let Some(&(audience, generation, commitment)) = epochs.get(epoch) else {
+                    continue;
+                };
+                let opened = open_wrap(
+                    identity,
+                    self.network(),
+                    epoch,
+                    audience,
+                    generation,
+                    commitment,
+                    capsule,
+                );
+                let key = if counting {
+                    opened?
+                } else {
+                    opened.ok().flatten()
+                };
+                if let Some(key) = key {
+                    keys.insert(*epoch, key);
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The key that opens the counting `Put` or `Delete` at `index`, sealed under `epoch`: a
+    /// counting epoch's from `unwrapped`, or, when `index` is one of the keyed `epoch`'s
+    /// dependents (F21 rule 1), that epoch's from `keyed`. A counting write under a keyed epoch
+    /// that is no dependent (one signed once its signer held the removal) opens for nobody.
+    fn op_key<'k>(
+        &self,
+        index: usize,
+        epoch: &RecordId,
+        unwrapped: &'k BTreeMap<RecordId, Zeroizing<[u8; 32]>>,
+        keyed: &'k BTreeMap<RecordId, Zeroizing<[u8; 32]>>,
+        effective: &eval::Effective,
+    ) -> Option<&'k Zeroizing<[u8; 32]>> {
+        if let Some(key) = unwrapped.get(epoch) {
+            return Some(key);
+        }
+        let at = *self.held.get(epoch)?;
+        if effective.dependents(at).binary_search(&index).is_ok() {
+            keyed.get(epoch)
+        } else {
+            None
+        }
+    }
+
     /// Select and unwrap the active [`EpochAudience::Commons`] epoch for `identity` (`F18`).
     ///
     /// Returns `Ok(None)` when `identity` is not an active bound member in [`Log::membership`],
@@ -1342,7 +1540,7 @@ impl Log {
         active_recipients: &BTreeSet<Recipient>,
         allow_coalesce: bool,
     ) -> bool {
-        self.reconcile_due(my_recipient, active_recipients, allow_coalesce, true)
+        self.reconcile_due(my_recipient, active_recipients, allow_coalesce, true, false)
     }
 
     /// The coverage rule of §3.3.7 for host lists: the header hosts of each host list whose every
@@ -1379,9 +1577,10 @@ impl Log {
             }
         }
         let removed = self.removed_recipients();
+        let reseal = self.reseal_due(my_recipient);
         epochs
             .into_iter()
-            .filter(|(_, list)| {
+            .filter(|(hosts, list)| {
                 let maximal: Vec<&RecordId> = list
                     .iter()
                     .filter(|&&(a, _)| !list.iter().any(|&(b, _)| a != b && effective.before(a, b)))
@@ -1398,10 +1597,95 @@ impl Log {
                             .get(*id)
                             .is_some_and(|set| !set.is_disjoint(&removed))
                     });
-                !maximal.is_empty() && opens && stale
+                let due = reseal.contains(&EpochAudience::Hosts(hosts.clone()));
+                !maximal.is_empty() && opens && (stale || due)
             })
             .map(|(hosts, _)| hosts)
             .collect()
+    }
+
+    /// F21 rule 5's due reason, structural: each audience with an uncovered keyed epoch that a
+    /// current member holds ([`Log::keyed_epochs`]), where the member `my_recipient` names holds
+    /// every such epoch and has the key of every newest counting epoch of the audience (it minted
+    /// it, or a counting [`Body::Wrap`] of it is addressed to `my_recipient`). A Mac that holds
+    /// none of them is not due for that audience at all, so it never takes a rank it cannot use.
+    #[must_use]
+    pub fn reseal_due(&self, my_recipient: &Recipient) -> BTreeSet<EpochAudience> {
+        let effective = self.effective();
+        let keyed = self.keyed_epochs_in(effective);
+        if keyed.is_empty() || self.recipient_is_removed(my_recipient) {
+            return BTreeSet::new();
+        }
+        let membership = self.membership();
+        let mine: BTreeSet<MemberId> = membership
+            .members()
+            .iter()
+            .filter(|(_, m)| m.binding.recipient() == *my_recipient)
+            .map(|(actor, _)| *actor)
+            .collect();
+        let mut uncovered: BTreeMap<EpochAudience, Vec<&Keyed>> = BTreeMap::new();
+        for epoch in &keyed {
+            if !epoch.covered && epoch.holders.iter().any(|h| membership.contains(h)) {
+                uncovered
+                    .entry(epoch.audience.clone())
+                    .or_default()
+                    .push(epoch);
+            }
+        }
+        if mine.is_empty() || uncovered.is_empty() {
+            return BTreeSet::new();
+        }
+        let mut epochs: BTreeMap<&EpochAudience, Vec<usize>> = BTreeMap::new();
+        let mut wrapped: BTreeMap<&RecordId, BTreeSet<&Recipient>> = BTreeMap::new();
+        for (i, record) in self.order.iter().enumerate().skip(1) {
+            if !effective.counts(i) {
+                continue;
+            }
+            match record.body() {
+                Body::Epoch { audience, .. } => epochs.entry(audience).or_default().push(i),
+                Body::Wrap {
+                    epoch, recipient, ..
+                } => {
+                    wrapped.entry(epoch).or_default().insert(recipient);
+                }
+                _ => {}
+            }
+        }
+        uncovered
+            .into_iter()
+            .filter(|(audience, list)| {
+                let held = list
+                    .iter()
+                    .all(|epoch| epoch.holders.iter().any(|h| mine.contains(h)));
+                let all = epochs.get(audience).map_or(&[][..], Vec::as_slice);
+                let newest: Vec<usize> = all
+                    .iter()
+                    .copied()
+                    .filter(|&a| !all.iter().any(|&b| a != b && effective.before(a, b)))
+                    .collect();
+                held && !newest.is_empty()
+                    && newest.iter().all(|&h| {
+                        mine.contains(self.order[h].actor())
+                            || wrapped
+                                .get(self.order[h].id())
+                                .is_some_and(|set| set.contains(my_recipient))
+                    })
+            })
+            .map(|(audience, _)| audience)
+            .collect()
+    }
+
+    /// What the vault pass's tender (`tend_epochs_at`) acts on for `[everyone]` and Commons: the
+    /// coverage rule of §3.3.7 ([`Log::coverage_due`]) or F21 rule 5's reseal
+    /// ([`Log::reseal_due`]). No wrap gap counts here: those close by the causal rule
+    /// (`Log::wrap_gaps`).
+    #[must_use]
+    pub fn rotation_due(
+        &self,
+        my_recipient: &Recipient,
+        active_recipients: &BTreeSet<Recipient>,
+    ) -> bool {
+        self.reconcile_due(my_recipient, active_recipients, true, false, true)
     }
 
     /// The coverage rule of §3.3.7 alone (keychain "Epochs"): whether the member `my_recipient`,
@@ -1409,23 +1693,25 @@ impl Log {
     /// audience has two or more causally newest epochs (concurrent removals on two sides of a
     /// split) or a newest epoch still wrapped to a Mac this log removed (a quorum `Remove` voided
     /// the remover's rotation, or a removal reached it before its new epoch), so the next writer
-    /// mints one higher epoch that covers them. No wrap gap counts here: those close by the
-    /// causal rule (`Log::wrap_gaps`).
+    /// mints one higher epoch that covers them.
     #[must_use]
-    pub fn rotation_due(
+    pub fn coverage_due(
         &self,
         my_recipient: &Recipient,
         active_recipients: &BTreeSet<Recipient>,
     ) -> bool {
-        self.reconcile_due(my_recipient, active_recipients, true, false)
+        self.reconcile_due(my_recipient, active_recipients, true, false, false)
     }
 
+    /// `reseal`: F21 rule 5's reason counts too. Only the ranked tender reseals, so the Commons
+    /// repair's [`Log::needs_commons_reconcile`] leaves it out.
     fn reconcile_due(
         &self,
         my_recipient: &Recipient,
         active_recipients: &BTreeSet<Recipient>,
         allow_coalesce: bool,
         gaps: bool,
+        reseal: bool,
     ) -> bool {
         if active_recipients.is_empty() || !active_recipients.contains(my_recipient) {
             return false;
@@ -1486,6 +1772,14 @@ impl Log {
             .map(|&(_, id)| id)
             .collect();
         if allow_coalesce {
+            // F21 rule 5: a holder of every uncovered keyed epoch of `[everyone]` or Commons, with
+            // the key of every newest epoch there, reseals it.
+            if reseal {
+                let due = self.reseal_due(my_recipient);
+                if due.contains(&EpochAudience::Everyone) || due.contains(&EpochAudience::Commons) {
+                    return true;
+                }
+            }
             let removed = self.removed_recipients();
             let holds_any_commons = commons_epochs.iter().any(|(_, id)| {
                 wrapped
@@ -1610,8 +1904,165 @@ impl Log {
         false
     }
 
+    /// Every keyed epoch (F21 rules 1 and 4), in record order: its dependents, who holds its key,
+    /// and whether a full reseal covers it. Structural: it reads records and decrypts nothing, so
+    /// every Mac that holds the same records reads the same.
+    #[must_use]
+    pub fn keyed_epochs(&self) -> Vec<Keyed> {
+        self.keyed_epochs_in(self.effective())
+    }
+
+    fn keyed_epochs_in(&self, effective: &eval::Effective) -> Vec<Keyed> {
+        let keyed: Vec<usize> = (1..self.order.len())
+            .filter(|&i| effective.keyed(i))
+            .collect();
+        if keyed.is_empty() {
+            return Vec::new();
+        }
+        let membership = self.membership();
+        let member_of: BTreeMap<Recipient, MemberId> = membership
+            .members()
+            .iter()
+            .map(|(actor, m)| (m.binding.recipient(), *actor))
+            .collect();
+        // Every recipient a seat binds to each actor: an attestation is a `Wrap` its signer
+        // addressed to itself.
+        let mut recipients: BTreeMap<MemberId, BTreeSet<Recipient>> = BTreeMap::new();
+        let mut epochs: BTreeMap<&EpochAudience, Vec<usize>> = BTreeMap::new();
+        let mut wraps: BTreeMap<RecordId, Vec<(usize, Recipient)>> = BTreeMap::new();
+        for (i, record) in self.order.iter().enumerate() {
+            match record.body() {
+                Body::Genesis { founders, .. } => {
+                    for founder in founders {
+                        if let Some(actor) = founder.member() {
+                            recipients
+                                .entry(actor)
+                                .or_default()
+                                .insert(founder.recipient);
+                        }
+                    }
+                }
+                Body::Admit { entrant, .. } => {
+                    recipients
+                        .entry(entrant.member())
+                        .or_default()
+                        .insert(entrant.request.binding().recipient());
+                }
+                Body::Epoch { audience, .. } if effective.counts(i) => {
+                    epochs.entry(audience).or_default().push(i);
+                }
+                Body::Wrap {
+                    epoch, recipient, ..
+                } => wraps.entry(*epoch).or_default().push((i, *recipient)),
+                _ => {}
+            }
+        }
+        let audience_of = |e: usize| match self.order[e].body() {
+            Body::Epoch { audience, .. } => Some(audience),
+            _ => None,
+        };
+        let wraps_of = |e: usize| wraps.get(self.order[e].id()).map_or(&[][..], Vec::as_slice);
+        let own = |actor: &MemberId, recipient: &Recipient| {
+            recipients
+                .get(actor)
+                .is_some_and(|set| set.contains(recipient))
+        };
+        // At record `at`, `actor` has the key of the counting epoch `h` when it minted `h` or a
+        // counting `Wrap` of `h` to it lies in `at`'s past.
+        let has_counting_key = |actor: &MemberId, h: usize, at: usize| {
+            self.order[h].actor() == actor
+                || wraps_of(h).iter().any(|&(w, recipient)| {
+                    effective.counts(w) && own(actor, &recipient) && effective.before(w, at)
+                })
+        };
+        // ...and of the keyed epoch `k` only when its attestation of `k` (a counting `Wrap` of
+        // `k` it signed to itself) lies in `at`'s past: only a reseal signs one.
+        let attests = |actor: &MemberId, k: usize, at: usize| {
+            wraps_of(k).iter().any(|&(w, recipient)| {
+                effective.counts(w)
+                    && self.order[w].actor() == actor
+                    && own(actor, &recipient)
+                    && effective.before(w, at)
+            })
+        };
+        // Each keyed epoch's dependents and holders: the dependents' signers, and the members
+        // rule 2's usable Wraps of it are addressed to.
+        let held: Vec<(usize, &EpochAudience, &[usize], BTreeSet<MemberId>)> = keyed
+            .iter()
+            .filter_map(|&e| {
+                let audience = audience_of(e)?;
+                let dependents = effective.dependents(e);
+                let mut holders: BTreeSet<MemberId> =
+                    dependents.iter().map(|&d| *self.order[d].actor()).collect();
+                for &(w, recipient) in wraps_of(e) {
+                    if effective.opens_wrap(w)
+                        && let Some(member) = member_of.get(&recipient)
+                    {
+                        holders.insert(*member);
+                    }
+                }
+                Some((e, audience, dependents, holders))
+            })
+            .collect();
+        // A full reseal: a counting epoch of the audience whose signer, there, has the key of
+        // every newest counting epoch of the audience in its past and of every keyed epoch of the
+        // audience that a current member holds, with a dependent in its past, that no earlier
+        // full reseal in its past covers already. A covered epoch's key goes to no newcomer and
+        // nobody attests it again, so a later keyed epoch of the audience is covered by whoever
+        // reseals it; one no current member holds nobody can attest, and rule 7 ignores it too.
+        // Decided in record order, where an epoch's past comes before it, and kept per epoch.
+        let mut full: BTreeMap<usize, bool> = BTreeMap::new();
+        for (audience, list) in &epochs {
+            for &e2 in list {
+                let signer = self.order[e2].actor();
+                let past: Vec<usize> = list
+                    .iter()
+                    .copied()
+                    .filter(|&h| effective.before(h, e2))
+                    .collect();
+                let newest_held = past
+                    .iter()
+                    .filter(|&&h| !past.iter().any(|&h2| effective.before(h, h2)))
+                    .all(|&h| has_counting_key(signer, h, e2));
+                let is_full = newest_held
+                    && held
+                        .iter()
+                        .filter(|(_, aud, _, holders)| {
+                            aud == audience && holders.iter().any(|h| membership.contains(h))
+                        })
+                        .filter(|(_, _, dependents, _)| {
+                            dependents.iter().any(|&d| effective.before(d, e2))
+                        })
+                        .filter(|(_, _, dependents, _)| {
+                            !past.iter().any(|&e1| {
+                                full.get(&e1).copied().unwrap_or(false)
+                                    && dependents.iter().all(|&d| effective.before(d, e1))
+                            })
+                        })
+                        .all(|&(k, _, _, _)| attests(signer, k, e2));
+                full.insert(e2, is_full);
+            }
+        }
+        held.into_iter()
+            .map(|(e, audience, dependents, holders)| {
+                let covered = epochs.get(audience).into_iter().flatten().any(|&e2| {
+                    full.get(&e2).copied().unwrap_or(false)
+                        && dependents.iter().all(|&d| effective.before(d, e2))
+                });
+                Keyed {
+                    epoch: *self.order[e].id(),
+                    audience: audience.clone(),
+                    dependents: dependents.iter().map(|&d| *self.order[d].id()).collect(),
+                    holders,
+                    covered,
+                }
+            })
+            .collect()
+    }
+
     /// Decrypt only the winning [`EpochAudience::Commons`] control descriptor for `identity`,
     /// skipping [`EpochAudience::Everyone`] and [`EpochAudience::Hosts`] X25519 unwraps (`F18`).
+    /// A winner sealed under a keyed Commons epoch (F21) opens as well.
     ///
     /// # Errors
     /// Any addressed `Commons` [`Body::Wrap`] or [`Body::Put`] fails authentication or validation.
@@ -1703,7 +2154,10 @@ impl Log {
                 unwrapped.insert(*epoch, key);
             }
         }
-        if unwrapped.is_empty() {
+        let keyed = self.unwrap_keyed_epochs(identity, effective, |audience| {
+            *audience == EpochAudience::Commons
+        })?;
+        if unwrapped.is_empty() && keyed.is_empty() {
             return Ok(None);
         }
         let mut candidates: Vec<CommonsControlOp> = Vec::new();
@@ -1718,7 +2172,7 @@ impl Log {
                 ciphertext,
             } = record.body()
             {
-                let Some(epoch_key) = unwrapped.get(epoch) else {
+                let Some(epoch_key) = self.op_key(i, epoch, &unwrapped, &keyed, effective) else {
                     continue;
                 };
                 let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
@@ -1763,6 +2217,7 @@ impl Log {
         }
         let unwrapped = self.unwrap_epochs(identity)?;
         let effective = self.effective();
+        let keyed_keys = self.unwrap_keyed_epochs(identity, effective, |_| true)?;
 
         let mut epochs_by_aud: BTreeMap<EpochAudience, Vec<(usize, RecordId)>> = BTreeMap::new();
         let mut max_generation: BTreeMap<EpochAudience, u64> = BTreeMap::new();
@@ -1821,6 +2276,39 @@ impl Log {
             }
             maximal_epochs.insert(aud.clone(), max_ids);
         }
+        // F21 rule 7: a keyed epoch a current member holds and no full reseal has covered yet
+        // leaves its audience not fully unwrapped on a Mac that cannot open it, so no full re-put
+        // runs there and its overlay leaves the audience's entries alone.
+        let mut uncovered_keyed: BTreeMap<EpochAudience, Vec<RecordId>> = BTreeMap::new();
+        let mut keyless_keyed: BTreeSet<EpochAudience> = BTreeSet::new();
+        let keyed_epochs = self.keyed_epochs_in(effective);
+        let members = if keyed_epochs.is_empty() {
+            eval::Membership::default()
+        } else {
+            self.membership()
+        };
+        for keyed in keyed_epochs {
+            if !keyed.holders.iter().any(|h| members.contains(h)) {
+                continue;
+            }
+            if !keyed_keys.contains_key(&keyed.epoch) {
+                keyless_keyed.insert(keyed.audience.clone());
+            }
+            if !keyed.covered {
+                uncovered_keyed
+                    .entry(keyed.audience)
+                    .or_default()
+                    .push(keyed.epoch);
+            }
+        }
+        for (aud, epochs) in &uncovered_keyed {
+            if epochs.iter().any(|epoch| !keyed_keys.contains_key(epoch)) {
+                fully_unwrapped_audiences.remove(aud);
+                if aud != &EpochAudience::Commons {
+                    hidden_epochs = true;
+                }
+            }
+        }
 
         let mut registers: BTreeMap<(Audience, String), Vec<CandidateOp>> = BTreeMap::new();
         let mut commons_candidates: Vec<CommonsControlOp> = Vec::new();
@@ -1838,7 +2326,8 @@ impl Log {
                     if excluded_audiences.contains(audience) {
                         continue;
                     }
-                    let Some(epoch_key) = unwrapped.get(epoch) else {
+                    let Some(epoch_key) = self.op_key(i, epoch, &unwrapped, &keyed_keys, effective)
+                    else {
                         continue;
                     };
                     let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
@@ -1877,7 +2366,8 @@ impl Log {
                     if excluded_audiences.contains(audience) {
                         continue;
                     }
-                    let Some(epoch_key) = unwrapped.get(epoch) else {
+                    let Some(epoch_key) = self.op_key(i, epoch, &unwrapped, &keyed_keys, effective)
+                    else {
                         continue;
                     };
                     let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
@@ -1899,6 +2389,9 @@ impl Log {
         let mut conflicts = BTreeSet::new();
         let mut by_audience: BTreeMap<Audience, BTreeMap<String, Entry>> = BTreeMap::new();
         let mut winning_epochs: BTreeMap<EpochAudience, BTreeSet<RecordId>> = BTreeMap::new();
+        let mut keyed_winning: BTreeMap<EpochAudience, BTreeSet<RecordId>> = BTreeMap::new();
+        let mut keyed_deletes: BTreeMap<Audience, BTreeSet<String>> = BTreeMap::new();
+        let mut winning_ops: BTreeMap<(Audience, String), RecordId> = BTreeMap::new();
         let mut host_winners: BTreeMap<String, Vec<(Audience, usize, RecordId)>> = BTreeMap::new();
 
         for ((audience, name), candidates) in registers {
@@ -1907,9 +2400,10 @@ impl Log {
             // made on the other. Siblings that write the same thing are no conflict.
             let register = Register::classify(&candidates, effective);
             let siblings = register.siblings(effective);
-            let Some(winner) = register.winner(&siblings).map(|i| &candidates[i]) else {
+            let Some(w) = register.winner(&siblings) else {
                 continue;
             };
+            let winner = &candidates[w];
             if siblings
                 .iter()
                 .any(|&i| !same_op(&candidates[i].op, &winner.op))
@@ -1924,14 +2418,26 @@ impl Log {
                         winner.record_id,
                     ));
                 }
+                winning_ops.insert(
+                    (audience.clone(), name.clone()),
+                    candidates[register.reps[w]].record_id,
+                );
                 by_audience
                     .entry(audience.clone())
                     .or_default()
                     .insert(name, entry.clone());
-                winning_epochs
+                // A keyed epoch carries no authority (F21 rule 3): its winners are kept apart.
+                let winners = if keyed_keys.contains_key(&winner.epoch) {
+                    &mut keyed_winning
+                } else {
+                    &mut winning_epochs
+                };
+                winners
                     .entry(EpochAudience::from(audience))
                     .or_default()
                     .insert(winner.epoch);
+            } else if keyed_keys.contains_key(&winner.epoch) {
+                keyed_deletes.entry(audience).or_default().insert(name);
             }
         }
 
@@ -1947,7 +2453,12 @@ impl Log {
                 .collect();
             if let Some(winner) = siblings.into_iter().min_by_key(|c| c.record_id) {
                 commons_control = Some(winner.value.clone());
-                winning_epochs
+                let winners = if keyed_keys.contains_key(&winner.epoch) {
+                    &mut keyed_winning
+                } else {
+                    &mut winning_epochs
+                };
+                winners
                     .entry(EpochAudience::Commons)
                     .or_default()
                     .insert(winner.epoch);
@@ -1974,20 +2485,138 @@ impl Log {
             }
         }
         drop_dangling_anchors(&mut by_audience, &mut winning_host_audience);
+        winning_ops.retain(|(audience, name), _| {
+            by_audience
+                .get(audience)
+                .is_some_and(|entries| entries.contains_key(name))
+        });
 
         Ok(Some(OpenedAudienceEntries {
             by_audience,
             commons_control,
             winning_host_audience,
             winning_epochs,
+            keyed_winning,
             maximal_epochs,
             max_generation,
             wrapped_recipients,
             conflicts,
             unwrapped_keys: unwrapped,
+            keyed_keys,
+            uncovered_keyed,
+            keyed_deletes,
+            winning_ops,
             fully_unwrapped_audiences,
             hidden_epochs,
+            keyless_keyed,
         }))
+    }
+
+    /// F21 rule 8: the current entries `member`, a Mac the log removed, could read though they
+    /// were written while it was out, as `identity` opens them: each whose winning op (for a
+    /// carry, the op it carries) another Mac signed while `member` was out (outside the cutoff of
+    /// some `Remove` of `member` that counts, with no counting `Admit` of it after that `Remove`
+    /// in its past), sealed under an epoch `member` minted or one a `Wrap` hands one of its
+    /// recipients. Resealing them does not take back what `member` read, so a person rotates
+    /// those values where they came from. Each is its audience and name, never a value; empty
+    /// where `member` is not out or `identity` opens nothing.
+    ///
+    /// # Errors
+    /// As [`Log::open_audience_entries`].
+    pub fn read_after_cutoff(
+        &self,
+        identity: &Identity,
+        member: &MemberId,
+    ) -> Result<Vec<(Audience, String)>> {
+        if self.membership().removal(member).is_none() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .open_audience_entries(identity)?
+            .map(|opened| self.read_after_cutoff_in(&opened, member))
+            .unwrap_or_default())
+    }
+
+    /// [`Log::read_after_cutoff`] over entries already opened: one opening serves every removed
+    /// Mac a caller asks about. Empty where `member` is not out.
+    #[must_use]
+    pub fn read_after_cutoff_in(
+        &self,
+        opened: &OpenedAudienceEntries,
+        member: &MemberId,
+    ) -> Vec<(Audience, String)> {
+        if self.membership().removal(member).is_none() {
+            return Vec::new();
+        }
+        let effective = self.effective();
+        // Each counting `Remove` of `member` with its cutoff, and each counting `Admit` of it.
+        let removes: Vec<(usize, usize)> = self
+            .order
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| effective.counts(i))
+            .filter_map(|(i, record)| match record.body() {
+                Body::Remove {
+                    member: out,
+                    cutoff,
+                } if out == member => self.record_index(cutoff).map(|cut| (i, cut)),
+                _ => None,
+            })
+            .collect();
+        let admits: Vec<usize> = (1..self.order.len())
+            .filter(|&i| effective.counts(i))
+            .filter(|&i| {
+                matches!(self.order[i].body(), Body::Admit { entrant, .. } if entrant.member() == *member)
+            })
+            .collect();
+        // `member` was out at record `at` when some `Remove` of it does not reach `at` and no
+        // `Admit` of it that follows that `Remove` lies in `at`'s past (as `cut` reads it).
+        let while_out = |at: usize| {
+            removes.iter().any(|&(r, cut)| {
+                !(cut == at || effective.before(at, cut))
+                    && !admits
+                        .iter()
+                        .any(|&a| effective.before(r, a) && effective.before(a, at))
+            })
+        };
+        let mut recipients: BTreeSet<Recipient> = BTreeSet::new();
+        if let Body::Genesis { founders, .. } = self.genesis().body() {
+            recipients.extend(
+                founders
+                    .iter()
+                    .filter(|f| f.member() == Some(*member))
+                    .map(|f| f.recipient),
+            );
+        }
+        for record in &self.order {
+            if let Body::Admit { entrant, .. } = record.body()
+                && entrant.member() == *member
+            {
+                recipients.insert(entrant.request.binding().recipient());
+            }
+        }
+        let reaches = |epoch: &RecordId| {
+            self.get(epoch).is_some_and(|r| r.actor() == member)
+                || self.order.iter().any(|r| {
+                    matches!(r.body(), Body::Wrap { epoch: e, recipient, .. }
+                        if e == epoch && recipients.contains(recipient))
+                })
+        };
+        opened
+            .winning_ops
+            .iter()
+            .filter(|(_, op)| {
+                let Some(at) = self.record_index(op) else {
+                    return false;
+                };
+                let record = &self.order[at];
+                let Body::Put { epoch, .. } = record.body() else {
+                    return false;
+                };
+                record.actor() != member && while_out(at) && reaches(epoch)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     /// Evaluate and decrypt the secret entries visible to `identity` from this log (`§3.5.3`).
@@ -2232,7 +2861,7 @@ mod tests {
     }
 
     /// A three-member log (m1 founds, admits m2 and m9) whose `[everyone]` epoch is wrapped to all
-    /// three.
+    /// three. It keeps m9's keys, so a test can sign as m9 on its side of a split.
     struct Three {
         log: Log,
         w1: [u8; 32],
@@ -2241,8 +2870,14 @@ mod tests {
         w2: [u8; 32],
         inc2: [u8; 16],
         m2: MemberId,
+        w9: [u8; 32],
+        inc9: [u8; 16],
+        m9: MemberId,
         id1: Identity,
         id2: Identity,
+        id9: Identity,
+        /// m9's `Admit`: the cutoff of a removal of m9 that accepted none of its records.
+        m9_entry: RecordId,
         epoch: RecordId,
         key: Zeroizing<[u8; 32]>,
     }
@@ -2250,8 +2885,9 @@ mod tests {
     fn three() -> Three {
         let (w1, inc1, id1, m1, e1) = make_entrant(51, "m1");
         let (w2, inc2, id2, m2, e2) = make_entrant(52, "m2");
-        let (_, _, id9, _, e9) = make_entrant(59, "m9");
+        let (w9, inc9, id9, m9, e9) = make_entrant(59, "m9");
         let mut log = Log::new(Record::found(&[7; 32], vec![e1], 1_000).unwrap()).unwrap();
+        let mut m9_entry = *log.network();
         for entrant in [e2, e9] {
             let admit = log
                 .draft(
@@ -2264,6 +2900,7 @@ mod tests {
                 )
                 .sign(&w1, inc1)
                 .unwrap();
+            m9_entry = *admit.id();
             log.insert(admit).unwrap();
         }
         let (draft, key) = log.draft_epoch(&m1, 1_002, Audience::Everyone, 1).unwrap();
@@ -2286,8 +2923,13 @@ mod tests {
             w2,
             inc2,
             m2,
+            w9,
+            inc9,
+            m9,
             id1,
             id2,
+            id9,
+            m9_entry,
             epoch,
             key,
         }
@@ -2518,6 +3160,1417 @@ mod tests {
         text::merge_for("mac-52", entries).expect("every Mac's merge stays valid");
         let opened = side_a.open_audience_entries(&t.id1).unwrap().unwrap();
         assert!(!opened.by_audience[&Audience::Everyone].contains_key("new"));
+    }
+
+    /// Sign `draft` with (`seed`, `incarnation`), hold it in `log`, and hand back its id.
+    fn hold(log: &mut Log, draft: Draft, seed: &[u8; 32], incarnation: [u8; 16]) -> RecordId {
+        let record = draft.sign(seed, incarnation).unwrap();
+        let id = *record.id();
+        log.insert(record).unwrap();
+        id
+    }
+
+    /// F21's split: `S=v0` and `U=u0` under the first epoch; on side 1, m1 removes m9 at its
+    /// `Admit` and reseals both for m1 and m2; on side 2, m9, unaware, mints `E` (generation 2),
+    /// wraps it to all three, carries `S` and `U` under it and puts `W=evil`. With `bogus`, m9
+    /// first wraps `E` to m2 under a wrong key.
+    struct KeyedSplit {
+        side_1: Log,
+        side_2: Log,
+        /// `E`, the epoch m9 minted past its cutoff.
+        epoch: RecordId,
+        /// `E`'s key, which m2 holds on side 2 through m9's `Wrap`.
+        key: Zeroizing<[u8; 32]>,
+    }
+
+    fn keyed_split(t: &Three, bogus: bool) -> KeyedSplit {
+        let mut base = t.log.clone();
+        for entry in [put("S", b"v0"), put("U", b"u0")] {
+            let draft = base
+                .draft_put(&t.m1, 1_500, t.epoch, &t.key, &entry)
+                .unwrap();
+            hold(&mut base, draft, &t.w1, t.inc1);
+        }
+        let mut side_1 = base.clone();
+        let removal = side_1.draft(
+            &t.m1,
+            1_600,
+            Body::Remove {
+                member: t.m9,
+                cutoff: t.m9_entry,
+            },
+        );
+        hold(&mut side_1, removal, &t.w1, t.inc1);
+        reseal(&mut side_1, t, 2, &[put("S", b"v0"), put("U", b"u0")]);
+        let mut side_2 = base;
+        let (draft, key) = side_2
+            .draft_epoch(&t.m9, 1_600, Audience::Everyone, 2)
+            .unwrap();
+        let epoch = hold(&mut side_2, draft, &t.w9, t.inc9);
+        if bogus {
+            let capsule =
+                seal_wrap(side_2.network(), &epoch, 2, t.id2.recipient(), &[0x99; 32]).unwrap();
+            let wrap = side_2.draft(
+                &t.m9,
+                1_601,
+                Body::Wrap {
+                    epoch,
+                    recipient: t.id2.recipient(),
+                    capsule,
+                },
+            );
+            hold(&mut side_2, wrap, &t.w9, t.inc9);
+        }
+        for id in [&t.id1, &t.id2, &t.id9] {
+            let wrap = side_2
+                .draft_wrap(&t.m9, 1_601, epoch, &key, id.recipient())
+                .unwrap();
+            hold(&mut side_2, wrap, &t.w9, t.inc9);
+        }
+        for entry in [put("S", b"v0"), put("U", b"u0"), put("W", b"evil")] {
+            let draft = side_2.draft_put(&t.m9, 1_602, epoch, &key, &entry).unwrap();
+            hold(&mut side_2, draft, &t.w9, t.inc9);
+        }
+        KeyedSplit {
+            side_1,
+            side_2,
+            epoch,
+            key,
+        }
+    }
+
+    /// m2, on m9's side of the split, edits `S`, adds `T` and deletes `U` under `E`.
+    fn m2_writes_under_e(t: &Three, split: &mut KeyedSplit) {
+        let log = &mut split.side_2;
+        let draft = log
+            .draft_put(&t.m2, 1_700, split.epoch, &split.key, &put("S", b"v1"))
+            .unwrap();
+        hold(log, draft, &t.w2, t.inc2);
+        let draft = log
+            .draft_put(&t.m2, 1_701, split.epoch, &split.key, &put("T", b"t"))
+            .unwrap();
+        hold(log, draft, &t.w2, t.inc2);
+        let draft = log
+            .draft_delete(&t.m2, 1_702, split.epoch, &split.key, "U")
+            .unwrap();
+        hold(log, draft, &t.w2, t.inc2);
+    }
+
+    /// F21's test 1. m9 is removed on one side of a split while, on the other, it mints an epoch
+    /// past its cutoff and m2, unaware, edits, adds and deletes under it. After the heal those
+    /// writes stand on every Mac, m9's own `Put` reads nowhere, and `E` carries no authority: it
+    /// is neither newest nor winning, only keyed-winning.
+    ///
+    /// NEGATIVE CONTROL: with `Log::unwrap_keyed_epochs` opening nothing (origin/main's reading,
+    /// where a cut epoch opens for nobody) this fails "S on m1" (left `v0`, right `v1`); tests 2
+    /// and 11 and the late-write test fail with it, while guards 10 and 12 pass.
+    #[test]
+    fn an_edit_add_and_delete_under_an_epoch_minted_past_its_minters_cutoff_stand_after_the_heal() {
+        let t = three();
+        let mut split = keyed_split(&t, false);
+        m2_writes_under_e(&t, &mut split);
+        let mut healed = split.side_1.clone();
+        healed.merge(&split.side_2).unwrap();
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            assert_eq!(read(&healed, id, "S"), Some(b"v1".to_vec()), "S on {who}");
+            assert_eq!(read(&healed, id, "T"), Some(b"t".to_vec()), "T on {who}");
+            assert_eq!(read(&healed, id, "U"), None, "U on {who}");
+            assert_eq!(read(&healed, id, "W"), None, "W on {who}");
+            let opened = healed.open_audience_entries(id).unwrap().unwrap();
+            assert!(opened.conflicts.is_empty(), "conflicts on {who}");
+            assert!(!opened.maximal_epochs[&EpochAudience::Everyone].contains(&split.epoch));
+            assert!(
+                !opened
+                    .winning_epochs
+                    .get(&EpochAudience::Everyone)
+                    .is_some_and(|set| set.contains(&split.epoch))
+            );
+            assert!(opened.keyed_winning[&EpochAudience::Everyone].contains(&split.epoch));
+            assert!(opened.keyed_keys.contains_key(&split.epoch));
+            assert!(!opened.unwrapped_keys.contains_key(&split.epoch));
+        }
+    }
+
+    /// F21's attack 3, whose premise the evaluator does not hold: a Mac m9 lets in past its
+    /// cutoff signs records that count where their past leaves m9's removal out. On test 1's
+    /// split, m9 also admits S on side 2, wraps `E` to it, and S puts `X` under `E`. After the
+    /// heal S's `Put` is no dependent of `E`: S is seated only by m9's `Admit`, which is cut, so
+    /// `E` is not keyed and no Mac reads `X`. Otherwise a removed Mac could make its own epochs
+    /// keyed at will through Macs it lets in, forcing a full reseal each time.
+    ///
+    /// NEGATIVE CONTROL: with `Graph::depends` not asking how `d`'s signer is seated, this fails
+    /// "a Mac m9 let in past its cutoff adds no dependent".
+    #[test]
+    fn a_mac_the_removed_minter_let_in_past_its_cutoff_adds_no_dependent() {
+        let t = three();
+        let mut split = keyed_split(&t, false);
+        let (ws, incs, ids, ms, es) = make_entrant(73, "m13");
+        let side_2 = &mut split.side_2;
+        let admit = side_2.draft(
+            &t.m9,
+            1_650,
+            Body::Admit {
+                entrant: es,
+                evidence: Evidence::Phrase,
+            },
+        );
+        hold(side_2, admit, &t.w9, t.inc9);
+        let wrap = side_2
+            .draft_wrap(&t.m9, 1_651, split.epoch, &split.key, ids.recipient())
+            .unwrap();
+        hold(side_2, wrap, &t.w9, t.inc9);
+        let draft = side_2
+            .draft_put(&ms, 1_652, split.epoch, &split.key, &put("X", b"sybil"))
+            .unwrap();
+        hold(side_2, draft, &ws, incs);
+        let mut healed = split.side_1.clone();
+        healed.merge(&split.side_2).unwrap();
+        assert!(
+            healed.keyed_epochs().is_empty(),
+            "a Mac m9 let in past its cutoff adds no dependent"
+        );
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            assert_eq!(read(&healed, id, "X"), None, "X on {who}");
+        }
+    }
+
+    /// F21's rule 8 with two removals of one Mac: m1 removes m9 at its `Admit`; m2 then puts
+    /// `S=v1` under the first epoch, which m9 holds; m9 signs a `Name` with that write in its
+    /// past, and m2 removes m9 again at that `Name`. `S=v1` lies inside the second cutoff but
+    /// m9 was out from the first, with no `Admit` of it since, so it is named.
+    ///
+    /// NEGATIVE CONTROL: excluding every write inside any cutoff (step 10's rule) fails "a write
+    /// made while m9 was out, inside a later cutoff, is named".
+    #[test]
+    fn read_after_cutoff_names_a_write_inside_a_later_cutoff_made_while_the_mac_was_out() {
+        let t = three();
+        let mut log = t.log.clone();
+        let draft = log
+            .draft_put(&t.m1, 1_500, t.epoch, &t.key, &put("S", b"v0"))
+            .unwrap();
+        hold(&mut log, draft, &t.w1, t.inc1);
+        let removal = log.draft(
+            &t.m1,
+            1_600,
+            Body::Remove {
+                member: t.m9,
+                cutoff: t.m9_entry,
+            },
+        );
+        hold(&mut log, removal, &t.w1, t.inc1);
+        let draft = log
+            .draft_put(&t.m2, 1_700, t.epoch, &t.key, &put("S", b"v1"))
+            .unwrap();
+        hold(&mut log, draft, &t.w2, t.inc2);
+        let name = log.draft(
+            &t.m9,
+            1_800,
+            Body::Name {
+                name: "m9-later".to_owned(),
+            },
+        );
+        let later = hold(&mut log, name, &t.w9, t.inc9);
+        let removal = log.draft(
+            &t.m2,
+            1_900,
+            Body::Remove {
+                member: t.m9,
+                cutoff: later,
+            },
+        );
+        hold(&mut log, removal, &t.w2, t.inc2);
+        for id in [&t.id1, &t.id2] {
+            let opened = log.open_audience_entries(id).unwrap().unwrap();
+            assert_eq!(
+                log.read_after_cutoff_in(&opened, &t.m9),
+                [(Audience::Everyone, "S".to_owned())],
+                "a write made while m9 was out, inside a later cutoff, is named"
+            );
+        }
+    }
+
+    /// F21's rule 2 opens a keyed epoch through a non-counting `Wrap` only when that `Wrap` lies
+    /// in the past of one of its dependents. On test 1's split with X, whom m1 lets in on side 1,
+    /// m9 wraps `E` to X after the heal. That `Wrap` makes X no holder, and X opens no key
+    /// through it: a removed Mac cannot add holders (or rank them) after the heal (attacks 4 and
+    /// 5).
+    ///
+    /// NEGATIVE CONTROL: with `Graph::usable_wraps` dropping its "in a dependent's past" clause,
+    /// this fails "a Wrap of E after every dependent makes no holder".
+    #[test]
+    fn a_wrap_the_removed_minter_signs_after_the_heal_opens_nothing() {
+        let t = three();
+        let mut split = keyed_split(&t, false);
+        let (_, _, idx, mx, ex) = make_entrant(74, "m14");
+        let side_1 = &mut split.side_1;
+        let admit = side_1.draft(
+            &t.m1,
+            1_650,
+            Body::Admit {
+                entrant: ex,
+                evidence: Evidence::Phrase,
+            },
+        );
+        hold(side_1, admit, &t.w1, t.inc1);
+        let held = side_1.open_audience_entries(&t.id1).unwrap().unwrap();
+        let e1 = held.maximal_epochs[&EpochAudience::Everyone][0];
+        let wrap = side_1
+            .draft_wrap(&t.m1, 1_651, e1, &held.unwrapped_keys[&e1], idx.recipient())
+            .unwrap();
+        hold(side_1, wrap, &t.w1, t.inc1);
+        m2_writes_under_e(&t, &mut split);
+        let mut healed = split.side_1.clone();
+        healed.merge(&split.side_2).unwrap();
+        let late = healed
+            .draft_wrap(&t.m9, 2_000, split.epoch, &split.key, idx.recipient())
+            .unwrap();
+        hold(&mut healed, late, &t.w9, t.inc9);
+        let keyed = healed.keyed_epochs();
+        assert_eq!(keyed.len(), 1, "CONTROL: E is keyed");
+        assert!(
+            !keyed[0].holders.contains(&mx),
+            "a Wrap of E after every dependent makes no holder"
+        );
+        let x_view = healed.open_audience_entries(&idx).unwrap().unwrap();
+        assert!(
+            !x_view.keyed_keys.contains_key(&split.epoch),
+            "X opens no key through a Wrap no dependent saw"
+        );
+        assert!(x_view.hidden_epochs, "X still waits for a holder's reseal");
+    }
+
+    /// F21's test 1 for Commons (rules 2 and 3 on the control descriptor). The control `c0` sits
+    /// under m1's Commons epoch; on side 1 m1 removes m9 and mints a Commons epoch for m1 and m2;
+    /// on side 2 m9, unaware, mints `C` for all three and m2 writes the control `v1` under it.
+    /// After the heal m1 and m2 read `v1` (through `open_commons_control` and
+    /// `open_audience_entries` alike), and `C` carries no authority: it is keyed-winning, never
+    /// winning.
+    ///
+    /// NEGATIVE CONTROLS, each restored with cp from a backup plus touch and confirmed with cmp:
+    /// - `open_commons_control` unwrapping no keyed epoch: fails "the control on m1 opens".
+    /// - the Commons control winner under a keyed epoch going to `winning_epochs`: fails "a
+    ///   keyed Commons epoch carries no authority on m1".
+    #[test]
+    fn a_commons_control_under_an_epoch_minted_past_its_minters_cutoff_stands_after_the_heal() {
+        let t = three();
+        let mut base = t.log.clone();
+        let (draft, key0) = base
+            .draft_epoch(&t.m1, 1_400, EpochAudience::Commons, 1)
+            .unwrap();
+        let c0 = hold(&mut base, draft, &t.w1, t.inc1);
+        for id in [&t.id1, &t.id2, &t.id9] {
+            let wrap = base
+                .draft_wrap(&t.m1, 1_401, c0, &key0, id.recipient())
+                .unwrap();
+            hold(&mut base, wrap, &t.w1, t.inc1);
+        }
+        let put = base
+            .draft_commons_put(&t.m1, 1_402, c0, &key0, b"ACD1-c0")
+            .unwrap();
+        hold(&mut base, put, &t.w1, t.inc1);
+        let mut side_1 = base.clone();
+        let removal = side_1.draft(
+            &t.m1,
+            1_600,
+            Body::Remove {
+                member: t.m9,
+                cutoff: t.m9_entry,
+            },
+        );
+        hold(&mut side_1, removal, &t.w1, t.inc1);
+        let (draft, key1) = side_1
+            .draft_epoch(&t.m1, 1_601, EpochAudience::Commons, 2)
+            .unwrap();
+        let c1 = hold(&mut side_1, draft, &t.w1, t.inc1);
+        for id in [&t.id1, &t.id2] {
+            let wrap = side_1
+                .draft_wrap(&t.m1, 1_602, c1, &key1, id.recipient())
+                .unwrap();
+            hold(&mut side_1, wrap, &t.w1, t.inc1);
+        }
+        let mut side_2 = base;
+        let (draft, key) = side_2
+            .draft_epoch(&t.m9, 1_600, EpochAudience::Commons, 2)
+            .unwrap();
+        let epoch = hold(&mut side_2, draft, &t.w9, t.inc9);
+        for id in [&t.id1, &t.id2, &t.id9] {
+            let wrap = side_2
+                .draft_wrap(&t.m9, 1_601, epoch, &key, id.recipient())
+                .unwrap();
+            hold(&mut side_2, wrap, &t.w9, t.inc9);
+        }
+        let put = side_2
+            .draft_commons_put(&t.m2, 1_700, epoch, &key, b"ACD1-v1")
+            .unwrap();
+        hold(&mut side_2, put, &t.w2, t.inc2);
+        let mut healed = side_1;
+        healed.merge(&side_2).unwrap();
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            assert_eq!(
+                healed
+                    .open_commons_control(id)
+                    .unwrap()
+                    .map(|v| v.as_slice().to_vec()),
+                Some(b"ACD1-v1".to_vec()),
+                "the control on {who} opens"
+            );
+            let opened = healed.open_audience_entries(id).unwrap().unwrap();
+            assert_eq!(
+                opened.commons_control.map(|v| v.as_slice().to_vec()),
+                Some(b"ACD1-v1".to_vec()),
+                "the control on {who}"
+            );
+            assert!(
+                !opened
+                    .winning_epochs
+                    .get(&EpochAudience::Commons)
+                    .is_some_and(|set| set.contains(&epoch)),
+                "a keyed Commons epoch carries no authority on {who}"
+            );
+            assert!(opened.keyed_winning[&EpochAudience::Commons].contains(&epoch));
+            assert!(!opened.maximal_epochs[&EpochAudience::Commons].contains(&epoch));
+        }
+    }
+
+    /// F21 rule 5 for a host list: m9, unaware of its removal on side 1, mints an epoch of a
+    /// list it is not on, wrapped to the list's members m1 and m2, and m2 puts `H=h1` under it.
+    /// After the heal the list's one newest epoch is m1's first, wrapped to no removed Mac, so
+    /// §3.3.7's coverage rule has nothing to do there; the keyed epoch alone makes the list due
+    /// on m2, its holder, which reads `h1`.
+    ///
+    /// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
+    /// `hosts_rotation_due` ignoring rule 5's reason (`stale || due` cut to `stale`): fails "the
+    /// list is due on its holder".
+    #[test]
+    fn a_host_list_with_an_uncovered_keyed_epoch_is_due_on_its_holder() {
+        let t = three();
+        let hosts = vec!["host-1".to_owned(), "host-2".to_owned()];
+        let entry = |value: &[u8]| Entry {
+            name: "H".to_owned(),
+            value: SecretBytes::from(value),
+            audience: Audience::Hosts(hosts.clone()),
+            if_absent: false,
+            anchor: None,
+        };
+        let mut base = t.log.clone();
+        let (draft, key0) = base
+            .draft_epoch(&t.m1, 1_400, EpochAudience::Hosts(hosts.clone()), 1)
+            .unwrap();
+        let h0 = hold(&mut base, draft, &t.w1, t.inc1);
+        for id in [&t.id1, &t.id2] {
+            let wrap = base
+                .draft_wrap(&t.m1, 1_401, h0, &key0, id.recipient())
+                .unwrap();
+            hold(&mut base, wrap, &t.w1, t.inc1);
+        }
+        let put = base
+            .draft_put(&t.m1, 1_402, h0, &key0, &entry(b"h0"))
+            .unwrap();
+        hold(&mut base, put, &t.w1, t.inc1);
+        let mut side_1 = base.clone();
+        let removal = side_1.draft(
+            &t.m1,
+            1_600,
+            Body::Remove {
+                member: t.m9,
+                cutoff: t.m9_entry,
+            },
+        );
+        hold(&mut side_1, removal, &t.w1, t.inc1);
+        let mut side_2 = base;
+        let (draft, key) = side_2
+            .draft_epoch(&t.m9, 1_600, EpochAudience::Hosts(hosts.clone()), 2)
+            .unwrap();
+        let epoch = hold(&mut side_2, draft, &t.w9, t.inc9);
+        for id in [&t.id1, &t.id2] {
+            let wrap = side_2
+                .draft_wrap(&t.m9, 1_601, epoch, &key, id.recipient())
+                .unwrap();
+            hold(&mut side_2, wrap, &t.w9, t.inc9);
+        }
+        let put = side_2
+            .draft_put(&t.m2, 1_700, epoch, &key, &entry(b"h1"))
+            .unwrap();
+        hold(&mut side_2, put, &t.w2, t.inc2);
+        let mut healed = side_1;
+        healed.merge(&side_2).unwrap();
+        assert!(
+            healed
+                .keyed_epochs()
+                .iter()
+                .any(|k| k.epoch == epoch && !k.covered),
+            "CONTROL: the list's keyed epoch is uncovered"
+        );
+        assert_eq!(
+            healed.hosts_rotation_due(&t.id2.recipient()),
+            std::slice::from_ref(&hosts),
+            "the list is due on its holder"
+        );
+        let opened = healed.open_audience_entries(&t.id2).unwrap().unwrap();
+        assert_eq!(
+            opened.by_audience[&Audience::Hosts(hosts.clone())]["H"]
+                .value
+                .as_slice(),
+            b"h1"
+        );
+    }
+
+    /// F21's test 9 (rule 8). After test 1's heal, `read_after_cutoff(m9)` names `S` and `T`, the
+    /// entries m2 wrote under m9's `E` while m9 was out, on m1 and m2 alike. It names neither
+    /// `U`, which m2 deleted, nor `W`, m9's own write, and nothing for m2, which is no removed
+    /// Mac. After m1 reseals `S` and `T` under an epoch m9 never got, they are still named (a
+    /// carry stands for the op it carries), and `N`, which m1 adds under that epoch, is not.
+    ///
+    /// NEGATIVE CONTROLS (each restored with cp from a backup plus touch, and confirmed with cmp):
+    /// - `winning_ops` takes the winning op itself, not the op a carry stands for: fails "after
+    ///   the reseal on m1" (left `[]`, right `["S", "T"]`).
+    /// - the epoch clause dropped (`reaches` answers `true`): fails "after the reseal on m1"
+    ///   (left `["N", "S", "T"]`, right `["S", "T"]`).
+    #[test]
+    fn read_after_cutoff_names_what_the_removed_mac_could_read() {
+        let t = three();
+        let mut split = keyed_split(&t, false);
+        m2_writes_under_e(&t, &mut split);
+        let mut healed = split.side_1.clone();
+        healed.merge(&split.side_2).unwrap();
+        let named = |log: &Log, id: &Identity, member: &MemberId| -> Vec<String> {
+            log.read_after_cutoff(id, member)
+                .unwrap()
+                .into_iter()
+                .map(|(audience, name)| {
+                    assert_eq!(audience, Audience::Everyone);
+                    name
+                })
+                .collect()
+        };
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            assert_eq!(named(&healed, id, &t.m9), ["S", "T"], "on {who}");
+            assert!(named(&healed, id, &t.m2).is_empty(), "m2 is in, on {who}");
+        }
+        reseal(
+            &mut healed,
+            &t,
+            3,
+            &[put("S", b"v1"), put("T", b"t"), put("N", b"n")],
+        );
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            assert_eq!(read(&healed, id, "S"), Some(b"v1".to_vec()), "S on {who}");
+            assert_eq!(read(&healed, id, "N"), Some(b"n".to_vec()), "N on {who}");
+            assert_eq!(
+                named(&healed, id, &t.m9),
+                ["S", "T"],
+                "after the reseal on {who}"
+            );
+        }
+    }
+
+    /// F21's test 10. m2 writes under `E` only once it holds m1's removal of m9: that write is
+    /// no dependent, so `E` stays unkeyed and every Mac reads the value side 1 resealed.
+    ///
+    /// NEGATIVE CONTROL: with rule 1's good-faith clause dropped from `Graph::depends` this fails
+    /// "S on m1" (left `v2`, right `v0`).
+    #[test]
+    fn a_write_signed_after_its_signer_held_the_removal_keys_nothing() {
+        let t = three();
+        let split = keyed_split(&t, false);
+        let mut side_2 = split.side_2.clone();
+        side_2.merge(&split.side_1).unwrap();
+        let late = side_2
+            .draft_put(&t.m2, 1_800, split.epoch, &split.key, &put("S", b"v2"))
+            .unwrap();
+        hold(&mut side_2, late, &t.w2, t.inc2);
+        let mut healed = split.side_1.clone();
+        healed.merge(&side_2).unwrap();
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            assert_eq!(read(&healed, id, "S"), Some(b"v0".to_vec()), "S on {who}");
+        }
+    }
+
+    /// m2 writes under `E` on m9's side, then holds m1's removal of m9 and writes under `E`
+    /// again. The first writes keep `E` keyed, but the late one is no dependent, so it opens for
+    /// nobody: registers take a counting write under a keyed epoch only when it depends on it.
+    ///
+    /// NEGATIVE CONTROL: with `Log::op_key` taking any counting write under a keyed epoch,
+    /// dependent or not, this fails "S on m1" (left `v2`, right `v1`).
+    #[test]
+    fn a_late_write_under_a_keyed_epoch_reads_nowhere() {
+        let t = three();
+        let mut split = keyed_split(&t, false);
+        m2_writes_under_e(&t, &mut split);
+        let mut side_2 = split.side_2.clone();
+        side_2.merge(&split.side_1).unwrap();
+        let late = side_2
+            .draft_put(&t.m2, 1_800, split.epoch, &split.key, &put("S", b"v2"))
+            .unwrap();
+        hold(&mut side_2, late, &t.w2, t.inc2);
+        let mut healed = split.side_1.clone();
+        healed.merge(&side_2).unwrap();
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            assert_eq!(read(&healed, id, "S"), Some(b"v1".to_vec()), "S on {who}");
+            assert_eq!(read(&healed, id, "T"), Some(b"t".to_vec()), "T on {who}");
+        }
+    }
+
+    /// F21's test 11. m9 wraps `E` to m2 under a wrong key before its real `Wrap`, both in the
+    /// past of m2's writes, and after the heal it signs a garbage `Wrap` to m2 too. m2's read
+    /// skips both non-counting `Wrap`s that fail and opens `E` through the real one.
+    ///
+    /// NEGATIVE CONTROL: with a failing non-counting `Wrap` treated as an error, as a counting one
+    /// is, this fails `m2's read is Ok: Error("membership epoch wrap key does not match epoch
+    /// commitment", Other)`.
+    #[test]
+    fn a_bogus_wrap_from_the_removed_minter_never_fails_a_read() {
+        let t = three();
+        let mut split = keyed_split(&t, true);
+        m2_writes_under_e(&t, &mut split);
+        let mut healed = split.side_1.clone();
+        healed.merge(&split.side_2).unwrap();
+        let garbage = healed.draft(
+            &t.m9,
+            1_900,
+            Body::Wrap {
+                epoch: split.epoch,
+                recipient: t.id2.recipient(),
+                capsule: vec![0x5a; 64],
+            },
+        );
+        hold(&mut healed, garbage, &t.w9, t.inc9);
+        let opened = healed
+            .open_entry_set(&t.id2)
+            .expect("m2's read is Ok")
+            .unwrap();
+        let s = opened.entries.iter().find(|e| e.name == "S").unwrap();
+        assert_eq!(s.value.as_slice(), b"v1");
+    }
+
+    /// F21's test 12. After test 1's heal no member hands `E` on or reuses it: neither
+    /// `Log::admission_epochs` nor `Log::wrap_gaps` names it, and m2's next write would reuse
+    /// the one newest epoch, side 1's, which counts.
+    ///
+    /// NEGATIVE CONTROL: with a keyed epoch's `Put` winners sent to `winning_epochs` this fails "m1
+    /// hands E to a new Mac" (and test 1 fails its `winning_epochs` assertion).
+    #[test]
+    fn a_keyed_epoch_is_never_reused_or_handed_on() {
+        let t = three();
+        let mut split = keyed_split(&t, false);
+        m2_writes_under_e(&t, &mut split);
+        let mut healed = split.side_1.clone();
+        healed.merge(&split.side_2).unwrap();
+        let audiences = [EpochAudience::Everyone];
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            let opened = healed.open_audience_entries(id).unwrap().unwrap();
+            let handed: Vec<RecordId> = Log::admission_epochs(&opened, &audiences)
+                .into_iter()
+                .map(|(_, epoch)| epoch)
+                .collect();
+            assert!(!handed.contains(&split.epoch), "{who} hands E to a new Mac");
+            assert!(
+                healed
+                    .wrap_gaps(&opened, &audiences)
+                    .iter()
+                    .all(|gap| gap.epoch != split.epoch),
+                "{who} closes a wrap gap of E"
+            );
+            let newest = &opened.maximal_epochs[&EpochAudience::Everyone];
+            assert_eq!(newest.len(), 1, "one newest epoch on {who}");
+            assert_ne!(newest[0], split.epoch);
+            assert!(opened.unwrapped_keys.contains_key(&newest[0]));
+        }
+    }
+
+    /// F21's test 2. Founders A, B, M and Y. On side 2, M removes A, mints `E` for all four,
+    /// puts `T`, and Y puts `S=v1` under `E` before M removes B too. After the heal A and B sign
+    /// the quorum `Remove` of M at `Log::undo_cutoff`, which voids `E`: Y's write stands for A, B
+    /// and Y, and M's own `Put` reads nowhere.
+    ///
+    /// NEGATIVE CONTROL: with `Graph::effective` keying an epoch only when it is cut, never when a
+    /// quorum voided it, this fails "S on A" (left `v0`, right `v1`), while test 1 passes.
+    #[test]
+    fn an_honest_write_under_the_epoch_of_a_member_a_quorum_voided_stands() {
+        let (wa, inca, ida, ma, ea) = make_entrant(61, "m1");
+        let (wb, incb, idb, mb, eb) = make_entrant(62, "m2");
+        let (wm, incm, idm, mm, em) = make_entrant(63, "m3");
+        let (wy, incy, idy, my, ey) = make_entrant(64, "m4");
+        let mut base =
+            Log::new(Record::found(&[7; 32], vec![ea, eb, em, ey], 1_000).unwrap()).unwrap();
+        let genesis = *base.network();
+        let (draft, key0) = base.draft_epoch(&ma, 1_001, Audience::Everyone, 1).unwrap();
+        let e0 = hold(&mut base, draft, &wa, inca);
+        for id in [&ida, &idb, &idm, &idy] {
+            let wrap = base
+                .draft_wrap(&ma, 1_002, e0, &key0, id.recipient())
+                .unwrap();
+            hold(&mut base, wrap, &wa, inca);
+        }
+        let draft = base
+            .draft_put(&ma, 1_003, e0, &key0, &put("S", b"v0"))
+            .unwrap();
+        hold(&mut base, draft, &wa, inca);
+
+        let mut side_2 = base.clone();
+        let removal = side_2.draft(
+            &mm,
+            1_100,
+            Body::Remove {
+                member: ma,
+                cutoff: genesis,
+            },
+        );
+        hold(&mut side_2, removal, &wm, incm);
+        let (draft, key) = side_2
+            .draft_epoch(&mm, 1_101, Audience::Everyone, 2)
+            .unwrap();
+        let epoch = hold(&mut side_2, draft, &wm, incm);
+        for id in [&ida, &idb, &idm, &idy] {
+            let wrap = side_2
+                .draft_wrap(&mm, 1_102, epoch, &key, id.recipient())
+                .unwrap();
+            hold(&mut side_2, wrap, &wm, incm);
+        }
+        let draft = side_2
+            .draft_put(&mm, 1_103, epoch, &key, &put("T", b"evil"))
+            .unwrap();
+        hold(&mut side_2, draft, &wm, incm);
+        let draft = side_2
+            .draft_put(&my, 1_104, epoch, &key, &put("S", b"v1"))
+            .unwrap();
+        hold(&mut side_2, draft, &wy, incy);
+        let removal = side_2.draft(
+            &mm,
+            1_105,
+            Body::Remove {
+                member: mb,
+                cutoff: genesis,
+            },
+        );
+        hold(&mut side_2, removal, &wm, incm);
+
+        let mut healed = base;
+        healed.merge(&side_2).unwrap();
+        let cutoff = healed.undo_cutoff(&mm).expect("an Undo of M");
+        for (seed, inc, by) in [(&wa, inca, &ma), (&wb, incb, &mb)] {
+            let share = healed.draft(by, 1_200, Body::Remove { member: mm, cutoff });
+            hold(&mut healed, share, seed, inc);
+        }
+        let membership = healed.membership();
+        assert!(
+            membership.removal(&mm).is_some_and(|r| r.quorum),
+            "M is out by quorum"
+        );
+        assert!(
+            membership.contains(&ma) && membership.contains(&mb),
+            "A and B are back"
+        );
+        for (who, id) in [("A", &ida), ("B", &idb), ("Y", &idy)] {
+            assert_eq!(read(&healed, id, "S"), Some(b"v1".to_vec()), "S on {who}");
+            assert_eq!(read(&healed, id, "T"), None, "T on {who}");
+        }
+        assert_eq!(healed.open_entries(&idm).unwrap(), None, "M reads nothing");
+    }
+
+    /// F21's attack 9, as the hostile review found it: Y keeps writing while the Undo's shares
+    /// are being collected. Founders A, B, M and Y; on side 2, M removes A, mints `E`, and Y puts
+    /// `S=v1` under it, then M removes B. After the heal A signs its share of the quorum
+    /// `Remove` of M; Y, holding it, still counts M (a lone share is no quorum) and puts `S=v2`
+    /// under `E`, its one newest epoch. Then B's share completes the quorum, which voids `E`.
+    /// v2 is still a dependent of `E` and stands for A, B and Y: A's share, in its past, was no
+    /// removal where Y signed it, so it does not trip the good-faith clause.
+    ///
+    /// NEGATIVE CONTROL: with `Graph::depends` judging a `Remove` by the quorums that take effect
+    /// alone (dropping its `stands_at_d` clause, cc2d71149c's rule), this fails "Y's second write
+    /// is a dependent of E", and every Mac reads `S=v1`.
+    #[test]
+    fn a_write_made_while_the_undo_shares_are_collected_stands() {
+        let (wa, inca, ida, ma, ea) = make_entrant(65, "m1");
+        let (wb, incb, idb, mb, eb) = make_entrant(66, "m2");
+        let (wm, incm, _, mm, em) = make_entrant(67, "m3");
+        let (wy, incy, idy, my, ey) = make_entrant(68, "m4");
+        let mut base =
+            Log::new(Record::found(&[7; 32], vec![ea, eb, em, ey], 1_000).unwrap()).unwrap();
+        let genesis = *base.network();
+        let (draft, key0) = base.draft_epoch(&ma, 1_001, Audience::Everyone, 1).unwrap();
+        let e0 = hold(&mut base, draft, &wa, inca);
+        for id in [&ida, &idb, &idy] {
+            let wrap = base
+                .draft_wrap(&ma, 1_002, e0, &key0, id.recipient())
+                .unwrap();
+            hold(&mut base, wrap, &wa, inca);
+        }
+        let draft = base
+            .draft_put(&ma, 1_003, e0, &key0, &put("S", b"v0"))
+            .unwrap();
+        hold(&mut base, draft, &wa, inca);
+
+        let mut log = base;
+        let removal = log.draft(
+            &mm,
+            1_100,
+            Body::Remove {
+                member: ma,
+                cutoff: genesis,
+            },
+        );
+        hold(&mut log, removal, &wm, incm);
+        let (draft, key) = log.draft_epoch(&mm, 1_101, Audience::Everyone, 2).unwrap();
+        let epoch = hold(&mut log, draft, &wm, incm);
+        for id in [&ida, &idb, &idy] {
+            let wrap = log
+                .draft_wrap(&mm, 1_102, epoch, &key, id.recipient())
+                .unwrap();
+            hold(&mut log, wrap, &wm, incm);
+        }
+        let draft = log
+            .draft_put(&my, 1_104, epoch, &key, &put("S", b"v1"))
+            .unwrap();
+        hold(&mut log, draft, &wy, incy);
+        let removal = log.draft(
+            &mm,
+            1_105,
+            Body::Remove {
+                member: mb,
+                cutoff: genesis,
+            },
+        );
+        hold(&mut log, removal, &wm, incm);
+
+        let cutoff = log.undo_cutoff(&mm).expect("an Undo of M");
+        let share = log.draft(&ma, 1_200, Body::Remove { member: mm, cutoff });
+        hold(&mut log, share, &wa, inca);
+        let held = log.open_audience_entries(&idy).unwrap().unwrap();
+        assert_eq!(
+            held.maximal_epochs[&EpochAudience::Everyone],
+            [epoch],
+            "CONTROL: with one share, Y still counts M's E as its one newest epoch"
+        );
+        let draft = log
+            .draft_put(&my, 1_210, epoch, &key, &put("S", b"v2"))
+            .unwrap();
+        let second = hold(&mut log, draft, &wy, incy);
+        let share = log.draft(&mb, 1_220, Body::Remove { member: mm, cutoff });
+        hold(&mut log, share, &wb, incb);
+
+        let membership = log.membership();
+        assert!(
+            membership.removal(&mm).is_some_and(|r| r.quorum),
+            "CONTROL: M is out by quorum"
+        );
+        assert!(
+            log.keyed_epochs()
+                .iter()
+                .any(|k| k.epoch == epoch && k.dependents.contains(&second)),
+            "Y's second write is a dependent of E"
+        );
+        for (who, id) in [("A", &ida), ("B", &idb), ("Y", &idy)] {
+            assert_eq!(read(&log, id, "S"), Some(b"v2".to_vec()), "S on {who}");
+        }
+    }
+
+    /// One founder of [`undone_lab`]: its writer seed, incarnation, identity and actor.
+    struct Founder {
+        seed: [u8; 32],
+        inc: [u8; 16],
+        id: Identity,
+        actor: MemberId,
+    }
+
+    impl Founder {
+        fn hold(&self, log: &mut Log, body: Body) -> RecordId {
+            let draft = log.draft(&self.actor, 1_400, body);
+            hold(log, draft, &self.seed, self.inc)
+        }
+    }
+
+    /// F16's Undo, the F8 lane's shape before F21's split: founders A, B, R and Y with `S=v0`
+    /// under A's epoch; B removes A, R and Y, and A and Y undo it by a quorum `Remove` of B,
+    /// which voids B's removals. Returns the log, A, R, Y and R's entrant.
+    fn undone_lab() -> (Log, Founder, Founder, Founder, Entrant) {
+        let founder = |tag: u8, label: &str| {
+            let (seed, inc, id, actor, entrant) = make_entrant(tag, label);
+            (
+                Founder {
+                    seed,
+                    inc,
+                    id,
+                    actor,
+                },
+                entrant,
+            )
+        };
+        let (a, ea) = founder(71, "m1");
+        let (b, eb) = founder(72, "m2");
+        let (r, er) = founder(73, "m3");
+        let (y, ey) = founder(74, "m4");
+        let mut log =
+            Log::new(Record::found(&[7; 32], vec![ea, eb, er.clone(), ey], 1_000).unwrap())
+                .unwrap();
+        let genesis = *log.network();
+        let (draft, key0) = log
+            .draft_epoch(&a.actor, 1_001, Audience::Everyone, 1)
+            .unwrap();
+        let e0 = hold(&mut log, draft, &a.seed, a.inc);
+        for id in [&a.id, &r.id, &y.id] {
+            let wrap = log
+                .draft_wrap(&a.actor, 1_002, e0, &key0, id.recipient())
+                .unwrap();
+            hold(&mut log, wrap, &a.seed, a.inc);
+        }
+        let draft = log
+            .draft_put(&a.actor, 1_003, e0, &key0, &put("S", b"v0"))
+            .unwrap();
+        hold(&mut log, draft, &a.seed, a.inc);
+        for member in [a.actor, r.actor, y.actor] {
+            b.hold(
+                &mut log,
+                Body::Remove {
+                    member,
+                    cutoff: genesis,
+                },
+            );
+        }
+        let cutoff = log.undo_cutoff(&b.actor).expect("an Undo of B");
+        for by in [&a, &y] {
+            by.hold(
+                &mut log,
+                Body::Remove {
+                    member: b.actor,
+                    cutoff,
+                },
+            );
+        }
+        let membership = log.membership();
+        assert!(
+            membership.removal(&b.actor).is_some_and(|r| r.quorum),
+            "B is out by quorum"
+        );
+        assert!(
+            [a.actor, r.actor, y.actor]
+                .iter()
+                .all(|m| membership.contains(m)),
+            "A, R and Y are back"
+        );
+        (log, a, r, y, er)
+    }
+
+    /// F21's split on `side_2`: R mints `E` for A, R and Y and puts `T`, and Y puts `S=v1` under
+    /// `E`. Returns `E` and Y's write.
+    fn r_mints_and_y_writes(
+        side_2: &mut Log,
+        a: &Founder,
+        r: &Founder,
+        y: &Founder,
+    ) -> (RecordId, RecordId) {
+        let (draft, key) = side_2
+            .draft_epoch(&r.actor, 1_501, Audience::Everyone, 2)
+            .unwrap();
+        let epoch = hold(side_2, draft, &r.seed, r.inc);
+        for id in [&a.id, &r.id, &y.id] {
+            let wrap = side_2
+                .draft_wrap(&r.actor, 1_502, epoch, &key, id.recipient())
+                .unwrap();
+            hold(side_2, wrap, &r.seed, r.inc);
+        }
+        let draft = side_2
+            .draft_put(&r.actor, 1_503, epoch, &key, &put("T", b"evil"))
+            .unwrap();
+        hold(side_2, draft, &r.seed, r.inc);
+        let draft = side_2
+            .draft_put(&y.actor, 1_504, epoch, &key, &put("S", b"v1"))
+            .unwrap();
+        let edit = hold(side_2, draft, &y.seed, y.inc);
+        (epoch, edit)
+    }
+
+    /// After the heal of `side_1` and `side_2`: R is out, Y's `edit` is a dependent of `epoch`,
+    /// and A and Y read `S=v1` and no `T`.
+    fn y_write_stands(
+        side_1: Log,
+        side_2: &Log,
+        f: (&Founder, &Founder, &Founder),
+        keyed: (RecordId, RecordId),
+    ) {
+        let (a, r, y) = f;
+        let (epoch, edit) = keyed;
+        let mut healed = side_1;
+        healed.merge(side_2).unwrap();
+        assert!(!healed.membership().contains(&r.actor), "R is out");
+        assert!(
+            healed
+                .keyed_epochs()
+                .iter()
+                .any(|k| k.epoch == epoch && k.dependents.contains(&edit)),
+            "Y's write is a dependent of E"
+        );
+        for (who, id) in [("A", &a.id), ("Y", &y.id)] {
+            assert_eq!(read(&healed, id, "S"), Some(b"v1".to_vec()), "S on {who}");
+            assert_eq!(read(&healed, id, "T"), None, "T on {who}");
+        }
+    }
+
+    /// F21 after F16's Undo, the F8 lane's shape ([`undone_lab`]). On side 1, A removes R; on
+    /// side 2, R mints `E` and Y writes under it ([`r_mints_and_y_writes`]). After the heal Y's
+    /// write is a dependent of `E` and stands for A and Y: B's voided removal of R, in its past,
+    /// removes nobody, so it neither unseats R where R signed `E` nor makes Y's write one signed
+    /// after its signer held R's removal.
+    ///
+    /// NEGATIVE CONTROLS (each restored with cp from a backup plus touch, confirmed with cmp):
+    /// - `Graph::depends` back on authorization with nothing void alone (origin/main's rule):
+    ///   fails "Y's write is a dependent of E".
+    /// - only the epoch clause back on it (`auth.plain[e]`): fails "Y's write is a dependent of
+    ///   E".
+    /// - only the `Remove` clause back on it (`auth.plain[r]`, a voided `Remove` cuts): fails
+    ///   "Y's write is a dependent of E".
+    #[test]
+    fn a_removal_a_quorum_undid_never_cuts_an_honest_write_under_a_removed_macs_epoch() {
+        let (base, a, r, y, _) = undone_lab();
+        let mut side_1 = base.clone();
+        a.hold(
+            &mut side_1,
+            Body::Remove {
+                member: r.actor,
+                cutoff: *base.network(),
+            },
+        );
+        let mut side_2 = base;
+        let keyed = r_mints_and_y_writes(&mut side_2, &a, &r, &y);
+        y_write_stands(side_1, &side_2, (&a, &r, &y), keyed);
+    }
+
+    /// As [`a_removal_a_quorum_undid_never_cuts_an_honest_write_under_a_removed_macs_epoch`], with
+    /// an Allow again between: after the Undo A removes R and Y lets R in again, an `Admit` that
+    /// counts only under the quorum (in the view with nothing void B's removal of Y stands). On
+    /// side 1 A removes R again, at that `Admit`; on side 2 R mints `E` and Y writes under it.
+    /// After the heal Y's write still stands: Y's `Admit` restores R between A's first removal
+    /// and `E`, so that removal does not cut `E` in Y's past.
+    ///
+    /// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): the
+    /// `Admit` clause back on authorization with nothing void (`auth.plain[a]`): fails "Y's write
+    /// is a dependent of E".
+    #[test]
+    fn an_allow_again_by_a_mac_a_voided_member_removed_restores_good_faith() {
+        let (mut base, a, r, y, er) = undone_lab();
+        let genesis = *base.network();
+        a.hold(
+            &mut base,
+            Body::Remove {
+                member: r.actor,
+                cutoff: genesis,
+            },
+        );
+        assert!(!base.membership().contains(&r.actor), "A removed R");
+        let again = y.hold(
+            &mut base,
+            Body::Admit {
+                entrant: er,
+                evidence: Evidence::Phrase,
+            },
+        );
+        assert!(base.membership().contains(&r.actor), "Y let R in again");
+        let mut side_1 = base.clone();
+        a.hold(
+            &mut side_1,
+            Body::Remove {
+                member: r.actor,
+                cutoff: again,
+            },
+        );
+        let mut side_2 = base;
+        let keyed = r_mints_and_y_writes(&mut side_2, &a, &r, &y);
+        y_write_stands(side_1, &side_2, (&a, &r, &y), keyed);
+    }
+
+    /// F21's test 3. m2 deletes `U`; a reseal re-issues that `Delete` under a fresh epoch, while
+    /// m2, with its own `Delete` in its past, puts `U=new` on the other side. After the heal
+    /// `U=new` stands with no conflict: a resealed `Delete` carries, as a resealed `Put` does.
+    ///
+    /// NEGATIVE CONTROL: with `Register::classify` never taking a `Delete` as a carry
+    /// (origin/main's rule) this fails "a resealed Delete read as a write on m1: {(Everyone,
+    /// "U")}". Letting a `Delete` carry with a `Put` live in its past instead fails
+    /// `epoch_wrap_put_delete_round_trip_and_refuse_tampering` ("m1 after delete").
+    #[test]
+    fn a_resealed_delete_loses_to_a_put_that_follows_the_delete_it_carries() {
+        let t = three();
+        let mut base = t.log.clone();
+        let draft = base
+            .draft_put(&t.m1, 1_500, t.epoch, &t.key, &put("U", b"u0"))
+            .unwrap();
+        hold(&mut base, draft, &t.w1, t.inc1);
+        let draft = base
+            .draft_delete(&t.m2, 1_501, t.epoch, &t.key, "U")
+            .unwrap();
+        hold(&mut base, draft, &t.w2, t.inc2);
+
+        let mut side_a = base.clone();
+        reseal(&mut side_a, &t, 2, &[]);
+        let opened = side_a.open_audience_entries(&t.id1).unwrap().unwrap();
+        let fresh = opened.maximal_epochs[&EpochAudience::Everyone][0];
+        let key = opened.unwrapped_keys[&fresh].clone();
+        let draft = side_a.draft_delete(&t.m1, 2_003, fresh, &key, "U").unwrap();
+        hold(&mut side_a, draft, &t.w1, t.inc1);
+
+        let mut side_b = base;
+        let draft = side_b
+            .draft_put(&t.m2, 1_600, t.epoch, &t.key, &put("U", b"new"))
+            .unwrap();
+        hold(&mut side_b, draft, &t.w2, t.inc2);
+
+        side_a.merge(&side_b).unwrap();
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            assert_eq!(read(&side_a, id, "U"), Some(b"new".to_vec()), "U on {who}");
+            let opened = side_a.open_entry_set(id).unwrap().unwrap();
+            assert!(
+                opened.conflicts.is_empty(),
+                "a resealed Delete read as a write on {who}: {:?}",
+                opened.conflicts
+            );
+        }
+    }
+
+    /// F21's coverage (rule 4) and rule 7 on test 1's split, with two more Macs: X, let in by m1
+    /// on side 1 and wrapped side 1's epoch alone, and W, let in by m2 on side 2, wrapped `E` by
+    /// m2 and writing under it too.
+    ///
+    /// - After the heal `E` is keyed and uncovered. m1, m2 and W hold it; m1 opens it and hides
+    ///   nothing, while X, which cannot open it, hides `[everyone]`.
+    /// - An epoch with no attestation never covers: m1 mints one past every dependent, holding
+    ///   side 1's epoch, but has not attested `E`.
+    /// - A partial mint never covers: W attests `E` and mints one past every dependent, but it
+    ///   lacks side 1's epoch, the newest one there.
+    /// - A full reseal covers: m1 attests `E`, then mints one for every member, and X stops
+    ///   hiding.
+    ///
+    /// NEGATIVE CONTROLS, each failing its own assertion:
+    /// - without the newest-key clause of a full reseal, "a partial mint never covers";
+    /// - without the attestation clause, "an epoch with no attestation never covers";
+    /// - with holders only the dependents' signers, "m1 holds E through m9's Wrap, m2 and W as
+    ///   writers";
+    /// - with rule 7 off, "a Mac without the key of an uncovered keyed epoch hides its audience";
+    /// - with rule 7 ignoring the keys a Mac opened, "a holder that opens it hides nothing".
+    #[test]
+    fn a_keyed_epoch_is_covered_only_by_a_full_reseal() {
+        let t = three();
+        let mut split = keyed_split(&t, false);
+        let (_, _, idx, _, ex) = make_entrant(70, "m10");
+        let (ww, incw, idw, mw, ew) = make_entrant(71, "m11");
+        let side_1 = &mut split.side_1;
+        let admit = side_1.draft(
+            &t.m1,
+            1_650,
+            Body::Admit {
+                entrant: ex,
+                evidence: Evidence::Phrase,
+            },
+        );
+        hold(side_1, admit, &t.w1, t.inc1);
+        let held = side_1.open_audience_entries(&t.id1).unwrap().unwrap();
+        let e1 = held.maximal_epochs[&EpochAudience::Everyone][0];
+        let wrap = side_1
+            .draft_wrap(&t.m1, 1_651, e1, &held.unwrapped_keys[&e1], idx.recipient())
+            .unwrap();
+        hold(side_1, wrap, &t.w1, t.inc1);
+        m2_writes_under_e(&t, &mut split);
+        let side_2 = &mut split.side_2;
+        let admit = side_2.draft(
+            &t.m2,
+            1_710,
+            Body::Admit {
+                entrant: ew,
+                evidence: Evidence::Phrase,
+            },
+        );
+        hold(side_2, admit, &t.w2, t.inc2);
+        let wrap = side_2
+            .draft_wrap(&t.m2, 1_711, split.epoch, &split.key, idw.recipient())
+            .unwrap();
+        hold(side_2, wrap, &t.w2, t.inc2);
+        let draft = side_2
+            .draft_put(&mw, 1_712, split.epoch, &split.key, &put("w-entry", b"w"))
+            .unwrap();
+        hold(side_2, draft, &ww, incw);
+        let mut healed = split.side_1.clone();
+        healed.merge(&split.side_2).unwrap();
+
+        let keyed = healed.keyed_epochs();
+        assert_eq!(keyed.len(), 1);
+        assert_eq!(keyed[0].epoch, split.epoch);
+        assert_eq!(keyed[0].dependents.len(), 4, "m2's three writes and W's");
+        assert_eq!(
+            keyed[0].holders,
+            BTreeSet::from([t.m1, t.m2, mw]),
+            "m1 holds E through m9's Wrap, m2 and W as writers"
+        );
+        assert!(!keyed[0].covered);
+        let x_view = healed.open_audience_entries(&idx).unwrap().unwrap();
+        assert_eq!(
+            x_view.uncovered_keyed[&EpochAudience::Everyone],
+            [split.epoch]
+        );
+        assert!(
+            x_view.hidden_epochs,
+            "a Mac without the key of an uncovered keyed epoch hides its audience"
+        );
+        assert!(
+            !x_view
+                .fully_unwrapped_audiences
+                .contains(&EpochAudience::Everyone)
+        );
+        let m1_view = healed.open_audience_entries(&t.id1).unwrap().unwrap();
+        assert!(
+            !m1_view.hidden_epochs,
+            "a holder that opens it hides nothing"
+        );
+        assert!(
+            m1_view
+                .fully_unwrapped_audiences
+                .contains(&EpochAudience::Everyone)
+        );
+
+        // m1 mints past every dependent with every newest key, no attestation.
+        let mint = |log: &mut Log, by: (&MemberId, &[u8; 32], [u8; 16]), generation| {
+            let (draft, key) = log
+                .draft_epoch(by.0, 3_000, Audience::Everyone, generation)
+                .unwrap();
+            let epoch = hold(log, draft, by.1, by.2);
+            for id in [&t.id1, &t.id2, &idx, &idw] {
+                let wrap = log
+                    .draft_wrap(by.0, 3_001, epoch, &key, id.recipient())
+                    .unwrap();
+                hold(log, wrap, by.1, by.2);
+            }
+        };
+        let attest = |log: &mut Log, by: (&MemberId, &[u8; 32], [u8; 16]), to: &Identity| {
+            let wrap = log
+                .draft_wrap(by.0, 2_900, split.epoch, &split.key, to.recipient())
+                .unwrap();
+            hold(log, wrap, by.1, by.2);
+        };
+        let m1 = (&t.m1, &t.w1, t.inc1);
+        let mut bare = healed.clone();
+        mint(&mut bare, m1, 3);
+        assert!(
+            !bare.keyed_epochs()[0].covered,
+            "an epoch with no attestation never covers"
+        );
+        assert!(
+            bare.open_audience_entries(&idx)
+                .unwrap()
+                .unwrap()
+                .hidden_epochs
+        );
+
+        // W attests `E` and mints, lacking side 1's epoch.
+        let mut partial = healed.clone();
+        attest(&mut partial, (&mw, &ww, incw), &idw);
+        mint(&mut partial, (&mw, &ww, incw), 3);
+        assert!(
+            !partial.keyed_epochs()[0].covered,
+            "a partial mint never covers"
+        );
+        assert!(
+            partial
+                .open_audience_entries(&idx)
+                .unwrap()
+                .unwrap()
+                .hidden_epochs
+        );
+
+        // m1 attests `E`, then mints: a full reseal.
+        let mut full = healed.clone();
+        attest(&mut full, m1, &t.id1);
+        mint(&mut full, m1, 3);
+        assert!(full.keyed_epochs()[0].covered, "a full reseal covers");
+        let x_view = full.open_audience_entries(&idx).unwrap().unwrap();
+        assert!(x_view.uncovered_keyed.is_empty());
+        assert!(!x_view.hidden_epochs);
+        assert!(
+            x_view
+                .fully_unwrapped_audiences
+                .contains(&EpochAudience::Everyone)
+        );
+    }
+
+    /// F21's coverage (rule 4) over two heals in one audience, each resealed by another Mac.
+    /// Heal 1 is test 1's split: m1 attests m9's `E` and reseals for m1, m2 and W, a Mac m1 let
+    /// in after the heal, which covers `E`. Then a second split: m1 removes W on one side while
+    /// W, unaware, mints `F` on the other and m2 puts `S=v3` under it. After heal 2, m2 attests
+    /// `F`, the one uncovered keyed epoch, and reseals for m1 and m2. That covers `F`: nobody
+    /// attests `E` again, which an earlier full reseal in the epoch's past already covers, so
+    /// no reseal is due anywhere and m1 reads `S=v3`.
+    ///
+    /// NEGATIVE CONTROL: with a full reseal required to attest every keyed epoch of the audience
+    /// with a dependent in its past, covered ones included (step 6's rule), this fails "m2's
+    /// reseal covers F" (`F` stays uncovered, and m2's reseal would repeat on every vault pass).
+    #[test]
+    fn a_later_keyed_epoch_is_covered_by_another_macs_full_reseal() {
+        let t = three();
+        let mut split = keyed_split(&t, false);
+        m2_writes_under_e(&t, &mut split);
+        let mut healed = split.side_1.clone();
+        healed.merge(&split.side_2).unwrap();
+        let (ww, incw, idw, mw, ew) = make_entrant(72, "m12");
+        let admit = healed.draft(
+            &t.m1,
+            2_800,
+            Body::Admit {
+                entrant: ew,
+                evidence: Evidence::Phrase,
+            },
+        );
+        let w_entry = hold(&mut healed, admit, &t.w1, t.inc1);
+        // Sign `by`'s attestation of `epoch` (a Wrap of it to `to`, `by`'s own recipient), then
+        // one higher `[everyone]` epoch wrapped to `ids`.
+        let reseal_by = |log: &mut Log,
+                         by: (&MemberId, &[u8; 32], [u8; 16]),
+                         to: &Identity,
+                         keyed: (RecordId, &[u8; 32]),
+                         generation: u64,
+                         ids: &[&Identity]| {
+            let wrap = log
+                .draft_wrap(by.0, 2_900, keyed.0, keyed.1, to.recipient())
+                .unwrap();
+            hold(log, wrap, by.1, by.2);
+            let (draft, key) = log
+                .draft_epoch(by.0, 3_000, Audience::Everyone, generation)
+                .unwrap();
+            let epoch = hold(log, draft, by.1, by.2);
+            for id in ids {
+                let wrap = log
+                    .draft_wrap(by.0, 3_001, epoch, &key, id.recipient())
+                    .unwrap();
+                hold(log, wrap, by.1, by.2);
+            }
+        };
+        reseal_by(
+            &mut healed,
+            (&t.m1, &t.w1, t.inc1),
+            &t.id1,
+            (split.epoch, &split.key),
+            3,
+            &[&t.id1, &t.id2, &idw],
+        );
+        assert!(
+            healed.keyed_epochs().iter().all(|k| k.covered),
+            "CONTROL: m1's reseal covers E"
+        );
+
+        let mut side_a = healed.clone();
+        let removal = side_a.draft(
+            &t.m1,
+            3_100,
+            Body::Remove {
+                member: mw,
+                cutoff: w_entry,
+            },
+        );
+        hold(&mut side_a, removal, &t.w1, t.inc1);
+        let mut side_b = healed;
+        let (draft, key_f) = side_b
+            .draft_epoch(&mw, 3_100, Audience::Everyone, 4)
+            .unwrap();
+        let epoch_f = hold(&mut side_b, draft, &ww, incw);
+        for id in [&t.id1, &t.id2, &idw] {
+            let wrap = side_b
+                .draft_wrap(&mw, 3_101, epoch_f, &key_f, id.recipient())
+                .unwrap();
+            hold(&mut side_b, wrap, &ww, incw);
+        }
+        let draft = side_b
+            .draft_put(&t.m2, 3_102, epoch_f, &key_f, &put("S", b"v3"))
+            .unwrap();
+        hold(&mut side_b, draft, &t.w2, t.inc2);
+        side_a.merge(&side_b).unwrap();
+        let keyed = side_a.keyed_epochs();
+        assert_eq!(keyed.len(), 2, "CONTROL: E and F are keyed");
+        assert!(
+            keyed.iter().any(|k| k.epoch == epoch_f && !k.covered),
+            "CONTROL: F is uncovered after heal 2"
+        );
+        let due = side_a.reseal_due(&t.id2.recipient());
+        assert!(
+            due.contains(&EpochAudience::Everyone),
+            "CONTROL: m2 is due to reseal F"
+        );
+
+        reseal_by(
+            &mut side_a,
+            (&t.m2, &t.w2, t.inc2),
+            &t.id2,
+            (epoch_f, &key_f),
+            5,
+            &[&t.id1, &t.id2],
+        );
+        assert!(
+            side_a.keyed_epochs().iter().all(|k| k.covered),
+            "m2's reseal covers F"
+        );
+        for id in [&t.id1, &t.id2] {
+            assert!(
+                side_a.reseal_due(&id.recipient()).is_empty(),
+                "no reseal is due once F is covered"
+            );
+        }
+        assert_eq!(read(&side_a, &t.id1, "S"), Some(b"v3".to_vec()));
+    }
+
+    /// F21's rule 6 carries a `Delete` only when every live op in its past is a `Delete`: one
+    /// that settles a `Put`/`Delete` conflict writes. m1 puts `U=a` while m2 deletes `U`, and m2's
+    /// `Delete` wins that conflict: it is redrafted, a fresh salt each time, until its record id
+    /// sorts below the `Put`'s, so the tie-break goes its way on every run. Once both sides hold
+    /// both, m1 deletes `U` while m2, unaware, puts `U=b`, and every Mac reads that as a conflict.
+    ///
+    /// NEGATIVE CONTROL: with `Register::classify` carrying a `Delete` whenever its past's winner
+    /// is a `Delete`, this fails "m1's Delete read as a carry on m1".
+    #[test]
+    fn a_delete_that_settles_a_conflict_is_no_carry() {
+        let t = three();
+        let mut base = t.log.clone();
+        let draft = base
+            .draft_put(&t.m1, 1_500, t.epoch, &t.key, &put("U", b"u0"))
+            .unwrap();
+        hold(&mut base, draft, &t.w1, t.inc1);
+        let conflict = (Audience::Everyone, "U".to_owned());
+        let mut side_a = base.clone();
+        let draft = side_a
+            .draft_put(&t.m1, 1_550, t.epoch, &t.key, &put("U", b"a"))
+            .unwrap();
+        let put_a = hold(&mut side_a, draft, &t.w1, t.inc1);
+        let delete = (0..64)
+            .find_map(|_| {
+                let record = base
+                    .draft_delete(&t.m2, 1_600, t.epoch, &t.key, "U")
+                    .unwrap()
+                    .sign(&t.w2, t.inc2)
+                    .unwrap();
+                (*record.id() < put_a).then_some(record)
+            })
+            .expect("one of 64 fresh salts sorts m2's Delete below m1's Put");
+        let mut side_b = base.clone();
+        side_b.insert(delete).unwrap();
+        side_a.merge(&side_b).unwrap();
+        side_b.merge(&side_a).unwrap();
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            assert_eq!(
+                read(&side_a, id, "U"),
+                None,
+                "CONTROL: m2's first Delete wins its conflict on {who}"
+            );
+        }
+
+        let draft = side_a
+            .draft_delete(&t.m1, 1_700, t.epoch, &t.key, "U")
+            .unwrap();
+        hold(&mut side_a, draft, &t.w1, t.inc1);
+        let draft = side_b
+            .draft_put(&t.m2, 1_700, t.epoch, &t.key, &put("U", b"b"))
+            .unwrap();
+        hold(&mut side_b, draft, &t.w2, t.inc2);
+        side_a.merge(&side_b).unwrap();
+        for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
+            let opened = side_a.open_entry_set(id).unwrap().unwrap();
+            assert!(
+                opened.conflicts.contains(&conflict),
+                "m1's Delete read as a carry on {who}"
+            );
+        }
     }
 
     #[test]

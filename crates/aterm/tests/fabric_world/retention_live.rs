@@ -51,7 +51,7 @@ fn base(w: &World) -> u64 {
 }
 
 /// The node log's cursor now, as `since=<seq> ep=<epoch>`.
-fn node_log_cursor(w: &World) -> String {
+pub(crate) fn node_log_cursor(w: &World) -> String {
     let r = w.verb("log n n=1");
     let h = r.header();
     assert!(r.ok(), "log n: {h}");
@@ -62,7 +62,7 @@ fn node_log_cursor(w: &World) -> String {
 /// Every link mark the node log wrote past `cursor`: each stored move of the link, from the
 /// bridge's own `link down` or `link up`, its lane's loss or a new incarnation's attach. A
 /// reset of the cursor answers a `gap` row, which counts too.
-fn link_moves_since(w: &World, cursor: &str) -> Vec<String> {
+pub(crate) fn link_moves_since(w: &World, cursor: &str) -> Vec<String> {
     let r = w.verb(&format!("log n kinds=link {cursor}"));
     assert!(r.ok(), "log n kinds=link {cursor}: {}", r.header());
     r.rows().to_vec()

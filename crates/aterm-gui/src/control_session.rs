@@ -3664,6 +3664,27 @@ pub(crate) fn cmd_meta_supervisor(
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
     rest: &str,
 ) -> Option<(String, bool)> {
+    cmd_meta_supervisor_serving(
+        ctx,
+        scope,
+        conn,
+        prove,
+        rest,
+        crate::harness_claim::served().is_some(),
+    )
+}
+
+/// [`cmd_meta_supervisor`] by an aterm that serves contract 3 (`serves`) or answers as one
+/// predating it (the negative control's seam, [`crate::harness_claim::served`]): then a claim
+/// naming `contract=` is the v2 grammar's usage error, and nothing is claimed.
+pub(crate) fn cmd_meta_supervisor_serving(
+    ctx: &SessionCtx,
+    scope: Scope,
+    conn: Option<u64>,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    rest: &str,
+    serves: bool,
+) -> Option<(String, bool)> {
     const USAGE: &str = "ERR usage: meta set supervisor <holder> [ttl=<ms>] | meta unset supervisor \
                          [holder=<holder>]\n";
     let mut toks = rest.split_whitespace();
@@ -3701,6 +3722,15 @@ pub(crate) fn cmd_meta_supervisor(
         return Some((USAGE.to_string(), false));
     }
     let words: Vec<&str> = toks.collect();
+    if crate::harness_claim::refused_before_v3(serves, &words) {
+        aterm_log::info!(
+            "harness @{}: {holder} claimed under contract=, which this aterm does not serve ({}); \
+             refused as the v2 grammar's usage error",
+            ctx.self_id,
+            crate::harness_claim::NO_CONTRACT3_SEAM
+        );
+        return Some((USAGE.to_string(), false));
+    }
     let words = match ctx.native_policy.read(holder, &words) {
         aterm_agent::harness::contract::Words::V2(words) => words,
         aterm_agent::harness::contract::Words::Refused(why) => {
@@ -5218,7 +5248,7 @@ pub(crate) fn cmd_raise(
     }
 }
 
-/// `exits [<n>] [since=<id>]` -> the instance's exit ledger, oldest-first, framed `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n> reason=<…> exit_code=<n|-> by=<sid|human|ctl|bridge|->` line per session that left the registry — the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps rows with id strictly greater) over the closed-session index, whose slots are linked in the write that records the roster's `Exited` row, in its seq order (the row id); bounded by the index's last 512 closes.
+/// `exits [<n>] [since=<id>]` -> the instance's exit ledger, oldest-first, framed `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n> reason=<…> exit_code=<n|-> by=<sid|human|ctl|bridge|harness|->` line per session that left the registry — the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps rows with id strictly greater) over the closed-session index, whose slots are linked in the write that records the roster's `Exited` row, in its seq order (the row id); bounded by the index's last 512 closes.
 pub(crate) fn cmd_exits(store: &Store, rest: &str) -> String {
     let page = match RingPage::parse(rest, "exits") {
         Ok(page) => page,
@@ -8418,6 +8448,7 @@ mod exits_tests {
                 ExitActor::Sid(sid) => TurnBy::Sid(sid),
                 ExitActor::Ctl => TurnBy::Ctl,
                 ExitActor::Bridge => TurnBy::Bridge,
+                ExitActor::Harness => TurnBy::Harness,
                 ExitActor::Human | ExitActor::Unknown => TurnBy::Unknown,
             };
             assert_eq!(by, named, "{scope:?}");

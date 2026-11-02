@@ -4,6 +4,7 @@
 //! Broker link-state reporting and reconnect tests against a live headless instance.
 
 use crate::harness;
+use crate::retention_live::{link_moves_since, node_log_cursor};
 
 use std::io::Read as _;
 use std::os::unix::net::UnixListener;
@@ -27,6 +28,56 @@ fn boot_sid(w: &World) -> String {
     until("aterm's boot session", || {
         w.sessions().first().map(|(_, sid, _)| sid.clone())
     })
+}
+
+/// **A KILLED BRIDGE'S LOSS LANDS AHEAD OF THE NEXT ATTACH, HOWEVER LONG ITS LANES TAKE**: the
+/// real lanes and their guard under the supervisor's own loop, each lane held past its hang-up
+/// for far longer than a relaunch's exec, read off the node log's link marks: the killed
+/// generation's `state=disconnected`, then the next one's `state=stalled`.
+///
+/// A retire that does not wait for the lanes, or a lane that lets go of its `LaneEnded` before
+/// its guard has run, attaches the next bridge during the hold, and the loss lands behind it.
+/// This asserts no time: that a healthy run's relaunch waits nothing is `fabric_launch`'s
+/// `the_loop_waits_nothing_after_a_healthy_run_and_the_floor_after_a_young_death`.
+#[test]
+fn a_killed_bridges_loss_lands_ahead_of_the_next_attach_however_long_its_lanes_take() {
+    let hold = harness::Hold::new("relaunch-order");
+    let w = World::boot_with(
+        "relaunch-order",
+        &[],
+        &[("ATERM_TEST_PUSH_HOLD", &hold.env())],
+    );
+    w.wait_ready();
+    // Past the supervisor's `RELAUNCH_HEALTHY`, so no back-off stands in for the wait.
+    std::thread::sleep(Duration::from_millis(5_500));
+    let cursor = node_log_cursor(&w);
+    let killed = w.bridge_pid();
+    hold.on("lane-loss");
+    harness::kill(killed, 9);
+    std::thread::sleep(Duration::from_secs(1));
+    hold.off("lane-loss");
+    w.await_bridge_back(killed);
+
+    let moves = link_moves_since(&w, &cursor);
+    let said: Vec<(&str, u64)> = moves
+        .iter()
+        .take(2)
+        .map(|row| {
+            let generation = kv(row, "gen").and_then(|g| g.parse().ok());
+            (
+                kv(row, "state").unwrap_or_else(|| panic!("no state= in {row}")),
+                generation.unwrap_or_else(|| panic!("no gen= in {row}")),
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            said[..],
+            [("disconnected", killed), ("stalled", next)] if killed < next
+        ),
+        "the link over a relaunch ({cursor}): {moves:#?}\n{}",
+        w.log_tail()
+    );
 }
 
 /// The broker is the harness's own, so "killed" is its handle's `shutdown` —

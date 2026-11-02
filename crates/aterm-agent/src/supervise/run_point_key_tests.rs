@@ -367,11 +367,32 @@ fn agys_point_at_a_narrow_pane_and_under_a_paste_is_its_turn() {
 /// submit mark. A program with no such reader keeps the screen's rows (none to tell a composer by),
 /// so its reader must find no composer on any program's frames here, Grok Build's own measured
 /// frames among them (its drafts too; no Codex frame is measured): one that learns to will fail
-/// this walk until its pairs join it. NEGATIVE CONTROL: each pair's composer differs, a draft in
-/// one and none in the other.
+/// this walk until its pairs join it. Grok Build's pairs clear a measured draft where it stands
+/// (the caret row emptied, the box shrunk back to it, the key row the empty composer's measured
+/// `Logged in with API key`): no signed-in frame of the same screen cleared is measured, and its
+/// reader reads the box's rows, never its words (a suggestion stands after an empty caret).
+/// NEGATIVE CONTROL: each pair's composer differs, a draft in one and none in the other.
 #[test]
 fn a_draft_typed_and_cleared_is_no_new_point_under_any_program() {
-    use aterm_phase::{kimi, muse};
+    use aterm_phase::{grok, kimi, muse};
+    let grok_cleared = |rows: &[String]| -> Vec<String> {
+        let (_, caret, bottom) = grok::composer_rows(rows).expect("Grok Build's composer box");
+        let row = &rows[caret];
+        let edge = row.rfind('│').expect("the box's right edge");
+        let head = &row[..row.find('❯').expect("the caret") + '❯'.len_utf8()];
+        let pad = row[..edge].chars().count() - head.chars().count();
+        let key_row = format!(
+            "{}{}",
+            " ".repeat(row.chars().count() - "Logged in with API key".len()),
+            "Logged in with API key"
+        );
+        let mut out: Vec<String> = rows[..caret].to_vec();
+        out.push(format!("{head}{}│", " ".repeat(pad)));
+        out.push(rows[bottom].clone());
+        out.push(String::new());
+        out.push(key_row);
+        out
+    };
     let claude = screen(aterm_phase::prompt::fixtures::API_ERROR_TWICE_MEASURED);
     let typed_at = |rows: &[String], caret: usize, glyph: &str| {
         let mut out = rows.to_vec();
@@ -400,7 +421,17 @@ fn a_draft_typed_and_cleared_is_no_new_point_under_any_program() {
                 screen(kimi::fixtures::IDLE),
                 screen(kimi::fixtures::DRAFT),
             )]),
-            Program::Codex | Program::Grok | Program::Generic => None,
+            Program::Grok => Some(vec![
+                (
+                    grok_cleared(&screen(grok::fixtures::IDLE_DRAFT)),
+                    screen(grok::fixtures::IDLE_DRAFT),
+                ),
+                (
+                    grok_cleared(&screen(grok::fixtures::DRAFT_MULTILINE_TYPED)),
+                    screen(grok::fixtures::DRAFT_MULTILINE_TYPED),
+                ),
+            ]),
+            Program::Codex | Program::Generic => None,
         }
     };
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
@@ -493,9 +524,9 @@ fn claude_rule(reader: &dyn ScreenReader, turn: &Turn) -> (String, Option<(u64, 
 
 /// EVERY OTHER POINT KEEPS CLAUDE CODE'S RULE BYTE FOR BYTE: over every measured screen of every
 /// program in the fixtures, each read whose key is not cut at the program's own turn end
-/// ([`own_turn_end`]) gets the key and the submit mark that rule gave, and Claude Code, Muse Code, Codex, Grok Build and a generic program
-/// never cut. NEGATIVE CONTROL: agy's and Kimi Code's keys, cut at their frames, differ from it on
-/// their own screens.
+/// ([`own_turn_end`]) gets the key and the submit mark that rule gave, and Claude Code, Muse
+/// Code, Codex and a generic program never cut. NEGATIVE CONTROL: agy's, Kimi Code's and Grok
+/// Build's keys, cut at their frames, differ from it on their own screens.
 #[test]
 fn every_other_programs_point_keeps_claude_codes_rule() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
@@ -525,15 +556,15 @@ fn every_other_programs_point_keeps_claude_codes_rule() {
             let now = (point_key(reader, &turn), submit_mark(reader, &turn.screen));
             let own = own_turn_end(reader, rows).is_some();
             match program {
-                Program::Agy | Program::Kimi if own => {
+                Program::Agy | Program::Kimi | Program::Grok if own => {
                     *cut.entry(program).or_default() += usize::from(now != (key, mark));
                 }
                 Program::Agy
                 | Program::Kimi
+                | Program::Grok
                 | Program::Codex
                 | Program::Claude
                 | Program::Muse
-                | Program::Grok
                 | Program::Generic => {
                     assert!(!own, "{program:?} on {name}");
                     assert_eq!(now, (key, mark), "{program:?} on {name}");
@@ -546,5 +577,9 @@ fn every_other_programs_point_keeps_claude_codes_rule() {
             + cut.get(&Program::Kimi).copied().unwrap_or(0)
             > 100,
         "agy's and Kimi Code's frames are cut: {cut:?}"
+    );
+    assert!(
+        cut.get(&Program::Grok).copied().unwrap_or(0) > 0,
+        "Grok Build's frames are cut: {cut:?}"
     );
 }

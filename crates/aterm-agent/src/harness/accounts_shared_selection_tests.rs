@@ -280,6 +280,11 @@ fn progress(bed: &Bed) -> (bool, usize) {
     let store = &bed.store;
     let opener = bed.home.join(".local/bin/aterm-open-url");
     fs::create_dir_all(opener.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    if !opener.try_exists().unwrap() {
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &opener).unwrap();
+    }
+    #[cfg(not(unix))]
     fs::write(opener, b"inert opener").unwrap();
     fs::create_dir_all(super::super::headless_oauth::browser_profile_dir(
         &store.dir,

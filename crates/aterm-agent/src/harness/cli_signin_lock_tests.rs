@@ -135,6 +135,9 @@ impl AccountsHost for LockHost {
     fn stdin_is_terminal(&self) -> bool {
         true
     }
+    fn current_exe(&self) -> Option<PathBuf> {
+        Some(std::env::current_exe().expect("the test executable"))
+    }
     fn retries_sign_in_lock(&self, _: u32) -> bool {
         let ended = self.running.borrow_mut().take().is_some();
         if let Some(left) = self.left.borrow_mut().take() {
@@ -367,6 +370,7 @@ fn an_unopenable_signin_lock_starts_no_claude_flow() {
     }
 }
 
+#[cfg(unix)]
 struct Published<'a> {
     host: &'a LockHost,
     store: accounts::Store,
@@ -374,6 +378,7 @@ struct Published<'a> {
     bytes: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl Write for Published<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.bytes.extend_from_slice(bytes);
@@ -396,6 +401,7 @@ impl Write for Published<'_> {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_claude_fallback_keeps_the_lock_until_the_new_binding_is_published() {
     let (_tmp, env, form) = fixture("claude-fallback-lock", true);

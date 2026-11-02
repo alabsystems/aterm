@@ -354,7 +354,7 @@ pub(super) fn private_directory(root: impl std::os::fd::AsFd) -> bool {
 }
 
 #[cfg(unix)]
-fn private_marker(file: &std::fs::File) -> bool {
+pub(super) fn private_metadata(file: &std::fs::File) -> bool {
     match astream_sys::owner_private(file) {
         Ok(Ok(_)) => true,
         Ok(Err(astream_sys::NotPrivate::Mode(mode))) => mode & 0o022 == 0,
@@ -386,7 +386,7 @@ fn read_marker(root: impl std::os::fd::AsFd) -> Result<Option<HeldMarker>, ()> {
         || metadata.uid() != crate::platform::our_uid()
         || metadata.mode() & 0o022 != 0
         || metadata.nlink() != 1
-        || !private_marker(&file)
+        || !private_metadata(&file)
     {
         return Err(());
     }
@@ -403,7 +403,7 @@ fn read_marker(root: impl std::os::fd::AsFd) -> Result<Option<HeldMarker>, ()> {
     if after.len() != bytes.len() as u64
         || after.nlink() != 1
         || after.modified().ok() != metadata.modified().ok()
-        || !private_marker(&file)
+        || !private_metadata(&file)
     {
         return Err(());
     }

@@ -18,15 +18,14 @@ fn never() -> Result<PathBuf, String> {
 /// not asked; empty or relative, it names no folder (the control: with no zshenv file, `$HOME`).
 #[test]
 fn the_environment_s_absolute_zdotdir_under_home_is_the_answer() {
-    let home = Path::new("/h");
+    let scratch = crate::testdir::dir("atpkg-zdotdir-env-");
+    let home = scratch.as_path();
+    let zdot = home.join(".config/zsh");
     for (env, want) in [
-        (
-            Some("/h/.config/zsh"),
-            ZshDir::At(PathBuf::from("/h/.config/zsh")),
-        ),
-        (Some("/h"), ZshDir::Home),
-        (Some(""), ZshDir::Home),
-        (Some("dots"), ZshDir::Home),
+        (Some(zdot.as_os_str()), ZshDir::At(zdot.clone())),
+        (Some(home.as_os_str()), ZshDir::Home),
+        (Some(std::ffi::OsStr::new("")), ZshDir::Home),
+        (Some(std::ffi::OsStr::new("dots")), ZshDir::Home),
         (None, ZshDir::Home),
     ] {
         let env = from_env(home, None, env.map(OsString::from));
@@ -40,45 +39,46 @@ fn the_environment_s_absolute_zdotdir_under_home_is_the_answer() {
 /// `.zshrc` from a scratch run. zsh's own answer decides there instead.
 #[test]
 fn an_inherited_zdotdir_outside_a_redirected_home_is_not_this_home_s() {
-    let account = Path::new("/Users//someone");
-    let scratch = Path::new("/scratch/home");
-    let real = || Some(OsString::from("/Users//someone/.config/zsh"));
-    assert_eq!(from_env(scratch, Some(account), real()), None);
+    let root = crate::testdir::dir("atpkg-zdotdir-explicit-");
+    let account = root.join("Users/someone");
+    let scratch = root.join("scratch/home");
+    let outside = root.join("opt/dots/zsh");
+    let real = || Some(account.join(".config/zsh").into_os_string());
+    assert_eq!(from_env(&scratch, Some(&account), real()), None);
     assert_eq!(
-        from_env(scratch, None, real()),
+        from_env(&scratch, None, real()),
         None,
         "no account record: not taken"
     );
     assert_eq!(
         from_env(
-            account,
-            Some(account),
-            Some(OsString::from("/opt/dots/zsh"))
+            &account,
+            Some(&account),
+            Some(outside.clone().into_os_string())
         ),
-        Some(PathBuf::from("/opt/dots/zsh")),
+        Some(outside.clone()),
         "the control: in the account's own home a ZDOTDIR anywhere is its own"
     );
     assert_eq!(
         from_env(
-            scratch,
-            Some(account),
-            Some(OsString::from("/scratch/home/zdot"))
+            &scratch,
+            Some(&account),
+            Some(scratch.join("zdot").into_os_string())
         ),
-        Some(PathBuf::from("/scratch/home/zdot")),
+        Some(scratch.join("zdot")),
         "under the redirected home it is that home's"
     );
     assert_eq!(
-        resolve(scratch, None, &[], never),
+        resolve(&scratch, None, &[], never),
         ZshDir::Home,
         "no zshenv file sets one for this home"
     );
-    let own = crate::testdir::dir("atpkg-zdotdir-explicit-");
+    let own = root.join("own");
+    std::fs::create_dir_all(&own).unwrap();
     std::fs::write(own.join(".zshenv"), "").unwrap();
     assert_eq!(
-        resolve(own.as_path(), None, &[own.join(".zshenv")], || {
-            Ok(PathBuf::from("/opt/dots/zsh"))
-        }),
-        ZshDir::At(PathBuf::from("/opt/dots/zsh")),
+        resolve(&own, None, &[own.join(".zshenv")], || Ok(outside.clone())),
+        ZshDir::At(outside),
         "zsh's answer, from this home's zshenv, may name a folder outside it"
     );
 }

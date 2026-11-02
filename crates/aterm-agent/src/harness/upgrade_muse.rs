@@ -60,18 +60,21 @@ enum Fate {
 }
 
 /// Muse Code's root options (`muse --help`, 1.4.13-R6996.1), each with its
-/// fate on a relaunch.
+/// fate on a relaunch. Approval and sandbox policy is process-launch state
+/// no session record restores, so those options are carried verbatim: a
+/// relaunch that dropped them silently downgraded a `--yolo` run to
+/// approval-on (measured 2026-10-31: a restored tab resumed bare).
 const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--agents", Arity::One, Fate::Keep),
-    ("--approval-judge", Arity::One, Fate::Drop),
-    ("--approval-mode", Arity::One, Fate::Drop),
+    ("--approval-judge", Arity::One, Fate::Keep),
+    ("--approval-mode", Arity::One, Fate::Keep),
     ("--base-url", Arity::One, Fate::Keep),
     ("-c", Arity::One, Fate::Keep),
     ("--config", Arity::One, Fate::Keep),
     ("--contributor-mode", Arity::One, Fate::Drop),
-    ("--disable-approval", Arity::None, Fate::Drop),
+    ("--disable-approval", Arity::None, Fate::Keep),
     ("--disable-request-user-input", Arity::None, Fate::Keep),
-    ("--disable-sandbox", Arity::None, Fate::Drop),
+    ("--disable-sandbox", Arity::None, Fate::Keep),
     ("--disable-shell", Arity::None, Fate::Keep),
     ("--disable-write", Arity::None, Fate::Keep),
     ("--echo-delay-ms", Arity::One, Fate::Keep),
@@ -84,11 +87,11 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--no-session-log", Arity::None, Fate::Refuse),
     ("--no-parallel-tool-calls", Arity::None, Fate::Keep),
     ("--parallel-tool-calls", Arity::None, Fate::Keep),
-    ("--permission-profile", Arity::One, Fate::Drop),
+    ("--permission-profile", Arity::One, Fate::Keep),
     ("--preset", Arity::One, Fate::Keep),
     ("--provider", Arity::One, Fate::Keep),
     ("--reasoning-effort", Arity::One, Fate::Drop),
-    ("--sandbox-network", Arity::One, Fate::Drop),
+    ("--sandbox-network", Arity::One, Fate::Keep),
     ("--subagent-worktree-isolation", Arity::None, Fate::Keep),
     ("--trust-workspace", Arity::None, Fate::Keep),
     ("-V", Arity::None, Fate::Refuse),
@@ -98,7 +101,7 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--worktree", Arity::None, Fate::Refuse),
     ("--worktree-base", Arity::One, Fate::Refuse),
     ("--worktree-existing", Arity::One, Fate::Refuse),
-    ("--yolo", Arity::None, Fate::Drop),
+    ("--yolo", Arity::None, Fate::Keep),
 ];
 
 /// `resume`'s own option: the most recent session in the workspace, never
@@ -703,6 +706,385 @@ pub fn told_line(session: &str, env: &[(String, String)]) -> Option<String> {
         "{PROGRAM} --contributor-mode off resume {session}"
     ));
     Some(said)
+}
+
+/// Environment variables Muse Code's `tbh_http_client` reads for custom TLS root certificates.
+const MUSE_CA_ENV_VARS: [&str; 3] = ["TBH_CA_CERTIFICATE", "SSL_CERT_FILE", "SSL_CERT_DIR"];
+
+/// What a Muse Code launch's `argv` says of the HTTP endpoint it speaks to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchEndpoint {
+    /// Explicit base URL (`--base-url` or `-c endpoint_transport.base_url`), with provider `meta`
+    /// or `local` and no `-c endpoint_transport` proxy, custom CA, or mTLS auth.
+    BaseUrl { url: String, source: &'static str },
+    /// Why `argv` names no directly probeable base URL.
+    Gap(String),
+}
+
+struct ConfigEndpoint {
+    provider: Option<String>,
+    base_url: Option<Result<Option<String>, &'static str>>,
+    proxy: Result<bool, &'static str>,
+    ca_bundle: Result<bool, &'static str>,
+    auth: Result<bool, &'static str>,
+}
+
+impl Default for ConfigEndpoint {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            base_url: None,
+            proxy: Ok(false),
+            ca_bundle: Ok(false),
+            auth: Ok(false),
+        }
+    }
+}
+
+fn muse_env_var<'a>(env: &'a [String], key: &str) -> Option<&'a str> {
+    env.iter()
+        .rev()
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, v)| *k == key && !v.trim().is_empty())
+        .map(|(_, v)| v.trim())
+}
+
+fn resolve_muse_whole_var(raw: &str, env: &[String]) -> Result<String, &'static str> {
+    if let Some(name) = raw.strip_prefix("${").and_then(|r| r.strip_suffix('}'))
+        && !name.is_empty()
+        && !name.contains(['$', '{', '}'])
+    {
+        return muse_env_var(env, name)
+            .map(str::to_string)
+            .ok_or("Muse Code's -c endpoint_transport references an unset environment variable");
+    }
+    Ok(raw.to_string())
+}
+
+fn parse_muse_transport_flag(val: &Value, bad_msg: &'static str) -> Result<bool, &'static str> {
+    match val {
+        Value::Null => Ok(false),
+        Value::String(s) => Ok(!s.trim().is_empty()),
+        _ => Err(bad_msg),
+    }
+}
+
+fn parse_muse_base_url_value(val: &Value, env: &[String]) -> Result<Option<String>, &'static str> {
+    match val {
+        Value::Null => Ok(None),
+        Value::String(s) => {
+            let resolved = resolve_muse_whole_var(s.trim(), env)?;
+            let trimmed = resolved.trim();
+            Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+        }
+        _ => Err("Muse Code's -c endpoint_transport.base_url is not a JSON string"),
+    }
+}
+
+fn parse_muse_auth_flag(val: &Value, env: &[String]) -> Result<bool, &'static str> {
+    match val {
+        Value::Null => Ok(false),
+        Value::String(s) => {
+            let resolved = resolve_muse_whole_var(s.trim(), env)?;
+            let trimmed = resolved.trim();
+            Ok(!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("bearer"))
+        }
+        Value::Object(map) => {
+            if map.is_empty() {
+                return Ok(false);
+            }
+            let bearer_only = map.len() == 1
+                && map
+                    .get("type")
+                    .or_else(|| map.get("mode"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| {
+                        resolve_muse_whole_var(t.trim(), env)
+                            .is_ok_and(|r| r.trim().eq_ignore_ascii_case("bearer"))
+                    });
+            Ok(!bearer_only)
+        }
+        _ => Err("Muse Code's -c endpoint_transport.auth is not a valid auth setting"),
+    }
+}
+
+fn apply_muse_config(spec: &str, env: &[String], state: &mut ConfigEndpoint) -> Result<(), String> {
+    let Some((raw_key, raw_val)) = spec.split_once('=') else {
+        return Err("Muse Code's -c/--config argument has no '='".to_string());
+    };
+    let key = raw_key.trim();
+    let raw_val = raw_val.trim();
+    match key {
+        "provider" => {
+            let parsed = match aterm_json::from_str::<Value>(raw_val) {
+                Ok(Value::String(s)) => resolve_muse_whole_var(s.trim(), env)
+                    .map_err(str::to_string)?
+                    .to_ascii_lowercase(),
+                Ok(Value::Null) => String::new(),
+                Ok(_) => {
+                    return Err("Muse Code's -c provider is not a JSON string".to_string());
+                }
+                Err(_) => raw_val.trim_matches('"').trim().to_ascii_lowercase(),
+            };
+            state.provider = Some(parsed);
+        }
+        "endpoint_transport.proxy" => {
+            state.proxy = aterm_json::from_str::<Value>(raw_val)
+                .map_err(|_| "Muse Code's -c endpoint_transport.proxy is not valid JSON")
+                .and_then(|v| {
+                    parse_muse_transport_flag(
+                        &v,
+                        "Muse Code's -c endpoint_transport.proxy is not a JSON string",
+                    )
+                });
+        }
+        "endpoint_transport.ca_bundle" => {
+            state.ca_bundle = aterm_json::from_str::<Value>(raw_val)
+                .map_err(|_| "Muse Code's -c endpoint_transport.ca_bundle is not valid JSON")
+                .and_then(|v| {
+                    parse_muse_transport_flag(
+                        &v,
+                        "Muse Code's -c endpoint_transport.ca_bundle is not a JSON string",
+                    )
+                });
+        }
+        "endpoint_transport.auth" => {
+            let parsed = match aterm_json::from_str::<Value>(raw_val) {
+                Ok(v) => Ok(v),
+                Err(_) if !raw_val.starts_with(['{', '[', '"']) => {
+                    Ok(Value::String(raw_val.to_string()))
+                }
+                Err(_) => Err("Muse Code's -c endpoint_transport.auth is not valid JSON"),
+            };
+            state.auth = parsed.and_then(|v| parse_muse_auth_flag(&v, env));
+        }
+        k if k.starts_with("endpoint_transport.auth.") => {
+            let parsed = match aterm_json::from_str::<Value>(raw_val) {
+                Ok(v) => Ok(v),
+                Err(_) if !raw_val.starts_with(['{', '[', '"']) => {
+                    Ok(Value::String(raw_val.to_string()))
+                }
+                Err(_) => Err("Muse Code's -c endpoint_transport.auth is not valid JSON"),
+            };
+            match parsed {
+                Ok(Value::Null) => {}
+                Ok(Value::String(s)) if s.trim().is_empty() => {}
+                Ok(Value::String(s))
+                    if matches!(
+                        k,
+                        "endpoint_transport.auth.type" | "endpoint_transport.auth.mode"
+                    ) && resolve_muse_whole_var(s.trim(), env)
+                        .is_ok_and(|r| r.trim().eq_ignore_ascii_case("bearer")) => {}
+                Ok(_) => state.auth = Ok(true),
+                Err(e) => state.auth = Err(e),
+            }
+        }
+        "endpoint_transport.base_url" => {
+            state.base_url = Some(
+                aterm_json::from_str::<Value>(raw_val)
+                    .map_err(|_| "Muse Code's -c endpoint_transport.base_url is not valid JSON")
+                    .and_then(|v| parse_muse_base_url_value(&v, env)),
+            );
+        }
+        "endpoint_transport" => match aterm_json::from_str::<Value>(raw_val) {
+            Ok(Value::Null) => {
+                state.base_url = Some(Ok(None));
+                state.proxy = Ok(false);
+                state.ca_bundle = Ok(false);
+                state.auth = Ok(false);
+            }
+            Ok(Value::Object(map)) => {
+                state.proxy = map.get("proxy").map_or(Ok(false), |v| {
+                    parse_muse_transport_flag(
+                        v,
+                        "Muse Code's -c endpoint_transport.proxy is not a JSON string",
+                    )
+                });
+                state.ca_bundle = map.get("ca_bundle").map_or(Ok(false), |v| {
+                    parse_muse_transport_flag(
+                        v,
+                        "Muse Code's -c endpoint_transport.ca_bundle is not a JSON string",
+                    )
+                });
+                state.auth = map
+                    .get("auth")
+                    .map_or(Ok(false), |v| parse_muse_auth_flag(v, env));
+                state.base_url = Some(
+                    map.get("base_url")
+                        .map_or(Ok(None), |v| parse_muse_base_url_value(v, env)),
+                );
+            }
+            _ => {
+                return Err("Muse Code's -c endpoint_transport is not a JSON object".to_string());
+            }
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn muse_option_val<'a>(
+    argv: &'a [String],
+    tok: &'a str,
+    name: &str,
+    attached: bool,
+    arity: Arity,
+    i: &mut usize,
+) -> Option<&'a str> {
+    if arity != Arity::One {
+        return None;
+    }
+    if attached {
+        if name.starts_with("--") {
+            tok.split_once('=').map(|(_, v)| v)
+        } else {
+            let rest = &tok[2..];
+            Some(rest.strip_prefix('=').unwrap_or(rest))
+        }
+    } else {
+        let next = argv
+            .get(*i)
+            .filter(|v| v.as_str() != "--")
+            .map(String::as_str);
+        if next.is_some() {
+            *i += 1;
+        }
+        next
+    }
+}
+
+fn muse_base_url_or_ca_gap(url: String, source: &'static str, env: &[String]) -> LaunchEndpoint {
+    if url
+        .trim()
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        && let Some(ca_var) = MUSE_CA_ENV_VARS
+            .into_iter()
+            .find(|k| muse_env_var(env, k).is_some())
+    {
+        return LaunchEndpoint::Gap(format!(
+            "Muse Code's launch sets {ca_var}, so its TLS endpoint cannot be probed with the OS \
+             trust store"
+        ));
+    }
+    LaunchEndpoint::BaseUrl { url, source }
+}
+
+/// Read the HTTP endpoint a Muse Code launch (`argv` and `env`) names through [`FLAGS`]'s option
+/// grammar: `--base-url` (any form before `--`, the last winning and outranking
+/// `-c endpoint_transport.base_url`), gated on `--provider` (`meta` or `local`, default `meta`),
+/// an unproxied `-c endpoint_transport` with no custom CA or mTLS auth, and no custom TLS CA
+/// environment variable on `https://` targets.
+#[must_use]
+pub fn launch_endpoint(argv: &[String], env: &[String]) -> LaunchEndpoint {
+    let mut positional_seen = false;
+    let mut exec = false;
+    let mut base_url_flag: Option<Option<&str>> = None;
+    let mut cfg = ConfigEndpoint::default();
+    let mut i = 1;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        i += 1;
+        if tok == "--" {
+            break;
+        }
+        if !maybe_option(tok) {
+            if !positional_seen {
+                positional_seen = true;
+                if tok == "exec" {
+                    exec = true;
+                } else if tok != "resume" && SUBCOMMANDS.contains(&tok) {
+                    return LaunchEndpoint::Gap(format!(
+                        "Muse Code subcommand {tok} runs no model session"
+                    ));
+                }
+            }
+            continue;
+        }
+        if tok == RESUME_LAST {
+            continue;
+        }
+        let (name, attached) = option_name(tok);
+        let arity = if exec && name == "--prompt-file" {
+            Arity::One
+        } else if let Some((arity, _)) = flag(name) {
+            arity
+        } else {
+            return LaunchEndpoint::Gap(
+                "Muse Code's launch passes an unrecognized option before --, so its route is not \
+                 read"
+                    .to_string(),
+            );
+        };
+        let val = muse_option_val(argv, tok, name, attached, arity, &mut i);
+        match name {
+            "--base-url" => {
+                base_url_flag = Some(val.map(str::trim).filter(|s| !s.is_empty()));
+            }
+            "--provider" => {
+                cfg.provider =
+                    Some(val.map_or_else(String::new, |s| s.trim().to_ascii_lowercase()));
+            }
+            "-c" | "--config" => {
+                let Some(spec) = val else {
+                    return LaunchEndpoint::Gap(
+                        "Muse Code's launch passes -c/--config with no value".to_string(),
+                    );
+                };
+                if let Err(why) = apply_muse_config(spec, env, &mut cfg) {
+                    return LaunchEndpoint::Gap(why);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(p) = cfg.provider.as_deref()
+        && !matches!(p, "meta" | "local")
+    {
+        return LaunchEndpoint::Gap(
+            "Muse Code's launch selects a provider that does not use its HTTP base URL".to_string(),
+        );
+    }
+    for check in [cfg.proxy, cfg.ca_bundle] {
+        match check {
+            Ok(false) => {}
+            Ok(true) => {
+                return LaunchEndpoint::Gap(
+                    "Muse Code's -c endpoint_transport configures its own proxy or CA bundle, so \
+                     its endpoint cannot be probed directly"
+                        .to_string(),
+                );
+            }
+            Err(why) => return LaunchEndpoint::Gap(why.to_string()),
+        }
+    }
+    match cfg.auth {
+        Ok(false) => {}
+        Ok(true) => {
+            return LaunchEndpoint::Gap(
+                "Muse Code's -c endpoint_transport.auth configures client-certificate or custom \
+                 transport auth, so its endpoint cannot be probed directly"
+                    .to_string(),
+            );
+        }
+        Err(why) => return LaunchEndpoint::Gap(why.to_string()),
+    }
+    match base_url_flag {
+        Some(Some(url)) => muse_base_url_or_ca_gap(url.to_string(), "Muse Code's --base-url", env),
+        Some(None) => {
+            LaunchEndpoint::Gap("Muse Code's launch passes --base-url with no value".to_string())
+        }
+        None => match cfg.base_url {
+            Some(Ok(Some(url))) => {
+                muse_base_url_or_ca_gap(url, "Muse Code's -c endpoint_transport.base_url", env)
+            }
+            Some(Err(why)) => LaunchEndpoint::Gap(why.to_string()),
+            None | Some(Ok(None)) => LaunchEndpoint::Gap(
+                "Muse Code's launch names no --base-url (its default endpoint is not read)"
+                    .to_string(),
+            ),
+        },
+    }
 }
 
 #[cfg(test)]

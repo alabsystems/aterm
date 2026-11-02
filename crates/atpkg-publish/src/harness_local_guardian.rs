@@ -866,7 +866,12 @@ fn run_attempt(
         ledger,
         seat.machine,
         need,
-        Admit::Wait,
+        // Controlled bodies launch no compiler and use their fixture's private seat.
+        if boot.controlled() {
+            seat.mode
+        } else {
+            Admit::Wait
+        },
         seat.pace,
         &mut |line| eprintln!("{line}"),
         stopped,

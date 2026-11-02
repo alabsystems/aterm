@@ -51,18 +51,71 @@ pub fn parse_browse(text: &str) -> Vec<String> {
 /// is a bounded observation; [`browse_members`] selects a rotating batch from the full snapshot.
 #[must_use]
 pub fn parse_browse_members(text: &str) -> Vec<String> {
-    let mut instances = parse_browse_service(text, MEMBER_SERVICE);
+    parse_browse_members_of(text, MEMBER_SERVICE)
+}
+
+/// [`parse_browse_members`] of a transcript of `dns-sd -B <service> local.`: `service`'s rows
+/// alone, at most [`MAX_MEMBERS`]. [`browse_members`] reads its browse of [`member_service`]
+/// with it.
+#[must_use]
+pub fn parse_browse_members_of(text: &str, service: &str) -> Vec<String> {
+    let mut instances = parse_browse_service(text, service);
     instances.truncate(MAX_MEMBERS);
     instances
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 fn member_candidate_names(text: &str, from: &AtomicUsize) -> Vec<String> {
-    rotated_names(
-        parse_browse_service(text, MEMBER_SERVICE),
-        from,
-        MAX_MEMBERS,
-    )
+    member_candidate_names_of(text, MEMBER_SERVICE, from)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn member_candidate_names_of(text: &str, service: &str, from: &AtomicUsize) -> Vec<String> {
+    rotated_names(parse_browse_service(text, service), from, MAX_MEMBERS)
+}
+
+/// The environment variable that points [`browse_members`] at a lab's own members service in
+/// place of [`MEMBER_SERVICE`]: `lab mac nux --scenario vault-phrase` sets it on its joiner, whose
+/// guest hears the members the lab Mac's LAN advertises and must never ask them. Which Bonjour
+/// type a Mac browses is no credential (whoever answers still proves who it is), but this build
+/// takes only a [`lab_service`] here and fails the browse on any other value
+/// ([`member_service`]), so a value it cannot take never falls back to the real members. No
+/// install sets it.
+pub const LAB_MEMBER_SERVICE_ENV: &str = "ATERM_LAB_MEMBER_SERVICE";
+
+/// Whether `service` is a lab's members service, `_alab-lab-<1 to 6 lowercase letters or
+/// digits>._tcp`: a type no ALab member advertises, whose name (`alab-lab-` and the rest) keeps
+/// to DNS-SD's 15 characters.
+#[must_use]
+pub fn lab_service(service: &str) -> bool {
+    service
+        .strip_prefix("_alab-lab-")
+        .and_then(|rest| rest.strip_suffix("._tcp"))
+        .is_some_and(|nonce| {
+            (1..=6).contains(&nonce.len())
+                && nonce
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
+/// The service [`browse_members`] browses, given [`LAB_MEMBER_SERVICE_ENV`]'s value (`None`:
+/// unset): [`MEMBER_SERVICE`], or the [`lab_service`] the variable names.
+///
+/// # Errors
+/// The variable is set to anything but a lab service (`_alab._tcp` itself, an empty value and
+/// one that is no UTF-8 included): the browse then looks for no member, never for the real ones.
+pub fn member_service(value: Option<&std::ffi::OsStr>) -> crate::Result<String> {
+    let Some(value) = value else {
+        return Ok(MEMBER_SERVICE.to_owned());
+    };
+    match value.to_str().filter(|v| lab_service(v)) {
+        Some(lab) => Ok(lab.to_owned()),
+        None => Err(crate::Error::new(format!(
+            "{LAB_MEMBER_SERVICE_ENV} names no lab service (`_alab-lab-<1 to 6 lowercase letters \
+             or digits>._tcp`), so this Mac browses for no member"
+        ))),
+    }
 }
 
 fn parse_browse_service(text: &str, expected_service: &str) -> Vec<String> {
@@ -237,17 +290,20 @@ pub fn browse_members(_budget: Duration) -> crate::Result<Vec<String>> {
     Err(crate::Error::new(NO_BROWSE))
 }
 
-/// Browse [`MEMBER_SERVICE`] on macOS within `budget` and resolve the fleet ports (`host:port`)
+/// Browse [`member_service`] on macOS within `budget` and resolve the fleet ports (`host:port`)
 /// of at most [`MAX_MEMBERS`] service instances. Successive calls in this process rotate through
 /// names in a stable order, including names beyond the first batch.
 ///
 /// # Errors
-/// The browse cannot start, or macOS refused this program the local network.
+/// The browse cannot start, [`LAB_MEMBER_SERVICE_ENV`] names no lab service, or macOS refused
+/// this program the local network.
 #[cfg(all(target_os = "macos", not(test)))]
 pub fn browse_members(budget: Duration) -> crate::Result<Vec<String>> {
     static FROM: AtomicUsize = AtomicUsize::new(0);
     let started = Instant::now();
-    let (out, err) = run_dns_sd(&["-B", MEMBER_SERVICE, "local."], budget / 2, |_| false)?;
+    let service = member_service(std::env::var_os(LAB_MEMBER_SERVICE_ENV).as_deref())?;
+    let service = service.as_str();
+    let (out, err) = run_dns_sd(&["-B", service, "local."], budget / 2, |_| false)?;
     let said = format!("{out}\n{err}");
     if said
         .lines()
@@ -255,22 +311,20 @@ pub fn browse_members(budget: Duration) -> crate::Result<Vec<String>> {
         .any(|line| line.split_whitespace().any(|word| word == POLICY_DENIED))
     {
         return Err(crate::Error::new(format!(
-            "browsing {MEMBER_SERVICE}: {}",
+            "browsing {service}: {}",
             aterm_http::LOCAL_NETWORK_REFUSED
         )));
     }
-    let instances = member_candidate_names(&out, &FROM);
+    let instances = member_candidate_names_of(&out, service, &FROM);
     let left = budget.saturating_sub(started.elapsed());
     let resolved: Vec<Vec<String>> = std::thread::scope(|scope| {
         let resolving: Vec<_> = instances
             .iter()
             .map(|name| {
                 scope.spawn(move || {
-                    run_dns_sd(
-                        &["-L", name.as_str(), MEMBER_SERVICE, "local."],
-                        left,
-                        |line| line.contains(" can be reached at "),
-                    )
+                    run_dns_sd(&["-L", name.as_str(), service, "local."], left, |line| {
+                        line.contains(" can be reached at ")
+                    })
                     .map(|(text, _)| parse_reached(&text))
                     .unwrap_or_default()
                 })
@@ -1581,6 +1635,68 @@ mod tests {
         assert_eq!(super::parse_reached(text), ["m22.local:7100"]);
     }
 
+    /// `ATERM_LAB_MEMBER_SERVICE` unset browses `_alab._tcp`; set, it names a lab service or the
+    /// browse fails, and it never falls back to the real members' service.
+    ///
+    /// NEGATIVE CONTROL (2026-10-29): `member_service` with its refusal arm returning
+    /// `Ok(MEMBER_SERVICE.to_owned())` (a value it cannot take falls back to the real members)
+    /// fails here at the first refused value: `"_alab._tcp" fell back to Ok("_alab._tcp")`.
+    #[test]
+    fn a_lab_member_service_is_taken_and_any_other_value_finds_no_member() {
+        use std::ffi::OsStr;
+        assert_eq!(super::member_service(None).unwrap(), "_alab._tcp");
+        for lab in [
+            "_alab-lab-k3x9q2._tcp",
+            "_alab-lab-a._tcp",
+            "_alab-lab-000000._tcp",
+        ] {
+            assert!(super::lab_service(lab), "{lab}");
+            assert_eq!(super::member_service(Some(OsStr::new(lab))).unwrap(), lab);
+        }
+        for refused in [
+            "_alab._tcp",
+            "_alab-vault._tcp",
+            "",
+            "_alab-lab-._tcp",
+            "_alab-lab-k3x9q2x._tcp",
+            "_alab-lab-K3X9._tcp",
+            "_alab-lab-k3x9._udp",
+            "_alab-lab-k3-9._tcp",
+            "_alab-lab-k3x9._tcp.",
+            " _alab-lab-k3x9._tcp",
+            "_alab-nux-k3x9._tcp",
+        ] {
+            assert!(!super::lab_service(refused), "{refused:?}");
+            let said = super::member_service(Some(OsStr::new(refused)));
+            assert!(said.is_err(), "{refused:?} fell back to {said:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            assert!(
+                super::member_service(Some(OsStr::from_bytes(b"_alab-lab-\xff._tcp"))).is_err()
+            );
+        }
+    }
+
+    /// A browse of a lab service reads that service's rows alone: a real member heard in the same
+    /// transcript is no lab member, and a lab member is no real one.
+    ///
+    /// NEGATIVE CONTROL (2026-10-29): `parse_browse_members_of` reading `MEMBER_SERVICE` whatever
+    /// service it is given fails here: `left: ["alab-1a2b3c4d"]`, `right: ["alab-5e6f7a8b"]`.
+    #[test]
+    fn a_lab_browse_reads_its_own_service_alone() {
+        let browse = "Browsing for _alab-lab-k3x9q2._tcp.local.\n\
+            12:00:00.000  Add        3  14 local.               _alab._tcp.               alab-1a2b3c4d\n\
+            12:00:00.001  Add        2   6 local.               _alab-lab-k3x9q2._tcp.    alab-5e6f7a8b\n\
+            12:00:00.002  Add        2   6 local.               _alab-lab-zzzzzz._tcp.    alab-00000000\n";
+        assert_eq!(
+            super::parse_browse_members_of(browse, "_alab-lab-k3x9q2._tcp"),
+            ["alab-5e6f7a8b"]
+        );
+        assert_eq!(super::parse_browse_members(browse), ["alab-1a2b3c4d"]);
+    }
+
     /// A joiner's browse keeps every member of a lab of 40 Macs, so each one is asked and can
     /// show the row a person presses Allow on.
     /// NEGATIVE CONTROL: the cut at `MAX_CANDIDATES` (16) this browse had leaves 24 of them
@@ -1638,6 +1754,24 @@ mod tests {
             }
             assert_eq!(selected, expected, "reordered={reordered}");
         }
+    }
+
+    #[test]
+    fn lab_member_batches_rotate_without_selecting_live_members() {
+        let service = "_alab-lab-merge1._tcp";
+        let transcript: String = (0..MAX_MEMBERS * 2)
+            .flat_map(|n| {
+                [service, MEMBER_SERVICE]
+                    .map(move |kind| format!("12:00:00.000 Add 3 14 local. {kind}. alab-{n:08x}\n"))
+            })
+            .collect();
+        let from = AtomicUsize::new(0);
+        let first = member_candidate_names_of(&transcript, service, &from);
+        let second = member_candidate_names_of(&transcript, service, &from);
+        assert_eq!(first.len(), MAX_MEMBERS);
+        assert_eq!(second.len(), MAX_MEMBERS);
+        assert!(first.iter().all(|name| !second.contains(name)));
+        assert!(member_candidate_names_of(&transcript, "_alab-lab-other._tcp", &from).is_empty());
     }
 
     use super::*;

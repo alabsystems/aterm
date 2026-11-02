@@ -4175,7 +4175,8 @@ mod parent_and_path_tests {
                 // copy of `own` there, and nothing in this process owns `fd` as a `File`.
                 unsafe { libc::dup2(own.as_raw_fd(), fd) };
                 let me = i32::try_from(std::process::id()).expect("a pid");
-                println!("it reads itself as {:?}", read_process_path(me));
+                // Keep the readiness proof on its own line even after libtest's single-thread prefix.
+                println!("\nit reads itself as {:?}", read_process_path(me));
                 let _ = std::io::stdin().read_line(&mut line);
             }
             return;

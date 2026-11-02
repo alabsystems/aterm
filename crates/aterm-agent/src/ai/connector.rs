@@ -1366,8 +1366,12 @@ pub fn ids() -> Vec<&'static str> {
 #[must_use]
 pub fn login_file(name: &str) -> Option<&'static str> {
     use std::path::{Path, PathBuf};
-    let wanted = name.strip_prefix("~/")?.to_ascii_lowercase();
-    let fold = |path: &Path| path.to_string_lossy().to_ascii_lowercase();
+    let rest = name
+        .strip_prefix("~/")
+        .or_else(|| name.strip_prefix("~\\"))?;
+    let fold = |s: &str| s.replace('\\', "/").to_ascii_lowercase();
+    let fold_path = |path: &Path| fold(&path.to_string_lossy());
+    let wanted = fold(rest);
     let journal = crate::harness::codex_app_login::JOURNAL_SUFFIX;
     let unjournaled = wanted.strip_suffix(journal).unwrap_or(&wanted);
     let stored = ROWS
@@ -1376,14 +1380,14 @@ pub fn login_file(name: &str) -> Option<&'static str> {
         .chain(Cli::ALL.map(Cli::connector))
         .find(|row| {
             row.stores.iter().any(|store| {
-                let file = fold(&Path::new(row.home.default).join(store));
+                let file = fold_path(&Path::new(row.home.default).join(store));
                 wanted == file || unjournaled == file
             })
         });
     if let Some(row) = stored {
         return Some(row.product);
     }
-    let wanted = PathBuf::from(wanted);
+    let wanted = PathBuf::from(&wanted);
     let claude_state = aterm_types::dirs::state_dir()
         .zip(aterm_types::dirs::home_dir())
         .and_then(|(state, home)| state.strip_prefix(home).ok().map(Path::to_path_buf))
@@ -1393,7 +1397,7 @@ pub fn login_file(name: &str) -> Option<&'static str> {
             Cli::Claude => crate::harness::accounts::Store::at(claude_state.as_deref()?),
             _ => crate::harness::accounts::Store::at_for(Path::new(""), cli, Path::new("")),
         };
-        let root = PathBuf::from(fold(&store.logins_dir()));
+        let root = PathBuf::from(fold_path(&store.logins_dir()));
         (wanted.starts_with(&root) && wanted != root).then_some(cli.connector().product)
     })
 }

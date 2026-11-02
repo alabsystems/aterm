@@ -278,6 +278,68 @@ fn the_same_mark_twice_moves_nothing_and_a_change_bumps_the_rev() {
     assert!(moved && raised.rev == 4 && raised.attention && raised.has_news());
 }
 
+/// A MAC ASLEEP BEFORE AN UPDATE SPENDS NONE OF A CARRIED CLOCK: the successor's `since` and
+/// `started` stand as long before its now as the predecessor's monotonic clock measured them,
+/// not the wall clock's whole gap, which still caps them. CONTROL: a row without the ages, an
+/// older build's, goes by the wall clock.
+#[test]
+fn a_carried_record_keeps_only_the_time_it_was_awake() {
+    let t0 = Instant::now();
+    let record = TaskRecord {
+        rev: 3,
+        state: TaskState::Stalled,
+        from: "ctl".into(),
+        why: Some("held"),
+        checked: None,
+        exit: None,
+        result_bytes: 0,
+        result_path: None,
+        attention: false,
+        since_unix_ms: 10_000,
+        since: t0 + Duration::from_secs(6),
+        started_unix_ms: 4_000,
+        started: t0,
+        entered: 3,
+        agent: None,
+        trusted_cwd: None,
+        fact: None,
+        fact_rev: 0,
+    };
+    let row = record.carry_row(t0 + Duration::from_secs(66));
+    assert!(row.contains(" age_ms=60000 ran_ms=66000"), "{row}");
+    let asleep_ms = 600_000;
+    let after = t0 + Duration::from_secs(2_000);
+    let back = TaskRecord::from_carry_row(&row, None, after, 70_000 + asleep_ms).expect("reads");
+    assert_eq!(back.since, after - Duration::from_secs(60));
+    assert_eq!(back.started, after - Duration::from_secs(66));
+    assert_eq!((back.since_unix_ms, back.started_unix_ms), (10_000, 4_000));
+
+    let older = row.replace(" age_ms=60000 ran_ms=66000", "");
+    let back = TaskRecord::from_carry_row(&older, None, after, 70_000 + asleep_ms).expect("reads");
+    assert_eq!(back.since, after - Duration::from_secs(660));
+    assert_eq!(back.started, after - Duration::from_secs(666));
+
+    let odd = row.replace(
+        " age_ms=60000 ran_ms=66000",
+        " age_ms=99999999 ran_ms=99999999",
+    );
+    let back = TaskRecord::from_carry_row(&odd, None, after, 70_000).expect("reads");
+    assert_eq!(
+        back.since,
+        after - Duration::from_secs(60),
+        "no more than the wall clock's gap"
+    );
+    assert_eq!(back.started, after - Duration::from_secs(66));
+    for bad in ["age_ms=x", "ran_ms=-1"] {
+        let row = format!("{older} {bad}");
+        assert_eq!(
+            TaskRecord::from_carry_row(&row, None, after, 70_000),
+            None,
+            "{bad}"
+        );
+    }
+}
+
 #[test]
 fn the_carried_row_round_trips_and_a_bad_row_is_none() {
     let t0 = Instant::now();
@@ -293,13 +355,16 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         attention: true,
         since_unix_ms: 10_000,
         since: t0,
+        started_unix_ms: 10_000,
+        started: t0,
         entered: 7,
         agent: Some(aterm_phase::Program::Agy),
         trusted_cwd: Some(folder("w/my proj")),
         fact: None,
         fact_rev: 0,
     };
-    let row = record.carry_row();
+    let carried = t0 + Duration::from_secs(5);
+    let row = record.carry_row(carried);
     let (wire, trusted) = if cfg!(windows) {
         (r"C:\state\aterm\tasks\r%201.txt", r"C:\w\my%20proj")
     } else {
@@ -309,14 +374,39 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         row,
         format!(
             "rev=7 state=exited from={SID} since=10000 result_bytes=9 attention=1 why=exit \
-             exit=-2 result_path={wire} agent=agy trusted_cwd={trusted}"
+             exit=-2 result_path={wire} age_ms=5000 agent=agy trusted_cwd={trusted}"
         )
     );
     let later = t0 + Duration::from_secs(60);
     let back = TaskRecord::from_carry_row(&row, Some(&tasks()), later, 15_000).expect("reads");
     assert_eq!(back.since, later - Duration::from_secs(5));
-    assert_eq!(back.carry_row(), row, "the row reads back to its own bytes");
-    assert_eq!(TaskRecord { since: t0, ..back }, record);
+    assert_eq!(
+        back.carry_row(later),
+        row,
+        "the row reads back to its own bytes"
+    );
+    let again = TaskRecord {
+        since: t0,
+        started: t0,
+        ..back
+    };
+    assert_eq!(again, record);
+    let started_earlier = TaskRecord {
+        started_unix_ms: 4_000,
+        started: t0
+            .checked_sub(Duration::from_secs(6))
+            .expect("a clock past six seconds"),
+        ..record.clone()
+    };
+    let back = TaskRecord::from_carry_row(
+        &started_earlier.carry_row(carried),
+        Some(&tasks()),
+        later,
+        15_000,
+    )
+    .expect("reads");
+    assert_eq!(back.started_unix_ms, 4_000);
+    assert_eq!(back.started, later - Duration::from_secs(11));
     let bare = TaskRecord {
         why: None,
         exit: None,
@@ -326,7 +416,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         trusted_cwd: None,
         ..record.clone()
     };
-    let back = TaskRecord::from_carry_row(&bare.carry_row(), Some(&tasks()), t0, 10_000).unwrap();
+    let back = TaskRecord::from_carry_row(&bare.carry_row(t0), Some(&tasks()), t0, 10_000).unwrap();
     assert_eq!(back, bare);
     let held = TaskRecord {
         state: TaskState::Stalled,
@@ -334,10 +424,10 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         ..bare.clone()
     };
     assert_eq!(
-        TaskRecord::from_carry_row(&held.carry_row(), Some(&tasks()), t0, 10_000),
+        TaskRecord::from_carry_row(&held.carry_row(t0), Some(&tasks()), t0, 10_000),
         Some(held)
     );
-    let newer = format!("{} model=opus pinned", bare.carry_row());
+    let newer = format!("{} model=opus pinned", bare.carry_row(t0));
     assert_eq!(
         TaskRecord::from_carry_row(&newer, Some(&tasks()), t0, 10_000),
         Some(bare.clone())
@@ -347,7 +437,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
             agent: Some(agent),
             ..bare.clone()
         };
-        let back = TaskRecord::from_carry_row(&with.carry_row(), Some(&tasks()), t0, 10_000)
+        let back = TaskRecord::from_carry_row(&with.carry_row(t0), Some(&tasks()), t0, 10_000)
             .expect("reads");
         let spawned = aterm_agent::harness::worker::worker_cli(agent).is_some();
         assert_eq!(back.agent, spawned.then_some(agent), "{agent:?}");
@@ -365,24 +455,24 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         ..bare.clone()
     };
     assert_eq!(
-        TaskRecord::from_carry_row(&with.carry_row(), Some(&tasks()), t0, 10_000),
+        TaskRecord::from_carry_row(&with.carry_row(t0), Some(&tasks()), t0, 10_000),
         Some(with.clone())
     );
     for bad in ["w/proj", "/w/../etc", "/w/proj/", "/w/a%0Ab", "/w//proj"] {
-        let row = format!("{} trusted_cwd={bad}", bare.carry_row());
+        let row = format!("{} trusted_cwd={bad}", bare.carry_row(t0));
         assert_eq!(
             TaskRecord::from_carry_row(&row, Some(&tasks()), t0, 10_000),
             Some(bare.clone()),
             "{bad}"
         );
     }
-    let unknown = format!("{} agent=a-later-cli", bare.carry_row());
+    let unknown = format!("{} agent=a-later-cli", bare.carry_row(t0));
     assert_eq!(
         TaskRecord::from_carry_row(&unknown, Some(&tasks()), t0, 10_000),
         Some(bare.clone())
     );
     for retired in aterm_phase::RETIRED_AGENTS {
-        let carried = format!("{} agent={retired}", bare.carry_row());
+        let carried = format!("{} agent={retired}", bare.carry_row(t0));
         assert_eq!(
             TaskRecord::from_carry_row(&carried, Some(&tasks()), t0, 10_000),
             Some(bare.clone()),
@@ -424,6 +514,8 @@ fn the_reply_event_and_status_spellings() {
         attention: false,
         since_unix_ms: 0,
         since: Instant::now(),
+        started_unix_ms: 0,
+        started: Instant::now(),
         entered: 3,
         agent: Some(aterm_phase::Program::Agy),
         trusted_cwd: Some(folder("w")),
@@ -1514,21 +1606,23 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         attention: false,
         since_unix_ms: 10_000,
         since: t0,
+        started_unix_ms: 10_000,
+        started: t0,
         entered: 1,
         agent: None,
         trusted_cwd: None,
         fact: hold_room(2),
         fact_rev: 3,
     };
-    let row = record.carry_row();
+    let row = record.carry_row(t0);
     assert_eq!(
         row,
-        "rev=4 state=working from=ctl since=10000 result_bytes=0 attention=0 \
+        "rev=4 state=working from=ctl since=10000 result_bytes=0 attention=0 age_ms=0 \
          fact=hold-room@v1#2 fact_rev=3"
     );
     let back = TaskRecord::from_carry_row(&row, None, t0, 10_000).expect("reads");
     assert_eq!((back.fact, back.fact_rev), (hold_room(2), 3));
-    assert_eq!(back.carry_row(), row);
+    assert_eq!(back.carry_row(t0), row);
     assert_eq!(
         fact_edit(&back, hold_room(2)),
         (NoteOutcome::Noted, None),
@@ -1547,14 +1641,18 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         fact: None,
         ..record.clone()
     };
-    let row = cleared.carry_row();
-    assert!(row.ends_with(" attention=0 fact_rev=3"), "{row}");
+    let row = cleared.carry_row(t0);
+    assert!(row.ends_with(" attention=0 age_ms=0 fact_rev=3"), "{row}");
     let back = TaskRecord::from_carry_row(&row, None, t0, 10_000).expect("reads");
     assert_eq!((back.fact, back.fact_rev), (None, 3));
     let older = row.replace(" fact_rev=3", "");
     let bare = TaskRecord::from_carry_row(&older, None, t0, 10_000).expect("an older row reads");
     assert_eq!((bare.fact, bare.fact_rev), (None, 0));
-    assert_eq!(bare.carry_row(), older, "an unedited word carries nothing");
+    assert_eq!(
+        bare.carry_row(t0),
+        older,
+        "an unedited word carries nothing"
+    );
     for odd in ["fact_rev=x", "fact_rev=-1", "fact_rev="] {
         let row = format!("{older} {odd}");
         let read = TaskRecord::from_carry_row(&row, None, t0, 10_000).expect("still reads");
@@ -1578,9 +1676,9 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         (None, 0),
         "a word with no rev past 0 stands for no edit"
     );
-    let twice = format!("{} fact_rev=4", record.carry_row());
+    let twice = format!("{} fact_rev=4", record.carry_row(t0));
     assert_eq!(TaskRecord::from_carry_row(&twice, None, t0, 10_000), None);
-    let twice = format!("{} fact=hold-room@v1#1", record.carry_row());
+    let twice = format!("{} fact=hold-room@v1#1", record.carry_row(t0));
     assert_eq!(TaskRecord::from_carry_row(&twice, None, t0, 10_000), None);
 }
 
@@ -1938,10 +2036,10 @@ fn a_done_marks_what_aterm_checked_and_the_record_carries_it() {
         wire.contains(&format!(" why=landed checked={on}")),
         "{wire}"
     );
-    let row = record.carry_row();
+    let row = record.carry_row(t0);
     assert!(row.contains(&format!(" why=landed checked={on}")), "{row}");
     let back = TaskRecord::from_carry_row(&row, Some(&tasks()), t0, 10_000).expect("reads");
-    assert_eq!(back.carry_row(), row);
+    assert_eq!(back.carry_row(t0), row);
     assert_eq!(back.checked.as_deref(), Some(on));
     assert!(
         await_row(SID, Some(&record), "idle", "-", "-", false).contains(&format!(" checked={on}")),
@@ -2040,7 +2138,7 @@ fn unicode_receipts_mark_done_and_roundtrip_through_records_and_result_sidecars(
         let (record, changed) = mark.apply(Some(&working), false, now, 10_000);
         assert!(changed && record.state == TaskState::Done);
         assert_eq!(record.checked.as_deref(), Some(word.as_str()));
-        let row = record.carry_row();
+        let row = record.carry_row(now);
         let restored = TaskRecord::from_carry_row(&row, Some(scratch.path()), now, 10_000)
             .expect("the same Unicode token survives record restoration");
         assert_eq!(restored.checked, record.checked);

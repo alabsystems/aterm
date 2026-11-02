@@ -2,8 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::table::tests::Lab;
-use aterm_secrets::commons::roster::Role;
+use crate::{
+    database::Command,
+    documents::application,
+    table::tests::{Lab, repair_commons},
+};
+use aterm_secrets::commons::{bootstrap::Bootstrap, roster::Role};
 
 const DAY: u64 = CLAIMS.period_s;
 /// Day 20,000 since the Unix epoch, a fixed clock.
@@ -403,6 +407,96 @@ fn a_full_catalog_leaves_the_claims_ring_its_slots() {
     });
 }
 
+/// The journal's week ring (`JOURNAL`, lab model design §11 step 4) has its own slots too: with
+/// the catalog's last shared slot assigned (a declared table awaiting storage) and the registry in
+/// its reserved slot, this Mac still appends to three weeks' journal tables (keeping the two its
+/// window still holds) and takes up day tables of the claims ring, and the declared table keeps
+/// its slot, since ring storage counts against none of the catalog's; a further declaration still
+/// waits on `Capacity`.
+/// NEGATIVE CONTROL: with `JOURNAL` left out of `RINGS` (its storage then counted against the
+/// catalog's slots), the declared table loses its slot: `` left: Capacity, right: Subscribed ``.
+#[test]
+fn the_journal_ring_has_its_own_slots_beside_a_full_catalog_and_the_registry() {
+    const WEEK: u64 = JOURNAL.period_s;
+    let lab = Lab::new(&[Role::Writer]);
+    let policy = Policy::default();
+    with_writer(&lab, |session, directory| {
+        let waiting = Descriptor::fresh(directory.trust, "waiting", "data", 1).unwrap();
+        let mut catalog = directory.catalog(session).unwrap();
+        catalog
+            .commit_catalog(session, &waiting.encode().unwrap())
+            .unwrap();
+        drop(catalog);
+        for _ in 1..CATALOG_SLOTS {
+            let scope = Scope::fresh(directory.trust).unwrap();
+            Store::join(session, &directory.path(scope).unwrap(), scope).unwrap();
+        }
+        let registry = super::super::reserved(directory.trust)[0].clone();
+        directory.publish(session, &registry).unwrap();
+        let state = |descriptor: &Descriptor| {
+            directory.snapshot(session).unwrap().entries[&descriptor.scope.digest()].state
+        };
+        assert_eq!(state(&waiting), State::Subscribed);
+        let first = D / 7;
+        for week in first..first + 3 {
+            let now = week * WEEK + 60;
+            directory.ring_subscriptions(session, &policy, now).unwrap();
+            let (placed, _) = directory
+                .append_journal(session, now, now, &[7; 64])
+                .unwrap()
+                .unwrap();
+            assert_eq!(placed, week);
+            let day = CLAIMS.epoch_of(now);
+            directory.enroll_ring(session, &CLAIMS, day, now).unwrap();
+        }
+        // The first week lies below the window by the third and is deleted.
+        let held = directory.ring_state(session, &JOURNAL).unwrap().held;
+        assert_eq!(held, BTreeSet::from([first + 1, first + 2]));
+        assert_eq!(state(&waiting), State::Subscribed);
+        assert_eq!(state(&registry), State::Subscribed);
+        let later = Descriptor::fresh(directory.trust, "later", "data", 1).unwrap();
+        let mut catalog = directory.catalog(session).unwrap();
+        catalog
+            .commit_catalog(session, &later.encode().unwrap())
+            .unwrap();
+        drop(catalog);
+        assert_eq!(state(&later), State::Capacity);
+        assert!(directory.publish(session, &later).is_err());
+    });
+}
+
+/// A Mac whose retained storage already fills every slot (an older build's catalog tables past
+/// the shared slots) keeps its journal local: the append is kept as `Kept::NoSlot`, and neither
+/// writes nor creates a table, where an enrollment would fail.
+/// NEGATIVE CONTROL: without the storage check in `Directory::append_within`, the enrollment
+/// fails the append: `` called `Result::unwrap()` on an `Err` value: Error("retained table
+/// storage limit reached") ``.
+#[test]
+fn a_journal_append_with_no_storage_slot_is_kept_local() {
+    let lab = Lab::new(&[Role::Writer]);
+    with_writer(&lab, |session, directory| {
+        directory.catalog(session).unwrap();
+        while std::fs::read_dir(&directory.root).unwrap().count() <= MAX_TABLES {
+            let scope = Scope::fresh(directory.trust).unwrap();
+            Store::join(session, &directory.path(scope).unwrap(), scope).unwrap();
+        }
+        let now = (D / 7) * JOURNAL.period_s + 60;
+        let kept = directory
+            .append_journal(session, now, now, &[7; 64])
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(kept, Kept::NoSlot);
+        let week = JOURNAL
+            .scope(directory.trust, JOURNAL.epoch_of(now))
+            .unwrap();
+        assert!(!directory.path(week).unwrap().exists());
+        assert_eq!(
+            std::fs::read_dir(&directory.root).unwrap().count(),
+            MAX_TABLES + 1
+        );
+    });
+}
+
 #[test]
 fn adopt_ring_tables_skips_excess_periods_when_held_reaches_max_held() {
     let lab = Lab::new(&[Role::Writer]);
@@ -435,5 +529,110 @@ fn adopt_ring_tables_skips_excess_periods_when_held_reaches_max_held() {
             .adopt_ring_tables(session, &policy, back, &offered)
             .unwrap();
         assert!(second.is_empty());
+    });
+}
+
+fn own_table(bootstrap: &Bootstrap) -> Result<Descriptor> {
+    Descriptor::application(bootstrap.trust(), "ring-test", "own", 1)
+}
+
+fn merge() -> Result<Vec<u8>> {
+    Command::Merge {
+        request: crate::crypto::random()?,
+    }
+    .encode()
+}
+
+/// A writer's own append names only its own previous record, never a peer's head: no merge is
+/// spent and a peer's head never holds it up, where a catalog commit names every head.
+/// NEGATIVE CONTROL: with `Store::commit_own` passing the projection's heads as parents (the
+/// `commit_catalog_with_merges` shape), the append names Mac 2's record and this fails.
+#[test]
+fn an_own_append_names_only_its_own_predecessor() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let write = |n: usize| {
+        application::with_store(&lab.paths[n], true, own_table, |session, store, _| {
+            application::append(session, store, &merge()?).map(|receipt| receipt.id)
+        })
+        .unwrap()
+    };
+    let first = write(0);
+    let peer = write(1);
+    repair_commons(&lab, 4);
+    application::with_store(&lab.paths[0], true, own_table, |session, store, _| {
+        let receipt = store.commit_own(session, &merge()?)?;
+        let records = store.catalog(session)?;
+        assert!(
+            records.iter().any(|record| record.header().id == peer),
+            "Mac 2's record is a head here"
+        );
+        let header = records
+            .iter()
+            .map(|record| record.header())
+            .find(|header| header.id == receipt.id)
+            .unwrap();
+        assert_eq!(header.previous, Some(first));
+        assert_eq!(header.parents, [first]);
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// A writer that fills its record share spills into the next period's table, is refused once
+/// every window table is full for it, and has room again once the clock reaches the next period.
+/// NEGATIVE CONTROLS: with `Shares::full` ignoring the writer's record share, every append lands
+/// in day D and this fails; with `Directory::has_room` reading a storage root not made yet (this
+/// Mac's first table), the first append fails:
+/// `` called `Result::unwrap()` on an `Err` value: Error("No such file or directory (os error 2)") ``.
+#[test]
+fn a_full_record_share_spills_into_the_next_period() {
+    let lab = Lab::new(&[Role::Writer]);
+    let shares = Shares {
+        records: 100,
+        bytes: usize::MAX,
+        writer_records: 2,
+        writer_bytes: usize::MAX,
+    };
+    with_writer(&lab, |session, directory| {
+        let now = at(D, 100);
+        let append =
+            |now: u64, n: u8| directory.append_own(session, &CLAIMS, shares, now, now, &[n; 64]);
+        let placed: Vec<u64> = (0..4).map(|n| append(now, n).unwrap().0).collect();
+        assert_eq!(placed, [D, D, D + 1, D + 1]);
+        assert_eq!(
+            append(now, 4).unwrap_err().to_string(),
+            Unplaced::Full.reason(),
+            "both of this writer's tables are full"
+        );
+        assert_eq!(append(at(D + 1, 0), 5).unwrap().0, D + 2);
+    });
+}
+
+/// A byte share spills the same way: a writer whose next record could pass its bytes goes to
+/// the next period with records to spare.
+/// NEGATIVE CONTROL: with `Shares::full` ignoring the writer's byte share, the second append
+/// stays in day D and this fails.
+#[test]
+fn a_full_byte_share_spills_into_the_next_period() {
+    let lab = Lab::new(&[Role::Writer]);
+    // A 1,000-byte row's bound (its bytes and 4 KiB of envelope) fits 6,000 bytes once; its
+    // sealed record takes more than 1,000 of them, so a second bound does not fit beside it.
+    let shares = Shares {
+        records: 100,
+        bytes: usize::MAX,
+        writer_records: 100,
+        writer_bytes: 6_000,
+    };
+    with_writer(&lab, |session, directory| {
+        let now = at(D, 100);
+        let placed: Vec<u64> = (0..2)
+            .map(|n| {
+                directory
+                    .append_own(session, &CLAIMS, shares, now, now, &[n; 1_000])
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        assert_eq!(placed, [D, D + 1]);
     });
 }

@@ -152,7 +152,7 @@ impl crate::site::Launch for StepChildren {
     }
 }
 
-fn started_of(pid: u32) -> Option<String> {
+pub(crate) fn started_of(pid: u32) -> Option<String> {
     let out = {
         command(aterm_uds::os_path!("ps"))
             .args(["-p", &pid.to_string(), "-o", "lstart="])
@@ -1274,7 +1274,19 @@ impl Real {
         let mut cmd = self.child(self.engine.join("bin/pub"), Some(prover));
         cmd.args(["stage", "aterm", "--commit", commit, "--repo-path"])
             .arg(&self.repo);
-        let handed = hand_transforms_cutter(&mut cmd, commit);
+        let handed = if crate::cutter::running()
+            .is_ok_and(|built| crate::accepted_measure::policy_cutter(&self.git(), commit, built))
+        {
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    hand_this_cutter(&mut cmd, &exe, crate::cutter::reference());
+                    "== transforms: owner-accepted policy cutter; export rules unchanged".into()
+                }
+                Err(_) => hand_transforms_cutter(&mut cmd, commit),
+            }
+        } else {
+            hand_transforms_cutter(&mut cmd, commit)
+        };
         (cmd, handed)
     }
 
@@ -1603,18 +1615,13 @@ pub fn shape_refusal(slug: &str, tag: &str, problems: Vec<String>) -> Refusal {
 
 /// What `ship site --latest` ending with `ended` means for the after-cut step; `detail` is the end of its transcript.
 /// # Errors
-/// A deployed site the live site does not show yet, and every failure of the sync.
+/// Any result other than a deployed website verified live, or a failure of the sync.
 pub fn site_outcome(
     ended: &Result<crate::site::Outcome, crate::site::Failure>,
     detail: Vec<String>,
 ) -> Result<AfterCut, Refusal> {
     use crate::site::Outcome;
-    let note = |s: &str| {
-        Ok(AfterCut {
-            note: s.into(),
-            site_deferred: false,
-        })
-    };
+    let note = |s: &str| Ok(AfterCut { note: s.into() });
     match ended {
         Ok(Outcome::Synced { deployed: true }) => {
             note("alab.systems brought to the release and deployed (ship site --latest)")
@@ -1622,30 +1629,12 @@ pub fn site_outcome(
         Ok(Outcome::Synced { deployed: false }) => {
             note("alab.systems already shows the release (ship site --latest)")
         }
-        Ok(Outcome::LiveUnchecked { deployed }) => note(if *deployed {
-            "alab.systems brought to the release and deployed, but the release could NOT be \
-             verified live: the live site could not be fetched (check it by hand)"
-        } else {
-            "alab.systems already committed for the release, but the release could NOT be \
-             verified live: the live site could not be fetched (check it by hand)"
-        }),
-        Ok(Outcome::NoDeploy) => note(&format!(
-            "alab.systems committed and pushed for the release but NOT deployed: SITE_NO_DEPLOY \
-             asked for no deploy (deploy with: {})",
-            crate::site::DEPLOY_LATER
-        )),
-        Ok(Outcome::NotDeployed) => note(&format!(
-            "alab.systems committed and pushed for the release but NOT deployed: the site's \
-             service-account key is missing here or was refused (deploy with: {})",
-            crate::site::DEPLOY_LATER
-        )),
-        Ok(Outcome::Skipped | Outcome::Deferred | Outcome::Planned { .. }) => {
-            note("alab.systems left as it is (ship site --latest did not sync)")
-        }
-        Ok(Outcome::NoCheckout(why)) => Ok(AfterCut {
-            note: format!("ship site said: {why}"),
-            site_deferred: true,
-        }),
+        Ok(outcome @ (Outcome::LiveUnchecked { .. } | Outcome::NoDeploy
+            | Outcome::NotDeployed | Outcome::Skipped | Outcome::Deferred
+            | Outcome::Planned { .. } | Outcome::NoCheckout(_))) => Err(Refusal::new(
+                format!("the application is published, but the website is not deployed and verified: {outcome:?}"),
+                format!("run {} with its configured checkout and deployment credential, then resume {RELEASE_COMMAND}; the application will not be rebuilt or republished", crate::site::DEPLOY_LATER),
+            ).detail(detail)),
         Ok(Outcome::LiveDisagrees { .. }) => Err(Refusal::new(
             "the site is deployed, but the live site does not agree yet (ship site exited 4)",
             format!("{RELEASE_COMMAND} again in a few minutes"),
@@ -2822,6 +2811,17 @@ impl Backend for Real {
 
     fn entered(&mut self, step: Step) {
         self.step = step;
+        if !self.scratch_logs
+            && crate::release::read_holder(&self.release.join(crate::release::RUNNING_FILE))
+                .is_some_and(|holder| holder.pid == std::process::id())
+            && let Err(error) = crate::durable::write_atomic_durable(
+                &self.release.join("latest-run"),
+                self.logs.to_string_lossy().as_bytes(),
+                0o600,
+            )
+        {
+            self.say(&format!("release status: cannot record log path: {error}"));
+        }
     }
 
     fn release_dir(&mut self) -> PathBuf {
@@ -3161,28 +3161,45 @@ impl Backend for Real {
         }
     }
 
-    fn staging_moved(&mut self) -> Result<Option<String>, String> {
+    fn candidate_missing(&mut self) -> Result<Option<String>, String> {
         let path = self.repo.join("publish/.out/attestation.json");
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let Some((remote, attested)) = attested_staging(&text) else {
+        let Some((attested, tree)) = attested_candidate(&text) else {
             return Ok(Some(format!(
-                "{} names no staging tier (staging.remote, staging.attested_rev)",
+                "{} names no qualified candidate (staging.attested_rev, export.tree)",
                 path.display()
             )));
         };
+        let reference = format!("refs/publication/candidates/{attested}");
         let out = self
-            .remote_git(&["ls-remote", "--refs", &remote, "refs/heads/main"])
-            .map_err(|e| format!("git ls-remote {remote}: {e}"))?;
-        if !out.status.success() {
+            .git()
+            .git(&["rev-parse", "--verify", "--quiet", &reference])
+            .map_err(|e| e.to_string())?;
+        if out.status == 1 {
+            return Ok(Some(
+                "the qualified staging candidate is not retained locally".into(),
+            ));
+        }
+        if !out.success() {
             return Err(format!(
-                "git ls-remote {remote} refs/heads/main exited {}: {}",
-                out.status.code().unwrap_or(-1),
+                "cannot read retained candidate: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        let listing = String::from_utf8_lossy(&out.stdout);
-        Ok(staging_moved_from(&listing, &attested))
+        let retained_tree = self
+            .git()
+            .git(&["rev-parse", &format!("{reference}^{{tree}}")])
+            .map_err(|e| e.to_string())?;
+        if !retained_tree.success() {
+            return Err("cannot read the retained candidate's tree".into());
+        }
+        Ok(
+            (out.stdout_utf8().trim() != attested || retained_tree.stdout_utf8().trim() != tree)
+                .then(|| {
+                    "the retained candidate does not match its attested commit and tree".into()
+                }),
+        )
     }
 
     fn cut_journal(&mut self) -> Option<CutState> {
@@ -3344,6 +3361,34 @@ impl Backend for Real {
             "the bump did not land",
             "read the commit step's log",
         ))
+    }
+
+    fn validation_tools(&mut self) -> Result<String, Refusal> {
+        let machine = aterm_verify::provision::this_machine(&self.repo).ok_or_else(|| {
+            Refusal::new("cannot resolve validation tool cache", "set HOME and retry")
+                .could_not_run()
+        })?;
+        let system = aterm_verify::provision::System::new(&self.repo);
+        let mut lines = Vec::new();
+        let code = aterm_verify::provision::run(
+            &aterm_verify::provision::Options::default(),
+            &machine,
+            &system,
+            &mut |line| {
+                println!("validation tools: {line}");
+                lines.push(line.to_string());
+            },
+        );
+        if code == 0 {
+            Ok("all pinned prerequisites are installed".into())
+        } else {
+            Err(Refusal::new(
+                "validation prerequisites are unavailable; no product build or staging started",
+                "run targo --unverified verify provision and retry the release",
+            )
+            .detail(lines)
+            .could_not_run())
+        }
     }
 
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal> {
@@ -3820,7 +3865,6 @@ impl Backend for Real {
                 "{tag} carries the lean shape as GitHub serves it; {}",
                 site.note
             ),
-            ..site
         })
     }
 
@@ -3925,46 +3969,13 @@ pub fn attested_engine(json: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The staging tier an attestation names, and the commit of its main it attested (`staging.remote`, `staging.attested_rev`): what `pub promote` asks again before it promotes.
+/// The immutable qualified commit and exported tree named by an attestation.
 #[must_use]
-pub fn attested_staging(json: &str) -> Option<(String, String)> {
+pub fn attested_candidate(json: &str) -> Option<(String, String)> {
     let a = aterm_json::from_str::<aterm_json::Value>(json).ok()?;
-    let staging = a.get("staging")?;
-    let field = |key: &str| {
-        staging
-            .get(key)
-            .and_then(aterm_json::Value::as_str)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-    };
-    Some((field("remote")?, field("attested_rev")?))
-}
-
-/// Why the staging tier's main in `listing` (`git ls-remote --refs <staging> refs/heads/main`) is not the `attested` commit — `pub promote` refuses the attestation then — or `None` when it is.
-#[must_use]
-pub fn staging_moved_from(listing: &str, attested: &str) -> Option<String> {
-    let mains: Vec<&str> = listing
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let (sha, name) = (fields.next()?, fields.next()?);
-            (name == "refs/heads/main" && fields.next().is_none()).then_some(sha)
-        })
-        .collect();
-    match mains.as_slice() {
-        [now] if now.eq_ignore_ascii_case(attested) => None,
-        [now] => Some(format!(
-            "the staging tier's main moved since R was attested ({}..{}: a peer's pub stage), \
-             and pub promote refuses that attestation",
-            short(attested),
-            short(now)
-        )),
-        [] => Some("the staging tier has no main".to_string()),
-        many => Some(format!(
-            "the staging tier answered {} copies of its main",
-            many.len()
-        )),
-    }
+    let revision = a.get("staging")?.get("attested_rev")?.as_str()?;
+    let tree = a.get("export")?.get("tree")?.as_str()?;
+    (!revision.is_empty() && !tree.is_empty()).then(|| (revision.into(), tree.into()))
 }
 
 /// Run a release in the clone at `repo`; the exit code.
@@ -5229,25 +5240,55 @@ mod tests {
     }
 
     #[test]
-    fn a_staging_tier_that_moved_since_the_attestation_is_named() {
+    fn the_qualified_candidate_requires_both_commit_and_tree() {
         let (s, t) = ("5".repeat(40), "6".repeat(40));
-        let json = format!(
-            "{{\"staging\":{{\"remote\":\"git@gh:o/aterm-staging.git\",\
-             \"attested_rev\":\"{s}\"}}}}"
-        );
+        let json =
+            format!("{{\"staging\":{{\"attested_rev\":\"{s}\"}},\"export\":{{\"tree\":\"{t}\"}}}}");
+        assert_eq!(attested_candidate(&json), Some((s.clone(), t.clone())));
         assert_eq!(
-            attested_staging(&json),
-            Some(("git@gh:o/aterm-staging.git".to_string(), s.clone()))
+            attested_candidate("{\"staging\":{\"attested_rev\":\"r\"}}"),
+            None
         );
-        assert_eq!(attested_staging("{\"staging\":{\"remote\":\"r\"}}"), None);
-        assert_eq!(attested_staging("not json"), None);
-        let main = |sha: &str| format!("{sha}\trefs/heads/main\n");
-        assert_eq!(staging_moved_from(&main(&s), &s), None);
-        assert_eq!(staging_moved_from(&main(&s.to_uppercase()), &s), None);
-        assert!(staging_moved_from(&main(&t), &s).is_some());
-        assert!(staging_moved_from("", &s).is_some());
-        let twice = format!("{}{}", main(&s), main(&t));
-        assert!(staging_moved_from(&twice, &s).is_some());
+        assert_eq!(attested_candidate("not json"), None);
+    }
+
+    #[test]
+    fn retained_candidate_is_checked_locally_and_missing_evidence_is_not_a_pass() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let git = GitCli::new(dir.path());
+        let run = |args: &[&str]| {
+            let out = git.git(args).unwrap();
+            assert!(out.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            out.stdout_utf8().trim().to_string()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "qualified",
+        ]);
+        let revision = run(&["rev-parse", "HEAD"]);
+        let tree = run(&["rev-parse", "HEAD^{tree}"]);
+        let reference = format!("refs/publication/candidates/{revision}");
+        run(&["update-ref", &reference, &revision]);
+        let out = dir.path().join("publish/.out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("attestation.json"), format!(
+            "{{\"staging\":{{\"attested_rev\":\"{revision}\"}},\"export\":{{\"tree\":\"{tree}\"}}}}"
+        )).unwrap();
+        let mut real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
+        assert_eq!(real.candidate_missing().unwrap(), None);
+        run(&["update-ref", "-d", "refs/heads/main"]);
+        assert_eq!(real.candidate_missing().unwrap(), None);
+        run(&["update-ref", "-d", &reference]);
+        assert!(real.candidate_missing().unwrap().is_some());
+        std::fs::rename(dir.path().join(".git"), dir.path().join("missing-git")).unwrap();
+        assert!(real.candidate_missing().is_err());
     }
 
     /// The build and cut steps run this very executable or nothing: a cutter that cannot name

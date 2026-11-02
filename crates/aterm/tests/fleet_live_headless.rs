@@ -2271,15 +2271,36 @@ fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
             .any(|peer| peer.node.as_deref() == Some(third_node.as_str()));
         (own, copy)
     };
+    let issuer_state = issuer.tmp.join("state");
+    let issuer_binds_third = || {
+        read_peers(&issuer_state)
+            .expect("the issuer's book")
+            .iter()
+            .any(|peer| peer.node.as_deref() == Some(third_node.as_str()))
+    };
     // The member's heartbeat brings the issuer's current book every BEAT_MS: a round that read
     // it before the removal, or a `peers` read a loaded machine kept from answering, leaves the
-    // older copy until that next round.
-    let cleared =
-        aterm_spec::wait::within(HANG, POLL_GAP, || (books() == (false, false)).then_some(()));
+    // older copy until that next round. The issuer beats too, at times this test does not set,
+    // and no Mac's `peers rm` takes a Mac out of another's book (`merge_signed`): an issuer round
+    // that reads the member's book between the two removals takes the third Mac back in, the
+    // member's next round copies it, and the removal is made again at both. While the issuer
+    // never takes it back, the member's one removal must hold against its own rounds.
+    let mut taken_back = 0_u32;
+    let cleared = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        if issuer_binds_third() {
+            taken_back += 1;
+            fleet_ok(&issuer.tmp, &["peers", "rm", &third_node], None);
+        }
+        if taken_back > 0 && books().0 {
+            fleet_ok(&member.tmp, &["peers", "rm", &third_node], None);
+        }
+        (books() == (false, false) && !issuer_binds_third()).then_some(())
+    });
     let (own_has_third, copy_has_third) = books();
     assert!(
         cleared.is_some(),
-        "removal from both books must leave no member binding: own={own_has_third} copy={copy_has_third}"
+        "removal from both books must leave no member binding: own={own_has_third} \
+         copy={copy_has_third} (the issuer took it back {taken_back} times)"
     );
     hold_ends(&member, &worker);
 }

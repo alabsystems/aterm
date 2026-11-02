@@ -944,6 +944,93 @@ fn uncertain_shared_renewal_requests_recovery_without_replaying_the_provider() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn shared_renewal_activity_names_the_running_route_and_ends_with_the_attempt() {
+    for fails in [false, true] {
+        let bed = Bed::new(None);
+        bed.provider.fail.store(fails, Ordering::SeqCst);
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let jobs = Arc::new(Mutex::new(Vec::new()));
+        let queued = jobs.clone();
+        let queue = move |work| {
+            queued.lock().unwrap().push(work);
+            Ok(())
+        };
+        let observed = || {
+            login_activity_of(
+                &guard.lock().unwrap(),
+                &bed.store,
+                Cli::Claude,
+                NOW + 1,
+                Instant::now(),
+            )
+        };
+        std::thread::scope(|scope| {
+            let (entered, reached) = std::sync::mpsc::sync_channel(1);
+            let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+            *bed.provider.flow_effect.lock().unwrap() = Some(Box::new(move || {
+                let _ = entered.send(());
+                // Dropping the sender also releases this mock during assertion unwinding.
+                match resumed.recv_timeout(aterm_spec::wait::MUST_HAPPEN) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        panic!("shared provider release hung")
+                    }
+                }
+            }));
+            bed.upkeep_observed(Some(&bed.factory()), &queue, true, &guard, Arc::new(|_| {}));
+            assert_eq!(bed.provider.calls.load(Ordering::SeqCst), 0);
+            let waiting = observed();
+            let queued_row = waiting.iter().find(|row| row.label == "shared").unwrap();
+            assert!(!queued_row.active);
+            assert_eq!(queued_row.route, None);
+            assert!(queued_row.next_at.is_some());
+            let work = jobs
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("shared renewal was queued");
+            let running = scope.spawn(work);
+            reached
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("shared provider was entered");
+            let rows = observed();
+            let row = rows.iter().find(|row| row.label == "shared").unwrap();
+            assert!(row.active, "{rows:?}");
+            assert_eq!(row.route.as_deref(), Some("mailbox"));
+            assert!(
+                login_activity_of(
+                    &guard.lock().unwrap(),
+                    &bed.store,
+                    Cli::Codex,
+                    NOW + 1,
+                    Instant::now()
+                )
+                .is_empty()
+            );
+            resume
+                .send(())
+                .expect("shared provider remains blocked until released");
+            running.join().unwrap();
+        });
+        assert_eq!(bed.provider.calls.load(Ordering::SeqCst), 1);
+        assert!(jobs.lock().unwrap().is_empty());
+        assert!(observed().iter().all(|row| !row.active));
+        let (logins, _) = bed.store.load_logins(NOW + 1).unwrap();
+        let attempt = logins.shared.latest(SOURCE).unwrap();
+        assert_eq!(attempt.intent.generation, 2);
+        if fails {
+            assert_eq!(attempt.outcome, accounts::shared::Outcome::Unknown);
+        } else {
+            assert!(matches!(
+                attempt.outcome,
+                accounts::shared::Outcome::Published { .. }
+            ));
+        }
+    }
+}
+
 fn observe_recovery(case: i64) -> (i64, i64, i64) {
     use accounts::shared::Outcome;
     let bed = Bed::new(None);

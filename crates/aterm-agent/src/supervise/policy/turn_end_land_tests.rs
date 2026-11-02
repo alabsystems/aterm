@@ -265,3 +265,49 @@ fn land_check_prompts_for_a_holdout() {
     }
     std::fs::write(&out, rows).expect("the prompts write");
 }
+
+/// UNDER LAND A HELD CARRY-ON'S SHORT REPLY MEASURES THE BACK-OFF FROM THE REPLY, ON THE SAME CLOCK
+/// AS CRUISE'S (`a_held_carry_ons_short_reply_measures_the_back_off_from_the_reply`): once the
+/// instruction is typed, Land's nudge waits out a short streak as Cruise's continue does. A hold
+/// that outlasted the back-off used to bring the nudge on the reply's heels. CONTROL: the
+/// instruction itself still comes at once, on no clock.
+#[test]
+fn a_held_carry_ons_short_reply_under_land_measures_the_back_off_from_the_reply() {
+    let backoff = TurnEndTiming::default().short_backoff;
+    let short = Duration::from_secs(20);
+    let mut st = TurnEndState::default();
+    let mut now = t0();
+    let a = act(
+        &mut st,
+        &land(idle("The parser reads the first half.", Some(short))),
+        now,
+    );
+    assert!(
+        matches!(&a, TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_LAND),
+        "CONTROL: the instruction at once: {a:?}"
+    );
+    now += short;
+    let a = at(
+        &mut st,
+        &land(idle("The second half is next.", Some(short))),
+        now,
+    );
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { .. }),
+        "a short reply backs off: {a:?}"
+    );
+    // The hold: the back-off runs out behind a draft, with nothing typed.
+    now += backoff * 8;
+    st.host_typed(now, HostTurn::CarryOn);
+    let worked = Duration::from_secs(3);
+    now += worked;
+    let a = at(
+        &mut st,
+        &land(idle("Picked it up; the lexer is next.", Some(worked))),
+        now,
+    );
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { until, .. } if *until >= now + backoff),
+        "the back-off from the reply: {a:?}"
+    );
+}

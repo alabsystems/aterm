@@ -1224,7 +1224,10 @@ fn a_descriptor_already_at_its_number_survives_the_exec() {
 
 /// A socket made through `aterm_uds::kept_out` still reaches the child it is passed to, and its
 /// original inheritance flags are restored once the spawn returns. Darwin kernels that support
-/// `FD_CLOFORK` retain that mark; older kernels leave it unset.
+/// `FD_CLOFORK` retain that mark; older kernels leave it unset. Off Apple, where the mark does
+/// not exist and the probe cannot open a socket through `/dev/fd`, a marked pipe stands in.
+/// Control: a socket off Apple (b73dfb6b4e) fails on Linux with `KeptOut: the child reads fd
+/// 101 as pass=[x]. Saw: "... pass=[]"`.
 #[test]
 fn a_passed_descriptor_kept_out_of_children_reaches_the_child_and_keeps_its_mark() {
     spawn_probe_checks_the_child(None, ProbePass::KeptOut);
@@ -1378,12 +1381,22 @@ fn a_spawn_takes_a_ready_kit_and_gives_it_its_winsize() {
     assert!(off.is_none(), "a pool never filled lends nothing");
     assert_eq!(fill_kits(pool, 2).expect("two kits open"), 2);
     assert_eq!(ready_spawn_kits(), 2, "the census reads the kits waiting");
-    let waiting = {
+    let (waiting, lent) = {
         let kits = pool.lock().unwrap();
         let first = &kits.ready[0];
-        vec![first.master, first.slave, first.status_rd, first.status_wr]
+        (
+            vec![first.master, first.slave, first.status_rd, first.status_wr],
+            pts_name(kits.ready[1].master).expect("the lent kit's pty name"),
+        )
     };
+    let _ = spawn_trace::take();
     spawn_probe_checks_the_child(Some(&waiting), ProbePass::Nothing);
+    assert_eq!(
+        spawn_trace::take(),
+        vec![lent],
+        "the spawn forked once, onto the live kit the pool lent: the dead-pty check passes a \
+         live one"
+    );
     {
         let kits = pool.lock().unwrap();
         assert_eq!(kits.ready.len(), 1, "the spawn took one kit");
@@ -1416,6 +1429,344 @@ fn a_full_or_off_pool_hands_a_spent_end_back() {
     pool.spent.clear();
 }
 
+/// ATERM-KI-1028-4 at the product's spawn: a pty whose slave XNU killed under it (here by
+/// `revoke(2)`, through [`pty_race`]) never carries a shell.
+#[cfg(target_os = "macos")]
+mod dead_pty_spawns {
+    use super::*;
+
+    /// A pool of the test's own lent to this thread's spawns, with the thread's race seam and
+    /// fork trace cleared, until it drops.
+    struct OwnPool(&'static std::sync::Mutex<KitPool>);
+
+    impl OwnPool {
+        fn new() -> Self {
+            let pool: &'static std::sync::Mutex<KitPool> =
+                Box::leak(Box::new(std::sync::Mutex::new(KitPool::new())));
+            TEST_KITS.with(|kits| kits.set(Some(pool)));
+            let _ = spawn_trace::take();
+            Self(pool)
+        }
+
+        /// The name, slave and four descriptors of the kit the next spawn takes.
+        fn next_lent(&self) -> (CString, Vec<libc::c_int>) {
+            let kits = self.0.lock().unwrap();
+            let kit = kits.ready.last().expect("a ready kit");
+            (
+                pts_name(kit.master).expect("the kit's pty name"),
+                vec![kit.master, kit.slave, kit.status_rd, kit.status_wr],
+            )
+        }
+    }
+
+    impl Drop for OwnPool {
+        fn drop(&mut self) {
+            TEST_KITS.with(|kits| kits.set(None));
+            pty_race::reset();
+            let _ = spawn_trace::take();
+            let _ = fill_kits(self.0, 0);
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ready
+                .clear();
+        }
+    }
+
+    fn slave_answers_fstat(slave: libc::c_int) -> bool {
+        // SAFETY: `st` is a zeroed plain-integer out-param that `fstat` fills.
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            libc::fstat(slave, &mut st) == 0
+        }
+    }
+
+    /// Revoke the slave of the kit the next spawn takes, and show it dead.
+    fn kill_next_lent(pool: &OwnPool) -> (CString, Vec<libc::c_int>) {
+        let (name, fds) = pool.next_lent();
+        assert!(
+            pty_race::revoke_slave(&name),
+            "revoke(2) {name:?}: {}",
+            io::Error::last_os_error()
+        );
+        assert!(
+            !slave_answers_fstat(fds[1]),
+            "PRECONDITION: the revoked slave {name:?} is dead"
+        );
+        (name, fds)
+    }
+
+    /// A spawn of `exec sleep 30` from this thread, so its pool and race seam apply.
+    fn spawn_sleeper() -> io::Result<SpawnedShell> {
+        // SAFETY: the trusted-launcher contract holds in a test that mints its own caps.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let runs: Vec<std::ffi::OsString> =
+            vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
+        spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&runs),
+            None,
+            None,
+            aterm_sandbox::Limits::inherit(),
+            None,
+            None,
+        )
+    }
+
+    /// The error a spawn whose every pty died must be: the dead-pty error, naming
+    /// ATERM-KI-1028-4 and `cause` once per dead pty, never a started shell.
+    fn assert_dead_pty_error(result: io::Result<SpawnedShell>, cause: &str, forked: &[CString]) {
+        match result {
+            Ok(sh) => {
+                hangup(sh.pid);
+                reap(sh.pid);
+                close_fd(sh.master);
+                panic!("a spawn whose ptys died returned a shell (it forked onto {forked:?})");
+            }
+            Err(err) => {
+                let text = err.to_string();
+                assert!(
+                    text.starts_with("every pty opened for this shell died")
+                        && text.ends_with("(ATERM-KI-1028-4)")
+                        && text.matches(cause).count() == 2,
+                    "the error names both dead ptys ({cause}) and ATERM-KI-1028-4: {text}"
+                );
+            }
+        }
+    }
+
+    /// A pooled pty whose slave died while it waited is never forked onto: the spawn finds it
+    /// dead before its fork, opens a fresh pty in its place (while it still holds the dead
+    /// one, so the two are distinct ptys), and the shell on that one has its controlling
+    /// terminal (`ctty=y`, and `(pgid, sid, tcgetpgrp)` all its pid).
+    ///
+    /// Negative control (2026-11-02): with `dead_pty` answering `None`, the spawn forked onto
+    /// the dead kit (its child said `T`, and the fresh pty then carried the shell), and this
+    /// failed with "the dead pooled pty \"/dev/ttys…\" was forked onto: [\"/dev/ttys…\",
+    /// \"/dev/ttys…\"]".
+    #[test]
+    fn a_dead_pooled_pty_is_never_forked_onto_and_the_shell_gets_a_live_terminal() {
+        let pool = OwnPool::new();
+        assert_eq!(fill_kits(pool.0, 1).expect("a kit opens"), 1);
+        let (dead, dead_fds) = kill_next_lent(&pool);
+        spawn_probe_checks_the_child(Some(&dead_fds), ProbePass::Nothing);
+        let forked = spawn_trace::take();
+        assert!(
+            !forked.contains(&dead),
+            "the dead pooled pty {dead:?} was forked onto: {forked:?}"
+        );
+        assert_eq!(forked.len(), 1, "one fork, onto the fresh pty: {forked:?}");
+        assert!(
+            pool.0.lock().unwrap().ready.is_empty(),
+            "the dead kit went back to no pool"
+        );
+    }
+
+    /// A pooled pty whose node is gone by name while its descriptors still answer (the parent's
+    /// `stat` of the slave's name shown a name that names nothing, through
+    /// [`pty_race::gone_by_name`]) is never forked onto either: the parent's by-name check finds
+    /// it dead, and the shell starts on a fresh pty with its controlling terminal.
+    ///
+    /// Negative control (2026-11-02): with the by-name check removed from `dead_pty`, the spawn
+    /// forked onto the pooled pty (alive in every other way, so its shell started), and this
+    /// failed with "the pooled pty \"/dev/ttys…\" whose node was gone was forked onto:
+    /// [\"/dev/ttys…\"]".
+    #[test]
+    fn a_pooled_pty_whose_node_is_gone_by_name_is_never_forked_onto() {
+        let pool = OwnPool::new();
+        assert_eq!(fill_kits(pool.0, 1).expect("a kit opens"), 1);
+        let (gone, gone_fds) = pool.next_lent();
+        pty_race::gone_by_name(1);
+        spawn_probe_checks_the_child(Some(&gone_fds), ProbePass::Nothing);
+        let forked = spawn_trace::take();
+        assert!(
+            !forked.contains(&gone),
+            "the pooled pty {gone:?} whose node was gone was forked onto: {forked:?}"
+        );
+        assert_eq!(forked.len(), 1, "one fork, onto the fresh pty: {forked:?}");
+        assert!(
+            pool.0.lock().unwrap().ready.is_empty(),
+            "the dead kit went back to no pool"
+        );
+    }
+
+    /// With no pooled pty to lend, a first fresh pty already dead before its fork is replaced
+    /// once, like a dead pooled one, rather than failing the spawn: one fork, onto the second
+    /// fresh pty, whose shell has its controlling terminal.
+    ///
+    /// Negative control (2026-11-02): with the first fresh pty's death an error at once (the
+    /// empty-pool arm returning `dead_pty`'s cause before the loop), the spawn failed and this
+    /// failed with "the probe command must spawn: Custom { kind: Other, error: \"/dev/ttys…:
+    /// its slave failed fstat (Bad file descriptor (os error 9))\" }".
+    #[test]
+    fn an_empty_pool_replaces_a_first_fresh_pty_found_dead_once() {
+        let pool = OwnPool::new();
+        assert!(
+            pool.0.lock().unwrap().ready.is_empty(),
+            "PRECONDITION: no pooled pty"
+        );
+        pty_race::in_fresh(1);
+        spawn_probe_checks_the_child(None, ProbePass::Nothing);
+        let forked = spawn_trace::take();
+        let struck = pty_race::take_struck_fresh();
+        assert_eq!(
+            struck.len(),
+            1,
+            "the first fresh pty was killed: {struck:?}"
+        );
+        assert_eq!(
+            forked.len(),
+            1,
+            "one fork, onto the second fresh pty: {forked:?}"
+        );
+        assert_ne!(
+            forked[0], struck[0],
+            "the dead first fresh pty was never forked onto"
+        );
+    }
+
+    /// A child whose pty dies between its parent's check and its `login_tty` (here revoked in
+    /// the child just before) never runs a shell without a controlling terminal: it says `T`
+    /// and ends before its exec, and the spawn forks once more, onto a fresh pty, where the
+    /// shell has its terminal.
+    ///
+    /// Negative control (2026-11-02): with the child's old fallback (on a failed `login_tty`,
+    /// `dup2` the slave onto 0/1/2 and go on), the shell ran on the dead slave with no
+    /// controlling terminal, the spawn returned its master, nothing it printed reached the
+    /// master, and this failed once the probe's one-minute hang detector passed, with "fds
+    /// 0/1/2 are ttys: dup2 cleared FD_CLOEXEC on the slave copies. Saw: \"\"".
+    #[test]
+    fn a_child_that_cannot_take_its_pty_never_runs_without_one_and_a_fresh_pty_carries_it() {
+        let _pool = OwnPool::new();
+        pty_race::in_children(1);
+        spawn_probe_checks_the_child(None, ProbePass::Nothing);
+        let forked = spawn_trace::take();
+        assert_eq!(
+            forked.len(),
+            2,
+            "the struck fork, then one onto a fresh pty: {forked:?}"
+        );
+        assert_ne!(
+            forked[0], forked[1],
+            "the fresh pty is another pty than the dead one"
+        );
+    }
+
+    /// A child whose pty dies just after its `login_tty` made it the controlling terminal (here
+    /// revoked in the child right after) never runs a shell on it: its check of fd 0 fails, it
+    /// says `D` and ends before its exec, and the spawn forks once more, onto a fresh pty,
+    /// where the shell has its terminal.
+    ///
+    /// Negative control (2026-11-02): with the child's check after `login_tty` removed, the
+    /// shell ran on the dead slave, the spawn returned its master, nothing it printed reached
+    /// the master, and this failed once the probe's one-minute hang detector passed, with
+    /// "fds 0/1/2 are ttys: dup2 cleared FD_CLOEXEC on the slave copies. Saw: \"\"".
+    #[test]
+    fn a_pty_that_dies_once_its_child_took_it_never_carries_the_shell_and_a_fresh_pty_does() {
+        let _pool = OwnPool::new();
+        pty_race::after_login_tty(1);
+        spawn_probe_checks_the_child(None, ProbePass::Nothing);
+        let forked = spawn_trace::take();
+        assert_eq!(
+            forked.len(),
+            2,
+            "the struck fork, then one onto a fresh pty: {forked:?}"
+        );
+        assert_ne!(
+            forked[0], forked[1],
+            "the fresh pty is another pty than the dead one"
+        );
+    }
+
+    /// A fresh pty that cannot open in place of a dead pooled one (EAGAIN, as a pty open can
+    /// fail under the same churn) is an error of the open's kind that still names the dead pty
+    /// and ATERM-KI-1028-4, so the tab's error says a dead pty was being replaced.
+    ///
+    /// Negative control (2026-11-02): with the bare open error (`fresh_kit(ws)` in
+    /// `replace_dead_pty`, no `map_err`), this failed with "the error names the failed open,
+    /// the dead pty it replaced and ATERM-KI-1028-4: Resource temporarily unavailable (os error
+    /// 35)".
+    #[test]
+    fn a_replacement_pty_that_cannot_open_is_an_error_naming_the_dead_one() {
+        let pool = OwnPool::new();
+        assert_eq!(fill_kits(pool.0, 1).expect("a kit opens"), 1);
+        let (dead, _) = kill_next_lent(&pool);
+        pty_race::fresh_opens_fail(1);
+        let result = spawn_sleeper();
+        let forked = spawn_trace::take();
+        let err = match result {
+            Ok(sh) => {
+                hangup(sh.pid);
+                reap(sh.pid);
+                close_fd(sh.master);
+                panic!("a spawn whose replacement pty could not open returned a shell: {forked:?}");
+            }
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("Resource temporarily unavailable")
+                && text.contains(&format!(
+                    "{}: its slave failed fstat",
+                    dead.to_string_lossy()
+                ))
+                && text.contains("opening a pty in place of a dead one")
+                && text.ends_with("ATERM-KI-1028-4)"),
+            "the error names the failed open, the dead pty it replaced and ATERM-KI-1028-4: \
+             {text}"
+        );
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::WouldBlock,
+            "the error keeps the open's kind: {err:?}"
+        );
+        assert!(forked.is_empty(), "nothing was forked: {forked:?}");
+    }
+
+    /// A spawn whose fresh pty dies in its child too is an error naming the cause, after
+    /// exactly two forks: one dead pty is replaced, and nothing loops.
+    ///
+    /// Negative control (2026-11-02): with `DEAD_PTY_REPLACEMENTS` at 2, the spawn forked a
+    /// third time and started its shell, and this failed with "a spawn whose ptys died
+    /// returned a shell (it forked onto [\"/dev/ttys…\", \"/dev/ttys…\", \"/dev/ttys…\"])".
+    #[test]
+    fn a_second_pty_its_child_cannot_take_is_an_error_naming_the_cause() {
+        let _pool = OwnPool::new();
+        pty_race::in_children(2);
+        let result = spawn_sleeper();
+        let forked = spawn_trace::take();
+        assert_dead_pty_error(result, "login_tty failed", &forked);
+        assert_eq!(forked.len(), 2, "two forks, then the error: {forked:?}");
+    }
+
+    /// A fresh pty found dead before its fork, in place of a dead pooled one, is the error: the
+    /// spawn forks onto neither.
+    ///
+    /// Negative control (2026-11-02): with `DEAD_PTY_REPLACEMENTS` at 2, the spawn opened a
+    /// third pty and started its shell there, and this failed with "a spawn whose ptys died
+    /// returned a shell (it forked onto [\"/dev/ttys…\"])".
+    #[test]
+    fn a_fresh_pty_dead_before_its_fork_after_a_dead_pooled_one_is_an_error_and_no_fork() {
+        let pool = OwnPool::new();
+        assert_eq!(fill_kits(pool.0, 1).expect("a kit opens"), 1);
+        let _ = kill_next_lent(&pool);
+        pty_race::in_fresh(1);
+        let result = spawn_sleeper();
+        let forked = spawn_trace::take();
+        assert_dead_pty_error(result, "its slave failed fstat", &forked);
+        assert!(forked.is_empty(), "nothing was forked: {forked:?}");
+    }
+}
+
 /// Where [`spawn_probe_checks_the_child`] passes its pipe's read end, a byte already in the pipe.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ProbePass {
@@ -1443,13 +1794,22 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>, pass: ProbePass)
     let authority = unsafe { aterm_cap::Authority::root_authority() };
     let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-    let (pipe_rd, pipe_wr) = if pass == ProbePass::KeptOut {
+    let (pipe_rd, pipe_wr) = if pass == ProbePass::KeptOut && cfg!(target_vendor = "apple") {
         // Probe the production socket path; older Darwin kernels ignore FD_CLOFORK.
         let (read, write) = aterm_uds::kept_out(std::os::unix::net::UnixStream::pair)
             .expect("a socket pair kept out of children");
         (read.into_raw_fd(), write.into_raw_fd())
     } else {
-        make_wake_pipe().expect("a pipe")
+        let (read, write) = make_wake_pipe().expect("a pipe");
+        if pass == ProbePass::KeptOut {
+            // Off Apple the probe reads its byte through `/dev/fd/N`, which cannot open a
+            // socket (Linux answers ENXIO), and keeping a descriptor out of children sets no
+            // mark there: a pipe's read end, marked the same way, carries the same delivery.
+            // SAFETY: `read` is this test's own read end, open across the call.
+            aterm_uds::keep_out_of_children(&unsafe { BorrowedFd::borrow_raw(read) })
+                .expect("mark the read end");
+        }
+        (read, write)
     };
     // SAFETY: `fcntl(F_DUPFD)` on a descriptor this test owns.
     let parked = unsafe { libc::fcntl(pipe_rd, libc::F_DUPFD, 100) };

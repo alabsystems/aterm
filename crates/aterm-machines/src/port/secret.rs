@@ -344,19 +344,8 @@ mod tests {
     #[cfg(unix)]
     fn terminal() -> (std::fs::File, std::fs::File) {
         use std::os::fd::FromRawFd as _;
-        let (mut typing, mut reading) = (0, 0);
-        // SAFETY: out-parameters of the right type; null name, termios and winsize.
-        let opened = unsafe {
-            libc::openpty(
-                &raw mut typing,
-                &raw mut reading,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());
-        // SAFETY: `openpty` returned both descriptors open and owned by nobody else.
+        let (typing, reading) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+        // SAFETY: `open_pty_pair` returned two fresh, close-on-exec descriptors owned here alone.
         unsafe {
             (
                 std::fs::File::from_raw_fd(typing),

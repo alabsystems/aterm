@@ -160,9 +160,10 @@ routes through the agent, so a person can type at any time, even mid-turn.
 When a window opens a session, aterm keeps a short primer current in the global
 context file of each coding agent it finds (Claude Code, Codex CLI, agy,
 OpenCode and Muse Code), installs its skills for all but agy, and sets a few
-Claude Code defaults in `~/.claude/settings.json` where their keys are unset.
-The primer applies only inside aterm (`TERM_PROGRAM=aterm`, `ATERM_CHILD=1`);
-keep your own rules outside its markers. `aterm agents remove` uninstalls it,
+Claude Code defaults in `~/.claude/settings.json` where their keys are unset;
+each `aterm init` keeps the primer and skills current too. The primer applies
+only inside aterm (`TERM_PROGRAM=aterm`, `ATERM_CHILD=1`); keep your own rules
+outside its markers. `aterm agents remove` uninstalls it,
 `agents_auto_prime = false` stops it, and `aterm help agents` lists every file
 and default.
 
@@ -316,6 +317,8 @@ it as privileged:
   `--all`) bound to each peer's node key, so the secret (`<state>/fleet.key`)
   alone drives nothing, and a local Take Over always wins (`aterm help fleet`).
 - Capture paths are confined to server-managed runtime directories.
+- Browser automation never adds Chromium's `--no-sandbox` flag. On Linux, run
+  it as an unprivileged user so Chromium can keep its sandbox enabled.
 - Terminal-side powers other programs could abuse — window operations,
   notifications, kitty-graphics reads of host files, OSC 52 clipboard reads
   (`allow_osc52_query`) — are off by default, and a multi-line paste into a

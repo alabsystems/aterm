@@ -100,9 +100,9 @@
 //! aterm depends on this crate directly (astream's `docs/ROADMAP.md`, "What aterm
 //! uses beyond the fabric"). It reads the boot through [`boot_session`] and
 //! [`parse_boot_id`] in aterm-link, aterm-agent, aterm-acaffiene, aterm-gui, aterm-uds,
-//! aterm-release (its publisher fence's `fence-boot`, compared as 16 bytes) and
-//! aterm-update (which reads Linux's `boot_id` file itself and judges it with
-//! [`parse_boot_id`]), and writes the boot text it records (aterm-agent's ledger and
+//! aterm-release (its publisher fence's `fence-boot`, compared as 16 bytes), aterm-cli
+//! (its setup ledger) and aterm-update (which reads Linux's `boot_id` file itself and
+//! judges it with [`parse_boot_id`]), and writes the boot text it records (aterm-agent's ledger and
 //! tapes, aterm-acaffiene's state file, aterm-release's fence, aterm-link's messages)
 //! with [`boot_id_text`]. Outside tests (whose oracle is the kernel's own text), only
 //! aterm-machines reads `kern.bootsessionuuid` otherwise, with a `sysctl -n`
@@ -120,7 +120,8 @@
 //! never installs the `SIGHUP` handler. Its private files are held to
 //! the owner rule: aterm-uds's `private_file` judges each file it reads with
 //! [`owner_private`] and each private directory with [`owner_private_dir`], and
-//! aterm-link reads the fabric's mint secret through capfile's `read_secret_in`.
+//! aterm-link reads the fabric's mint secret through capfile's `read_secret_at`, and
+//! `fabric on --dry-run` through its `read_secret_at_narrowed`.
 
 #![deny(unsafe_code)]
 

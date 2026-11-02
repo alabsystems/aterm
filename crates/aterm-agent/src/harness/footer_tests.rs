@@ -6514,6 +6514,105 @@ fn an_unobserved_recovery_stays_unknown_on_tight_rules_and_keeps_its_reset_in_di
 }
 
 #[test]
+fn a_paused_recovery_keeps_the_provider_wall_without_becoming_a_wait() {
+    use super::super::account_progress::{
+        AccountProgress, ProgressPhase, SESSION_AUTOPILOT_OFF_FINDING,
+    };
+    let mut progress = AccountProgress::unknown(100);
+    progress.phase = ProgressPhase::Paused;
+    progress.details.push(SESSION_AUTOPILOT_OFF_FINDING.into());
+    let facts = FooterFacts {
+        account_progress: Some(progress.clone()),
+        usage: Some(super::super::session_usage::UsageFacts {
+            wall: Some(super::super::session_usage::Wall {
+                label: "7d",
+                resets: "tomorrow".into(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let view = facts.account_progress_view().unwrap();
+    assert_eq!(view.phase, ProgressPhase::Paused);
+    assert_eq!((view.eligible, view.next_at), (None, None));
+    assert!(view.wall.as_ref().unwrap().contains("tomorrow"));
+    assert_eq!(view.details, progress.details);
+    assert_eq!(facts.account_progress.as_ref(), Some(&progress));
+    // The former Unknown representation would promote this same typed limit to Waiting.
+    let mut former = facts.clone();
+    former.account_progress.as_mut().unwrap().phase = ProgressPhase::Unknown;
+    assert_eq!(
+        former.account_progress_view().unwrap().phase,
+        ProgressPhase::Waiting
+    );
+}
+
+#[test]
+fn unavailable_recovery_withdraws_current_claims_without_rewriting_the_decision() {
+    use super::super::account_progress::{
+        AccountProgress, EXECUTION_HISTORY_PREFIX, EXECUTION_PREPARED_FINDING,
+        OBSERVER_BUSY_FINDING, OwnClaimBlocker, OwnClaimFinding, ProgressPhase,
+        RECOVERY_HISTORY_PREFIX,
+    };
+    let mut recorded = AccountProgress::unknown(100);
+    recorded.account = Some("recorded-account".into());
+    recorded.known = Some(2);
+    recorded.eligible = Some(1);
+    recorded.phase = ProgressPhase::Ready;
+    recorded.next_at = Some(200);
+    recorded.details = vec![
+        EXECUTION_PREPARED_FINDING.into(),
+        format!("{EXECUTION_HISTORY_PREFIX}older check"),
+    ];
+    recorded.own_claim = Some(OwnClaimFinding {
+        blocker: OwnClaimBlocker::HeldElsewhere { until: 150 },
+        pinned: true,
+    });
+    let mut facts = FooterFacts {
+        account_progress: Some(recorded.clone()),
+        account_progress_busy: true,
+        ..Default::default()
+    };
+    facts.usage.get_or_insert_with(Default::default).wall =
+        Some(super::super::session_usage::Wall {
+            label: "7d",
+            resets: "tomorrow".into(),
+        });
+    let unavailable = facts.account_progress_view().unwrap().into_owned();
+    assert_eq!(unavailable.phase, ProgressPhase::Unknown);
+    assert_eq!(unavailable.eligible, None);
+    assert_eq!(unavailable.next_at, None);
+    assert_eq!(unavailable.observed_at, recorded.observed_at);
+    assert_eq!(unavailable.account, recorded.account);
+    assert_eq!(unavailable.known, recorded.known);
+    assert_eq!(unavailable.own_claim, recorded.own_claim);
+    assert!(unavailable.wall.as_ref().unwrap().contains("tomorrow"));
+    assert_eq!(unavailable.details[0], OBSERVER_BUSY_FINDING);
+    assert_eq!(
+        unavailable.details[1],
+        format!("{RECOVERY_HISTORY_PREFIX}{EXECUTION_PREPARED_FINDING}")
+    );
+    assert_eq!(unavailable.details[2], recorded.details[1]);
+    assert_eq!(facts.account_progress, Some(recorded.clone()));
+    assert_eq!(
+        facts.account_progress_view().unwrap().as_ref(),
+        &unavailable
+    );
+    facts.account_progress_busy = false;
+    assert_eq!(facts.account_progress_view().unwrap().as_ref(), &recorded);
+    facts.account_progress = None;
+    facts.account_progress_busy = true;
+    let unread = facts.account_progress_view().unwrap();
+    assert_eq!(unread.phase, ProgressPhase::Unknown);
+    assert_eq!(unread.observed_at, 0);
+    assert_eq!(unread.account, None);
+    assert_eq!(unread.known, None);
+    assert_eq!(unread.eligible, None);
+    assert_eq!(unread.next_at, None);
+    assert!(unread.wall.as_ref().unwrap().contains("tomorrow"));
+}
+
+#[test]
 fn recovery_outlasts_chips_until_no_recovery_form_fits() {
     use super::super::account_progress::{AccountProgress, ProgressPhase};
     let mut observed = AccountProgress::unknown(100);

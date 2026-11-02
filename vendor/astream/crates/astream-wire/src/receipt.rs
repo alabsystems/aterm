@@ -24,8 +24,10 @@
 //! - `dl=`, on an `expired`, is the deadline the ask carried. It is RELATIVE: a span in ms
 //!   that the asker's bridge counts from when it recorded the ask, on its own clock. It is
 //!   not an instant, so nothing here can hold it against a time.
-//! - `t=` is the SENDER's wall clock, informational ([`V1Receipt::sender_t_ms`]). No
-//!   broker stamps a time yet (R3), so there is no `bt=`.
+//! - `t=` is the SENDER's wall clock, informational ([`V1Receipt::sender_t_ms`]). A broker's
+//!   own time, `bt=` (R3), is never in this body: it rides the record's `0xB6` trailer, and
+//!   a reader that asks for it gets it from the broker's client beside the body
+//!   (astream-broker's `Client::broker_times` and `fetch_stamped`).
 //!
 //! The view reads every `ack` and `expired` record the bridges write on an `in` lane. It
 //! ignores `from=` (a node's attested session), `text=` (the pct-encoded words aterm always
@@ -61,7 +63,8 @@
 //! expired re=<off> dl=<ms> bt=<ms>
 //! ```
 //!
-//! A header word, an ABSOLUTE `dl=`, and a broker time `bt=` that no broker stamps. No
+//! A header word, an ABSOLUTE `dl=`, and a broker time `bt=` in the body, where no broker
+//! writes one (a broker's `bt=` rides the record's trailer, above). No
 //! writer emits this grammar, and [`FabricReceipt::decode`] refuses every receipt on the
 //! bus: the first token of each is `v=1`, which it does not read. (Its `v=1` arm read only
 //! the `state=` spelling `asb ack` retired, and took that body's `t=`, the sender's clock,
@@ -88,10 +91,11 @@
 //! WHAT THE MODEL DOES NOT COVER: the bus's deadlines. It judges one request whose deadline
 //! is an absolute `dlMs` on the same monotone clock that stamps `btMs`. On the bus the
 //! deadline is a relative `dl=` that the asker's bridge turns into an instant on its own
-//! clock, and no record carries that instant or a `bt=`, so neither the instant nor the
-//! check that a recorded `expired` came after it is anything this model or this module
-//! sees. The asker-judged deadline is the bridge's (aterm-link's deadline sweep, and its
-//! tests).
+//! clock, and no record carries that instant. No receipt's body carries a `bt=`, and the
+//! trailer's (R3), which says when the broker appended the record, reaches neither this
+//! model nor this module. So neither the instant nor the check that a recorded `expired`
+//! came after it is anything they see. The asker-judged deadline is the bridge's
+//! (aterm-link's deadline sweep, and its tests).
 
 use crate::Offset;
 use core::fmt;
@@ -931,7 +935,8 @@ impl V1Receipt {
         }
     }
 
-    /// The sender's wall clock (`t=`), informational: no broker stamps a time yet (R3).
+    /// The sender's wall clock (`t=`), informational. A broker's `bt=` (R3) is never in the
+    /// body this reads: it rides the record's trailer.
     #[must_use]
     pub const fn sender_t_ms(&self) -> Option<u64> {
         match self {

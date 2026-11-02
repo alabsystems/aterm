@@ -150,8 +150,19 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
     assert_eq!(Some(actor), repair.authenticated_actor());
     assert_eq!(endpoint.address, addr);
     assert_eq!(endpoint.observed_at_ms, round.completed_at_ms);
+    let outbound = round.connection.unwrap();
+    assert_eq!(outbound.peer, addr);
+    assert!(outbound.began_ms > 0);
+    assert!(outbound.authenticated_ms >= outbound.began_ms);
+    assert!(outbound.authenticated_ms <= round.completed_at_ms);
     let (_, _, success, round) = server.task.join().unwrap();
     assert!(success);
+    let inbound = round.connection.unwrap();
+    assert_eq!(inbound.local, outbound.peer);
+    assert_eq!(inbound.peer, outbound.local);
+    assert!(inbound.began_ms > 0);
+    assert!(inbound.authenticated_ms >= inbound.began_ms);
+    assert!(inbound.authenticated_ms <= round.completed_at_ms);
     assert!(
         round.authenticated_endpoint().is_none(),
         "inbound source is not a service endpoint"
@@ -311,7 +322,7 @@ fn cancellation_before_socket_install_cannot_be_reversed() {
     .unwrap();
     let mut channel = Channel::default();
     channel.stop();
-    assert!(!channel.install(&connection).unwrap());
+    assert!(!channel.install(&connection, 1).unwrap());
     assert!(channel.socket.is_none());
 }
 
@@ -1018,6 +1029,7 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
         &mut observer,
         vec![([0xff; 48], at)],
         &[],
+        &super::super::place::Publisher::default(),
         || (wall, at),
     );
     observer.observe(
@@ -1028,7 +1040,14 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
         at,
     );
     assert!(published.snapshot().peers.is_empty());
-    super::super::observe_contacts(&bootstrap, &mut observer, vec![contact], &[], || (wall, at));
+    super::super::observe_contacts(
+        &bootstrap,
+        &mut observer,
+        vec![contact],
+        &[],
+        &super::super::place::Publisher::default(),
+        || (wall, at),
+    );
     let mut round = RepairRound::panicked(Some("127.0.0.1:41384".parse().unwrap()));
     round.actor = Some(newest.actor);
     round.exchange_started = true;
@@ -1043,13 +1062,19 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
         &mut observer,
         Vec::new(),
         &[wrong, unknown],
+        &super::super::place::Publisher::default(),
         || (wall, at),
     );
     let mut failed = round.clone();
     failed.control = Err("failed after authentication".into());
-    super::super::observe_contacts(&bootstrap, &mut observer, Vec::new(), &[failed], || {
-        (wall, at)
-    });
+    super::super::observe_contacts(
+        &bootstrap,
+        &mut observer,
+        Vec::new(),
+        &[failed],
+        &super::super::place::Publisher::default(),
+        || (wall, at),
+    );
     observer.observe(Visibility::Active, 0, "before endpoint", wall, at);
     assert!(
         published.snapshot().peers[0]
@@ -1057,9 +1082,14 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
             .is_none()
     );
     let endpoint = round.authenticated_endpoint().unwrap().1;
-    super::super::observe_contacts(&bootstrap, &mut observer, Vec::new(), &[round], || {
-        (wall, at)
-    });
+    super::super::observe_contacts(
+        &bootstrap,
+        &mut observer,
+        Vec::new(),
+        &[round],
+        &super::super::place::Publisher::default(),
+        || (wall, at),
+    );
     observer.observe(
         Visibility::Active,
         0,

@@ -1736,6 +1736,9 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
         lost: None,
         held: false,
         holds: Vec::new(),
+        claim_ended: false,
+        not_claim_worker: false,
+        claim_worker: None,
     }
 }
 
@@ -2353,6 +2356,278 @@ fn a_durable_layout_names_the_conversation_the_agents_record_names_as_it_is_take
     record(&left, &copy.start);
     assert_eq!(conversation(&mut app), Some(left), "the record names it");
     crate::harness_host::publish_snapshot_for_test(&sid, None);
+}
+
+/// A RESTORE TIMES A CLAIM WORKER IT BRINGS BACK, AND CLOSES A TAB WHOSE WORKER IS NOT COMING
+/// BACK: the task record that held a worker's time crossed nothing, so, read back through the
+/// crash journal's own encoding, a leaf whose agent ran in the claim folder gets a `working
+/// why=restored` record, or it would never end, and a leaf whose layout names a claim worker's
+/// folder (`claim_worker`) gets `exited why=exit` where that worker had ended (`claim_ended`),
+/// an agent on the leaf or only its shell, so a Claude Code brought back there is not the
+/// worker, and where no agent rides the leaf (a plain quit forgets a running worker's), so the
+/// tab closes in time. CONTROL: an agent of another folder, a leaf with none, an ended task of a
+/// folder that is no claim folder, and an agent in the claim folder that its writer says is no
+/// worker's (`not_claim_worker`: someone's own Claude Code there) get no record.
+#[test]
+fn a_restored_claim_worker_gets_a_task_record() {
+    let claim = format!(
+        "/state/{}/{}",
+        aterm_agent::harness::cli::HARNESS,
+        aterm_agent::harness::credit_offers::CLAIM_FOLDER
+    );
+    let worker = restore::AgentRestore {
+        cwd: claim.clone(),
+        ..dead_agent()
+    };
+    let tab_of = |local: u64, agent: Option<&restore::AgentRestore>, folder: &str, ended: bool| {
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                local_id: Some(local),
+                agent: agent.cloned().map(Box::new),
+                claim_worker: Some(folder.to_owned()),
+                claim_ended: ended,
+                ..bare_leaf()
+            },
+        ))
+    };
+    let manifest = restore::RestoreManifest::new(vec![window_of(vec![
+        leaf_hosting(7, None),
+        leaf_hosting(8, Some(worker.clone())),
+        leaf_hosting(9, Some(dead_agent())),
+        tab_of(10, Some(&worker), &claim, true),
+        tab_of(11, None, &claim, true),
+        tab_of(12, None, "/Users//me/project", true),
+        tab_of(13, None, &claim, false),
+        tab_of(14, Some(&worker), &claim, false),
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                local_id: Some(15),
+                agent: Some(Box::new(worker.clone())),
+                not_claim_worker: true,
+                ..bare_leaf()
+            },
+        )),
+    ])]);
+    let header = crate::crash_journal::JournalHeader::now(std::process::id(), false);
+    let text = crate::crash_journal::encode(&manifest, &header).expect("encoded");
+    let (_, mut read) = crate::crash_journal::decode(&text).expect("decoded");
+    let mut cold = App::headless_for_test();
+    cold.restore_into_window(WindowId(0), read.windows.remove(0));
+    let mut records: Vec<_> = cold
+        .store
+        .read()
+        .unwrap()
+        .snapshot()
+        .into_iter()
+        .filter_map(|h| {
+            let timeline = h.ctx.timeline.lock().unwrap();
+            timeline
+                .task()
+                .map(|task| (h.local_id, task.state, task.why, task.trusted_cwd.clone()))
+        })
+        .collect();
+    records.sort_unstable_by_key(|(local, ..)| *local);
+    let states: Vec<_> = records
+        .iter()
+        .map(|(_, state, why, folder)| (*state, *why, folder.clone()))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            (
+                crate::task_record::TaskState::Working,
+                Some(crate::task_record::WHY_RESTORED),
+                Some(claim.clone())
+            ),
+            (
+                crate::task_record::TaskState::Exited,
+                Some("exit"),
+                Some(claim.clone())
+            ),
+            (
+                crate::task_record::TaskState::Exited,
+                Some("exit"),
+                Some(claim.clone())
+            ),
+            (
+                crate::task_record::TaskState::Exited,
+                Some("exit"),
+                Some(claim.clone())
+            ),
+            (
+                crate::task_record::TaskState::Working,
+                Some(crate::task_record::WHY_RESTORED),
+                Some(claim)
+            ),
+        ],
+        "(8) a worker named by its agent alone (a layout before `claim_worker`), (10) an agent \
+         in an ended worker's tab, (11) only its shell, (13) a running worker a plain quit forgot, \
+         (14) a running worker brought back; (15) none"
+    );
+}
+
+/// A CLAIM WORKER THE PTY KEEPER HANDS BACK KEEPS ITS TIME (2026-11-02 review): after a crash the
+/// keeper reattaches the worker's shell with its Claude Code still running there, so a leaf whose
+/// image caught no agent for it names no worker that is gone: its tab gets `working
+/// why=restored`, which the look ends in time, not `exited`, which would leave that worker
+/// running and its tab open for good. CONTROL: the same leaf filled by a new shell (a quit forgot
+/// the worker) and an ended worker's tab handed back get `exited why=exit`.
+#[test]
+fn a_claim_worker_the_keeper_hands_back_keeps_its_time() {
+    use crate::task_record::TaskState::{Exited, Working};
+    let claim = format!(
+        "/state/{}/{}",
+        aterm_agent::harness::cli::HARNESS,
+        aterm_agent::harness::credit_offers::CLAIM_FOLDER
+    );
+    let state_of = |handed_back: bool, ended: bool| {
+        let leaf = restore::TerminalLeafRestore {
+            local_id: Some(3),
+            claim_worker: Some(claim.clone()),
+            claim_ended: ended,
+            ..bare_leaf()
+        };
+        let mut app = App::headless_for_test();
+        let mut shell = crate::stub_session(9);
+        if handed_back {
+            shell.handoff_local_id = Some(3);
+        }
+        app.carry_restored_identity(
+            &leaf,
+            crate::app_restore::FillingShell::Unregistered(&shell),
+            crate::app_restore::LeafIds::Retired,
+        );
+        let timeline = shell.ctx.timeline.lock().unwrap();
+        timeline.task().map(|task| (task.state, task.why))
+    };
+    assert_eq!(
+        state_of(true, false),
+        Some((Working, Some(crate::task_record::WHY_RESTORED))),
+        "a running worker the keeper handed back"
+    );
+    assert_eq!(
+        state_of(false, false),
+        Some((Exited, Some("exit"))),
+        "CONTROL: a new shell"
+    );
+    assert_eq!(
+        state_of(true, true),
+        Some((Exited, Some("exit"))),
+        "CONTROL: an ended worker's tab"
+    );
+}
+
+/// AN OWED RELAUNCH IN A CLAIM FOLDER IS NO CLAIM WORKER'S (2026-11-02 review): a relaunch the
+/// host still owes a tab (queued, its agent not read yet, so nothing published) rides the tab's
+/// leaf in a handoff's layout and, filled in by `fill_desk_agents`, in the crash journal's and a
+/// quit's; in a tab with no claim worker's record that leaf says its agent is no worker's, so the
+/// next restore does not time someone's own Claude Code there as one. CONTROL: an owed relaunch
+/// in another folder is not marked.
+#[cfg(unix)]
+#[test]
+fn an_owed_relaunch_in_a_claim_folder_is_no_claim_workers() {
+    let claim = format!(
+        "/state/{}/{}",
+        aterm_agent::harness::cli::HARNESS,
+        aterm_agent::harness::credit_offers::CLAIM_FOLDER
+    );
+    let marks = |cwd: &str| {
+        let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
+            std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+        );
+        let mut app = App::headless_for_test();
+        let sid = {
+            let g = app.store.read().unwrap();
+            g.by_local(0).expect("registered").sid.as_str().to_string()
+        };
+        app.harness = Some(host.clone());
+        host.owe_for_test(
+            &sid,
+            Some(aterm_agent::harness::relaunch::Snapshot {
+                cwd: cwd.to_owned(),
+                ..owed_relaunch(&sid)
+            }),
+        );
+        let mut desk = app.capture_restore_manifest();
+        app.fill_desk_agents(&mut desk);
+        assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
+        let handoff = app.capture_handoff_layout();
+        app.rollback_overlap(None, &[]);
+        host.owe_for_test(&sid, None);
+        let of = |layout: &restore::RestoreManifest| {
+            layout
+                .handed_off_leaves()
+                .into_iter()
+                .find(|leaf| leaf.local_id == Some(0))
+                .map(|leaf| (leaf.agent.map(|agent| agent.cwd), leaf.not_claim_worker))
+        };
+        (of(&desk), of(&handoff))
+    };
+    let owed_in = |cwd: &str, marked: bool| Some((Some(cwd.to_owned()), marked));
+    assert_eq!(
+        marks(&claim),
+        (owed_in(&claim, true), owed_in(&claim, true)),
+        "(the desk, the handoff)"
+    );
+    assert_eq!(
+        marks("/Users//me/project"),
+        (
+            owed_in("/Users//me/project", false),
+            owed_in("/Users//me/project", false)
+        ),
+        "CONTROL: another folder"
+    );
+}
+
+/// A LEAF A RESTORE STILL OWED KEEPS ITS WRITER'S WORD (2026-11-02 review): a desk written while a
+/// cold restore drains carries the tabs it has not placed yet as their layout wrote them, with no
+/// session of this run (`RestoreDrain::carry_owed`). One from a layout before `claim_worker` names
+/// a running claim worker only by its agent in the claim folder, so the desk's mark leaves it
+/// unmarked, or the next restore would give that worker no record and it would never end; one its
+/// writer marked stays marked. CONTROL: a leaf this run wrote from a live session, its agent in
+/// the claim folder and no claim worker named, is marked.
+#[test]
+fn a_leaf_a_restore_still_owed_keeps_its_writers_word() {
+    let claim = format!(
+        "/state/{}/{}",
+        aterm_agent::harness::cli::HARNESS,
+        aterm_agent::harness::credit_offers::CLAIM_FOLDER
+    );
+    let in_claim = restore::AgentRestore {
+        cwd: claim,
+        ..dead_agent()
+    };
+    let leaf = |local_id: Option<u64>, marked: bool| {
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                local_id,
+                agent: Some(Box::new(in_claim.clone())),
+                not_claim_worker: marked,
+                ..bare_leaf()
+            },
+        ))
+    };
+    let mut desk = restore::RestoreManifest::new(vec![window_of(vec![
+        leaf(Some(1), false),
+        leaf(None, false),
+        leaf(None, true),
+    ])]);
+    desk.mark_claim_bystanders();
+    let marks: Vec<bool> = desk.windows[0]
+        .restored_tabs
+        .iter()
+        .map(|tab| match &tab.root {
+            restore::RestoredSplitTree::Leaf {
+                view: restore::RestoredView::Terminal(leaf),
+            } => leaf.not_claim_worker,
+            other => panic!("a terminal leaf: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        marks,
+        [true, false, true],
+        "(this run's, an older layout's owed, a marked owed)"
+    );
 }
 
 #[test]

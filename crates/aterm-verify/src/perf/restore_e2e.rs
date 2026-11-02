@@ -100,7 +100,16 @@ impl Args {
                         return Err("`--passes` needs a positive integer, got `0`".to_string());
                     }
                 }
-                "--profile" => a.profile = Profile::parse(raw)?,
+                "--profile" => {
+                    a.profile = Profile::parse(raw)?;
+                    if a.profile == Profile::Shipped {
+                        return Err(
+                            "`--profile shipped` is the fabric lane's: the restore bench drives \
+                             seams debug assertions compile in"
+                                .to_string(),
+                        );
+                    }
+                }
                 "--json-out" => a.json_out = Some(PathBuf::from(raw)),
                 "--no-windows" | "--admit" => {}
                 other => {

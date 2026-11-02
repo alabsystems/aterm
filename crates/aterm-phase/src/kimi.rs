@@ -16,7 +16,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 7, "0.7");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 8, "0.8");
 
 /// The usage limit is spent: Kimi Code's own quota patterns (lowercase).
 const QUOTA: [&str; 3] = [
@@ -116,6 +116,34 @@ fn context_count(count: &str) -> bool {
     }
 }
 
+/// How many of the screen's last drawn rows its `context: N%` footer may stand in when no
+/// composer is drawn: it stays at the foot under an approval or question box (measured on
+/// 2.4.0's box and question frames), however much blank screen stands under the drawing.
+const FOOTER_ROWS: usize = 4;
+
+/// The context the footer says is left: the share its `context: N%` row leaves, read under the
+/// composer where one is drawn ([`composer_rows`]), else on a footer row at the screen's foot,
+/// where it stands under a box a question or an approval drew in the composer's place. For
+/// the window's displays only ([`crate::ScreenReader::context_shown`]).
+#[must_use]
+pub fn context_left(rows: &[String]) -> Option<u8> {
+    let used = match composer_rows(rows) {
+        Some((_, _, bottom)) => rows[bottom + 1..].iter().find_map(|r| context_row(r)),
+        None => {
+            let drawn = rows
+                .iter()
+                .rposition(|r| !crate::text::trim(r).is_empty())
+                .map_or(0, |last| last + 1);
+            rows[..drawn]
+                .iter()
+                .rev()
+                .take(FOOTER_ROWS)
+                .find_map(|r| context_row(r))
+        }
+    }?;
+    Some(100u8.saturating_sub(used.min(100)))
+}
+
 /// The composer as `(caret row, lines)`, the caret row's draft first ([`composer_rows`]).
 #[must_use]
 pub fn composer(rows: &[String]) -> Option<(usize, Vec<String>)> {
@@ -129,11 +157,14 @@ pub fn composer(rows: &[String]) -> Option<(usize, Vec<String>)> {
     Some((caret, lines))
 }
 
-/// Whether `rows` are Kimi Code's own screen: its welcome row, or its composer over its
-/// `context: N%` footer ([`composer_rows`]).
+/// Whether `rows` are Kimi Code's own screen: its welcome row, its composer over its
+/// `context: N%` footer ([`composer_rows`]), or that footer standing at the screen's foot
+/// under a box drawn in the composer's place ([`context_left`], measured on 2.4.0's approval
+/// and question frames).
 #[must_use]
 pub fn is_kimi_screen(rows: &[String]) -> bool {
     composer_rows(rows).is_some()
+        || context_left(rows).is_some()
         || rows.iter().any(|r| {
             crate::text::trim_start(r)
                 .strip_prefix('│')
@@ -232,6 +263,11 @@ pub mod fixtures {
     /// Kimi Code 2.4.0 after a custom provider's 401 (`[provider.auth_error]`) under an earlier
     /// quota wall: neither a managed login wall nor the earlier quota wall (MEASURED).
     pub const AUTH_401_240: &str = include_str!("fixtures/kimi-2.4.0-auth-401.txt");
+    /// Kimi Code 2.4.0 asking to run a shell command, its approval in the composer's place
+    /// over the `context: N%` footer (MEASURED).
+    pub const BOX_SHELL_240: &str = include_str!("fixtures/kimi-2.4.0-box-shell.txt");
+    /// Kimi Code 2.4.0's question standing in the composer's place (MEASURED).
+    pub const QUESTION_240: &str = include_str!("fixtures/kimi-2.4.0-question.txt");
     /// Kimi Code 2.3.1 signed out at its idle composer, after the folder was trusted (MEASURED).
     pub const IDLE: &str = include_str!("fixtures/kimi-2.3.1-idle.txt");
     /// The same with `hello` typed and unsent (MEASURED).

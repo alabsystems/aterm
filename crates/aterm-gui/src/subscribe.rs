@@ -25,7 +25,7 @@ pub(crate) struct TargetStreams {
     pub screen: bool,
     /// Emit `DELTA <sid> seq=<n> cursor <row> <col> <visible> <style>` on any caret change (position, DECSCUSR style, or DECTCEM visibility) — even at an unchanged seq.
     pub cursor: bool,
-    /// The lifecycle digest: `EVENT <sid> block-complete <id> exit=<code>` on OSC 133 D, `EVENT <sid> turn <id> submitted=<0|1> status=<..> dur_ms=<..>` per completed turn (the turn ledger), `EVENT <sid> title <pct>` on an OSC 0/2 title change, `EVENT <sid> bell total=<n>` on a BEL, the timeline kinds [`timeline_wire_kind`] carries (`meta field=<f> value=<pct|->`, `agent`, `status`, `human`, `render`, a program's own `program state=<w>[ kind=<k>] rev=<id>` and `act <act> rev=<id>`, the fabric digest), and at retirement `EVENT <sid> closing reason=<token> by=<sid|human|ctl|bridge|->` then `EVENT <sid> exited`.
+    /// The lifecycle digest: `EVENT <sid> block-complete <id> exit=<code>` on OSC 133 D, `EVENT <sid> turn <id> submitted=<0|1> status=<..> dur_ms=<..>` per completed turn (the turn ledger), `EVENT <sid> title <pct>` on an OSC 0/2 title change, `EVENT <sid> bell total=<n>` on a BEL, the timeline kinds [`timeline_wire_kind`] carries (`meta field=<f> value=<pct|->`, `agent`, `status`, `human`, `render`, a program's own `program state=<w>[ kind=<k>] rev=<id>` and `act <act> rev=<id>`, the fabric digest), and at retirement `EVENT <sid> closing reason=<token> by=<sid|human|ctl|bridge|harness|->` then `EVENT <sid> exited`.
     pub events: bool,
     /// Emit `DELTA <sid> seq=<n> cells <nbytes>\n<styled-json>` when the styled frame changes — the LOSSLESS styled-screen frame (Item 1's payload) pushed live, so an outer agent sees the inner TUI's colour/attrs, not plaintext.
     pub cells: bool,
@@ -1721,6 +1721,15 @@ fn push_held(step: &str) -> bool {
 #[cfg(not(debug_assertions))]
 const fn push_held(_step: &str) -> bool {
     false
+}
+
+/// Wait while a test holds `step`, on a thread that has nothing else to do meanwhile. A shipped
+/// build holds nothing.
+#[cfg(any(unix, test))]
+pub(crate) fn wait_out_hold(step: &str) {
+    while push_held(step) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 fn timeline_held(_under: &crate::session_timeline::SessionTimeline) -> bool {

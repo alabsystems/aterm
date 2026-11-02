@@ -784,6 +784,268 @@ impl Drop for SpawnKit {
     }
 }
 
+/// The pty's name for a message (`/dev/ttys004`), or "the pty" when its master cannot say.
+fn pty_label(master: libc::c_int) -> String {
+    pts_name(master).map_or_else(
+        |_| "the pty".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// Why the pty of `master` and `slave` cannot carry a shell, read in the parent before a fork:
+/// its slave descriptor is dead (`fstat` or `tcgetattr` fails) or, on macOS, its node is gone by
+/// name. Under heavy pty churn XNU can remove a new pty's `/dev/ttys…` node while another
+/// process's pty that held the same minor finishes tearing down, which kills every descriptor
+/// of the slave (ATERM-KI-1028-4); a pooled pty, opened well before its spawn, is the widest
+/// window. `None`: the pty answered all of it.
+fn dead_pty(master: libc::c_int, slave: libc::c_int) -> Option<String> {
+    // SAFETY: `st` is a zeroed plain-integer out-param that `fstat` fills from `slave`.
+    let fstat_ok = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(slave, &mut st) == 0
+    };
+    if !fstat_ok {
+        let err = io::Error::last_os_error();
+        return Some(format!(
+            "{}: its slave failed fstat ({err})",
+            pty_label(master)
+        ));
+    }
+    // SAFETY: `t` is a zeroed plain-integer out-param that `tcgetattr` fills from `slave`.
+    let tcgetattr_ok = unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(slave, &mut t) == 0
+    };
+    if !tcgetattr_ok {
+        let err = io::Error::last_os_error();
+        return Some(format!(
+            "{}: its slave failed tcgetattr ({err})",
+            pty_label(master)
+        ));
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let name = match pts_name(master) {
+            Ok(name) => name,
+            Err(err) => return Some(format!("its master cannot name it ({err})")),
+        };
+        #[cfg(all(test, target_os = "macos"))]
+        let name = pty_race::by_name(name);
+        // SAFETY: `name` is a NUL-terminated path and `node` a zeroed out-param `stat` fills.
+        let named = unsafe {
+            let mut node: libc::stat = std::mem::zeroed();
+            libc::stat(name.as_ptr(), &mut node) == 0
+        };
+        if !named {
+            let err = io::Error::last_os_error();
+            return Some(format!(
+                "{}: its node is gone ({err})",
+                name.to_string_lossy()
+            ));
+        }
+    }
+    None
+}
+
+/// How many dead ptys one spawn replaces with a fresh one before it is an error
+/// ([`replace_dead_pty`]).
+const DEAD_PTY_REPLACEMENTS: usize = 1;
+
+/// The fresh pty a spawn takes in place of a dead one, whose cause (`died_of`) joins `deaths`:
+/// one its parent found dead before the fork ([`dead_pty`]), one whose child could not make it
+/// its controlling terminal (status byte `T`), or one that died in the child just after it did
+/// (status byte `D`: fd 0 then failed `fstat` or `tcgetattr`). The caller still holds the dead pty while this
+/// opens the fresh one, so the two are distinct ptys (never the same minor reopened). A spawn
+/// replaces [`DEAD_PTY_REPLACEMENTS`] dead ptys; past that the spawn is an error naming every
+/// cause and ATERM-KI-1028-4's, and nothing loops. A fresh pty that cannot open (likeliest under
+/// the same churn: EAGAIN or EMFILE) is an error of its kind that still names the dead ones.
+fn replace_dead_pty(
+    deaths: &mut Vec<String>,
+    died_of: String,
+    ws: &libc::winsize,
+) -> io::Result<SpawnKit> {
+    deaths.push(died_of);
+    if deaths.len() > DEAD_PTY_REPLACEMENTS {
+        return Err(io::Error::other(format!(
+            "every pty opened for this shell died before the shell could use it ({}): under \
+             heavy pty churn macOS can remove a new pty's /dev node while another process's \
+             pty on the same number finishes tearing down (ATERM-KI-1028-4)",
+            deaths.join("; then ")
+        )));
+    }
+    fresh_kit(ws).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "{err} (opening a pty in place of a dead one: {}; ATERM-KI-1028-4)",
+                deaths.join("; then ")
+            ),
+        )
+    })
+}
+
+/// A kit opened for a spawn that the pool could not lend one, or in place of a dead one.
+fn fresh_kit(ws: &libc::winsize) -> io::Result<SpawnKit> {
+    #[cfg(all(test, target_os = "macos"))]
+    if pty_race::open_fails() {
+        return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+    }
+    let kit = SpawnKit::open(Some(ws))?;
+    #[cfg(all(test, target_os = "macos"))]
+    pty_race::opened_fresh(kit.master);
+    Ok(kit)
+}
+
+/// What this thread's spawns forked onto (tests): the name of each pty a spawn forked a child
+/// onto, in order, read in the parent before the fork.
+#[cfg(test)]
+pub(crate) mod spawn_trace {
+    use std::cell::RefCell;
+    use std::ffi::CString;
+
+    std::thread_local! {
+        static FORKED_ONTO: RefCell<Vec<CString>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// In the parent, before the fork onto the pty of `master`.
+    pub(super) fn forking_onto(master: libc::c_int) {
+        let name = super::pts_name(master).unwrap_or_default();
+        FORKED_ONTO.with(|f| f.borrow_mut().push(name));
+    }
+
+    /// The ptys this thread's spawns forked onto since the last take.
+    pub(crate) fn take() -> Vec<CString> {
+        FORKED_ONTO.with(|f| std::mem::take(&mut *f.borrow_mut()))
+    }
+}
+
+/// A test's ATERM-KI-1028-4, on demand: a pty's slave killed under a spawn. `revoke(2)` on the
+/// slave's name kills every descriptor of it as XNU's race does (`fstat` fails with EBADF,
+/// `tcgetattr` fails, `login_tty`'s `TIOCSCTTY` says ENOENT; measured on macOS 27.0), though it
+/// leaves the node in place; the node's removal itself, which no test can do to `/dev`, is
+/// shown to the parent's check by a name that names nothing ([`gone_by_name`]). It applies only
+/// to spawns from the thread that set it, so every other test's spawn runs as it is.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod pty_race {
+    use std::cell::{Cell, RefCell};
+    use std::ffi::{CStr, CString};
+
+    std::thread_local! {
+        static IN_CHILD: Cell<u32> = const { Cell::new(0) };
+        static AFTER_LOGIN_TTY: Cell<u32> = const { Cell::new(0) };
+        static FRESH: Cell<u32> = const { Cell::new(0) };
+        static GONE_BY_NAME: Cell<u32> = const { Cell::new(0) };
+        static OPEN_FAILS: Cell<u32> = const { Cell::new(0) };
+        static STRUCK_FRESH: RefCell<Vec<CString>> = const { RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "C" {
+        fn revoke(path: *const libc::c_char) -> libc::c_int;
+    }
+
+    /// Kill the slave in the child, just before its `login_tty`, on each of this thread's next
+    /// `n` forks.
+    pub(crate) fn in_children(n: u32) {
+        IN_CHILD.with(|c| c.set(n));
+    }
+
+    /// Kill the slave in the child just after its `login_tty` made it the controlling terminal,
+    /// on each of this thread's next `n` forks.
+    pub(crate) fn after_login_tty(n: u32) {
+        AFTER_LOGIN_TTY.with(|c| c.set(n));
+    }
+
+    /// On each of this thread's next `n` parent checks that reach the slave's name, `stat` a
+    /// name that names nothing: the pty's node gone while its descriptors still answer.
+    pub(crate) fn gone_by_name(n: u32) {
+        GONE_BY_NAME.with(|c| c.set(n));
+    }
+
+    /// Fail each of this thread's next `n` fresh pty opens with EAGAIN, as a pty open can fail
+    /// under the churn that kills ptys.
+    pub(crate) fn fresh_opens_fail(n: u32) {
+        OPEN_FAILS.with(|c| c.set(n));
+    }
+
+    /// In the parent, before a fresh kit opens: whether this open is one that fails.
+    pub(super) fn open_fails() -> bool {
+        take_one(&OPEN_FAILS)
+    }
+
+    /// This thread's seam, all of it off, and its record of struck fresh ptys cleared.
+    pub(crate) fn reset() {
+        in_children(0);
+        after_login_tty(0);
+        in_fresh(0);
+        gone_by_name(0);
+        fresh_opens_fail(0);
+        let _ = take_struck_fresh();
+    }
+
+    /// The names of the fresh ptys [`in_fresh`] killed since the last take.
+    pub(crate) fn take_struck_fresh() -> Vec<CString> {
+        STRUCK_FRESH.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    /// Kill the slave of each of the next `n` fresh ptys this thread's spawns open, as it opens.
+    pub(crate) fn in_fresh(n: u32) {
+        FRESH.with(|c| c.set(n));
+    }
+
+    fn take_one(left: &'static std::thread::LocalKey<Cell<u32>>) -> bool {
+        left.with(|c| {
+            let n = c.get();
+            c.set(n.saturating_sub(1));
+            n > 0
+        })
+    }
+
+    /// `revoke(2)` the slave named `name`; `false` when it failed.
+    pub(crate) fn revoke_slave(name: &CStr) -> bool {
+        // SAFETY: `name` is a NUL-terminated path `revoke` only reads.
+        unsafe { revoke(name.as_ptr()) == 0 }
+    }
+
+    /// In the parent, before the fork onto `master`'s pty: the slave name this fork's child
+    /// revokes before its `login_tty` and the one it revokes after, each when this fork is one
+    /// of the struck ones.
+    pub(super) fn child_strikes(master: libc::c_int) -> (Option<CString>, Option<CString>) {
+        let before = take_one(&IN_CHILD);
+        let after = take_one(&AFTER_LOGIN_TTY);
+        let name = || super::pts_name(master).ok();
+        (before.then(name).flatten(), after.then(name).flatten())
+    }
+
+    /// In the child, before or after its `login_tty`: `revoke(2)` by the name its parent made;
+    /// no allocation, no lock (one syscall on a live C string).
+    pub(super) fn in_child(name: Option<&CString>) {
+        if let Some(name) = name {
+            revoke_slave(name);
+        }
+    }
+
+    /// In the parent, as a fresh kit of `master`'s pty opens.
+    pub(super) fn opened_fresh(master: libc::c_int) {
+        if take_one(&FRESH)
+            && let Ok(name) = super::pts_name(master)
+        {
+            revoke_slave(&name);
+            STRUCK_FRESH.with(|s| s.borrow_mut().push(name));
+        }
+    }
+
+    /// In the parent's check, the slave name it `stat`s: `name`, or on a struck check `name`
+    /// with `.gone` after it, which names nothing.
+    pub(super) fn by_name(name: CString) -> CString {
+        if !take_one(&GONE_BY_NAME) {
+            return name;
+        }
+        let mut gone = name.into_bytes();
+        gone.extend_from_slice(b".gone");
+        CString::new(gone).unwrap_or_default()
+    }
+}
+
 const SPENT_MAX: usize = 16;
 
 #[derive(Debug)]
@@ -960,7 +1222,13 @@ pub fn spawn_shell_with_pid(
 
 /// [`spawn_shell_with_pid`], filling the winsize pixel fields from the host's cell metrics, and
 /// handing the child `pass` ([`PassedFd`]) when there is one. A pass the child cannot put in
-/// place fails the spawn closed: the child exits before its exec and the call is an `Err`.
+/// place fails the spawn closed: the child exits before its exec and the call is an `Err`. No
+/// shell starts on a pty found dead up to the child's last check before its exec
+/// (ATERM-KI-1028-4): one the parent finds dead before the fork (`dead_pty`), a pooled one
+/// included, one the child cannot make its controlling terminal, or one dead in the child right
+/// after it did, is replaced by a fresh pty once, and a dead replacement is an `Err` naming the
+/// cause. A pty that dies after that check (during the exec, or under the running shell) still
+/// ends the shell: nothing in user space sees that coming.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1138,141 +1406,203 @@ pub fn spawn_shell_with_pid_cell_px(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    let kit = match pooled {
+    let mut kit = match pooled {
         Some(kit) => {
             kit.size(&ws);
             kit
         }
-        None => SpawnKit::open(Some(&ws))?,
+        None => fresh_kit(&ws)?,
     };
-    let (master, slave, status_rd, status_wr) = kit.into_raw();
-    let inherit_strip = aterm_uds::spawnfd::InheritStrip::prepare();
-    // A passed descriptor kept out of children (`aterm_uds::kept_out`) is unmarked for this fork
-    // alone, so the child has the copy it puts at its number.
-    let spawning = aterm_uds::spawn_lock::handing(handed.as_slice());
-    // SAFETY: `fork` takes no arguments and returns child pid, 0, or -1.
-    let pid = unsafe { libc::fork() };
-    if pid != 0 {
-        // The parent's hold ends with the copy. The child's is never released (no lock call is
-        // safe there): it execs or `_exit`s.
-        drop(spawning);
-    }
-    if pid < 0 {
-        let err = io::Error::last_os_error();
-        // SAFETY: fork failed, so no child exists; closing the four owned descriptors.
+    // What each dead pty this spawn met died of: it forks onto no pty its parent finds dead, and
+    // replaces a dead one, found here or by its child, with a fresh one, once
+    // ([`replace_dead_pty`]; ATERM-KI-1028-4).
+    let mut deaths: Vec<String> = Vec::new();
+    let (master, pid, status) = loop {
+        if let Some(died_of) = dead_pty(kit.master, kit.slave) {
+            // The dead kit closes only once its replacement is open.
+            let dead = std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, &ws)?);
+            drop(dead);
+            continue;
+        }
+        let (master, slave, status_rd, status_wr) = kit.into_raw();
+        #[cfg(test)]
+        spawn_trace::forking_onto(master);
+        #[cfg(all(test, target_os = "macos"))]
+        let strikes = pty_race::child_strikes(master);
+        let inherit_strip = aterm_uds::spawnfd::InheritStrip::prepare();
+        // A passed descriptor kept out of children (`aterm_uds::kept_out`) is unmarked for this
+        // fork alone, so the child has the copy it puts at its number.
+        let spawning = aterm_uds::spawn_lock::handing(handed.as_slice());
+        // SAFETY: `fork` takes no arguments and returns child pid, 0, or -1.
+        let pid = unsafe { libc::fork() };
+        if pid != 0 {
+            // The parent's hold ends with the copy. The child's is never released (no lock call is
+            // safe there): it execs or `_exit`s.
+            drop(spawning);
+        }
+        if pid < 0 {
+            let err = io::Error::last_os_error();
+            // SAFETY: fork failed, so no child exists; closing the four owned descriptors.
+            unsafe {
+                libc::close(slave);
+                libc::close(master);
+                libc::close(status_rd);
+                libc::close(status_wr);
+            }
+            return Err(err);
+        }
+        if pid == 0 {
+            // SAFETY: `status_rd` is the inherited read-end fd; `close` is a-s-safe.
+            unsafe {
+                libc::close(status_rd);
+            }
+            #[cfg(all(test, target_os = "macos"))]
+            pty_race::in_child(strikes.0.as_ref());
+            // SAFETY: `slave` is the child's inherited pty fd and `status_wr` its exec-status write
+            // end; `login_tty`, `write` and `_exit` are a-s-safe, and `b` is a 1-byte stack local.
+            // Nothing here allocates, takes a lock, or reads the environment. A slave `login_tty`
+            // cannot make the controlling terminal is dead (ATERM-KI-1028-4): the child says `T`
+            // and ends before its exec, so no shell runs without a terminal.
+            unsafe {
+                if libc::login_tty(slave) == -1 {
+                    let b: u8 = b'T';
+                    libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
+                    libc::_exit(126);
+                }
+            }
+            #[cfg(all(test, target_os = "macos"))]
+            pty_race::in_child(strikes.1.as_ref());
+            // SAFETY: `st` and `t` are zeroed plain-integer stack out-params that `fstat` and
+            // `tcgetattr` fill from fd 0, the slave `login_tty` just put there; `fstat`,
+            // `tcgetattr`, `write` and `_exit` are a-s-safe, and `b` is a 1-byte stack local. No
+            // allocation, no lock. A slave that died after `login_tty` took it (ATERM-KI-1028-4
+            // a moment later) is dead all the same: the child says `D` and ends before its exec.
+            unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                let mut t: libc::termios = std::mem::zeroed();
+                if libc::fstat(libc::STDIN_FILENO, &mut st) != 0
+                    || libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0
+                {
+                    let b: u8 = b'D';
+                    libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
+                    libc::_exit(126);
+                }
+            }
+            // SAFETY: `sa` and `empty` are zeroed/initialized locals; signal calls are a-s-safe; no
+            // allocation, no locks.
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(std::ptr::addr_of_mut!(sa.sa_mask));
+                sa.sa_flags = 0;
+                let mut sig: libc::c_int = 1;
+                while sig < 32 {
+                    if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+                        libc::sigaction(sig, std::ptr::addr_of!(sa), std::ptr::null_mut());
+                    }
+                    sig += 1;
+                }
+                let mut empty: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(std::ptr::addr_of_mut!(empty));
+                libc::sigprocmask(
+                    libc::SIG_SETMASK,
+                    std::ptr::addr_of!(empty),
+                    std::ptr::null_mut(),
+                );
+            }
+            inherit_strip.apply();
+            if limits.apply(sandbox_cap).is_err() {
+                // SAFETY: `write` and `_exit` are async-signal-safe; `b` is a 1-byte stack local.
+                unsafe {
+                    let b: u8 = b'S';
+                    libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
+                    libc::_exit(126);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if !runs_program {
+                // SAFETY: sets this process's own darwin role; takes no pointers.
+                unsafe {
+                    libc::setpriority(PRIO_DARWIN_ROLE, 0, SHELL_ROLE);
+                }
+            }
+            if let Some(dir) = &chdir_c {
+                // SAFETY: the path is a live C string; chdir, write and _exit are
+                // async-signal-safe.
+                unsafe {
+                    if libc::chdir(dir.as_ptr()) != 0 {
+                        let b: u8 = b'C';
+                        libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
+                        libc::_exit(126);
+                    }
+                }
+            }
+            // SAFETY: `master` is this child's inherited master fd; `close` is async-signal-safe.
+            unsafe {
+                if master > libc::STDERR_FILENO {
+                    libc::close(master);
+                }
+            }
+            let status_wr = match pass {
+                None => status_wr,
+                // SAFETY: the forked child before its exec, after the strip and the master's close;
+                // `status_wr` is its exec-status write end.
+                Some(pass) => match unsafe { place_passed(pass, status_wr) } {
+                    Ok(status_wr) => status_wr,
+                    // SAFETY: `write` and `_exit` are async-signal-safe; `b` is a 1-byte stack
+                    // local.
+                    Err(status_wr) => unsafe {
+                        let b: u8 = b'P';
+                        libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
+                        libc::_exit(126);
+                    },
+                },
+            };
+            #[cfg(test)]
+            pre_exec_stall::in_child();
+            // SAFETY: `exec_target` is a live C string, and `argv` and `envp` null-terminated
+            // arrays of live C strings, all outliving the call; `write`/`_exit` are
+            // async-signal-safe.
+            unsafe {
+                libc::execve(exec_target.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                let b: u8 = b'E';
+                libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
+                libc::_exit(127);
+            }
+        }
+        // SAFETY: `slave` is the parent's copy of the pty slave fd; `close` releases this copy.
         unsafe {
             libc::close(slave);
-            libc::close(master);
-            libc::close(status_rd);
+        }
+        // SAFETY: `status_wr` is the parent's copy of the write end.
+        unsafe {
             libc::close(status_wr);
         }
-        return Err(err);
-    }
-    if pid == 0 {
-        // SAFETY: `status_rd` is the inherited read-end fd; `close` is a-s-safe.
-        unsafe {
-            libc::close(status_rd);
-        }
-        // SAFETY: `slave` is the child's inherited pty fd; `login_tty`/`dup2`/`close` are a-s-safe.
-        // Nothing here allocates, takes a lock, or reads the environment.
-        unsafe {
-            if libc::login_tty(slave) == -1 {
-                libc::dup2(slave, libc::STDIN_FILENO);
-                libc::dup2(slave, libc::STDOUT_FILENO);
-                libc::dup2(slave, libc::STDERR_FILENO);
-                if slave > libc::STDERR_FILENO {
-                    libc::close(slave);
-                }
+        let status = wait_for_exec_status(status_rd, EXEC_START_HANG);
+        retire_spent(status_rd);
+        let how = match status {
+            ExecStatus::FailedBeforeExec(b'T') => {
+                "the shell could not make it its controlling terminal (login_tty failed)"
             }
-        }
-        // SAFETY: `sa` and `empty` are zeroed/initialized locals; signal calls are a-s-safe; no
-        // allocation, no locks.
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = libc::SIG_DFL;
-            libc::sigemptyset(std::ptr::addr_of_mut!(sa.sa_mask));
-            sa.sa_flags = 0;
-            let mut sig: libc::c_int = 1;
-            while sig < 32 {
-                if sig != libc::SIGKILL && sig != libc::SIGSTOP {
-                    libc::sigaction(sig, std::ptr::addr_of!(sa), std::ptr::null_mut());
-                }
-                sig += 1;
+            ExecStatus::FailedBeforeExec(b'D') => {
+                "it died once the shell had made it its controlling terminal (fstat or \
+                 tcgetattr on it failed in the child)"
             }
-            let mut empty: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(std::ptr::addr_of_mut!(empty));
-            libc::sigprocmask(
-                libc::SIG_SETMASK,
-                std::ptr::addr_of!(empty),
-                std::ptr::null_mut(),
-            );
-        }
-        inherit_strip.apply();
-        if limits.apply(sandbox_cap).is_err() {
-            // SAFETY: `write` and `_exit` are async-signal-safe; `b` is a 1-byte stack local.
-            unsafe {
-                let b: u8 = b'S';
-                libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
-                libc::_exit(126);
-            }
-        }
-        #[cfg(target_os = "macos")]
-        if !runs_program {
-            // SAFETY: sets this process's own darwin role; takes no pointers.
-            unsafe {
-                libc::setpriority(PRIO_DARWIN_ROLE, 0, SHELL_ROLE);
-            }
-        }
-        if let Some(dir) = &chdir_c {
-            // SAFETY: the path is a live C string; chdir, write and _exit are async-signal-safe.
-            unsafe {
-                if libc::chdir(dir.as_ptr()) != 0 {
-                    let b: u8 = b'C';
-                    libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
-                    libc::_exit(126);
-                }
-            }
-        }
-        // SAFETY: `master` is this child's inherited master fd; `close` is async-signal-safe.
-        unsafe {
-            if master > libc::STDERR_FILENO {
-                libc::close(master);
-            }
-        }
-        let status_wr = match pass {
-            None => status_wr,
-            // SAFETY: the forked child before its exec, after the strip and the master's close; `status_wr` is its exec-status write end.
-            Some(pass) => match unsafe { place_passed(pass, status_wr) } {
-                Ok(status_wr) => status_wr,
-                // SAFETY: `write` and `_exit` are async-signal-safe; `b` is a 1-byte stack local.
-                Err(status_wr) => unsafe {
-                    let b: u8 = b'P';
-                    libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
-                    libc::_exit(126);
-                },
-            },
+            _ => break (master, pid, status),
         };
-        #[cfg(test)]
-        pre_exec_stall::in_child();
-        // SAFETY: `exec_target` is a live C string, and `argv` and `envp` null-terminated arrays
-        // of live C strings, all outliving the call; `write`/`_exit` are async-signal-safe.
+        // The child could not take its pty, or lost it: the pty is dead, not the program. Its
+        // fresh replacement opens while this master still holds the dead one's number.
+        let died_of = format!("{}: {how}", pty_label(master));
+        let fresh = replace_dead_pty(&mut deaths, died_of, &ws);
+        // SAFETY: `pid` is this attempt's child, ended before its exec, and `master` the parent's
+        // owned master fd of the dead pty.
         unsafe {
-            libc::execve(exec_target.as_ptr(), argv.as_ptr(), envp.as_ptr());
-            let b: u8 = b'E';
-            libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
-            libc::_exit(127);
+            libc::kill(pid, libc::SIGKILL);
+            libc::close(master);
         }
-    }
-    // SAFETY: `slave` is the parent's copy of the pty slave fd; `close` releases this copy.
-    unsafe {
-        libc::close(slave);
-    }
-    // SAFETY: `status_wr` is the parent's copy of the write end.
-    unsafe {
-        libc::close(status_wr);
-    }
-    let status = wait_for_exec_status(status_rd, EXEC_START_HANG);
-    retire_spent(status_rd);
+        reap(pid);
+        kit = fresh?;
+    };
     let failure: Option<(io::ErrorKind, String)> = match status {
         ExecStatus::Execed => None,
         ExecStatus::FailedBeforeExec(b'C') => Some((

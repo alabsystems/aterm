@@ -351,6 +351,8 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
                                     [last] [read=<group template>] <filter>` (no filter on `default`). Exactly one
                                     prefix rule sets the cut; hold rules carry what they keep below it in <log>.held.
                                     Needs asb built with the retention feature (the default)
+  --resident-budget BYTES:          serve: keep at most about BYTES of decoded records in memory, reading older
+                                    retained records back from the log file on demand (default: all resident)
   --retention-interval-ms N:        serve: run the retention tick at least every N ms (default 60000; a batch past
                                     what the rules' bytes or a cap allow asks for one at once)
   --max-retained-records N / --max-retained-bytes N:
@@ -1129,6 +1131,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--max-retained-bytes",
     "--retain-file",
     "--retention-interval-ms",
+    "--resident-budget",
 ];
 
 /// Flags that take no value.
@@ -2219,6 +2222,20 @@ fn refuse_live_socket(_ep: &str) -> Result<(), u8> {
 /// flushed, every two seconds.
 const SERVE_HEALTH_EVERY: Duration = Duration::from_secs(2);
 
+/// `serve --resident-budget BYTES`: how much decoded record data the log keeps in memory
+/// (`None`, every retained record, when absent); a non-numeric value is a usage error.
+fn serve_resident_budget(cli: &Cli) -> Result<Option<usize>, u8> {
+    match cli.num("--resident-budget")? {
+        None => Ok(None),
+        Some(n) => match usize::try_from(n) {
+            Ok(b) => Ok(Some(b)),
+            Err(_) => Err(usage_error(&format!(
+                "--resident-budget {n}: larger than this platform's address space"
+            ))),
+        },
+    }
+}
+
 /// `serve`'s tier: `--durability strict|ordered|relaxed` (strict when absent), and
 /// `--horizon-ms N` for ordered alone (the default horizon, one second, when absent).
 /// Strict like every other flag: an unknown tier, a horizon for another tier or a
@@ -2358,6 +2375,7 @@ fn open_broker(
     mut at_rest_key: Option<[u8; 32]>,
     anti_rollback: ServeAntiRollback,
     durability: Durability,
+    resident_budget: Option<usize>,
 ) -> io::Result<Broker> {
     #[cfg_attr(
         not(any(feature = "cap", feature = "at-rest", feature = "anti-rollback")),
@@ -2388,6 +2406,7 @@ fn open_broker(
     }
     #[cfg(not(feature = "anti-rollback"))]
     let _ = anti_rollback;
+    opts.resident_budget = resident_budget;
     Broker::open_opts(log, opts, || Ok(astream_broker::Prepared::Nothing))
 }
 
@@ -2414,8 +2433,16 @@ fn open_log(
     at_rest_key: Option<[u8; 32]>,
     anti_rollback: ServeAntiRollback,
     durability: Durability,
+    resident_budget: Option<usize>,
 ) -> Result<Broker, u8> {
-    match open_broker(log, secret, at_rest_key, anti_rollback, durability) {
+    match open_broker(
+        log,
+        secret,
+        at_rest_key,
+        anti_rollback,
+        durability,
+        resident_budget,
+    ) {
         Ok(b) => Ok(b),
         Err(e) => {
             let msg = e.to_string().to_ascii_lowercase();
@@ -2954,6 +2981,7 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
         )));
     }
     let durability = serve_durability(cli)?;
+    let resident_budget = serve_resident_budget(cli)?;
     let rate_limit = serve_rate_limit(cli)?;
     let (at_rest_src, anti_rollback) = validate_serve_at_rest(cli, durability)?;
     if has_unix && cfg!(not(unix)) {
@@ -3034,7 +3062,14 @@ fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
         refuse_live_socket(sock)?;
     }
     let created_here = !std::path::Path::new(&log).exists();
-    let broker_res = open_log(&log, secret, at_rest_key, anti_rollback, durability);
+    let broker_res = open_log(
+        &log,
+        secret,
+        at_rest_key,
+        anti_rollback,
+        durability,
+        resident_budget,
+    );
     if let Some(ref mut k) = at_rest_key {
         k.fill(0);
         std::hint::black_box(k);
@@ -3202,6 +3237,7 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
             "--max-retained-bytes",
             "--retain-file",
             "--retention-interval-ms",
+            "--resident-budget",
         ],
     )?;
     if !cli.listens.is_empty() {
@@ -3284,6 +3320,7 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
         )));
     }
     let durability = serve_durability(cli)?;
+    let resident_budget = serve_resident_budget(cli)?;
     let rate_limit = serve_rate_limit(cli)?;
     let (at_rest_src, anti_rollback) = validate_serve_at_rest(cli, durability)?;
     if tcp {
@@ -3322,7 +3359,14 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
         refuse_live_socket(sock)?;
     }
     let created_here = !std::path::Path::new(&log).exists();
-    let broker_res = open_log(&log, secret, at_rest_key, anti_rollback, durability);
+    let broker_res = open_log(
+        &log,
+        secret,
+        at_rest_key,
+        anti_rollback,
+        durability,
+        resident_budget,
+    );
     if let Some(ref mut k) = at_rest_key {
         k.fill(0);
         std::hint::black_box(k);

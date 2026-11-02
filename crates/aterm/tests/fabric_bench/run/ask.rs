@@ -300,8 +300,8 @@ pub(super) fn steps_rows(columns: &[(&str, &Spent, usize)]) -> Vec<String> {
     if columns.iter().any(|(_, s, _)| !s.dir) {
         rows.push(String::new());
         rows.push(
-            "The state dir's rows were not counted in every window: a build without debug \
-             assertions."
+            "The state dir's rows were not counted in every window: a build without its \
+             seams."
                 .to_string(),
         );
     }

@@ -38,6 +38,18 @@ pub(crate) enum Woke {
     /// macOS's Local Network answer for aterm moved as the window heard it
     /// ([`local_network_moved`]): which LAN hosts aterm may reach changed, or may have.
     LocalNetwork,
+    /// The network place settled ([`hear_place`], `aterm_netplace::moves`): the keeper read the
+    /// new network, so it is usable now, told behind a route move's with only the flap rest
+    /// (`aterm_netplace::moves::REST_MS`). Off macOS and Linux nothing tells it, tests included
+    /// (they tell it on Unix).
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        expect(
+            dead_code,
+            reason = "the place source rides the route socket, macOS's and Linux's"
+        )
+    )]
+    Place,
 }
 
 impl Woke {
@@ -49,6 +61,7 @@ impl Woke {
             Self::Browse => "a member heard on the _alab._tcp browse",
             Self::Beacon => "a Commons beacon after two minutes of no peer, or from a new one",
             Self::LocalNetwork => "macOS's Local Network answer for aterm",
+            Self::Place => "the network place settling onto a network",
         }
     }
 }
@@ -320,11 +333,25 @@ fn herded(spread: Duration, others: usize) -> Duration {
     Duration::from_millis(ms.saturating_mul(share) / HERD)
 }
 
+/// The herd a move told at `now_ms` waits out: the `book`'s other members, or none where the
+/// network place's record says this Mac is returning alone from a remote stay
+/// (`aterm_netplace::Record::lone_return`): only it moved, so it has no herd to stagger against.
+/// A router or access point reboot, which moves every Mac from the ALab LAN through offline back
+/// onto it, keeps the herd; so does a Mac with no record. Off Unix no fleet book is read, so
+/// only the tests ask.
+#[cfg(any(test, unix))]
+fn herd_given(book: usize, record: Option<&aterm_netplace::Record>, now_ms: u64) -> usize {
+    if record.is_some_and(|record| record.lone_return(now_ms)) {
+        0
+    } else {
+        book
+    }
+}
+
 /// How many other members share this Mac's moves: the peers its fleet book holds and its copy of
 /// its issuer's book, each once ([`aterm_net::fleet_member::answer_key`]), this Mac's own node
-/// aside; none in no fleet. Read at each move, so a join or a leave counts from the next one. A
-/// member away from its LAN still counts the fleet (the book does not say where each is), and so
-/// waits its share, in the consumers that dial the fleet: the API reach probe's watch waits none
+/// aside; none in no fleet, and none for a Mac returning alone ([`herd_given`]). Read at each
+/// move, so a join or a leave counts from the next one. The API reach probe's watch waits none
 /// ([`Moved::watch_at_once`]).
 #[cfg(all(not(test), unix))]
 fn members_here() -> usize {
@@ -340,12 +367,19 @@ fn members_here() -> usize {
         .and_then(|issuer| issuer.node.as_deref())
         .map(|issuer| member::read_issuer_book(&state, issuer))
         .unwrap_or_default();
-    book.iter()
+    let others = book
+        .iter()
         .chain(&copies)
         .filter(|peer| peer.node.is_none() || peer.node != own)
         .map(member::answer_key)
         .collect::<std::collections::BTreeSet<_>>()
-        .len()
+        .len();
+    let record = aterm_netplace::record::read(&aterm_netplace::record::dir(&state));
+    herd_given(
+        others,
+        record.as_ref().map(|written| &written.record),
+        aterm_netplace::unix_ms_now(),
+    )
 }
 
 /// None off Unix, which keeps no fleet book, and in a test build, whose signals name their own
@@ -434,6 +468,15 @@ pub(crate) fn local_network_moved() {
 fn start_sources(moved: &Arc<Moved>) {
     #[cfg(all(not(test), any(target_os = "macos", target_os = "linux")))]
     hear_routes(moved);
+    #[cfg(all(not(test), any(target_os = "macos", target_os = "linux")))]
+    if let Some(state) = aterm_types::dirs::state_dir() {
+        hear_place(
+            moved,
+            aterm_netplace::record::dir(&state),
+            aterm_uds::network::RouteChanges::open(),
+            PLACE_LOOKS,
+        );
+    }
     hear_alab_tcp_on(moved, &[]);
     let _ = moved;
 }
@@ -714,6 +757,96 @@ fn hear_routes(moved: &Arc<Moved>) {
         (Woke::Route, REST),
         move || Some(changes.wait(LONG)),
     );
+}
+
+/// How often the place source reads the keeper's record: every second for a minute after a route
+/// change (the keeper reads the new network within its settle), once a minute otherwise.
+#[cfg(all(not(test), any(target_os = "macos", target_os = "linux")))]
+const PLACE_LOOKS: PlaceLooks = PlaceLooks {
+    after_a_change: Duration::from_secs(1),
+    fast_for: Duration::from_secs(60),
+    steady: Duration::from_secs(60),
+};
+
+/// The place source's pace (`PLACE_LOOKS`).
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "the place source rides the route socket, macOS's and Linux's"
+    )
+)]
+pub(crate) struct PlaceLooks {
+    /// The look while a route change settles.
+    pub(crate) after_a_change: Duration,
+    /// How long after a route change it looks that often.
+    pub(crate) fast_for: Duration,
+    /// The look otherwise.
+    pub(crate) steady: Duration,
+}
+
+/// THE PLACE SOURCE (`aterm_netplace::moves`): reads the network place's record in `dir` at
+/// `looks`' pace, faster for a while after each change `routes` (this source's own route socket)
+/// tells, and tells [`Woke::Place`] the moment the place settles onto another network than the
+/// one it last told, with no rest: the route source tells a move at its first message (often the
+/// old address going away) and rests [`REST`], and this is the move that says the new network is
+/// usable. A settle back onto the network last told (a flapping link) is told at most once a
+/// rest (`aterm_netplace::moves::REST_MS`), so each consumer's converge pass, probe lease,
+/// heartbeat and claims re-read stays bounded.
+/// Whether the herd's spread applies is [`herd_given`]'s: a return from away waits none, a router
+/// reboot keeps it. Whether its thread started.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    expect(
+        dead_code,
+        reason = "the place source rides the route socket, macOS's and Linux's"
+    )
+)]
+#[cfg(unix)]
+pub(crate) fn hear_place(
+    moved: &Arc<Moved>,
+    dir: std::path::PathBuf,
+    routes: Option<aterm_uds::network::RouteChanges>,
+    looks: PlaceLooks,
+) -> bool {
+    // The first look, on the caller's thread: where the place stands as the source starts is no
+    // move, and any settle after this returns is one.
+    let mut watch = aterm_netplace::moves::SettledWatch::new();
+    let _ = watch.look(
+        aterm_netplace::record::read(&dir)
+            .as_ref()
+            .map(|written| &written.record),
+        aterm_netplace::unix_ms_now(),
+    );
+    let mut fast_until: Option<Instant> = None;
+    spawn_source(
+        "aterm-moved-place",
+        Arc::clone(moved),
+        (Woke::Place, Duration::ZERO),
+        move || {
+            let look = if fast_until.is_some_and(|until| Instant::now() < until) {
+                looks.after_a_change
+            } else {
+                looks.steady
+            };
+            let changed = match &routes {
+                Some(routes) => routes.wait(look),
+                None => {
+                    std::thread::sleep(look);
+                    false
+                }
+            };
+            if changed {
+                fast_until = Instant::now().checked_add(looks.fast_for);
+            }
+            let record = aterm_netplace::record::read(&dir);
+            Some(watch.look(
+                record.as_ref().map(|written| &written.record),
+                aterm_netplace::unix_ms_now(),
+            ))
+        },
+    )
 }
 
 /// How long every peer the Commons runtime heard must go unheard for the next one heard to be a
@@ -1073,6 +1206,119 @@ pub(crate) mod tests {
         let mut waiting = spread.watch_at_once();
         spread.tell_at(Woke::Beacon, Instant::now() + secs(3600));
         assert_eq!(waiting.wait(HANG), Woke::Beacon, "at once, waiting");
+    }
+
+    /// A RETURN FROM AWAY WAITS NO HERD, A REBOOT KEEPS IT (docs/DESIGN-network-place-2026-11-01.md,
+    /// part B): a move told as this Mac comes back from a long stay on a phone hotspot (told
+    /// before the keeper read home, or after) waits none of its fleet's spread, since only it
+    /// moved; a router or access point reboot (the ALab LAN, offline, the same ALab LAN) and a
+    /// Mac with no record keep the herd of 35.
+    /// NEGATIVE CONTROL: a `herd_given` that keeps the book whatever the record (the original
+    /// `members_here`) fails "a lone return waits no herd".
+    #[test]
+    fn a_return_from_away_waits_no_herd_and_a_reboot_keeps_it() {
+        use aterm_netplace::place::{Known, Record, step};
+        let t0 = 1_800_000_000_000_u64;
+        let min = 60_000;
+        let home = aterm_netplace::sample::home(t0, 3);
+        let hotspot = aterm_netplace::sample::hotspot(t0, t0);
+        let facts = |place: &aterm_netplace::Place| aterm_netplace::Facts {
+            route: place.route.clone(),
+            tunnel: None,
+            path: place.path,
+        };
+        let offline = aterm_netplace::Facts::default();
+        let walk = |record: Record, steps: &[(&aterm_netplace::Facts, u64)]| {
+            steps.iter().fold(record, |record, (facts, now)| {
+                step(&record, facts, &Default::default(), None, *now, Some(t0)).0
+            })
+        };
+        let learned = Record {
+            remembered: vec![Known {
+                network: home.network.clone().expect("strong"),
+                learned_ms: t0,
+                confirmed_ms: t0,
+            }],
+            ..Record::default()
+        };
+        let (at_home, on_hotspot) = (facts(&home), facts(&hotspot));
+        let away = walk(learned.clone(), &[(&at_home, t0), (&on_hotspot, t0 + min)]);
+        assert_eq!(
+            herd_given(35, Some(&away), t0 + 60 * min),
+            0,
+            "a lone return waits no herd"
+        );
+        let arrived = walk(away, &[(&at_home, t0 + 60 * min)]);
+        assert_eq!(
+            herd_given(35, Some(&arrived), t0 + 60 * min + 5_000),
+            0,
+            "told once the keeper read home"
+        );
+        let rebooted = walk(
+            learned,
+            &[
+                (&at_home, t0),
+                (&offline, t0 + 30 * min),
+                (&at_home, t0 + 31 * min),
+            ],
+        );
+        assert_eq!(
+            herd_given(35, Some(&rebooted), t0 + 31 * min),
+            35,
+            "a reboot keeps the herd"
+        );
+        assert_eq!(herd_given(35, None, t0), 35, "no record keeps the herd");
+    }
+
+    /// THE SETTLED PLACE IS A MOVE TOLD WITH NO REST: the place source over a record directory
+    /// tells each watch [`Woke::Place`] once the record settles onto a network (from offline),
+    /// and again at once when it settles onto another one.
+    /// NEGATIVE CONTROL: a source that reads no record (its closure answering `Some(false)`)
+    /// tells nothing, and the first wait hangs past the one-minute detector: "the arrival".
+    #[cfg(unix)]
+    #[test]
+    fn a_settled_place_is_told_as_a_move_with_no_rest() {
+        use aterm_netplace::place::{Record, step};
+        use aterm_netplace::record::{Written, write};
+        let root = aterm_tempfile::tempdir().expect("a scratch directory");
+        let dir = aterm_netplace::record::dir(root.path());
+        let t0 = 1_800_000_000_000_u64;
+        let home = aterm_netplace::sample::home(t0, 3);
+        let other = {
+            let mut route = home.route.clone().expect("a route");
+            route.gateway_hw = Some(vec![9, 9, 9, 9, 9, 9]);
+            route
+        };
+        let facts = |route: Option<aterm_netplace::RouteFacts>| aterm_netplace::Facts {
+            route,
+            tunnel: None,
+            path: home.path,
+        };
+        let mut record = Record::default();
+        let mut put = |facts: &aterm_netplace::Facts, now: u64| {
+            record = step(&record, facts, &Default::default(), None, now, Some(t0)).0;
+            write(
+                &dir,
+                &Written {
+                    record: record.clone(),
+                    ..Written::default()
+                },
+            )
+            .expect("the record");
+        };
+        put(&facts(None), t0);
+        let moved = Arc::new(Moved::new());
+        let mut watch = moved.watch();
+        let looks = PlaceLooks {
+            after_a_change: Duration::from_millis(5),
+            fast_for: Duration::from_millis(5),
+            steady: Duration::from_millis(5),
+        };
+        assert!(hear_place(&moved, dir.clone(), None, looks));
+        put(&facts(home.route.clone()), t0 + 60_000);
+        assert_eq!(watch.wait(HANG), Woke::Place, "the arrival");
+        put(&facts(Some(other)), t0 + 120_000);
+        assert_eq!(watch.wait(HANG), Woke::Place, "another network, at once");
     }
 
     /// THIS MAC'S SPREAD: derived from its node id, else its host name; the same each time for

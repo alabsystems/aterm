@@ -3550,11 +3550,10 @@ fn warnings(
     w
 }
 
-/// The local clock's offset from UTC in seconds, read once per process (`tm_gmtoff`); `None`
+/// The local clock's offset from UTC in seconds at `ms` since the epoch (`tm_gmtoff`); `None`
 /// where the C library cannot say, and the report then prints UTC and says so.
-pub(crate) fn local_offset() -> Option<i64> {
-    static OFFSET: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
-    *OFFSET.get_or_init(aterm_uds::zone::local_offset_now)
+pub(crate) fn local_offset_at_ms(ms: u64) -> Option<i64> {
+    aterm_uds::zone::local_offset_at(i64::try_from(ms / 1000).unwrap_or(i64::MAX / 2))
 }
 
 /// A record's time at the clock's offset: `HH:MM:SS` within 20 hours of `now`, `MM-DDTHH:MM`
@@ -3575,16 +3574,43 @@ pub fn clock(t_ms: u64, now_ms: u64, offset: i64) -> String {
     }
 }
 
-/// How the times in this report are zoned, for the header.
-pub(crate) fn zone_label(offset: Option<i64>) -> String {
+/// [`clock`] at `t_ms`'s own local offset (`local_at`, Unix seconds to UTC offset seconds),
+/// naming that offset (`UTC±HH:MM`, or `UTC` when `local_at` returns `None`) whenever it
+/// differs from `header_offset`.
+#[must_use]
+pub fn clock_at(
+    t_ms: u64,
+    now_ms: u64,
+    header_offset: Option<i64>,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> String {
+    if t_ms == 0 {
+        return "-".to_string();
+    }
+    let secs = i64::try_from(t_ms / 1000).unwrap_or(i64::MAX / 2);
+    let row_offset = local_at(secs);
+    let base = clock(t_ms, now_ms, row_offset.unwrap_or(0));
+    if row_offset == header_offset {
+        base
+    } else {
+        format!("{base} {}", zone_word(row_offset))
+    }
+}
+
+pub(crate) fn zone_word(offset: Option<i64>) -> String {
     match offset {
-        None => "times UTC".to_string(),
+        None => "UTC".to_string(),
         Some(o) => {
             let sign = if o < 0 { '-' } else { '+' };
             let o = o.abs();
-            format!("times UTC{sign}{:02}:{:02}", o / 3600, (o % 3600) / 60)
+            format!("UTC{sign}{:02}:{:02}", o / 3600, (o % 3600) / 60)
         }
     }
+}
+
+/// How the times in this report are zoned, for the header.
+pub(crate) fn zone_label(offset: Option<i64>) -> String {
+    format!("times {}", zone_word(offset))
 }
 
 fn table(out: &mut String, header: &[&str], rows: &[Vec<String>], right: &[bool]) {
@@ -3623,10 +3649,20 @@ fn num(v: Option<u64>) -> String {
     v.map_or_else(|| "-".to_string(), |n| n.to_string())
 }
 
+#[cfg(test)]
 fn traffic_cells(t: &Traffic, now_ms: u64, offset: i64) -> Vec<String> {
+    traffic_cells_at(t, now_ms, Some(offset), &|_| Some(offset))
+}
+
+fn traffic_cells_at(
+    t: &Traffic,
+    now_ms: u64,
+    header_offset: Option<i64>,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> Vec<String> {
     vec![
         format!("@{}", t.off),
-        clock(t.t_ms, now_ms, offset),
+        clock_at(t.t_ms, now_ms, header_offset, local_at),
         t.kind.clone(),
         t.len.to_string(),
         t.trust.to_string(),
@@ -4017,7 +4053,14 @@ pub const REMOTE_NODE_NOTE: &str = "remote = no aterm instance here answers as t
 /// Render the report as the text a human reads.
 #[must_use]
 pub fn render_text(r: &Report) -> String {
-    let offset = local_offset();
+    render_text_local(r, &aterm_uds::zone::local_offset_at)
+}
+
+/// [`render_text`], asking `local_at` (Unix seconds to UTC offset seconds) at the report's
+/// timestamp and at each traffic record's timestamp.
+#[must_use]
+pub fn render_text_local(r: &Report, local_at: &dyn Fn(i64) -> Option<i64>) -> String {
+    let offset = local_at(i64::try_from(r.now_ms / 1000).unwrap_or(i64::MAX / 2));
     let off = offset.unwrap_or(0);
     let mut out = String::new();
     out.push_str(&format!(
@@ -4388,7 +4431,7 @@ pub fn render_text(r: &Report) -> String {
         let rows: Vec<Vec<String>> = r
             .traffic
             .iter()
-            .map(|t| traffic_cells(t, r.now_ms, off))
+            .map(|t| traffic_cells_at(t, r.now_ms, offset, local_at))
             .collect();
         table(
             &mut out,
@@ -4803,7 +4846,20 @@ fn status_main(json: bool) -> ExitCode {
 /// One `tail` line.
 #[must_use]
 pub fn tail_line(t: &Traffic, now_ms: u64, offset: i64, bodies: bool) -> String {
-    let c = traffic_cells(t, now_ms, offset);
+    tail_line_at(t, now_ms, Some(offset), &|_| Some(offset), bodies)
+}
+
+/// [`tail_line`] at `t.t_ms`'s own local offset (`local_at`), naming that offset whenever it
+/// differs from `header_offset`.
+#[must_use]
+pub fn tail_line_at(
+    t: &Traffic,
+    now_ms: u64,
+    header_offset: Option<i64>,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+    bodies: bool,
+) -> String {
+    let c = traffic_cells_at(t, now_ms, header_offset, local_at);
     let mut line = format!(
         "{:<8} {:<8}  {:<10} {:>5}  {:<8} {:<42} {}",
         c[0], c[1], c[2], c[3], c[4], c[5], c[6]
@@ -4901,8 +4957,8 @@ fn tail_gap_json(filter: &str, gap: &astream_broker::Gap) -> String {
 struct TailFmt {
     bodies: bool,
     json: bool,
-    /// The local clock's offset from UTC, seconds (the table's TIME column).
-    offset: i64,
+    /// The local clock's offset from UTC when `tail` printed its header, seconds.
+    offset: Option<i64>,
 }
 
 impl TailFmt {
@@ -4910,16 +4966,35 @@ impl TailFmt {
         Self {
             bodies,
             json,
-            offset: 0,
+            offset: Some(0),
         }
     }
 
     fn record(self, fleet: &str, off: u64, subject: &str, raw: &[u8]) -> String {
+        self.record_at(
+            fleet,
+            off,
+            subject,
+            raw,
+            crate::now_ms(),
+            &aterm_uds::zone::local_offset_at,
+        )
+    }
+
+    fn record_at(
+        self,
+        fleet: &str,
+        off: u64,
+        subject: &str,
+        raw: &[u8],
+        now_ms: u64,
+        local_at: &dyn Fn(i64) -> Option<i64>,
+    ) -> String {
         let t = traffic_of(fleet, off, subject, raw);
         if self.json {
             tail_json(fleet, subject, &t, self.bodies)
         } else {
-            tail_line(&t, crate::now_ms(), self.offset, self.bodies)
+            tail_line_at(&t, now_ms, self.offset, local_at, self.bodies)
         }
     }
 
@@ -5009,6 +5084,85 @@ fn is_subject_filter(f: &str) -> bool {
     })
 }
 
+/// The broker link a tail reads on ([`TailLink::open`]): one connection with the caps
+/// attached, on which the tail subscribes where the caps grant what it reads, and which reads
+/// each face on by told fetches where they do not ([`tail_faces`]).
+struct TailLink {
+    conn: Conn,
+    closer: transport::Closer,
+    /// What the tail reads: its `--filter`, or the fleet's root.
+    whole: String,
+    /// Where the caps do not grant the fleet's root: the faces the tail reads apart.
+    faces: Option<Vec<String>>,
+    /// The log's head when the link opened: where a tail with no `--from` starts.
+    head: u64,
+    /// The read bound [`TailLink::open`] set on `closer`, as it recorded it (astream's closer
+    /// has no getter for it): the connect's ([`io_timeout`]), or, where it reads `faces` on by
+    /// fetches, the deadline it opened with.
+    read_timeout: Duration,
+}
+
+impl TailLink {
+    /// The link [`tail`] reads on: where it reads faces apart, every read on it waits as
+    /// astream lets a stream wait ([`astream_broker::IDLE_MARK_DEADLINE`]), not for the 3 s of
+    /// a one-shot request ([`IO_TIMEOUT`]), as a live tail fetches for as long as it runs.
+    fn for_tail(cfg: &Config, want: Option<&str>) -> io::Result<Self> {
+        Self::open(cfg, want, astream_broker::IDLE_MARK_DEADLINE)
+    }
+
+    /// Dial `cfg`'s broker, attach its caps and read the head of what the tail reads (`want`,
+    /// else the fleet's root). Where the broker refuses the fleet's root to those caps, the
+    /// tail reads apart each face they grant ([`readable_faces`]), and every read on the link
+    /// then waits `deadline` at most.
+    fn open(cfg: &Config, want: Option<&str>, deadline: Duration) -> io::Result<Self> {
+        let broker = safe(&cfg.broker, 256);
+        let (mut conn, closer) = transport::connect(&cfg.broker, io_timeout())
+            .map_err(|e| io::Error::new(e.kind(), format!("the broker at {broker}: {e}")))?;
+        transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
+        let whole = match want {
+            Some(f) => {
+                let root = fleet_root(&cfg.fleet);
+                let prefix = root.trim_end_matches('>');
+                if !f.starts_with(prefix) {
+                    return Err(io::Error::other(format!(
+                        "--filter {} is not under this fleet ({prefix}…)",
+                        safe(f, 128)
+                    )));
+                }
+                f.to_string()
+            }
+            None => fleet_root(&cfg.fleet),
+        };
+        let (faces, head) = match conn.fetch(0, &whole, 0) {
+            Ok((_, (_, head))) => (None, head),
+            Err(e) if refused(&e) && want.is_some() => return Err(e),
+            Err(e) if refused(&e) => {
+                let faces = readable_faces(&cfg.fleet, &cfg.cap_files);
+                let head = faces
+                    .iter()
+                    .find_map(|f| conn.fetch(0, f, 0).ok().map(|(_, (_, h))| h))
+                    .ok_or(e)?;
+                (Some(faces), head)
+            }
+            Err(e) => return Err(e),
+        };
+        let read_timeout = if faces.is_some() {
+            closer.set_read_timeout(Some(deadline))?;
+            deadline
+        } else {
+            io_timeout()
+        };
+        Ok(Self {
+            conn,
+            closer,
+            whole,
+            faces,
+            head,
+            read_timeout,
+        })
+    }
+}
+
 fn tail(
     cfg: &Config,
     fmt: TailFmt,
@@ -5016,46 +5170,32 @@ fn tail(
     want: Option<&str>,
     out: &mut impl Write,
 ) -> io::Result<()> {
+    tail_on(cfg, TailLink::for_tail(cfg, want)?, fmt, from, out)
+}
+
+/// [`tail`] on `link`, from `from`, else from the head the link read.
+fn tail_on(
+    cfg: &Config,
+    link: TailLink,
+    fmt: TailFmt,
+    from: Option<u64>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let TailLink {
+        mut conn,
+        closer,
+        whole,
+        faces,
+        head,
+        read_timeout,
+    } = link;
     let broker = safe(&cfg.broker, 256);
-    let (mut conn, closer) = transport::connect(&cfg.broker, io_timeout())
-        .map_err(|e| io::Error::new(e.kind(), format!("the broker at {broker}: {e}")))?;
-    transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
-    let whole = match want {
-        Some(f) => {
-            let root = fleet_root(&cfg.fleet);
-            let prefix = root.trim_end_matches('>');
-            if !f.starts_with(prefix) {
-                return Err(io::Error::other(format!(
-                    "--filter {} is not under this fleet ({prefix}…)",
-                    safe(f, 128)
-                )));
-            }
-            f.to_string()
-        }
-        None => fleet_root(&cfg.fleet),
-    };
-    let (faces, head) = match conn.fetch(0, &whole, 0) {
-        Ok((_, (_, head))) => (None, head),
-        Err(e) if refused(&e) && want.is_some() => return Err(e),
-        Err(e) if refused(&e) => {
-            let faces = readable_faces(&cfg.fleet, &cfg.cap_files);
-            let head = faces
-                .iter()
-                .find_map(|f| conn.fetch(0, f, 0).ok().map(|(_, (_, h))| h))
-                .ok_or(e)?;
-            (Some(faces), head)
-        }
-        Err(e) => return Err(e),
-    };
     let filter = faces
         .as_ref()
         .map_or_else(|| whole.clone(), |f| f.join(" "));
     let start = from.unwrap_or(head);
-    let offset = local_offset();
-    let fmt = TailFmt {
-        offset: offset.unwrap_or(0),
-        ..fmt
-    };
+    let offset = local_offset_at_ms(crate::now_ms());
+    let fmt = TailFmt { offset, ..fmt };
     eprintln!(
         "aterm fabric tail — {filter} on {broker}, from @{start}{} ({}); Ctrl-C stops{}",
         if from.is_some() {
@@ -5088,8 +5228,7 @@ fn tail(
         return Ok(());
     }
     if let Some(faces) = faces {
-        closer.set_read_timeout(Some(astream_broker::IDLE_MARK_DEADLINE))?;
-        return tail_faces(cfg, &mut conn, &faces, start, fmt, out);
+        return tail_faces(cfg, &mut conn, &faces, start, read_timeout, fmt, out);
     }
     let mut sub = conn.subscribe(start, &filter)?;
     closer.set_read_timeout(None)?;
@@ -5259,17 +5398,25 @@ impl FaceMerge {
     }
 }
 
+/// The words a tail's error ends with: where a resume starts, as every record below `floor` is
+/// printed.
+fn resume_from(floor: u64) -> String {
+    format!("(resume with --from {floor})")
+}
+
 /// [`tail_faces`]'s merge, run until it must wait for a stream: print what `merge` says to
 /// (`print` false: the reader is gone), and read a face on where it says to by `fetch(face,
 /// filter, from)`, a page in offset order and the offset after the last record the broker
-/// scanned. Whether the reader is still there. A fetch that fails, or moves nothing, ends the
-/// tail with an error that names the face and the `--from` a resume starts at, as every record
-/// below the merge's floor is printed. LAWS: it returns only where nothing is held or a face
-/// that has not said it is caught up holds the merge with fewer than its hold held.
+/// scanned, which waits `deadline` at most for the broker. Whether the reader is still there.
+/// A fetch that fails, or moves nothing, ends the tail with an error that names the face and
+/// the `--from` a resume starts at ([`resume_from`]), as every record below the merge's floor
+/// is printed. LAWS: it returns only where nothing is held or a face that has not said it is
+/// caught up holds the merge with fewer than its hold held.
 fn drain_merge(
     merge: &mut FaceMerge,
     faces: &[String],
     broker: &str,
+    deadline: Duration,
     mut fetch: impl FnMut(usize, &str, u64) -> io::Result<(Vec<astream_broker::Record>, u64)>,
     mut print: impl FnMut(u64, &str, &[u8]) -> bool,
 ) -> io::Result<bool> {
@@ -5286,18 +5433,17 @@ fn drain_merge(
                 };
                 let failed = |e: io::Error, floor: u64| {
                     let why = match e.kind() {
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => format!(
-                            "no answer in {} s",
-                            astream_broker::IDLE_MARK_DEADLINE.as_secs()
-                        ),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                            format!("no answer in {} s", deadline.as_secs())
+                        }
                         _ => e.to_string(),
                     };
                     io::Error::new(
                         e.kind(),
                         format!(
-                            "the broker at {broker} did not read {} on from @{from}: {why} \
-                             (resume with --from {floor})",
-                            safe(filter, 128)
+                            "the broker at {broker} did not read {} on from @{from}: {why} {}",
+                            safe(filter, 128),
+                            resume_from(floor)
                         ),
                     )
                 };
@@ -5347,14 +5493,17 @@ fn read_face(
 
 /// `tail` where the caps do not grant the fleet's root: one subscription per readable face
 /// ([`readable_faces`]), merged by offset ([`FaceMerge`], [`drain_merge`]). `conn` reads a face
-/// on by a fetch where the merge says to; `tail` bounds its reads as astream bounds a stream's
-/// ([`astream_broker::IDLE_MARK_DEADLINE`]), not by the 3 s of a one-shot request, as a live
-/// tail fetches for as long as it runs.
+/// on by a fetch where the merge says to, each read on it bounded by `deadline` (its
+/// [`TailLink`]'s, which for [`tail`] is astream's bound on a stream,
+/// [`astream_broker::IDLE_MARK_DEADLINE`]). A face of a broker that refuses `IdleMarks` (one
+/// that predates them) is caught from `start`, as its stream marks nothing: it is read on by
+/// fetches, never waited for.
 fn tail_faces(
     cfg: &Config,
     conn: &mut Conn,
     faces: &[String],
     start: u64,
+    deadline: Duration,
     fmt: TailFmt,
     out: &mut impl Write,
 ) -> io::Result<()> {
@@ -5380,6 +5529,7 @@ fn tail_faces(
             &mut merge,
             faces,
             &broker,
+            deadline,
             |_, filter, from| {
                 transport::fetch_told_kept(conn, from, filter, transport::POST_PAGE)
                     .map(|((page, (next, _)), _)| (page, next))
@@ -5807,6 +5957,7 @@ mod tests {
                 merge,
                 &faces,
                 "/b",
+                astream_broker::IDLE_MARK_DEADLINE,
                 |face, _, from| Ok(fetch(face, from)),
                 |off, _, _| {
                     printed.push(off);
@@ -5942,6 +6093,7 @@ mod tests {
             &mut merge,
             &faces,
             "/b",
+            astream_broker::IDLE_MARK_DEADLINE,
             |face, _, from| match from {
                 0 => Ok(face_page(&[vec![1, 2], vec![]], 3, face, from)),
                 _ => Err(io::Error::from(io::ErrorKind::TimedOut)),
@@ -5956,7 +6108,7 @@ mod tests {
             ended
                 .as_ref()
                 .is_err_and(|e| e.kind() == io::ErrorKind::TimedOut
-                    && e.to_string().contains("--from 3")
+                    && e.to_string().contains(&resume_from(3))
                     && e.to_string().contains(&faces[0])),
             "{ended:?}"
         );
@@ -6151,6 +6303,324 @@ mod tests {
             Ok(()),
             "it ends when its reader does"
         );
+    }
+
+    /// A GUARDED BROKER AND A CAP THAT GRANTS TWO OF ITS FACES APART: the broker serves at
+    /// `real`; `god` holds the fleet's root, so it publishes anywhere on f1; `cap` grants
+    /// [`TwoFaces::FACES`] and not the root, so a tail under it reads the two faces apart
+    /// ([`TailLink::open`]).
+    #[cfg(unix)]
+    struct TwoFaces {
+        _server: astream_broker::BrokerHandle,
+        god: Conn,
+        real: std::path::PathBuf,
+        cap: std::path::PathBuf,
+        seq: u64,
+    }
+
+    #[cfg(unix)]
+    impl TwoFaces {
+        /// The two faces, in the order [`readable_faces`] reads them.
+        const FACES: [&'static str; 2] = ["/f/f1/in/n-a/>", "/f/f1/pub/>"];
+        /// A subject on each face.
+        const SUBJECTS: [&'static str; 2] =
+            ["/f/f1/in/n-a/s-y/n-b/note", "/f/f1/pub/n-b/s-x/presence"];
+
+        fn new(dir: &std::path::Path) -> Self {
+            let secret = vec![0x5a_u8; 32];
+            let broker = astream_broker::Broker::open_guarded_with(
+                dir.join("b.log"),
+                secret.clone(),
+                astream_broker::Durability::Relaxed,
+            )
+            .expect("a guarded broker");
+            let real = dir.join("b.sock");
+            let server = broker.serve(&real).expect("serve the broker");
+            let (mut god, _) =
+                transport::connect(&real.to_string_lossy(), aterm_spec::wait::MUST_HAPPEN)
+                    .expect("dial");
+            let all = astream_cap::mint(&secret, "/f/f1/>").expect("mint the fleet's cap");
+            god.attach(&all.filter, &all.tag).expect("attach it");
+            let cap = dir.join("two.cap");
+            let lines: String = Self::FACES
+                .iter()
+                .map(|face| {
+                    let c = astream_cap::mint(&secret, &format!("ro:{face}")).expect("mint");
+                    format!("{}\n", astream_cap::capfile::format_line(&c.filter, &c.tag))
+                })
+                .collect();
+            std::fs::write(&cap, lines).expect("the two faces' cap");
+            Self {
+                _server: server,
+                god,
+                real,
+                cap,
+                seq: 0,
+            }
+        }
+
+        /// A tail's config of f1 on the broker at `sock` (the broker's own socket, or one in
+        /// front of it), under the two faces' cap.
+        fn cfg(&self, sock: &std::path::Path) -> Config {
+            crate::cli::parse(&[
+                "--fleet".to_string(),
+                "f1".to_string(),
+                "--broker".to_string(),
+                sock.to_string_lossy().into_owned(),
+                "--cap-file".to_string(),
+                self.cap.to_string_lossy().into_owned(),
+            ])
+            .expect("a config")
+            .cfg
+        }
+
+        /// Publish a record on face `face`: its offset.
+        fn publish(&mut self, face: usize) -> u64 {
+            self.seq += 1;
+            let body = format!("v=1 t={} state=live", 1_700_000_000_000 + self.seq);
+            self.god
+                .publish(7, self.seq, Self::SUBJECTS[face], body.as_bytes())
+                .expect("lands")
+                .0
+        }
+    }
+
+    /// A BROKER IN FRONT OF THE ONE AT `real`, listening at `at`, that relays every frame
+    /// either way, but: where `older`, it answers `IdleMarks`, and `GapNotices`, which a broker
+    /// that predates idle marks predates too (astream's `Client::ask_for_tail`), as such a
+    /// broker does, with what astream's broker answers a request it cannot decode, `Error 5
+    /// "malformed request"` ([`astream_broker::proto::ERR_REFUSED`]), keeping the connection;
+    /// and once the flag it hands back is set, it takes every request it is sent and answers
+    /// none, as a stalled broker does, while the streams it serves go on.
+    #[cfg(unix)]
+    fn broker_in_front(
+        real: &std::path::Path,
+        at: &std::path::Path,
+        older: bool,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        use astream_broker::proto::{
+            decode_request, encode_response, read_frame, write_frame, ERR_REFUSED,
+        };
+        use astream_broker::{Request, Response};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::{atomic::Ordering, Arc, Mutex, PoisonError};
+        let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = UnixListener::bind(at).expect("bind the broker in front");
+        let real = real.to_path_buf();
+        let stall = Arc::clone(&stalled);
+        std::thread::spawn(move || {
+            for peer in listener.incoming() {
+                let (Ok(peer), Ok(broker)) = (peer, UnixStream::connect(&real)) else {
+                    return;
+                };
+                let to_peer = Arc::new(Mutex::new(peer.try_clone().expect("the peer's writer")));
+                let back = Arc::clone(&to_peer);
+                let mut from_broker = broker.try_clone().expect("the broker's reader");
+                let peer_end = peer.try_clone().expect("the peer's end");
+                std::thread::spawn(move || {
+                    while let Ok(Some(frame)) = read_frame(&mut from_broker) {
+                        let mut to = back.lock().unwrap_or_else(PoisonError::into_inner);
+                        if write_frame(&mut *to, &frame).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = peer_end.shutdown(std::net::Shutdown::Both);
+                });
+                let stall = Arc::clone(&stall);
+                let (mut from_peer, mut to_broker) = (peer, broker);
+                std::thread::spawn(move || {
+                    while let Ok(Some(frame)) = read_frame(&mut from_peer) {
+                        let sent = match decode_request(&frame) {
+                            _ if stall.load(Ordering::SeqCst) => Ok(()),
+                            Some(Request::IdleMarks | Request::GapNotices) if older => {
+                                let refusal = Response::Error {
+                                    code: ERR_REFUSED,
+                                    msg: "malformed request".to_string(),
+                                };
+                                let mut to = to_peer.lock().unwrap_or_else(PoisonError::into_inner);
+                                write_frame(&mut *to, &encode_response(&refusal))
+                            }
+                            _ => write_frame(&mut to_broker, &frame),
+                        };
+                        if sent.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to_broker.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        stalled
+    }
+
+    /// A BROKER THAT REFUSES `IdleMarks`, AS ONE THAT PREDATES THEM DOES, MARKS NO TAIL, so
+    /// [`tail_faces`] takes each of its faces as caught at the tail's start (`merge.caught(i,
+    /// start)`) and reads every face on by a told fetch, never waiting for a stream that says
+    /// nothing until its face's next record. Two faces, their records interleaved by offset,
+    /// tailed from the fourth record: every record at or above it prints once, offsets strictly
+    /// increasing, then a live one, and the tail returns when its reader goes. The fetch link
+    /// waits for the one-minute hang detector, so no fetch the broker answers is held to a
+    /// budget.
+    /// NEGATIVE CONTROL (run): without the `caught` call the merge holds the last record for
+    /// the other face's stream, which never says it is past it: the hang detector fires.
+    #[cfg(unix)]
+    #[test]
+    fn a_tail_reads_each_face_of_a_broker_that_refuses_idle_marks_on_by_fetches_in_offset_order() {
+        use aterm_spec::wait::MUST_HAPPEN;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-tail-older")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let mut world = TwoFaces::new(dir.path());
+        let older = dir.path().join("older.sock");
+        let _stall = broker_in_front(&world.real, &older, true);
+        let cfg = world.cfg(&older);
+        let offs: Vec<u64> = (0..12).map(|i| world.publish(i % 2)).collect();
+        let start = offs[3];
+        let want: Vec<u64> = offs.iter().copied().filter(|off| *off >= start).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut out = Sent {
+            tx,
+            buf: Vec::new(),
+            lines: want.len() + 1,
+        };
+        std::thread::spawn(move || {
+            let ended = TailLink::open(&cfg, None, MUST_HAPPEN).and_then(|link| {
+                tail_on(&cfg, link, TailFmt::new(false, true), Some(start), &mut out)
+            });
+            let _ = done_tx.send(ended.map_err(|e| e.to_string()));
+        });
+        let mut printed = Vec::new();
+        while printed.len() < want.len() {
+            let line = rx
+                .recv_timeout(MUST_HAPPEN)
+                .unwrap_or_else(|e| panic!("the records from @{start} ({printed:?}): {e}"));
+            printed.extend(tail_off(&line));
+        }
+        assert!(
+            printed.windows(2).all(|w| w[0] < w[1]),
+            "offsets strictly increasing: {printed:?}"
+        );
+        assert_eq!(printed, want, "every record at or above the start, once");
+        let live = world.publish(0);
+        let line = rx
+            .recv_timeout(MUST_HAPPEN)
+            .unwrap_or_else(|e| panic!("the live record @{live}: {e}"));
+        assert_eq!(tail_off(&line), Some(live), "{line}");
+        world.publish(1);
+        assert_eq!(
+            done_rx.recv_timeout(MUST_HAPPEN).expect("the tail returns"),
+            Ok(()),
+            "it ends when its reader does"
+        );
+    }
+
+    /// THE TAIL'S FETCH LINK WAITS AS ASTREAM LETS A STREAM WAIT: where the caps do not grant
+    /// the fleet's root, the link [`tail`] opens ([`TailLink::for_tail`]) reads the faces apart
+    /// and is opened with [`astream_broker::IDLE_MARK_DEADLINE`], never the 3 s of a one-shot
+    /// request ([`IO_TIMEOUT`]), as a live tail fetches for as long as it runs. It reads the
+    /// deadline [`TailLink::open`] recorded (astream's closer has no getter for a socket's
+    /// timeout); that `open` sets it on the socket is shown by
+    /// `a_fetch_the_broker_never_answers_ends_the_tail_naming_the_face_and_the_from_that_resumes_it`.
+    /// NEGATIVE CONTROL (run): [`IO_TIMEOUT`] in `for_tail` fails it.
+    #[cfg(unix)]
+    #[test]
+    fn the_tails_fetch_link_waits_the_idle_mark_deadline_never_a_requests_timeout() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-tail-link")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let world = TwoFaces::new(dir.path());
+        let link = TailLink::for_tail(&world.cfg(&world.real), None).expect("the tail's link");
+        let faces: Vec<String> = TwoFaces::FACES.into_iter().map(String::from).collect();
+        assert_eq!(link.faces, Some(faces), "the faces are read apart");
+        assert_eq!(link.read_timeout, astream_broker::IDLE_MARK_DEADLINE);
+    }
+
+    /// A FETCH THE BROKER NEVER ANSWERS ENDS THE TAIL AT ITS LINK'S DEADLINE, NAMING THE FACE
+    /// AND THE `--from` THAT RESUMES IT: the broker answers both faces' subscriptions (each
+    /// backlog, then each stream's catch-up mark, so the backlog prints with no fetch; the last
+    /// record is on the second face, so the first face's mark is read before it prints), then
+    /// takes the told fetch a live record on the second face needs of the first and never
+    /// replies. Opened with a 1 s deadline, the value under test (that fetch is the first
+    /// request the link sends past its opening, so no reply that comes is held to it), the
+    /// tail ends with an error of a timeout's kind that names the first face and, by the
+    /// producer's own words ([`resume_from`]), the merge's floor, every record below it
+    /// printed. The hang detector's clock starts before the stall, and the told fetch's read
+    /// only after it (the live record that asks for that fetch is published past the stall),
+    /// so a read [`TailLink::open`]'s deadline never bounded, which waits the connect's bound
+    /// ([`io_timeout`], the detector's under test), cannot end inside the detector, whatever
+    /// order the threads run in: this test, not the `read_timeout` it recorded, is what shows
+    /// that the socket's reads honour the deadline `open` is given.
+    /// NEGATIVE CONTROL (run): without `open`'s `closer.set_read_timeout(Some(deadline))`, the
+    /// hang detector fires.
+    #[cfg(unix)]
+    #[test]
+    fn a_fetch_the_broker_never_answers_ends_the_tail_naming_the_face_and_the_from_that_resumes_it()
+    {
+        use aterm_spec::wait::MUST_HAPPEN;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-tail-stall")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let mut world = TwoFaces::new(dir.path());
+        let front = dir.path().join("front.sock");
+        let stall = broker_in_front(&world.real, &front, false);
+        let cfg = world.cfg(&front);
+        let offs: Vec<u64> = [0, 1, 0, 1, 0, 1]
+            .into_iter()
+            .map(|face| world.publish(face))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut out = Sent {
+            tx,
+            buf: Vec::new(),
+            lines: usize::MAX,
+        };
+        std::thread::spawn(move || {
+            let ended = TailLink::open(&cfg, None, Duration::from_secs(1))
+                .and_then(|link| tail_on(&cfg, link, TailFmt::new(false, true), Some(0), &mut out));
+            let _ = done_tx.send(ended.map_err(|e| (e.kind(), e.to_string())));
+        });
+        let mut printed = Vec::new();
+        while printed.len() < offs.len() {
+            let line = rx
+                .recv_timeout(MUST_HAPPEN)
+                .unwrap_or_else(|e| panic!("the backlog ({printed:?}): {e}"));
+            printed.extend(tail_off(&line));
+        }
+        assert_eq!(printed, offs, "the backlog, in offset order");
+        assert!(
+            io_timeout() >= MUST_HAPPEN,
+            "a read the deadline never bounded waits the connect's bound, at least the detector"
+        );
+        let detector = Instant::now() + MUST_HAPPEN;
+        stall.store(true, std::sync::atomic::Ordering::SeqCst);
+        world.publish(1);
+        let ended = done_rx
+            .recv_timeout(detector.saturating_duration_since(Instant::now()))
+            .expect("the tail ends at its link's deadline");
+        assert!(
+            Instant::now() < detector,
+            "the tail ends at its link's deadline, inside the hang detector from the stall"
+        );
+        let (kind, said) = ended.expect_err("a fetch the broker never answers ends the tail");
+        assert!(
+            matches!(kind, io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            "{kind:?}: {said}"
+        );
+        assert!(
+            said.contains(&safe(TwoFaces::FACES[0], 128)),
+            "it names the face: {said}"
+        );
+        let floor = printed.last().map_or(0, |off| off + 1);
+        assert!(
+            said.contains(&resume_from(floor)),
+            "a resume from the floor, @{floor}: {said}"
+        );
+        assert!(rx.try_recv().is_err(), "nothing past the floor printed");
     }
 
     #[test]
@@ -9070,6 +9540,111 @@ mod tests {
         ])
         .render(&mut out);
         assert_eq!(out, r#"{"a":"q\"uo\\te\u000a\u001b","b":[1,null,true]}"#);
+    }
+
+    #[test]
+    fn reports_tails_and_inboxes_label_offsets_across_daylight_saving() {
+        const PDT: i64 = -7 * 3600;
+        const PST: i64 = -8 * 3600;
+        const CHANGE: i64 = 1_793_523_600; // 2026-11-01T09:00:00Z
+        let la_at = |unix: i64| Some(if unix < CHANGE { PDT } else { PST });
+        let pre_ms = u64::try_from(CHANGE - 1800).unwrap() * 1000; // 01:30:00 PDT
+        let post_ms = u64::try_from(CHANGE + 1800).unwrap() * 1000; // 01:30:00 PST
+        let now_ms = u64::try_from(CHANGE + 2700).unwrap() * 1000; // 01:45:00 PST
+
+        assert_eq!(clock_at(0, now_ms, Some(PST), &la_at), "-");
+        assert_eq!(
+            clock_at(pre_ms, now_ms, Some(PST), &la_at),
+            "01:30:00 UTC-07:00"
+        );
+        assert_eq!(clock_at(post_ms, now_ms, Some(PST), &la_at), "01:30:00");
+        assert_eq!(
+            clock_at(pre_ms, now_ms, Some(PST), &|_| None),
+            "08:30:00 UTC"
+        );
+        assert_eq!(
+            clock(pre_ms, now_ms, PST),
+            "00:30:00",
+            "CONTROL: flat PST shifts pre-change 01:30 PDT to 00:30"
+        );
+
+        let mut r = healthy();
+        r.now_ms = now_ms;
+        r.traffic = vec![
+            traffic_of(
+                "f",
+                1,
+                "/f/f/in/n-1/s-1/h-a/note",
+                format!("v=1 t={pre_ms} text=pre").as_bytes(),
+            ),
+            traffic_of(
+                "f",
+                2,
+                "/f/f/in/n-1/s-1/h-a/note",
+                format!("v=1 t={post_ms} text=post").as_bytes(),
+            ),
+        ];
+        let report = render_text_local(&r, &la_at);
+        assert!(report.contains("01:45:00 · times UTC-08:00"), "{report}");
+        assert!(
+            report.contains("  @1      01:30:00 UTC-07:00  note")
+                && report.contains("  @2      01:30:00            note"),
+            "{report}"
+        );
+
+        let tail = TailFmt {
+            bodies: false,
+            json: false,
+            offset: Some(PST),
+        };
+        let tail_pre = tail.record_at(
+            "f",
+            1,
+            "/f/f/in/n-1/s-1/h-a/note",
+            format!("v=1 t={pre_ms} text=pre").as_bytes(),
+            now_ms,
+            &la_at,
+        );
+        let tail_post = tail.record_at(
+            "f",
+            2,
+            "/f/f/in/n-1/s-1/h-a/note",
+            format!("v=1 t={post_ms} text=post").as_bytes(),
+            now_ms,
+            &la_at,
+        );
+        assert!(tail_pre.contains("01:30:00 UTC-07:00  note"), "{tail_pre}");
+        assert!(
+            tail_post.contains("01:30:00  note") && !tail_post.contains("UTC-"),
+            "{tail_post}"
+        );
+
+        let inbox_pre = crate::person::inbox_delivery_line(
+            ("f", "h-a.cap"),
+            7,
+            "/f/f/in/p/h-a/n-1/note",
+            format!("v=1 t={pre_ms} text=hello").as_bytes(),
+            now_ms,
+            Some(PST),
+            &la_at,
+        );
+        let inbox_post = crate::person::inbox_delivery_line(
+            ("f", "h-a.cap"),
+            8,
+            "/f/f/in/p/h-a/n-1/note",
+            format!("v=1 t={post_ms} text=later").as_bytes(),
+            now_ms,
+            Some(PST),
+            &la_at,
+        );
+        assert_eq!(
+            inbox_pre,
+            "@7  01:30:00 UTC-07:00  note  from=n-1 trust=agent  text=hello\n"
+        );
+        assert_eq!(
+            inbox_post,
+            "@8  01:30:00  note  from=n-1 trust=agent  text=later\n"
+        );
     }
 }
 

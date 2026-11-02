@@ -49,7 +49,9 @@
 //! vault custody, pairing Macs of one island during the cut; the accounts plane ([`accounts`]) is
 //! a model run of main's account claims on two Macs' table replicas on a simulated clock.
 //! After the heal the removals plane ([`removals`]) runs F16's quorum Undo: b2 removes every
-//! other member with the CLI, and the Macs it removed undo it and read a value b2 cannot.
+//! other member with the CLI, and the Macs it removed undo it and read a value b2 cannot. Then it
+//! holds F21's split: a1 removes b3 on island A while b1 writes under b3's epoch on island B, and
+//! after the heal every member reads that write.
 //!
 //! A run whose cut held is a measurement of the build, whatever it finds, so `--record` writes it
 //! under `docs/measured/` red or green. Only a run whose cut leaked is never recorded there.
@@ -3090,6 +3092,25 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
             }
         ),
     });
+    if let Some(kept) = &removed.kept {
+        lane.say(&match &kept.skipped {
+            Some(why) => format!("removals: F21's split: not run: {why}"),
+            None => format!(
+                "removals: F21's split: b1 put {} under {}'s epoch while a1 removed it; read after \
+                 the heal by {}",
+                removals::KEPT_NAME,
+                removals::CUT,
+                names(
+                    &kept
+                        .ends
+                        .iter()
+                        .filter(|e| e.reads_value)
+                        .map(|e| e.mac.clone())
+                        .collect::<Vec<_>>()
+                )
+            ),
+        });
+    }
     let accounts = accounts::run();
     mark("end");
     Ok(Evidence {
@@ -3425,6 +3446,16 @@ pub fn report(ev: &Evidence, checks: &[Check]) -> String {
          puts {} under the newest epoch; each Mac is then read from its own records",
         removals::REMOVER,
         removals::VALUE_NAME
+    );
+    let _ = writeln!(
+        out,
+        "- F21's split after it: the lab carries records only within each island; a1 removes {} \
+         and a3 on island A while {}, not yet told, removes a3 and b1 puts {} under its epoch on \
+         island B, each kept on its Mac; then the lab heals, runs the tender's pass, and reads \
+         each Mac from its own records",
+        removals::CUT,
+        removals::CUT,
+        removals::KEPT_NAME
     );
     match &ev.removals {
         Some(r) => out.push_str(&removals::report(r)),

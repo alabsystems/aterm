@@ -56,6 +56,11 @@ pub struct Caps {
     /// 24-bit colour: `38;2;r;g;b` and `48;2;r;g;b`, and the colon forms with and without a
     /// colour-space id, each channel clamped to 255.
     pub truecolour: bool,
+    /// A zero-width combining mark attaches to a cell and moves nothing.
+    pub combining_marks: bool,
+    /// A VS16 widens a text-default emoji, a VS15 narrows a wide one, a skin tone joins a wide glyph,
+    /// a regional indicator its pair, and a glyph other than ASCII a joiner before it.
+    pub clusters: bool,
 }
 
 fn line(cols: u16, rows: u16, bytes: &[u8], row: u16) -> String {
@@ -74,6 +79,7 @@ fn resized(cols: u16, rows: u16, before: &[u8], to: u16, after: &[u8], row: u16)
 
 impl Caps {
     pub fn probe() -> Caps {
+        let at = |text: &str| fold(6, 1, &[Record::Out(text.into())]).cursor();
         let bce = fold(4, 1, &[Record::Out(b"\x1b[44m\n".to_vec())]);
         let pen = fold(4, 1, &[Record::Out(b"\x1b[31m\x1b7\x1b[0m\x1b8X".to_vec())]);
         let vt = fold(4, 3, &[Record::Out(b"\x0b".to_vec())]);
@@ -117,6 +123,15 @@ impl Caps {
             .cell(0, 0)
             .map(|c| (c.fg_rgb, c.bg_rgb))
                 == Some((Some((1, 2, 255)), Some((4, 5, 6)))),
+            combining_marks: line(4, 1, "a\u{301}".as_bytes(), 0) == "a\u{301}",
+            clusters: at("\u{2600}\u{fe0f}") == (0, 2)
+                && fold(6, 1, &[Record::Out("\u{1f600}\u{fe0e}".into())])
+                    .cell(0, 0)
+                    .map(|c| c.width)
+                    == Some(1)
+                && at("\u{1f44d}\u{1f3fd}") == (0, 2)
+                && at("\u{1f1fa}\u{1f1f8}") == (0, 2)
+                && at("\u{1f468}\u{200d}\u{1f4bb}") == (0, 2),
         }
     }
 }

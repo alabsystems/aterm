@@ -949,16 +949,15 @@ fn read_back(
     if src.next.0 > 0 && (ver.identity() != src.identity() || ver.lineage() != src.lineage()) {
         return Err(differs("the identity"));
     }
-    if ver.records.len() != src.records.len()
-        || ver
-            .records
-            .iter()
-            .zip(&src.records)
-            .any(|(a, b)| **a != **b)
+    if ver.tier.len() != src.tier.len()
+        || (0..src.tier.len()).any(|i| match (ver.record_arc(i), src.record_arc(i)) {
+            (Some(a), Some(b)) => *a != *b,
+            _ => true,
+        })
     {
         return Err(differs("a record"));
     }
-    if ver.record_bts != src.record_bts {
+    if ver.tier.bts() != src.tier.bts() {
         return Err(differs("a broker time"));
     }
     if ver.carried_wills != src.carried_wills

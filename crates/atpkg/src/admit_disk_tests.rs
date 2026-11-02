@@ -639,7 +639,7 @@ fn the_runs_own_pass_keeps_its_directories_and_frees_the_rest() {
     let home = dir.join("home");
     let root = cache_root(&home);
     let lay = |name: &str| {
-        let leaf = build_dir(&root, &dir.join(name));
+        let leaf = build_dir(&root, &Path::new("/").join(name));
         std::fs::create_dir_all(leaf.join("debug")).expect("a build directory");
         std::fs::write(leaf.join("debug/x"), b"0123456789").expect("written");
         leaf

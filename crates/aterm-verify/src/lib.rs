@@ -346,6 +346,8 @@ pub struct Ctx {
     pub child_ceiling: Option<Duration>,
     /// `--no-windows`.
     pub no_windows: bool,
+    /// A focused GUI pacing measurement, never release qualification.
+    pub cursor_pacing: bool,
     /// `--app <APP>`.
     pub measure_artifact: Option<MeasureArtifact>,
     /// Requested `--test-jobs` ceiling; [`Self::test_jobs`] applies admission.
@@ -467,6 +469,7 @@ impl Ctx {
             head_at_start: None,
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             no_windows: false,
+            cursor_pacing: false,
             measure_artifact: None,
             test_jobs: testrun::DEFAULT_JOBS,
             test_threads: pinned_threads,
@@ -650,6 +653,13 @@ impl Ctx {
         self
     }
 
+    /// Select only the GUI cursor-pacing burst.
+    #[must_use]
+    pub const fn with_cursor_pacing(mut self, focused: bool) -> Self {
+        self.cursor_pacing = focused;
+        self
+    }
+
     /// `--app <APP>`.
     #[must_use]
     pub fn with_measure_artifact(mut self, artifact: Option<MeasureArtifact>) -> Self {
@@ -724,6 +734,9 @@ impl Ctx {
                     }
                 }
             }
+        }
+        if self.cursor_pacing && check == Check::Measure {
+            cmd.push_str(" --cursor-pacing");
         }
         if self.no_windows && check.spec().stages.iter().any(|id| id.opens_windows()) {
             cmd.push_str(" --no-windows");
@@ -1502,17 +1515,21 @@ fn run_with(
             let owner = owners[i].and_then(|c| ctx.checks.iter().position(|k| *k == c));
             let held = held_note(&stages, i, held, budget);
             let (report, begun_at, machine) = staged(ctx, &quiet, spec, held, seams);
+            let waiting = begun_at.saturating_duration_since(t0);
+            let execution = begun_at.elapsed();
+            // The ordered log and aggregate check result can wait for other stages;
+            // the completed stage's decisions must already be visible to the caller.
+            if let Ok(mut o) = out.lock() {
+                let event = report::stage_event(&report, waiting, execution);
+                let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
+            }
             if let Some(k) = owner
                 && let Ok(mut p) = progress[k].lock()
             {
                 p.started = Some(p.started.map_or(begun_at, |s| s.min(begun_at)));
             }
             if let Ok(mut c) = clocks.lock() {
-                c[i] = Some((
-                    begun_at.saturating_duration_since(t0),
-                    begun_at.elapsed(),
-                    machine,
-                ));
+                c[i] = Some((waiting, execution, machine));
             }
             if let Some(k) = owner
                 && let Ok(mut p) = progress[k].lock()
@@ -1905,6 +1922,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_cells(parsed.cells.clone())
         .with_cells_pulled(cells_pulled)
         .with_no_windows(parsed.no_windows)
+        .with_cursor_pacing(parsed.cursor_pacing)
         .with_measure_artifact(measure_artifact)
         .with_child_ceiling(parsed.timeout.unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)))
         .with_test_jobs(parsed.test_jobs)
@@ -2675,6 +2693,56 @@ mod tests {
         let mut r = Report::new(spec.title.clone());
         r.pass("ran");
         r
+    }
+
+    #[test]
+    fn a_completed_stage_is_reported_before_its_dependent_runs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        static DEPENDENT_RAN: AtomicBool = AtomicBool::new(false);
+        struct LiveOutput;
+        impl std::io::Write for LiveOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.starts_with(b"verify-event: ") {
+                    REPORTED.store(true, Ordering::SeqCst);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
+            if spec.id != plan::StageId::TestCompile {
+                assert!(
+                    REPORTED.load(Ordering::SeqCst),
+                    "compile completion was buffered"
+                );
+                DEPENDENT_RAN.store(true, Ordering::SeqCst);
+            }
+            let mut report = Report::new(spec.title.clone());
+            report.pass("ran");
+            report
+        }
+        REPORTED.store(false, Ordering::SeqCst);
+        DEPENDENT_RAN.store(false, Ordering::SeqCst);
+        let ctx = Ctx::new(
+            PathBuf::from("/repo"),
+            Scope::crate_only("aterm-verify"),
+            EnvSnapshot::default(),
+            PathBuf::from("/tmp"),
+        )
+        .with_checks(&[Check::Test]);
+        let result = run_with(
+            &ctx,
+            &mut LiveOutput,
+            &mut std::io::sink(),
+            &Show::default(),
+            Seams { stage, ..LIVE },
+        );
+        assert_eq!(result.unwrap(), exit::PASS);
+        assert!(REPORTED.load(Ordering::SeqCst));
+        assert!(DEPENDENT_RAN.load(Ordering::SeqCst));
     }
 
     /// A run whose checkout's HEAD moves while its stages run ends COULD NOT RUN, its checks'

@@ -209,6 +209,39 @@ factored out and proved first. Many of the functions carry `#[cfg_attr(trust_ver
 of them first needs either a pure core factored out of the FFI shell, or the skip lifted. The difficulty
 column says which.
 
+### Explicit wait sampling (2026-11-02)
+
+`wait_sample::sample` is an explicit macOS observation of a supplied same-UID process
+identity, including its birth and exec version, checked before the child starts and after its
+report is read. It runs `/usr/bin/sample PID 1 100 -file REPORT` only through `spawnfd`, in a
+caller-supplied owner-private directory, with a fresh `0600` report, a one-minute hang detector
+and cancellation checks between waits of at most 25 ms. Cancellation requests `SIGKILL` on the
+owned sampler alone and bounds its reap wait to 100 ms; the existing reaper owns one the kernel
+will not reap. There is no permission escalation or automatic sampling. Reports are retained,
+read up to 4 MiB, and never returned as raw text. Unsupported platforms touch nothing.
+
+The pure decoder names a closed kind only when every parsed stack leaf agrees and each such
+leaf is a known waiting syscall in the one kernel-library mapping whose exact Apple system
+path, UUID and starting address match this process's loaded kernel library, bounded by its
+loaded `__TEXT` segment. A program symbol, an ancestor,
+lookalike image, wrong UUID, out-of-image address, unknown leaf or conflicting thread cannot
+grant that name. `Timer` additionally requires an immediately enclosing `nanosleep` frame in
+the separately authenticated loaded Apple `libsystem_c` image; a bare `__semwait_signal`
+does not prove that its timeout is enabled. Branch siblings pop the caller stack, so a trusted
+caller above an intervening program frame grants nothing. Only `flock` initially names
+`Lock`: generic `fcntl` lacks its command
+argument and can be a non-lock operation, so remains `Unparsed`. Arbitrary signal suspension
+is not a child wait and remains `Unparsed`; only `wait4` variants initially name `Children`.
+`Lock` never identifies a
+lock or a holder. Identity brackets establish a
+point observation, not continuous ownership, and the retained report can outlive its evidence.
+The unit controls are `wait_sample::tests::{a_timer_needs_its_authenticated_direct_nanosleep_caller,
+an_apple_report_names_only_its_authenticated_waiting_leaves,
+a_program_symbol_or_image_cannot_name_a_wait,
+all_threads_and_branches_must_agree_on_the_waiting_leaf,
+the_pid_birth_exec_and_same_uid_read_must_all_still_match}`; they exercise the decoder and
+identity predicate, not a live task sample or an additional proof lane.
+
 ## 0. Notation used in the statements
 
 - `Tbl(P)`: the open descriptor numbers > 2 in process P. `Node(fd)`: fstat `(dev, ino)`. `OFD(fd)`: the open file description fd names. `CLOEXEC(fd)`: `FD_CLOEXEC` is set. `Unflagged(P)` = `{ fd ∈ Tbl(P) | ¬CLOEXEC(fd) }`, the descriptors an exec would carry.

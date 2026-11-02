@@ -19,6 +19,7 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use crate::budget::{BudgetEvent, Slot, Slots, UnitBudget, UnitPermit};
 use crate::control_auth::{self, AuthOutcome};
+use crate::fabric::handler_tally;
 use crate::input::{Egress, InputEvent, InputOutcome, PasteFraming, ScrollIntent, Source};
 use crate::session_store::Store;
 use crate::subscribe::{self, InstanceStreams, PushOptions, PushScopes, Requested};
@@ -50,7 +51,7 @@ pub(crate) use control_query::{
 mod control_end;
 
 #[path = "control_input.rs"]
-mod control_input;
+pub(crate) mod control_input;
 use control_input::INPUT_QUEUE_FULL;
 #[cfg(all(test, unix))]
 pub(crate) use control_input::ask_signal_end;
@@ -62,7 +63,7 @@ pub(crate) use control_input::{GuardedInput, InputFence, input_if_fenced_observe
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use control_input::{cmd_signal, restart_verb};
 #[cfg(all(test, unix))]
-pub(crate) use control_input::{control_fence, paste_event};
+pub(crate) use control_input::{control_fence, parse_window_resize, paste_event};
 pub(crate) use control_input::{
     feed_bytes, no_such_tab, parse_ctrl, parse_key, parse_mouse, send_bytes,
 };
@@ -2562,6 +2563,7 @@ struct BridgeLostGuard {
 #[cfg(any(unix, test))]
 impl Drop for BridgeLostGuard {
     fn drop(&mut self) {
+        crate::subscribe::wait_out_hold("lane-loss");
         crate::fabric::bridge_lost_waking(&self.store, self.generation, &|sid| {
             wake_sid_watchers(&self.store, sid);
         });
@@ -2805,6 +2807,7 @@ static BRIDGE_CONTEXT: std::sync::OnceLock<Arc<ControlWorkerContext>> = std::syn
 pub(crate) fn attach_fabric_bridge(
     stream: CtlStream,
     generation: crate::fabric::BridgeGeneration,
+    ended: crate::fabric_launch::LaneEnded,
 ) -> bool {
     let Some(context) = BRIDGE_CONTEXT.get().cloned() else {
         return false;
@@ -2813,6 +2816,7 @@ pub(crate) fn attach_fabric_bridge(
         "aterm-fabric-bridge".to_string(),
         crate::qos::Role::Responsive,
         move || {
+            let _ended = ended;
             context.serve_bridge(stream, generation);
         },
     )
@@ -3397,6 +3401,7 @@ pub(crate) fn spawn(
             #[cfg(unix)]
             crate::fabric_launch::spawn_supervisor(&startup_config);
             crate::fleet_listen::start_fleet_listener(startup_config.effective_fleet());
+            crate::net_place::start();
             let admit = move |stream: CtlStream| {
                 // Peer credential gate: refuse other uids before spending a lane (Unix:
                 // unverifiable also refuses; Windows: the peer pid's token user where
@@ -4495,6 +4500,17 @@ fn cmd_fabric(rest: &str, store: &Store) -> String {
     }
 }
 
+/// The handler tally's row of the bridge-only verb `verb`, split as the bridge's own wait tally
+/// splits its verb lane (`aterm_link::wait_tally::lane_row`).
+fn bridge_tally_row(verb: &str, rest: &str) -> handler_tally::Row {
+    match verb {
+        "deliver" => handler_tally::Row::Deliver,
+        "outbox" if rest.trim_start().starts_with("sent ") => handler_tally::Row::Sent,
+        "outbox" => handler_tally::Row::Outbox,
+        _ => handler_tally::Row::OtherBridge,
+    }
+}
+
 fn dispatch_bridge_verb(
     verb: &str,
     rest: &str,
@@ -4512,7 +4528,11 @@ fn dispatch_bridge_verb(
         return "ERR denied\n".to_string();
     }
     let generation = crate::fabric::lane_generation();
-    let log_wake = |sid: &aterm_session::SessionId| wake_sid_watchers(store, sid);
+    let log_wake = |sid: &aterm_session::SessionId| {
+        let _timed = handler_tally::timer(|| handler_tally::Row::WakeWatchers);
+        wake_sid_watchers(store, sid);
+    };
+    let _timed = handler_tally::timer(|| bridge_tally_row(verb, rest));
     let reply = match verb {
         "deliver" => crate::fabric::cmd_deliver_waking(store, rest, &log_wake),
         "link" => {
@@ -4766,7 +4786,10 @@ fn dispatch_owner(
         "topic" => dispatch_topic_verb(rest, selector, scope, store, own_session),
         "story" => dispatch_story_verb(rest, selector, scope, store, own_session, proxy),
         "sessions" => match rest.trim() {
-            "bridge" => control_session::cmd_sessions_bridge(store),
+            "bridge" => {
+                let _timed = handler_tally::timer(|| handler_tally::Row::Sessions);
+                control_session::cmd_sessions_bridge(store)
+            }
             "status" => control_session::cmd_sessions_status(proxy),
             _ => refuse_stray_args(verb, rest)
                 .unwrap_or_else(|| control_session::cmd_sessions_store(store, Some(proxy))),
@@ -9627,7 +9650,10 @@ fn serve_session_verb(
         "cell" => control_query::cmd_cell(term, rest),
         "search" => control_query::cmd_search(term, rest, &ctx.rewrap_gauge),
         "edges" | "grants" => control_session::cmd_edges(ctx),
-        "inbox" => crate::fabric::cmd_inbox_verb(ctx, rest),
+        "inbox" => {
+            let _timed = handler_tally::timer(|| handler_tally::Row::Inbox);
+            crate::fabric::cmd_inbox_verb(ctx, rest)
+        }
         "post" => {
             if post_scope_denied(scope) {
                 log_denial(

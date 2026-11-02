@@ -37,6 +37,9 @@ impl Urgency {
     }
 }
 
+/// What clears [`Exception::login_over_limit`].
+pub const LOGIN_OVER_LIMIT_CLEARS: &str = "the sign-in closed, or the agent working";
+
 /// The recorded reason for recovering from a refused standing decision.
 const REFUSES_GO_AHEAD: &str = "The agent repeated a request; recovery will change approach.";
 
@@ -252,6 +255,14 @@ impl Exception {
         self.why == REFUSES_GO_AHEAD
     }
 
+    /// Whether this is [`Self::login_over_limit`]: the person told now to close their own
+    /// `/login` standing over a usage limit, which is how the loop answers that limit until they
+    /// do, so no second notice tells the limit as unhandled (`Session::limit_after`).
+    #[must_use]
+    pub fn tells_login_over_limit(&self) -> bool {
+        self.kind == ExceptionKind::Login && self.clears == LOGIN_OVER_LIMIT_CLEARS
+    }
+
     /// Whether the agent working on a busy screen ends this exception, `at_break` a break of its
     /// own background work: every exception ends so but the refusal of the standing go-ahead
     /// ([`Self::refuses_go_ahead`]) at such a break, where the refusal is told and nothing is
@@ -340,6 +351,38 @@ impl Exception {
                 .to_string(),
             action: "Press Esc in this tab to close the panel.".to_string(),
             ..Self::dialog()
+        }
+    }
+
+    /// Claude Code's own `/login` dialog, still open at the dialog canary's third rung:
+    /// [`Self::dialog`]'s kind, in words that name the sign-in, which a reader here reads
+    /// ([`aterm_phase::login_screen`]).
+    #[must_use]
+    pub fn login_dialog() -> Self {
+        Self {
+            why: "A Claude Code sign-in has stood open in this tab, and only you can finish it."
+                .to_string(),
+            action: "Press Esc in this tab to close the sign-in.".to_string(),
+            ..Self::dialog()
+        }
+    }
+
+    /// A PERSON'S OWN `/login` STILL DRAWN OVER A USAGE LIMIT WHOSE ACT IS DUE after aterm's Escs
+    /// at it left it standing ([`super::login::over_limit_unclosed`]): the dialog covers the
+    /// composer the limit's resume, and Claude Code's own continue, would reach, and one key of the
+    /// person's closes it, so it is told now.
+    #[must_use]
+    pub fn login_over_limit() -> Self {
+        Self {
+            kind: ExceptionKind::Login,
+            when: Urgency::Now,
+            why: "A sign-in left open in this tab keeps its usage limit's reset from resuming it."
+                .to_string(),
+            action: "Press Esc in this tab to close the sign-in.".to_string(),
+            clears: LOGIN_OVER_LIMIT_CLEARS,
+            escalated: false,
+            notice: None,
+            held: None,
         }
     }
 
@@ -950,6 +993,9 @@ pub fn exception_for(
         }
         None => reading,
     };
+    if super::login::over_limit_unclosed(state, reading, cfg, now) {
+        return Some(Exception::login_over_limit());
+    }
     if let Some(told) = claude_login(state, reading, cfg, now) {
         return told;
     }

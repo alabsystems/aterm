@@ -13,7 +13,11 @@ description = "Fast non-cryptographic hashing for aterm: FxHash (replaces rustc-
 # ONE FNV-1a/64. astream-wire's `hash::fnv1a_64_update`, `FNV1A_64_INIT` and
 # `FNV1A_64_PRIME` are the byte loop, offset basis and prime astream's
 # `assign_partition` hashes a partition key with; aterm's stable hash folds
-# bytes through the same function, so the two cannot drift. astream-wire has no dependencies and no
+# bytes through the same function, so the two cannot drift. Its word step is
+# astream-wire's `hash::fnv1a_64_mix_u64`, which no astream code calls and which
+# shares only the multiply and the prime with that loop: this crate's
+# `the_word_fold_agrees_with_astreams_byte_loop` holds the two together. astream-wire
+# has no dependencies and no
 # platform code; the macOS and Linux graphs already hold it (aterm-restore,
 # astream-broker), and on Windows and wasm32 this is where it enters.
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }

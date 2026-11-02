@@ -17,6 +17,9 @@ pub(crate) const PROGRAMS: [&str; 2] = ["claude", "codex"];
 /// `Condition::runs`).
 const RUNS: [&str; 3] = ["usable", "unseen", "low"];
 
+/// The condition of a row no use of which was ever read: its login may stand at a sign-in screen.
+const UNSEEN: &str = "unseen";
+
 /// The condition of a row a wall stands on (`Condition::Limited`), until its `walled_until_ms`.
 const LIMITED: &str = "limited";
 
@@ -52,6 +55,12 @@ impl Row {
             seven_day: fields.number("pct7"),
             walled_until_ms: survey::walled_until_ms(fields),
         }
+    }
+
+    /// Whether nothing has shown this row works: it runs a worker only where no read row can, since
+    /// its missing figures would otherwise rank it as the least used of all.
+    fn unproven(&self) -> bool {
+        self.condition == UNSEEN
     }
 
     /// Whether a worker of `program` can run on it now: a row of that program, enrolled, in a
@@ -114,7 +123,8 @@ impl Member {
             .flatten()
             .filter(|row| row.takes(program, self.at_ms))
             .min_by(|a, b| {
-                (used(a.seven_day), used(a.five_hour), &a.label).cmp(&(
+                (a.unproven(), used(a.seven_day), used(a.five_hour), &a.label).cmp(&(
+                    b.unproven(),
                     used(b.seven_day),
                     used(b.five_hour),
                     &b.label,
@@ -182,8 +192,8 @@ pub(crate) struct Counts {
 }
 
 /// The member of `members` a worker of `program` goes to: of those that let this Mac drive them
-/// and have a row it can run on now, the one whose best row ([`Member::best`]) has used the least
-/// of its week, then of its five hours, then the one with the fewest sessions at work, then the
+/// and have a row it can run on now, the one whose best row ([`Member::best`]) has been read working
+/// (an `unseen` row goes last), then has used the least of its week, then of its five hours, then the one with the fewest sessions at work, then the
 /// first by host (and node). Never one that does not let this Mac drive it.
 /// # Errors
 /// No member qualifies: what the members it read were.
@@ -195,6 +205,7 @@ pub(crate) fn pick<'a>(program: &str, members: &'a [Member]) -> Result<Chosen<'a
         .collect();
     let chosen = able.iter().min_by(|(a, ra), (b, rb)| {
         (
+            ra.unproven(),
             used(ra.seven_day),
             used(ra.five_hour),
             a.busy,
@@ -202,6 +213,7 @@ pub(crate) fn pick<'a>(program: &str, members: &'a [Member]) -> Result<Chosen<'a
             &a.node,
         )
             .cmp(&(
+                rb.unproven(),
                 used(rb.seven_day),
                 used(rb.five_hour),
                 b.busy,

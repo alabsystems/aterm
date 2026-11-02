@@ -699,12 +699,13 @@ pub struct BrokerLog {
     /// the raw on-disk byte stream in RAM.
     #[cfg_attr(not(feature = "anti-rollback"), allow(dead_code))]
     log_id: [u8; 16],
-    /// Committed records, each behind an `Arc` so the egress catch-up (`read_from`)
-    /// hands subscribers cheap shared handles instead of deep-copying subject+body.
-    records: Vec<Arc<BrokerRecord>>,
-    /// Optional broker-stamped wall time (`bt=`, Unix milliseconds, `REQUIREMENTS` R3)
-    /// aligned 1:1 with `records` (`base..next`).
-    record_bts: Vec<Option<u64>>,
+    /// The committed records (`base..next`): for every one, where its frame starts in
+    /// the file and its broker-stamped wall time (`bt=`, Unix ms, `REQUIREMENTS` R3); for
+    /// the newest, within the residency budget, the decoded record behind an `Arc`, so
+    /// the egress catch-up hands subscribers cheap shared handles. An older record is
+    /// read back from its frame ([`record_arc`](Self::record_arc)), so the log's
+    /// resident memory no longer grows with its retained history (`tier.rs`).
+    tier: crate::tier::Tier,
     /// The lowest offset still retained (records below it were pruned by retention).
     /// `0` for a never-retained log; recovered from the `<log>.base` sidecar. Kept
     /// records keep their ABSOLUTE offsets — record `i` in `records` has seq
@@ -838,6 +839,9 @@ pub struct BrokerLog {
     staged: Vec<BrokerRecord>,
     /// Broker-stamped wall times (`bt=`) aligned 1:1 with `staged`.
     staged_bts: Vec<Option<u64>>,
+    /// Where each staged record's frame starts in `staged_bytes`, aligned 1:1 with
+    /// `staged`: the batch's start in the file plus this is the record's position.
+    staged_at: Vec<usize>,
     staged_bytes: Vec<u8>,
     /// Where the last staged frame starts in `staged_bytes`: the record, staged with the
     /// continues mark like every other, that [`commit_batch`](Self::commit_batch)
@@ -921,6 +925,10 @@ pub struct BrokerLog {
     /// so a test sees what an embedder that woke at the poison would leave a reopen.
     #[cfg(test)]
     pub(crate) id_at_poison: Option<Option<Vec<u8>>>,
+    /// Positional cold reads (`file.read_at`) performed by [`record_arc`](Self::record_arc)
+    /// during this open, for unit tests proving cold-read bounds.
+    #[cfg(all(test, any(unix, feature = "retention")))]
+    cold_reads: std::sync::atomic::AtomicU64,
     /// The documented fault-injection seam ([`inject_faults`](Self::inject_faults)).
     faults: InjectedFaults,
     /// The compaction's I/O seam (`compact.rs`): inert unless a unit test arms it.
@@ -3326,6 +3334,12 @@ pub struct OpenOptions {
     /// refusing pipelined writes past the failed sequence (`gap-fenced=<seq>: ...`) until
     /// an idempotent retry at `<= <seq>` commits. Ignored by [`BrokerLog::open_opts`].
     pub sticky_batch_refusal: bool,
+    /// `Some(bytes)`: keep at most about `bytes` of decoded records resident (subject and
+    /// body, plus a small per-record overhead), reading older retained records back from
+    /// the file on demand, so a long-running broker's memory no longer grows with its
+    /// retained history ([`BrokerLog::set_resident_budget`]). The newest record always
+    /// stays resident. `None` (the default) keeps every retained record resident.
+    pub resident_budget: Option<usize>,
     /// The crash simulation's recovery mutation (a negative control).
     #[cfg(test)]
     pub(crate) mutation: Mutation,
@@ -3428,7 +3442,8 @@ impl fmt::Debug for OpenOptions {
             .field("volume", &self.volume)
             .field("health_every", &self.health_every)
             .field("selective_tail_wake", &self.selective_tail_wake)
-            .field("sticky_batch_refusal", &self.sticky_batch_refusal);
+            .field("sticky_batch_refusal", &self.sticky_batch_refusal)
+            .field("resident_budget", &self.resident_budget);
         // Keys and secrets are never printed.
         #[cfg(feature = "cap")]
         {
@@ -3908,6 +3923,19 @@ pub(crate) enum Begun {
     /// A batch to write and flush with the log's lock RELEASED ([`BatchWrite::run`]),
     /// then settle under it ([`BrokerLog::commit_end`]).
     Write(BatchWrite),
+}
+
+/// One bounded step of a subscriber's or fork's scan ([`BrokerLog::read_tail_chunk`]).
+pub(crate) enum TailStep {
+    /// Up to `max` candidate records, with the offset one past the last summary or held
+    /// entry this step inspected.
+    Chunk {
+        records: Vec<Arc<BrokerRecord>>,
+        scanned_to: u64,
+    },
+    /// A matching (or `also_at`) cold record at this offset could not be read back from
+    /// the log file before any earlier record in this step was queued.
+    Unreadable(u64),
 }
 
 /// A staged batch on its way to the file with the log's lock RELEASED: its bytes as
@@ -4742,6 +4770,8 @@ impl BrokerLog {
         records.truncate(kept_records);
         let mut record_bts = scanned.record_bts;
         record_bts.truncate(kept_records);
+        let mut record_at = scanned.record_at;
+        record_at.truncate(kept_records);
         let kept_head = base.0.saturating_add(records.len() as u64);
         let dropped = existing.len().saturating_sub(keep) as u64;
         let (serving, served) = Self::settle_and_flush_open(
@@ -4812,8 +4842,12 @@ impl BrokerLog {
             durable_len,
             newest_at,
             log_id,
-            records: rebuilt.records,
-            record_bts,
+            tier: crate::tier::Tier::from_parts(
+                rebuilt.records,
+                record_bts,
+                record_at,
+                crate::tier::Tier::RESIDENT_ALL,
+            ),
             base,
             next,
             dedup: rebuilt.dedup,
@@ -4836,6 +4870,7 @@ impl BrokerLog {
             group_commits: rebuilt.group_commits,
             staged: Vec::new(),
             staged_bts: Vec::new(),
+            staged_at: Vec::new(),
             staged_bytes: Vec::new(),
             staged_last_at: 0,
             last_bt_ms: rebuilt.max_bt,
@@ -4862,6 +4897,8 @@ impl BrokerLog {
             refuse_barrier: false,
             #[cfg(test)]
             id_at_poison: None,
+            #[cfg(all(test, any(unix, feature = "retention")))]
+            cold_reads: std::sync::atomic::AtomicU64::new(0),
             closed: false,
             released: false,
             faults: InjectedFaults::default(),
@@ -4880,6 +4917,9 @@ impl BrokerLog {
         // recovered from the bytes, so a broker restart cannot hand a producer back a
         // budget its registered wills already hold.
         log.reserve_pending_will_subjects();
+        if let Some(budget) = opts.resident_budget {
+            log.set_resident_budget(budget);
+        }
         Ok((log, dropped))
     }
 
@@ -6028,16 +6068,18 @@ impl BrokerLog {
         let prior = logid::read(&self.dir)?;
         let mut kept_records_vec = Vec::new();
         let mut kept_bts_vec = Vec::new();
+        let mut kept_at_vec = Vec::new();
         let mut r_idx = 0usize;
         while r_idx < kept_count {
-            let Some(arc_rec) = self.records.get(r_idx) else {
+            let (Some(arc_rec), Some(at)) = (self.record_arc(r_idx), self.tier.at(r_idx)) else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "truncate_replica_to: in-memory record count mismatch",
+                    "truncate_replica_to: in-memory record count mismatch or unreadable record",
                 ));
             };
-            kept_records_vec.push((**arc_rec).clone());
-            kept_bts_vec.push(self.record_bts.get(r_idx).copied().flatten());
+            kept_records_vec.push((*arc_rec).clone());
+            kept_bts_vec.push(self.tier.bt(r_idx));
+            kept_at_vec.push(at);
             r_idx = r_idx.saturating_add(1);
         }
 
@@ -6116,8 +6158,12 @@ impl BrokerLog {
         self.durable_len = keep as u64;
         self.newest_at = new_newest_at;
         self.log_id = new_log_id;
-        self.records = rebuilt.records;
-        self.record_bts = kept_bts_vec;
+        self.tier = crate::tier::Tier::from_parts(
+            rebuilt.records,
+            kept_bts_vec,
+            kept_at_vec,
+            self.tier.budget(),
+        );
         self.next = target_head;
         self.durable_head = target_head.0;
         self.held_from = None;
@@ -6372,7 +6418,7 @@ impl BrokerLog {
         LogStats {
             base: self.base,
             head: self.next,
-            retained_records: self.records.len(),
+            retained_records: self.tier.len(),
             retained_bytes: self.durable_len as usize,
             distinct_subjects: self.last.len(),
             bound_producers: self.bind.len(),
@@ -6428,7 +6474,7 @@ impl BrokerLog {
             let Ok(idx) = usize::try_from(rel) else {
                 return None;
             };
-            return self.record_bts.get(idx).copied().flatten();
+            return self.tier.bt(idx);
         }
         #[cfg(feature = "retention")]
         {
@@ -6512,39 +6558,38 @@ impl BrokerLog {
         fn accumulate_face_stat(
             by_face: &mut BTreeMap<String, (u64, u64)>,
             filter: &Filter,
-            rec: &BrokerRecord,
+            hidden: bool,
+            subject: &str,
+            bytes: u64,
         ) {
-            if is_hidden_record(rec) || !filter.matches_str(&rec.subject) {
+            if hidden || !filter.matches_str(subject) {
                 return;
             }
-            let commit_len = match &rec.commit {
-                Some(c) => c.group.len().saturating_add(12),
-                None => 0,
-            };
-            let n = astream_wire::HEADER_SIZE
-                .saturating_add(crate::brecord::RECORD_FIXED_LEN)
-                .saturating_add(rec.subject.len())
-                .saturating_add(rec.body.len())
-                .saturating_add(commit_len) as u64;
-            let face = face_prefix_of(&rec.subject);
+            let face = face_prefix_of(subject);
             let slot = by_face.entry(face).or_insert((0, 0));
             slot.0 = slot.0.saturating_add(1);
-            slot.1 = slot.1.saturating_add(n);
+            slot.1 = slot.1.saturating_add(bytes);
         }
 
         let mut by_face: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         #[cfg(feature = "retention")]
         for (&off, h) in self.hold.range(0, self.base.0.min(visible)) {
             if off < visible {
-                accumulate_face_stat(&mut by_face, filter, &h.rec);
+                accumulate_face_stat(
+                    &mut by_face,
+                    filter,
+                    is_hidden_record(&h.rec),
+                    &h.rec.subject,
+                    crate::brecord::plaintext_frame_bytes(&h.rec),
+                );
             }
         }
         let max_idx = usize::try_from(visible.saturating_sub(self.base.0))
             .unwrap_or(usize::MAX)
-            .min(self.records.len());
-        if let Some(slice) = self.records.get(..max_idx) {
-            for rec in slice {
-                accumulate_face_stat(&mut by_face, filter, rec);
+            .min(self.tier.len());
+        for i in 0..max_idx {
+            if let Some(s) = self.tier.summary(i) {
+                accumulate_face_stat(&mut by_face, filter, s.is_hidden(), s.subject(), s.bytes());
             }
         }
         let mut out = Vec::new();
@@ -7011,14 +7056,13 @@ impl BrokerLog {
                     rec.seq.0, self.base.0
                 )));
             }
+            let held_arc: Option<Arc<BrokerRecord>>;
             let held: Option<&BrokerRecord> = if rec.seq.0 < self.next.0 {
                 let Ok(idx) = usize::try_from(rec.seq.0.saturating_sub(self.base.0)) else {
                     return Err(StageErr::TooLarge);
                 };
-                match self.records.get(idx) {
-                    Some(arc) => Some(arc.as_ref()),
-                    None => None,
-                }
+                held_arc = self.record_arc(idx);
+                held_arc.as_deref()
             } else {
                 let Ok(idx) = usize::try_from(rec.seq.0.saturating_sub(self.next.0)) else {
                     return Err(StageErr::TooLarge);
@@ -7308,11 +7352,17 @@ impl BrokerLog {
     /// record (including wills carried across compaction via `<log>.state`).
     fn latest_wills(&self) -> Vec<(Offset, WillRecord)> {
         let mut latest: HashMap<u64, (Offset, WillRecord)> = self.carried_wills.clone();
-        for rec in &self.records {
-            if rec.subject != WILL_SUBJECT {
+        for i in 0..self.tier.len() {
+            let Some(s) = self.tier.summary(i) else {
+                continue;
+            };
+            if s.subject() != WILL_SUBJECT {
                 continue;
             }
-            if let Some(will) = WillRecord::from_record(rec) {
+            let Some(rec) = self.record_arc(i) else {
+                continue;
+            };
+            if let Some(will) = WillRecord::from_record(&rec) {
                 latest.insert(rec.producer_id, (rec.seq, will));
             }
         }
@@ -7607,6 +7657,7 @@ impl BrokerLog {
         }
         self.staged.push(rec);
         self.staged_bts.push(bt_ms);
+        self.staged_at.push(self.staged_last_at);
         Ok(())
     }
 
@@ -7847,6 +7898,7 @@ impl BrokerLog {
             self.log_id = log_identity(&bytes);
         }
         self.newest_at = Some(self.durable_len.saturating_add(self.staged_last_at as u64));
+        let batch_start = self.durable_len;
         self.durable_len = self.durable_len.saturating_add(bytes.len() as u64);
         // The buffer comes back for the next batch to stage into, its capacity kept.
         bytes.clear();
@@ -7878,8 +7930,11 @@ impl BrokerLog {
             (h, s) => h.or(s),
         };
         let staged_bts = std::mem::take(&mut self.staged_bts);
+        let staged_at = std::mem::take(&mut self.staged_at);
         for (idx, rec) in std::mem::take(&mut self.staged).into_iter().enumerate() {
             let bt_ms = staged_bts.get(idx).copied().flatten();
+            let frame_at =
+                batch_start.saturating_add(staged_at.get(idx).copied().unwrap_or(0) as u64);
             // A committed `/a/will` record holds its target subject from here on: the
             // staged reservation went out with `staged_new_subjects` above, and this is
             // what an open rebuilds from these same records.
@@ -7932,8 +7987,7 @@ impl BrokerLog {
             self.next = next_seq;
             #[cfg(feature = "retention")]
             self.hold.note(&rec);
-            self.records.push(Arc::new(rec));
-            self.record_bts.push(bt_ms);
+            self.tier.push(Arc::new(rec), bt_ms, frame_at);
         }
         // The visible head is HELD at the batch's first escalated record until a full
         // flush covers it — unless this commit's own flush was full (Strict, or a
@@ -7961,7 +8015,6 @@ impl BrokerLog {
                 .last
                 .get(target)
                 .and_then(|off| self.record_at(off.0))
-                .cloned()
                 .or_else(|| self.carried_last.get(target).cloned());
             if let Some(removed) = removed {
                 let removed_bt = self.subject_bt_ms(target, removed.seq);
@@ -8348,6 +8401,7 @@ impl BrokerLog {
         let rolled = self.rollback_to(self.durable_len);
         self.staged.clear();
         self.staged_bts.clear();
+        self.staged_at.clear();
         self.staged_bytes.clear();
         self.staged_dedup.clear();
         self.staged_new_subjects.clear();
@@ -8415,6 +8469,7 @@ impl BrokerLog {
         // The watermark is pre-bound before a byte is written. Then the append: on disk
         // when it returns Ok under Strict, and for an escalated record on any tier.
         self.prebind_watermark(&frame)?;
+        let frame_at = self.durable_len;
         let durable = self.append_frame(&frame, escalated)?;
         update_durable_wills_on_record(
             &mut self.durable_latest_wills,
@@ -8439,8 +8494,7 @@ impl BrokerLog {
         self.next = next;
         #[cfg(feature = "retention")]
         self.hold.note(&rec);
-        self.records.push(Arc::new(rec));
-        self.record_bts.push(bt_ms);
+        self.tier.push(Arc::new(rec), bt_ms, frame_at);
         if durable {
             self.durable_head = self.next.0;
             self.held_from = None;
@@ -8562,10 +8616,10 @@ impl BrokerLog {
                 if matched {
                     let rec = match self.record_at(off.0) {
                         Some(r) => Some(r),
-                        None => self.carried_last.get(subject),
+                        None => self.carried_last.get(subject).cloned(),
                     };
                     if let Some(rec) = rec {
-                        out.push(rec.clone());
+                        out.push(rec);
                     }
                 }
                 if out.len() >= max || visited >= scan_max {
@@ -8630,10 +8684,10 @@ impl BrokerLog {
                 if off.0 < visible && filter.matches_str(subject) {
                     let rec = match self.record_at(off.0) {
                         Some(r) => Some(r),
-                        None => self.carried_last.get(subject),
+                        None => self.carried_last.get(subject).cloned(),
                     };
                     if let Some(rec) = rec {
-                        out.push(rec.clone());
+                        out.push(rec);
                     }
                 }
             }
@@ -8811,13 +8865,23 @@ impl BrokerLog {
         let mut off = start;
         while off < limit {
             next = off.saturating_add(1);
-            if let Some(rec) = self.record_at(off) {
-                if !is_hidden_record(rec) && filter.matches_str(&rec.subject) {
-                    out.push(rec.clone());
-                    if out.len() >= max {
-                        break;
-                    }
-                }
+            let Some(s) = self.summary_at(off) else {
+                next = off;
+                break;
+            };
+            if s.is_hidden() || !filter.matches_str(s.subject()) {
+                off = next;
+                continue;
+            }
+            let Some(rec) = self.record_at(off) else {
+                // A retained offset that cannot be read now: the page ends before it,
+                // so the next read starts there again instead of skipping it.
+                next = off;
+                break;
+            };
+            out.push(rec);
+            if out.len() >= max {
+                break;
             }
             off = next;
         }
@@ -8880,6 +8944,104 @@ impl BrokerLog {
         *cursor = (*cursor).max(self.base.0);
         let behind = usize::try_from(head.saturating_sub(*cursor)).unwrap_or(usize::MAX);
         self.read_range(Offset(*cursor), behind.min(max))
+    }
+
+    /// Filtered bounded read for subscriber tails and `ForkSubscribe` snapshots:
+    /// scans up to `max` entries from `*cursor` toward `head`, skipping non-matching
+    /// retained summaries without reading cold frames from disk (except `also_at`, so a
+    /// counterfactual fork replaces a non-matching record at `fork_at`).
+    pub(crate) fn read_tail_chunk(
+        &self,
+        cursor: &mut u64,
+        head: u64,
+        filter: &Filter,
+        also_at: Option<u64>,
+        max: usize,
+    ) -> TailStep {
+        let max_scan = max.max(1);
+        #[cfg(feature = "retention")]
+        if *cursor < self.base.0 {
+            let mut out = Vec::new();
+            let hold_end = self.base.0.min(head);
+            let mut scanned_to = hold_end;
+            for (&off, h) in self.hold.range(*cursor, hold_end) {
+                let is_also = match also_at {
+                    Some(a) => a == off,
+                    None => false,
+                };
+                if !is_also && (is_hidden_record(&h.rec) || !filter.matches_str(&h.rec.subject)) {
+                    continue;
+                }
+                if out.len() >= max_scan {
+                    scanned_to = off;
+                    break;
+                }
+                out.push(Arc::clone(&h.rec));
+            }
+            if !out.is_empty() {
+                return TailStep::Chunk {
+                    records: out,
+                    scanned_to,
+                };
+            }
+            if head <= self.base.0 {
+                *cursor = hold_end;
+                return TailStep::Chunk {
+                    records: Vec::new(),
+                    scanned_to: hold_end,
+                };
+            }
+        }
+        let head = head.min(self.next.0);
+        if *cursor >= head {
+            return TailStep::Chunk {
+                records: Vec::new(),
+                scanned_to: *cursor,
+            };
+        }
+        if head <= self.base.0 {
+            *cursor = head;
+            return TailStep::Chunk {
+                records: Vec::new(),
+                scanned_to: head,
+            };
+        }
+        *cursor = (*cursor).max(self.base.0);
+        let len = self.tier.len();
+        let from = (*cursor).saturating_sub(self.base.0).min(len as u64) as usize;
+        let end_rel = head.saturating_sub(self.base.0).min(len as u64) as usize;
+        let to = from.saturating_add(max_scan).min(end_rel);
+        let mut out = Vec::new();
+        let mut scanned_to = *cursor;
+        for i in from..to {
+            let off = self.base.0.saturating_add(i as u64);
+            let want = match also_at {
+                Some(a) if a == off => true,
+                _ => match self.tier.summary(i) {
+                    Some(s) => !s.is_hidden() && filter.matches_str(s.subject()),
+                    None => true,
+                },
+            };
+            if !want {
+                scanned_to = off.saturating_add(1);
+                continue;
+            }
+            let Some(rec) = self.record_arc(i) else {
+                if out.is_empty() {
+                    return TailStep::Unreadable(off);
+                }
+                break;
+            };
+            out.push(rec);
+            scanned_to = off.saturating_add(1);
+        }
+        if out.is_empty() {
+            *cursor = scanned_to;
+        }
+        TailStep::Chunk {
+            records: out,
+            scanned_to,
+        }
     }
 
     /// THE GAP NOTICE a tail reading `filter` is owed at `cursor` before its next record
@@ -8966,14 +9128,96 @@ impl BrokerLog {
         }
     }
 
-    /// The retained record at ABSOLUTE offset `off` (records are held base-relative),
-    /// or `None` if it was pruned or is not committed.
-    fn record_at(&self, off: u64) -> Option<&Arc<BrokerRecord>> {
+    /// The retained record's summary at ABSOLUTE offset `off`, or `None` if it was pruned
+    /// or is not committed.
+    fn summary_at(&self, off: u64) -> Option<&crate::tier::Summary> {
         let rel = off.checked_sub(self.base.0)?;
         let Ok(i) = usize::try_from(rel) else {
             return None;
         };
-        self.records.get(i)
+        self.tier.summary(i)
+    }
+
+    /// The retained record at ABSOLUTE offset `off` (records are held base-relative),
+    /// or `None` if it was pruned or is not committed.
+    fn record_at(&self, off: u64) -> Option<Arc<BrokerRecord>> {
+        let rel = off.checked_sub(self.base.0)?;
+        let Ok(i) = usize::try_from(rel) else {
+            return None;
+        };
+        self.record_arc(i)
+    }
+
+    /// The retained record at INDEX `i` (offset `base + i`): the resident handle when the
+    /// tier holds it decoded, otherwise read back from its frame in the file.
+    ///
+    /// A cold read runs the pipeline the open's recovery scan runs on the same bytes —
+    /// `Frame::decode` (CRC), the at-rest open bound to the record's index, the record
+    /// parse — and checks the record's `seq` is `base + i`, so it returns exactly the
+    /// record the open would recover there, or `None`. `None` for a retained index is a
+    /// device error or damage since the open; readers treat it as the end of what they
+    /// can deliver now (a page stops short, never skips past it).
+    pub(crate) fn record_arc(&self, i: usize) -> Option<Arc<BrokerRecord>> {
+        if let Some(hot) = self.tier.hot(i) {
+            return Some(Arc::clone(hot));
+        }
+        let start = self.tier.at(i)?;
+        let end = match self.tier.at(i.checked_add(1)?) {
+            Some(next) => next,
+            None => self.durable_len,
+        };
+        let len = usize::try_from(end.checked_sub(start)?).ok()?;
+        #[cfg(all(test, any(unix, feature = "retention")))]
+        self.cold_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes = self.file.read_at(start, len).ok()?;
+        let decoded = Frame::decode(&bytes).ok()??;
+        if decoded.consumed != len {
+            return None;
+        }
+        let index = self.base.0.checked_add(i as u64)?;
+        let payload = open_disk_payload(self.at_rest_ref(), index, decoded.frame.payload)?;
+        let (rec, _, _) = BrokerRecord::from_payload_marked_bt(&payload)?;
+        if rec.seq.0 != index {
+            return None;
+        }
+        Some(Arc::new(rec))
+    }
+
+    /// Positional cold reads performed since open or the last [`reset_cold_reads`](Self::reset_cold_reads).
+    #[cfg(all(test, any(unix, feature = "retention")))]
+    pub(crate) fn cold_reads(&self) -> u64 {
+        self.cold_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reset the positional cold-read counter to zero.
+    #[cfg(all(test, any(unix, feature = "retention")))]
+    pub(crate) fn reset_cold_reads(&self) {
+        self.cold_reads
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn frame_at_for_test(&self, idx: usize) -> Option<u64> {
+        self.tier.at(idx)
+    }
+
+    /// Bound the decoded records this log keeps resident to about `budget` bytes of
+    /// subject and body (the newest record always stays). Older records are read back
+    /// from the file on demand. [`usize::MAX`] keeps every retained record resident,
+    /// which is the default.
+    pub fn set_resident_budget(&mut self, budget: usize) {
+        self.tier.set_budget(budget);
+    }
+
+    /// `(resident records, resident bytes, retained records)`: what the residency budget
+    /// is holding in memory now.
+    pub fn residency(&self) -> (usize, usize, usize) {
+        (
+            self.tier.resident(),
+            self.tier.resident_bytes(),
+            self.tier.len(),
+        )
     }
 
     /// How many DISTINCT subjects `producer_id` has created in the last-value index.
@@ -9159,17 +9403,33 @@ impl BrokerLog {
                 ..crate::retention::Plan::default()
             };
         };
+        // The planner reads each retained record's summary (offset, subject, bytes), and
+        // loads a whole record only to carry it below the cut: a log with a residency
+        // budget plans without decoding its cold records.
         let view = crate::retention::View {
             base: self.base.0,
             ceiling: ceiling.min(self.next.0),
-            records: &self.records,
-            record_bts: &self.record_bts,
+            records: self.tier.summaries(),
+            record_bts: self.tier.bts(),
             stamps: &self.hold.stamps,
             groups: &self.group_commits,
             held: &self.hold.entries,
             now,
         };
         let mut plan = crate::retention::plan(rules, &view, forced);
+        for (idx, at_ms, bt_ms) in std::mem::take(&mut plan.carry_unloaded) {
+            let Some(rec) = self.record_arc(idx) else {
+                plan = crate::retention::Plan {
+                    cut: self.base.0,
+                    headroom: u64::MAX,
+                    room: rules.per_class(u64::MAX),
+                    ..crate::retention::Plan::default()
+                };
+                break;
+            };
+            plan.carry
+                .push(crate::retention::Held { rec, at_ms, bt_ms });
+        }
         self.hold.planned(std::mem::take(&mut plan.room));
         plan
     }
@@ -9490,6 +9750,24 @@ impl BrokerLog {
             self.compact_abandon(c);
             return Err(e);
         }
+        // The records the cut drops, read while the old file is still the log: after the
+        // switch their frames are gone, and their still-theirs dedup keys go in step 5.
+        let drain_len = usize::try_from(c.drop_count)
+            .unwrap_or(self.tier.len())
+            .min(self.tier.len());
+        let mut dropped_keys: Vec<(u64, u64, Offset)> = Vec::new();
+        for i in 0..drain_len {
+            let Some(rec) = self.record_arc(i) else {
+                self.compact_abandon(c);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "retention: a record the cut drops could not be read back",
+                ));
+            };
+            if rec.subject != COMMIT_SUBJECT {
+                dropped_keys.push((rec.producer_id, rec.producer_seq, rec.seq));
+            }
+        }
         // 4) The switch. A failed rename leaves the log as it was.
         if let Err(e) = rename_path(c.copy.kept(), &self.path) {
             self.compact_abandon(c);
@@ -9509,24 +9787,13 @@ impl BrokerLog {
         }
         // 5) In memory (infallible): re-base, drop the pruned records and their
         //    still-theirs dedup keys, take the carried state and the new identity.
-        let drain_len = usize::try_from(c.drop_count)
-            .unwrap_or(self.records.len())
-            .min(self.records.len());
-        let old_records = std::mem::take(&mut self.records);
-        let old_bts = std::mem::take(&mut self.record_bts);
-        for (i, rec) in old_records.into_iter().enumerate() {
-            let bt_ms = old_bts.get(i).copied().flatten();
-            if i < drain_len {
-                if rec.subject != COMMIT_SUBJECT
-                    && self.dedup.get(&(rec.producer_id, rec.producer_seq)) == Some(&rec.seq)
-                {
-                    self.dedup.remove(&(rec.producer_id, rec.producer_seq));
-                }
-            } else {
-                self.records.push(rec);
-                self.record_bts.push(bt_ms);
+        for (pid, pseq, seq) in dropped_keys {
+            if self.dedup.get(&(pid, pseq)) == Some(&seq) {
+                self.dedup.remove(&(pid, pseq));
             }
         }
+        // The kept suffix's frames moved down by exactly the bytes cut.
+        self.tier.drain_front(drain_len, cut);
         if let Some((carried_wills, carried_last, carried_last_bt, carried_charges)) = carried {
             self.carried_wills = carried_wills;
             self.carried_last = carried_last;
@@ -9611,10 +9878,10 @@ impl BrokerLog {
             if off.0 < min {
                 let rec = match self.record_at(off.0) {
                     Some(r) => Some(r),
-                    None => self.carried_last.get(subj),
+                    None => self.carried_last.get(subj).cloned(),
                 };
                 if let Some(rec) = rec {
-                    carried_last.insert(subj.clone(), Arc::clone(rec));
+                    carried_last.insert(subj.clone(), rec);
                     if let Some(bt) = self.subject_bt_ms(subj, off) {
                         carried_last_bt.insert(subj.clone(), bt);
                     }
@@ -9622,13 +9889,25 @@ impl BrokerLog {
             }
         }
         let mut carried_charges: CarriedCharges = self.carried_charges.clone();
-        for rec in &self.records {
-            if rec.seq.0 >= min {
+        for i in 0..self.tier.len() {
+            let Some(s) = self.tier.summary(i) else {
+                continue;
+            };
+            if s.offset() >= min {
                 break;
             }
-            if let Some(target) = retire_target(rec) {
+            if s.is_hidden() && s.subject() != RETIRE_SUBJECT {
+                continue;
+            }
+            if !s.is_hidden() && carried_charges.contains_key(s.subject()) {
+                continue;
+            }
+            let Some(rec) = self.record_arc(i) else {
+                continue;
+            };
+            if let Some(target) = retire_target(&rec) {
                 carried_charges.remove(target);
-            } else if !is_hidden_record(rec) {
+            } else if !is_hidden_record(&rec) {
                 carried_charges
                     .entry(rec.subject.clone())
                     .or_insert(rec.producer_id);
@@ -9744,19 +10023,14 @@ impl BrokerLog {
     /// (`bt=`), for leader-to-follower replication (`FollowerLink`) so replicas preserve
     /// the leader's exact `bt=` stamps without recomputing (`REQUIREMENTS` R3).
     pub(crate) fn read_from_stamped(&self, start: Offset) -> Vec<(Arc<BrokerRecord>, Option<u64>)> {
-        let len = self.records.len();
+        let len = self.tier.len();
         let from = start.0.saturating_sub(self.base.0).min(len as u64) as usize;
-        let Some(slice) = self.records.get(from..len) else {
-            return Vec::new();
-        };
         let mut out = Vec::new();
-        for (i, rec) in slice.iter().enumerate() {
-            let bt = self
-                .record_bts
-                .get(from.saturating_add(i))
-                .copied()
-                .flatten();
-            out.push((Arc::clone(rec), bt));
+        for i in from..len {
+            let Some(rec) = self.record_arc(i) else {
+                break;
+            };
+            out.push((rec, self.tier.bt(i)));
         }
         out
     }
@@ -9771,13 +10045,10 @@ impl BrokerLog {
         // Records sit at absolute offsets base..next; map `start` to an index (clamp a
         // below-base request for pruned records to the earliest retained). Clamp in u64
         // space then narrow — a lossy `as usize` would wrap a >2^32 offset on 32-bit.
-        let len = self.records.len();
+        let len = self.tier.len();
         let from = start.0.saturating_sub(self.base.0).min(len as u64) as usize;
         let to = from.saturating_add(max).min(len);
-        match self.records.get(from..to) {
-            Some(slice) => slice.to_vec(),
-            None => Vec::new(),
-        }
+        self.collect(from, to)
     }
 
     /// Whether any committed record at an offset in `from..to` is one a subscriber can
@@ -9788,29 +10059,45 @@ impl BrokerLog {
     /// the log lock, to decide whether the batch wakes the subscriber tails.
     pub fn any_deliverable(&self, from: Offset, to: Offset) -> bool {
         // Clamped as `read_range` clamps: in u64 space, then narrowed below `len`.
-        let len = self.records.len();
+        let len = self.tier.len();
         let lo = from.0.saturating_sub(self.base.0).min(len as u64) as usize;
         let hi = to.0.saturating_sub(self.base.0).min(len as u64) as usize;
-        let Some(recs) = self.records.get(lo..hi) else {
-            return false;
-        };
-        for r in recs {
-            if !is_hidden_record(r) {
-                return true;
+        for i in lo..hi {
+            match self.tier.summary(i) {
+                Some(s) if !s.is_hidden() => return true,
+                Some(_) => {}
+                None => return true,
             }
         }
         false
     }
 
-    /// Borrow the retained committed records in `from..to` without cloning `Arc`s.
-    pub(crate) fn visible_slice(&self, from: Offset, to: Offset) -> &[Arc<BrokerRecord>] {
-        let len = self.records.len();
+    /// The retained committed records' summaries in `from..to`, borrowed directly from
+    /// the tier with no allocation and no cold reads.
+    pub(crate) fn visible_summaries(&self, from: Offset, to: Offset) -> &[crate::tier::Summary] {
+        let sums = self.tier.summaries();
+        let len = sums.len();
         let lo = from.0.saturating_sub(self.base.0).min(len as u64) as usize;
         let hi = to.0.saturating_sub(self.base.0).min(len as u64) as usize;
-        match self.records.get(lo..hi) {
-            Some(recs) => recs,
-            None => &[],
+        let hi = hi.max(lo);
+        sums.get(lo..hi).unwrap_or(&[])
+    }
+
+    /// Records at indices `lo..hi`, stopping at the first one that cannot be read.
+    fn collect(&self, lo: usize, hi: usize) -> Vec<Arc<BrokerRecord>> {
+        let mut out = Vec::with_capacity(hi.saturating_sub(lo).min(4096));
+        for i in lo..hi {
+            let Some(rec) = self.record_arc(i) else {
+                break;
+            };
+            out.push(rec);
         }
+        out
+    }
+
+    /// Every retained record, resident or read back (used by [`fork_shared`](Self::fork_shared)).
+    fn materialize(&self) -> Vec<Arc<BrokerRecord>> {
+        self.collect(0, self.tier.len())
     }
 
     /// How many retained records a handle OUTSIDE the log still shares: copies a
@@ -9818,8 +10105,8 @@ impl BrokerLog {
     /// reader copies out of the log at once.
     #[cfg(test)]
     pub(crate) fn shared_records(&self) -> usize {
-        self.records
-            .iter()
+        self.tier
+            .hot_iter()
             .filter(|r| Arc::strong_count(r) > 1)
             .count()
     }
@@ -9835,7 +10122,7 @@ impl BrokerLog {
         fork_at: Offset,
         replacement: BrokerRecord,
     ) -> Vec<Arc<BrokerRecord>> {
-        let mut out = self.records.clone();
+        let mut out = self.materialize();
         // `fork_at` is an ABSOLUTE offset; records are stored base-relative, so a fork
         // at or above the retained base maps to index `fork_at - base` (a fork below
         // the base targets a pruned record and is a no-op).
@@ -10021,6 +10308,8 @@ pub(crate) enum RepairAt {
 pub(crate) struct Scan {
     pub(crate) records: Vec<BrokerRecord>,
     pub(crate) record_bts: Vec<Option<u64>>,
+    /// Byte at which each record's frame starts, aligned with `records`.
+    pub(crate) record_at: Vec<u64>,
     /// Byte length of the intact prefix.
     pub(crate) valid_len: usize,
     pub(crate) tail: Tail,
@@ -10111,6 +10400,7 @@ pub(crate) fn scan_from(
 ) -> Scan {
     let mut out: Vec<BrokerRecord> = Vec::new();
     let mut out_bts: Vec<Option<u64>> = Vec::new();
+    let mut out_at: Vec<u64> = Vec::new();
     let mut pos = 0usize;
     let mut seal_end = (base, 0usize);
     let mut floor_at = if floor == Some(base) {
@@ -10184,6 +10474,7 @@ pub(crate) fn scan_from(
                     Some((r, mark, bt_ms)) if r.seq.0 == expected => {
                         out.push(r);
                         out_bts.push(bt_ms);
+                        out_at.push(pos as u64);
                         // A decoded frame always consumes >= its header; guard anyway so
                         // a zero-progress decode can never spin.
                         if d.consumed == 0 {
@@ -10298,6 +10589,7 @@ pub(crate) fn scan_from(
     Scan {
         records: out,
         record_bts: out_bts,
+        record_at: out_at,
         valid_len: pos,
         tail,
         seal_end,
@@ -10309,43 +10601,78 @@ pub(crate) fn scan_from(
 mod tests {
     #[test]
     fn checked_ingest_refuses_different_bytes_at_a_retained_key_after_restart() {
-        let root = crate::test_scratch::Scratch::new("checked-publish");
-        let path = root.path().join("log");
-        let original = {
-            let mut log = super::BrokerLog::open_with(&path, super::Durability::Relaxed).unwrap();
-            log.publish_checked(9, 1, "db/tx".into(), b"original".to_vec())
-                .unwrap()
-                .0
-        };
-        let mut log = super::BrokerLog::open_with(&path, super::Durability::Relaxed).unwrap();
-        assert_eq!(
-            log.publish_checked(9, 1, "db/tx".into(), b"original".to_vec())
-                .unwrap(),
-            (original, true)
-        );
-        let before = log.stats().head;
-        for (subject, body) in [
-            ("db/tx", b"fork".as_slice()),
-            ("db/other", b"original".as_slice()),
-        ] {
-            match log
-                .publish_checked(9, 1, subject.into(), body.to_vec())
-                .unwrap_err()
-            {
-                super::CheckedPublishError::Conflict(record) => {
-                    assert_eq!(record.seq, original);
-                    assert_eq!(record.body, b"original");
+        for tier in [super::Durability::Relaxed, super::Durability::Strict] {
+            let root = crate::test_scratch::Scratch::new("checked-publish");
+            let path = root.path().join("log");
+            let original = {
+                let mut log = super::BrokerLog::open_with(&path, tier).unwrap();
+                log.publish_checked(9, 1, "db/tx".into(), b"original".to_vec())
+                    .unwrap()
+                    .0
+            };
+            let mut log = super::BrokerLog::open_with(&path, tier).unwrap();
+            assert_eq!(
+                log.publish_checked(9, 1, "db/tx".into(), b"original".to_vec())
+                    .unwrap(),
+                (original, true)
+            );
+            let before = log.stats().head;
+            for (subject, body) in [
+                ("db/tx", b"fork".as_slice()),
+                ("db/other", b"original".as_slice()),
+            ] {
+                match log
+                    .publish_checked(9, 1, subject.into(), body.to_vec())
+                    .unwrap_err()
+                {
+                    super::CheckedPublishError::Conflict(record) => {
+                        assert_eq!(record.seq, original);
+                        assert_eq!(record.body, b"original");
+                    }
+                    other => panic!("unexpected refusal: {other}"),
                 }
-                other => panic!("unexpected refusal: {other}"),
             }
+            assert_eq!(log.stats().head, before);
+            assert!(
+                !log.publish_checked(9, 2, "db/tx".into(), b"fork".to_vec())
+                    .unwrap()
+                    .1,
+                "separate local keys retain both distributed branches"
+            );
         }
-        assert_eq!(log.stats().head, before);
-        assert!(
-            !log.publish_checked(9, 2, "db/tx".into(), b"fork".to_vec())
-                .unwrap()
-                .1,
-            "separate local keys retain both distributed branches"
-        );
+    }
+
+    /// The window's edge, and the control for the test above: once retention has dropped the
+    /// record, nothing remembers its key, so the same key with different bytes appends. A
+    /// caller needing lifetime idempotency keeps its keys in its own history.
+    #[cfg(feature = "retention")]
+    #[test]
+    fn checked_ingest_covers_only_the_retained_window() {
+        let root = crate::test_scratch::Scratch::new("checked-publish-window");
+        let path = root.path().join("log");
+        let mut log = super::BrokerLog::open_with(&path, super::Durability::Strict).unwrap();
+        let first = log
+            .publish_checked(9, 1, "db/tx".into(), b"original".to_vec())
+            .unwrap()
+            .0;
+        let kept = log
+            .publish_checked(9, 2, "db/tx".into(), b"kept".to_vec())
+            .unwrap()
+            .0;
+        assert!(matches!(
+            log.publish_checked(9, 1, "db/tx".into(), b"fork".to_vec()),
+            Err(super::CheckedPublishError::Conflict(_))
+        ));
+        assert!(log.retain_before(kept).unwrap() > 0);
+        let (at, deduped) = log
+            .publish_checked(9, 1, "db/tx".into(), b"fork".to_vec())
+            .unwrap();
+        assert!(!deduped);
+        assert!(at > first, "it appended, above the record that named it");
+        assert!(matches!(
+            log.publish_checked(9, 2, "db/tx".into(), b"fork".to_vec()),
+            Err(super::CheckedPublishError::Conflict(_))
+        ));
     }
     use super::*;
     use crate::brecord::BREC_VERSION;

@@ -110,11 +110,54 @@ fn read_opened(
     past: Past,
     links: Links,
 ) -> crate::Result<Option<Vec<u8>>> {
+    Ok(read_opened_stamped(path, max, admit, past, links)
+        .map_err(Unread::into_error)?
+        .map(|(_, bytes)| bytes))
+}
+
+/// Why a stamped read ([`read_owned_stamped`]) read no bytes from a file at its path.
+#[derive(Debug)]
+pub enum Unread {
+    /// The file is one the reader refuses as it is: a symlink, not a regular file, owned by
+    /// another user, a mode that lets other users write it, or past the bound. Read again, it is
+    /// refused again until it changes.
+    Refused(Error),
+    /// The open, `fstat` or read failed (too many open files, an I/O error): read again, it may
+    /// read.
+    Failed(Error),
+}
+
+impl Unread {
+    /// The error either way.
+    pub fn into_error(self) -> Error {
+        match self {
+            Self::Refused(e) | Self::Failed(e) => e,
+        }
+    }
+}
+
+/// [`read_opened`], with the [`FileStamp`] of the file it opened, taken (`fstat`) before it reads
+/// a byte: a change during the read leaves the file's stamp unlike this one.
+fn read_opened_stamped(
+    path: &Path,
+    max: usize,
+    admit: Admit,
+    past: Past,
+    links: Links,
+) -> Result<Option<(FileStamp, Vec<u8>)>, Unread> {
     let nofollow = if links == Links::Refuse {
         libc::O_NOFOLLOW
     } else {
         0
     };
+    let refused = |why: String| Unread::Refused(Error::new(format!("{}: {why}", path.display())));
+    let failed = |e: io::Error| Unread::Failed(Error::new(format!("{}: {e}", path.display())));
+    #[cfg(test)]
+    count_read(path);
+    #[cfg(test)]
+    if take_read_failure(path) {
+        return Err(failed(io::Error::other("the test's disk failed the read")));
+    }
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(nofollow | libc::O_NONBLOCK)
@@ -123,34 +166,25 @@ fn read_opened(
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) if links == Links::Refuse && e.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(Error::new(format!(
-                "{}: is a symlink; refused",
-                path.display()
-            )));
+            return Err(refused("is a symlink; refused".to_owned()));
         }
-        Err(e) => return Err(Error::new(format!("{}: {e}", path.display()))),
+        Err(e) => return Err(failed(e)),
     };
-    let meta = file
-        .metadata()
-        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    let meta = file.metadata().map_err(failed)?;
     if !meta.file_type().is_file() {
-        return Err(Error::new(format!(
-            "{}: not a regular file",
-            path.display()
-        )));
+        return Err(refused("not a regular file".to_owned()));
     }
     match admit {
         Admit::Any => {}
         Admit::AtermConfig => {
             if let Some(why) = aterm_types::dirs::aterm_config_file_refusal(&meta) {
-                return Err(Error::new(format!("{}: {why}", path.display())));
+                return Err(refused(why));
             }
         }
         Admit::Private | Admit::Owned => {
             if meta.uid() != euid() {
-                return Err(Error::new(format!(
-                    "{}: owned by uid {}, not this user",
-                    path.display(),
+                return Err(refused(format!(
+                    "owned by uid {}, not this user",
                     meta.uid()
                 )));
             }
@@ -160,9 +194,8 @@ fn read_opened(
                 0o022
             };
             if meta.mode() & forbidden != 0 || meta.mode() & 0o6000 != 0 {
-                return Err(Error::new(format!(
-                    "{}: mode {:o} lets other users {}; run chmod 600 on it",
-                    path.display(),
+                return Err(refused(format!(
+                    "mode {:o} lets other users {}; run chmod 600 on it",
                     meta.mode() & 0o7777,
                     if admit == Admit::Private {
                         "read it"
@@ -180,16 +213,12 @@ fn read_opened(
     } else {
         limit.saturating_add(1)
     };
-    crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes)
-        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes).map_err(failed)?;
     if bytes.len() > max {
         zeroize::Zeroize::zeroize(&mut bytes);
-        return Err(Error::new(format!(
-            "{}: larger than {max} bytes",
-            path.display()
-        )));
+        return Err(refused(format!("larger than {max} bytes")));
     }
-    Ok(Some(bytes))
+    Ok(Some((FileStamp::of(&meta), bytes)))
 }
 
 /// A buffer sized once for reading a file of `len` bytes (its `fstat` size) under a cap of
@@ -219,6 +248,16 @@ pub fn read_owned(path: &Path, max: usize) -> crate::Result<Option<Vec<u8>>> {
 /// home-manager links from its store.
 pub fn read_aterm_config(path: &Path, max: usize) -> crate::Result<Option<Vec<u8>>> {
     read_opened(path, max, Admit::AtermConfig, Past::Refuse, Links::Follow)
+}
+
+/// [`read_owned`], with the [`FileStamp`] of the file it read, taken from the open file before
+/// the read: a file that changes during the read shows a new stamp at the next [`stamp`].
+///
+/// # Errors
+/// [`Unread::Refused`]: the file is one [`read_owned`] refuses as it is. [`Unread::Failed`]: the
+/// open, `fstat` or read failed.
+pub fn read_owned_stamped(path: &Path, max: usize) -> Result<Option<(FileStamp, Vec<u8>)>, Unread> {
+    read_opened_stamped(path, max, Admit::Owned, Past::Refuse, Links::Refuse)
 }
 
 /// [`read_owned`] that keeps the first `max` bytes of a longer file instead of refusing it.
@@ -258,6 +297,22 @@ pub(crate) fn open_lock(path: &Path) -> crate::Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    let metadata = lock_metadata(&file, path)?;
+    if metadata.mode() & 0o7777 != 0o600 {
+        narrow_lock(&file, path)?;
+    }
+    aterm_uds::keep_out_of_children(&file)
+        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    Ok(file)
+}
+
+/// The metadata of the lock file `file` opened at `path` (`O_NOFOLLOW`, so never through a
+/// symlink), once it passed the checks every taker and observer of a vault lock makes: a regular
+/// file, owned by this user, with one hard link. Its mode is left to the caller to judge.
+///
+/// # Errors
+/// The file cannot be examined, or it fails one of those checks.
+pub(crate) fn lock_metadata(file: &File, path: &Path) -> crate::Result<std::fs::Metadata> {
     let metadata = file
         .metadata()
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
@@ -281,23 +336,72 @@ pub(crate) fn open_lock(path: &Path) -> crate::Result<File> {
             metadata.nlink()
         )));
     }
-    if metadata.mode() & 0o7777 != 0o600 {
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    Ok(metadata)
+}
+
+/// Set the lock file `file` opened at `path`, which passed [`lock_metadata`], to `0600` through
+/// its descriptor (`fchmod`), so the inode those checks judged is the one changed, never whatever
+/// the name points at by then.
+///
+/// # Errors
+/// The `fchmod` fails (a read-only filesystem, say).
+pub(crate) fn narrow_lock(file: &File, path: &Path) -> crate::Result<()> {
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| Error::new(format!("{}: {e}", path.display())))
+}
+
+/// What tells one file's contents from another's without reading them: the device and inode
+/// of the file at a path, its length, and when its contents and its inode last changed (in
+/// nanoseconds). A file renamed over the path, or one written since, has another stamp; only a
+/// rewrite in place of the same length within the clock's granularity keeps it, which no
+/// writer of these files does (each writes a new file and renames it, or appends).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    /// The device it is on.
+    pub dev: u64,
+    /// Its inode.
+    pub ino: u64,
+    /// Its length in bytes.
+    pub len: u64,
+    /// When its contents last changed.
+    pub mtime_ns: i128,
+    /// When its inode last changed.
+    pub ctime_ns: i128,
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        let ns = |secs: i64, nsec: i64| i128::from(secs) * 1_000_000_000 + i128::from(nsec);
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime_ns: ns(meta.mtime(), meta.mtime_nsec()),
+            ctime_ns: ns(meta.ctime(), meta.ctime_nsec()),
+        }
     }
-    aterm_uds::keep_out_of_children(&file)
-        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-    Ok(file)
+}
+
+/// The [`FileStamp`] of what is at `path` (`lstat`, so a symlink's own, never its target's), or
+/// `None` when nothing is there or it cannot be examined.
+pub fn stamp(path: &Path) -> Option<FileStamp> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| FileStamp::of(&meta))
 }
 
 /// Append `bytes` to the regular file at `path` (never through a symlink) while it is still
-/// `len` bytes long, and make them durable ([`aterm_durable::durable_data`]). A file of another
-/// length is left as it is: its writer was not the one that last read or wrote it.
+/// the file `expected` stamped (its device, inode and length), and make them durable
+/// ([`aterm_durable::durable_data`]). Another file there, or one of another length, is left as
+/// it is: its writer was not the one that last read or wrote it. A file renamed over the path
+/// with the same length is another inode, so the check is of the file's identity, not its
+/// length alone.
 ///
 /// # Errors
-/// The file is missing, not `len` bytes long, or the open, write or flush fails. A write cut
-/// short leaves part of `bytes` on the end of the file; its writer replaces the file whole then.
-pub fn append_at(path: &Path, len: u64, bytes: &[u8]) -> crate::Result<()> {
+/// The file is missing, not the one `expected` names, or the open, write or flush fails. A
+/// write cut short leaves part of `bytes` on the end of the file; its writer replaces the file
+/// whole then.
+pub fn append_at(path: &Path, expected: &FileStamp, bytes: &[u8]) -> crate::Result<FileStamp> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
         && kind(parent)? != Kind::Dir
     {
@@ -317,14 +421,56 @@ pub fn append_at(path: &Path, len: u64, bytes: &[u8]) -> crate::Result<()> {
                 || metadata.nlink() != 1
                 || metadata.mode() & 0o077 != 0
                 || metadata.mode() & 0o6000 != 0
-                || metadata.len() != len
+                || metadata.dev() != expected.dev
+                || metadata.ino() != expected.ino
+                || metadata.len() != expected.len
             {
                 return Err(io::Error::other("not the file this writer last left"));
             }
             file.write_all(bytes)?;
-            aterm_durable::durable_data(&file)
+            aterm_durable::durable_data(&file)?;
+            file.metadata().map(|after| FileStamp::of(&after))
         });
     appended.map_err(|e| Error::new(format!("{}: {e}", path.display())))
+}
+
+/// [`write_atomic`], returning the [`FileStamp`] of the file it placed: the one an `lstat` of
+/// `path` reads after the rename, when its device and inode are the temporary file's. `None`
+/// when they are not (another writer renamed a file over it in between) or the `lstat` fails:
+/// its caller then knows no stamp of what `path` holds, and reads it again.
+///
+/// # Errors
+/// As [`write_atomic`]: the temporary file cannot be made, written, flushed or renamed (`path`
+/// is as it was), or the directory's flush after the rename failed (`path` holds `bytes`, but
+/// its entry may not survive a power loss).
+pub fn write_atomic_stamped(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> crate::Result<Option<FileStamp>> {
+    let (tmp, mut file) = temp_beside(path, mode)?;
+    let placed = file
+        .write_all(bytes)
+        .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(mode)))
+        .and_then(|()| aterm_durable::durable(&file))
+        .and_then(|()| file.metadata())
+        .and_then(|meta| {
+            drop(file);
+            std::fs::rename(&tmp, path).map(|()| (meta.dev(), meta.ino()))
+        });
+    let (dev, ino) = placed.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        Error::new(format!("{}: {e}", path.display()))
+    })?;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    // A directory whose entries cannot be flushed here is accepted, as `write_atomic` accepts it.
+    let _flushed_or_unavailable =
+        aterm_durable::DirFlushed::classify(aterm_durable::Flush::Durable.dir(dir))
+            .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+    Ok(stamp(path).filter(|placed| placed.dev == dev && placed.ino == ino))
 }
 
 /// [`write_atomic`] for one of many files a pass writes: the temporary file's bytes ordered
@@ -568,7 +714,89 @@ fn sync(file: &File) -> io::Result<()> {
 
 /// This process's effective uid.
 pub fn euid() -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = EUID_SEAM.with(std::cell::Cell::get) {
+        return uid;
+    }
     aterm_uds::peer::our_uid()
+}
+
+/// How many reads each path took since this test process started ([`reads_of`]).
+#[cfg(test)]
+static READS: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Count one read of `path` ([`reads_of`]).
+#[cfg(test)]
+fn count_read(path: &Path) {
+    *READS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .or_default() += 1;
+}
+
+/// Reads of each path this test process fails before opening it ([`fail_reads`]).
+#[cfg(test)]
+static READ_FAILS: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Fail the next `times` reads of `path` as an I/O error would ([`Unread::Failed`]), opening
+/// nothing.
+#[cfg(test)]
+pub(crate) fn fail_reads(path: &Path, times: usize) {
+    READ_FAILS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), times);
+}
+
+/// Whether this read of `path` is one [`fail_reads`] fails, counting it.
+#[cfg(test)]
+fn take_read_failure(path: &Path) -> bool {
+    let mut fails = READ_FAILS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match fails.get_mut(path) {
+        Some(left) if *left > 0 => {
+            *left -= 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// How many times this test process opened `path` to read it (each tempdir path is one test's).
+#[cfg(test)]
+pub(crate) fn reads_of(path: &Path) -> usize {
+    READS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The uid [`euid`] answers on this thread while [`as_another_user`] runs.
+    static EUID_SEAM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with [`euid`] answering a uid other than this process's on this thread: every file this
+/// user made is then another user's to the checks inside it, as a lock another account left is.
+#[cfg(test)]
+pub(crate) fn as_another_user<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EUID_SEAM.with(|seam| seam.set(None));
+        }
+    }
+    let other = aterm_uds::peer::our_uid().wrapping_add(1);
+    EUID_SEAM.with(|seam| seam.set(Some(other)));
+    let _reset = Reset;
+    f()
 }
 
 #[cfg(test)]
@@ -577,6 +805,40 @@ mod tests {
 
     fn scratch() -> aterm_tempfile::TempDir {
         aterm_tempfile::tempdir().expect("tempdir")
+    }
+
+    /// F23 (rule 5): an append refuses a file renamed over the one its writer last left, though
+    /// it has the same length: `append_at` checks the file's device and inode with its length.
+    /// NEGATIVE CONTROL: the length-only check of main before F23 appends onto it, and the test
+    /// fails "the append went onto a file renamed over with the same length".
+    #[test]
+    fn an_append_refuses_a_file_renamed_over_with_the_same_length() {
+        let root = scratch();
+        let path = root.path().join("team.records");
+        let left = write_atomic_stamped(&path, b"ours", 0o600)
+            .expect("write")
+            .expect("its stamp");
+        assert_eq!(stamp(&path), Some(left));
+        let beside = root.path().join("team.records.new");
+        write_atomic(&beside, b"some", 0o600).expect("write");
+        std::fs::rename(&beside, &path).expect("renamed over");
+        assert_eq!(stamp(&path).map(|now| now.len), Some(left.len));
+        assert!(
+            append_at(&path, &left, b"tail").is_err(),
+            "the append went onto a file renamed over with the same length"
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), b"some");
+
+        // The file it stamped takes the append, which returns the stamp it leaves.
+        let now = stamp(&path).expect("stamped");
+        let after = append_at(&path, &now, b"tail").expect("appended");
+        assert_eq!(std::fs::read(&path).expect("read"), b"sometail");
+        assert_eq!(stamp(&path), Some(after));
+        assert_eq!(after.len, 8);
+        assert_eq!(
+            read_owned_stamped(&path, 64).expect("read"),
+            Some((after, b"sometail".to_vec()))
+        );
     }
 
     #[test]
@@ -656,23 +918,25 @@ mod tests {
 
         let append_file = root.path().join("append.bin");
         write_atomic(&append_file, b"head", 0o600).expect("write append");
-        append_at(&append_file, 4, b"-tail").expect("append private");
+        let stamped = |path: &Path| stamp(path).expect("stamped");
+        append_at(&append_file, &stamped(&append_file), b"-tail").expect("append private");
         assert_eq!(std::fs::read(&append_file).expect("read"), b"head-tail");
         std::fs::set_permissions(&append_file, std::fs::Permissions::from_mode(0o644))
             .expect("widen append");
-        assert!(append_at(&append_file, 9, b"!").is_err());
+        assert!(append_at(&append_file, &stamped(&append_file), b"!").is_err());
         std::fs::set_permissions(&append_file, std::fs::Permissions::from_mode(0o600))
             .expect("restore append");
         let append_hard = root.path().join("append.hard");
         std::fs::hard_link(&append_file, &append_hard).expect("hard link append");
-        assert!(append_at(&append_file, 9, b"!").is_err());
+        assert!(append_at(&append_file, &stamped(&append_file), b"!").is_err());
         std::fs::remove_file(&append_hard).expect("rm hard link append");
         let real_dir = root.path().join("real-dir");
         std::fs::create_dir(&real_dir).expect("real dir");
         write_atomic(&real_dir.join("in.bin"), b"abcd", 0o600).expect("seed in");
         let link_dir = root.path().join("link-dir");
         std::os::unix::fs::symlink(&real_dir, &link_dir).expect("symlink dir");
-        assert!(append_at(&link_dir.join("in.bin"), 4, b"ef").is_err());
+        let real = stamped(&real_dir.join("in.bin"));
+        assert!(append_at(&link_dir.join("in.bin"), &real, b"ef").is_err());
     }
 
     /// A read fills one buffer sized from the file's length, a byte over so it sees the end

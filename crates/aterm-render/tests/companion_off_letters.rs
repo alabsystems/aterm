@@ -474,9 +474,10 @@ fn letters_under_their_bar(judged: &[Judged], from: u64, row: usize) -> (usize, 
 }
 
 /// The right edge, frame px, of the last letter of a row the replay writes from its column 0
-/// (`Replay::new`'s cells, 14 px across, from the frame's left edge).
+/// (`Replay::new`'s cells, `cw` px across, from the frame's left edge).
 fn line_end(row: &str) -> i32 {
-    14 * row.trim_end().chars().count() as i32
+    let cw = Replay::new("off", DARK, TrailColor::Automatic).cell.0 as i32;
+    cw * row.trim_end().chars().count() as i32
 }
 
 /// The frames from `from` ms, once the head law first holds the body in row `row` (cell height

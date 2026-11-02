@@ -132,7 +132,7 @@ impl EdgeToken {
     /// Compares two tokens in constant time.
     #[must_use]
     pub fn ct_eq(&self, other: &Self) -> bool {
-        crate::ct_eq(&self.0, &other.0)
+        aterm_digest::ct_eq(&self.0, &other.0)
     }
 }
 

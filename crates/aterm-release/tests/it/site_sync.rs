@@ -1266,6 +1266,7 @@ fn a_key_case((deploy, failure): (Deploy, Option<&str>)) {
         }
         None => {
             assert_eq!(ended, Ok(Outcome::NotDeployed), "{deploy:?}\n{out}");
+            assert_eq!(crate::site::report(&ended), 3);
             let last = out.lines().last().unwrap_or_default();
             assert!(
                 last.starts_with("SITE NOT DEPLOYED — committed and pushed, but ")
@@ -1602,13 +1603,8 @@ fn a_live_site_that_cannot_be_fetched_is_unchecked_never_synced() {
     );
     assert_eq!(world.deploys().len(), 1);
     assert!(world.count(|c| matches!(c, Call::Live(_))) > 0);
-    assert_eq!(crate::site::report(&ended), 0);
-    let after = crate::release_steps::site_outcome(&ended, Vec::new()).expect("a note");
-    assert!(!after.site_deferred);
-    assert!(
-        after.note.contains("could NOT be verified live"),
-        "{after:?}"
-    );
+    assert_eq!(crate::site::report(&ended), 3);
+    assert!(crate::release_steps::site_outcome(&ended, Vec::new()).is_err());
     let (ended, out) = lab.run(&mut world);
     assert_eq!(
         ended,

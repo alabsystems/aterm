@@ -189,6 +189,23 @@ pub struct GroupCommit {
     pub upto: u64,
 }
 
+/// The bytes a [`BrokerRecord`] takes in a plaintext [`Frame`] (without batch marks,
+/// `bt=` trailer, or at-rest AEAD overhead): shared by retention byte accounting
+/// (`retention::record_bytes`), wire `Stats` per-face accounting, and `Tier` summaries.
+#[must_use]
+pub(crate) fn plaintext_frame_bytes(rec: &BrokerRecord) -> u64 {
+    let commit = match &rec.commit {
+        Some(c) => c.group.len().saturating_add(12),
+        None => 0,
+    };
+    let n = astream_wire::HEADER_SIZE
+        .saturating_add(RECORD_FIXED_LEN)
+        .saturating_add(rec.subject.len())
+        .saturating_add(rec.body.len())
+        .saturating_add(commit);
+    n as u64
+}
+
 const fn encode_u32_le_bytes(v: u32) -> [u8; 4] {
     [v as u8, (v >> 8) as u8, (v >> 16) as u8, (v >> 24) as u8]
 }

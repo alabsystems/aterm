@@ -1767,6 +1767,66 @@ fn one_cause_that_refused_every_peer_is_said_once() {
     assert_eq!(fleet_note(&[peer(NoRoute), answered]), None);
 }
 
+/// Away from the ALab LAN (a phone hotspot), a fleet read no dialled peer answered says where this
+/// Mac is, whether every dial found no route (no Local Network privacy blame) or timed out (no
+/// note before); a sandbox that refused every connect is still the sandbox, a read a peer answered
+/// takes no note, and on the ALab LAN the no-route note stands.
+/// NEGATIVE CONTROL: returning `fleet_note`'s note whatever the place prints the privacy blame for
+/// the hotspot's no-route read, and this test fails at "no privacy blame away".
+#[test]
+fn a_fleet_read_from_another_network_says_where_this_mac_is() {
+    let peer = |fault: PeerFault| PeerSurvey {
+        label: "m7".to_owned(),
+        answer: Err("timed out".to_owned()),
+        fault,
+        unproven: false,
+        node: None,
+        addr: None,
+    };
+    fn utc(_: i64) -> Option<i64> {
+        Some(0)
+    }
+    let words = aterm_netplace::words::Words {
+        now_ms: 1_800_000_060_000,
+        zone: &utc,
+    };
+    let away = aterm_netplace::sample::hotspot(1_800_000_000_000, 1_800_000_000_000);
+    let said = aterm_netplace::words::survey_note(&away, &words);
+    assert!(said.is_some());
+    use PeerFault::{NoRoute, NotPermitted, Other};
+    let note = |faults: &[PeerFault], place: &aterm_netplace::Place| {
+        fleet_note_at(
+            &faults.iter().map(|f| peer(*f)).collect::<Vec<_>>(),
+            Some(place),
+            &words,
+        )
+    };
+    assert_eq!(
+        note(&[NoRoute, NoRoute], &away),
+        said,
+        "no privacy blame away"
+    );
+    assert_eq!(note(&[Other, Other], &away), said, "timeouts away");
+    assert_eq!(
+        note(&[NotPermitted, NotPermitted], &away).as_deref(),
+        Some(SANDBOX_NOTE)
+    );
+    let answered = PeerSurvey {
+        answer: Ok(vec!["instance pid=1".to_owned()]),
+        ..peer(Other)
+    };
+    assert_eq!(
+        fleet_note_at(&[peer(Other), answered], Some(&away), &words),
+        None
+    );
+    let home = aterm_netplace::sample::home(1_800_000_000_000, 0);
+    assert_eq!(
+        note(&[NoRoute, NoRoute], &home).as_deref(),
+        Some(NO_ROUTE_NOTE)
+    );
+    assert_eq!(note(&[Other, Other], &home), None);
+}
+
 #[test]
 fn the_peers_that_allow_facts_alone_are_named() {
     let at = |host: usize, level: &str| peer(host, level, 1, 0);

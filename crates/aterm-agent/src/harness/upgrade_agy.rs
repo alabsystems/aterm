@@ -555,10 +555,12 @@ pub fn is_conversation_uuid(s: &str) -> bool {
         && matches!(b[19], b'8' | b'9' | b'a' | b'b')
 }
 
-/// Whether `argv` passes `--settings` (any Go spelling before `--` or a positional), overriding
-/// [`SETTINGS_JSON`] for this session alone.
+/// The session override `argv` passes via `--settings` (any Go spelling before `--` or a
+/// positional, the last occurrence winning): `None` when absent, `Some(None)` when `--settings` is
+/// passed with no value, or `Some(Some(value))` for the raw value token.
 #[must_use]
-pub fn has_settings_override(argv: &[String]) -> bool {
+pub fn settings_override(argv: &[String]) -> Option<Option<&str>> {
+    let mut found = None;
     let mut i = 1;
     while i < argv.len() {
         let tok = argv[i].as_str();
@@ -570,7 +572,20 @@ pub fn has_settings_override(argv: &[String]) -> bool {
             break;
         };
         if name == FLAG_SETTINGS {
-            return true;
+            found = Some(match attached {
+                Some(value) => Some(value),
+                None => {
+                    let value = argv
+                        .get(i)
+                        .filter(|v| v.as_str() != "--")
+                        .map(String::as_str);
+                    if value.is_some() {
+                        i += 1;
+                    }
+                    value
+                }
+            });
+            continue;
         }
         if attached.is_none()
             && matches!(flag(name), Some((Arity::One, _)))
@@ -579,7 +594,14 @@ pub fn has_settings_override(argv: &[String]) -> bool {
             i += 1;
         }
     }
-    false
+    found
+}
+
+/// Whether `argv` passes `--settings` (any Go spelling before `--` or a positional), overriding
+/// [`SETTINGS_JSON`] for this session alone.
+#[must_use]
+pub fn has_settings_override(argv: &[String]) -> bool {
+    settings_override(argv).is_some()
 }
 
 /// THE CONFIG DIRECTORY A PROCESS WITH THIS ARGV AND HOME USES.

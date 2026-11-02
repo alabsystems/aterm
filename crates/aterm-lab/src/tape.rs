@@ -311,7 +311,7 @@ pub(crate) fn run_failed(summary: &J) -> Option<String> {
     })
 }
 
-fn summary_refusal(source: &Path) -> Result<(), String> {
+pub(crate) fn summary_refusal(source: &Path) -> Result<(), String> {
     let path = source.join("summary.json");
     if !source.is_dir() || !path.exists() {
         return Ok(());
@@ -319,6 +319,15 @@ fn summary_refusal(source: &Path) -> Result<(), String> {
     let raw = std::fs::read(&path).map_err(|e| format!("{} does not read: {e}", path.display()))?;
     let summary =
         J::parse_bytes(&raw).map_err(|e| format!("{} does not read: {e}", path.display()))?;
+    if summary
+        .get(crate::occupancy_standin::SUMMARY_KEY)
+        .is_some_and(J::truthy)
+    {
+        return Err(format!(
+            "{} ran the lab's stand-in, no real agent: its tape is not promoted",
+            source.display()
+        ));
+    }
     match run_failed(&summary) {
         Some(why) => Err(format!(
             "{} did not go as its scenario meant ({why}): its tape is not promoted; run it again",

@@ -468,9 +468,7 @@ pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64)
                 };
             }
             if !proven.fleet {
-                return refuse(
-                    "no seat binds this node key, and the Mac did not prove the fleet's key",
-                );
+                return refuse(NO_SEAT);
             }
             Decision::Fleet
         }
@@ -478,6 +476,115 @@ pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64)
         NodeStanding::Contested => refuse("two seats hold this node key: a person decides"),
         NodeStanding::Removed(_) => refuse("the vault removed this node key: a person decides"),
     }
+}
+
+/// Why a Mac with neither a seat nor the fleet's key gets none by its proof.
+const NO_SEAT: &str = "no seat binds this node key, and the Mac did not prove the fleet's key";
+
+/// Why a member that cannot sign lets nobody in.
+const NOT_HERE: &str = "this member admits nobody through the membership log";
+
+/// Why a member that may not know of a removal lets no new key in.
+const NOT_FRESH: &str = "this member did not read all of the vault's newest records just now (no \
+                         server or peer answered, or one holds records this build cannot take), \
+                         so it may not know of a removal: another member may let the Mac in";
+
+/// Whether this member read all of the vault's newest records from its servers and peers just now
+/// (within [`FRESH_WITHIN`]).
+fn read_newest(paths: &Paths) -> bool {
+    super::sync_records_until(paths, None, &[], None, Some(Instant::now() + FRESH_WITHIN))
+        .is_ok_and(|pass| !pass.untaken)
+}
+
+/// Whether a Mac under `node` has nothing in `log` that gives it a claim: no seat, no `Admit` and no
+/// unproved founder names the node key.
+fn unclaimed(log: &Log, node: &[u8; 32]) -> bool {
+    let membership = log.membership();
+    membership.node(node) == NodeStanding::Unknown
+        && !membership
+            .unproved()
+            .iter()
+            .any(|founder| founder.node_key == Some(*node))
+        && !log
+            .records()
+            .any(|r| matches!(r.body(), Body::Admit { entrant, .. } if entrant.node_key == *node))
+}
+
+/// Why the member at `paths` refuses `proving` at `now_ms` whatever the Mac proves next, or `None`
+/// where it would go on, as [`admit_by_proof`] rules. A desk asks this BEFORE the possession
+/// challenge, so the Mac has sent nothing a member could sign on and may try the next member and its
+/// plain ask (`join::prove_first`): a `NO` after possession stays ambiguous, as nothing authenticates
+/// it, and a forged one must not send the Mac to a second member. Refusing on an older log is the
+/// safe side, as nothing was signed and the Mac tries again. A readable state with no usable log
+/// refuses here too; a log or signer it cannot read decides nothing here.
+///
+/// A Mac that proved neither the fleet's key nor a claim on its node key has shown only keys it
+/// chose, and is told [`NO_SEAT`] and nothing more of the log or of a recipient it may have copied,
+/// with no server read, so a Mac that proves itself to each member in turn waits on none of them.
+/// For any other the vault's newest records come only once [`decide`] would let it in, and decide
+/// again.
+///
+/// What stays for after possession: [`Book::moved_seats_read`]'s refusal, as the seat moves by itself
+/// once every member updated and a plain ask would put a person's Allow in front of the very seat it
+/// protects, and whatever changes or fails between this and the signature.
+#[must_use]
+pub fn refuses_before_possession_at_ms(
+    paths: &Paths,
+    proving: &crate::members::desk::Proving<'_>,
+    book: Book,
+    now_ms: u64,
+) -> Option<String> {
+    let Some((_, log, _, opened)) = held_log(paths).ok()? else {
+        return Some(NOT_HERE.to_owned());
+    };
+    if !proving.fleet && unclaimed(&log, &proving.node) {
+        return Some(NO_SEAT.to_owned());
+    }
+    let binding = proving.request.binding();
+    if let Some(why) = roster_keeps_out(paths, Some(&opened), binding, proving.node) {
+        return Some(why);
+    }
+    let Some((me, ..)) = log_entries::open_local_member_signer(paths, &log).ok()? else {
+        return Some(NOT_HERE.to_owned());
+    };
+    if log.audience_left_out(&EpochAudience::Everyone, &me)
+        || held_audiences(&log, &opened, &me).is_none()
+    {
+        return Some(NOT_HERE.to_owned());
+    }
+    let proven = Proven {
+        request: proving.request,
+        node: proving.node,
+        name: proving.name,
+        fleet: proving.fleet,
+        book: Book {
+            moved_seats_read: true,
+            ..book
+        },
+    };
+    match decide(&log, &me, &proven, now_ms) {
+        Decision::Refuse(why) => return Some(why),
+        Decision::Already => return None,
+        _ => {}
+    }
+    if !read_newest(paths) {
+        return Some(NOT_FRESH.to_owned());
+    }
+    let (_, log, _, _) = held_log(paths).ok().flatten()?;
+    match decide(&log, &me, &proven, now_ms) {
+        Decision::Refuse(why) => Some(why),
+        _ => None,
+    }
+}
+
+/// [`refuses_before_possession_at_ms`] at this Mac's clock.
+#[must_use]
+pub fn refuses_before_possession(
+    paths: &Paths,
+    proving: &crate::members::desk::Proving<'_>,
+    book: Book,
+) -> Option<String> {
+    refuses_before_possession_at_ms(paths, proving, book, aterm_time::unix_millis().unwrap_or(0))
 }
 
 /// The machine name an `Allowed` and an `Admit` carry for a Mac asking under `asked`.
@@ -502,10 +609,13 @@ fn admitted_name(asked: &str) -> String {
 /// Local state cannot be read or written, or signing fails.
 pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate::Result<Readmit> {
     // The vault's newest records first, from its servers and peers: a member that has not read
-    // a removal since (asleep, or away with only the removed Mac) would let that Mac back in.
-    let fresh =
-        super::sync_records_until(paths, None, &[], None, Some(Instant::now() + FRESH_WITHIN))
-            .is_ok();
+    // a removal since (asleep, or away with only the removed Mac) would let that Mac back in. So
+    // would one whose server holds a removal it cannot take, past a record of a kind only a newer
+    // build writes: a pass that took records beside it, or named a memo's heads so the server
+    // sent nothing, still did not read the vault's newest records.
+    let fresh = read_newest(paths);
+    // Read before the state is taken: an entry read under this process's lock finds no policy.
+    let policy = super::handover::policy_servers(paths);
     let Some(lock) = StateLock::try_take_until(paths, Instant::now() + HANDOVER_LOCK_WAIT)? else {
         return Ok(Readmit::Busy);
     };
@@ -531,11 +641,7 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
         return Ok(Readmit::Refused(why));
     }
     if !fresh && decision != Decision::Already {
-        return Ok(Readmit::Refused(
-            "this member read the vault's newest records from no server or peer just now, so it \
-             may not know of a removal: another member may let the Mac in"
-                .to_owned(),
-        ));
+        return Ok(Readmit::Refused(NOT_FRESH.to_owned()));
     }
     let actor = binding.actor();
     let name = admitted_name(proven.name);
@@ -656,6 +762,7 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
             records: store.encode(),
             ..admission
         },
+        policy,
     )?;
     drop(lock);
     if !signed.is_empty() {
@@ -706,9 +813,7 @@ pub fn prove_at_ms(
         Readmit::Busy => Err(Error::new(
             "a vault pass on this member holds its state; try another member or again soon",
         )),
-        Readmit::NotHere => Err(Error::new(
-            "this member admits nobody through the membership log",
-        )),
+        Readmit::NotHere => Err(Error::new(NOT_HERE)),
     }
 }
 

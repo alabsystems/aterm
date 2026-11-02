@@ -11878,6 +11878,18 @@ struct RelaunchBooks {
     startup: bool,
 }
 
+/// A `/login` dialog this loop reads standing, and aterm's Escs at it where it is a person's own
+/// left over a usage limit ([`super::login::over_limit_act`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StandingLogin {
+    /// When this loop first read the dialog, since no screen read none.
+    seen: Instant,
+    /// When aterm's newest Esc at it went in.
+    backed_out: Option<Instant>,
+    /// aterm's Escs at it.
+    backs: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct LoginBooks {
     cancelled: bool,
@@ -12451,6 +12463,9 @@ struct YieldSeed {
 pub struct TurnEndState {
     pub timing: TurnEndTiming,
     login_confirmed: bool,
+    /// THE `/login` DIALOG STANDING since a screen last read none, and aterm's Escs at it where it
+    /// is a person's own left over a usage limit ([`super::login::over_limit_act`]).
+    standing_login: Option<StandingLogin>,
     acts: VecDeque<Instant>,
     wall_acts: VecDeque<(Instant, &'static str)>,
     awaiting: Option<Awaited>,
@@ -12715,6 +12730,7 @@ impl TurnEndState {
         Self {
             timing,
             login_confirmed: false,
+            standing_login: None,
             acts: VecDeque::new(),
             wall_acts: VecDeque::new(),
             awaiting: None,
@@ -14315,6 +14331,37 @@ impl TurnEndState {
             .filter(|until| now < *until)
     }
 
+    /// UNTIL WHEN A PERSON'S OWN `/login` aterm closed with its Esc
+    /// ([`super::login::over_limit_act`]) may still be closing: [`TurnEndTiming::take_within`] from
+    /// the Esc, doubled at each Esc since the dialog was last read gone and at most
+    /// [`BACK_OUT_PAUSE_MAX`]. Past it, a dialog still drawn gets the Esc again, up to
+    /// [`super::login::OVER_LIMIT_BACKS_MAX`].
+    #[must_use]
+    pub fn login_over_limit_closing(&self, now: Instant) -> Option<Instant> {
+        let left = self.standing_login.as_ref()?;
+        let pause = super::super::ladder::doubling(
+            self.timing.take_within,
+            left.backs.saturating_sub(1),
+            BACK_OUT_PAUSE_MAX,
+        );
+        left.backed_out
+            .map(|at| later(at, pause))
+            .filter(|until| now < *until)
+    }
+
+    /// When this loop first read the `/login` dialog standing now, since a screen last read none.
+    #[must_use]
+    pub fn login_dialog_seen(&self) -> Option<Instant> {
+        self.standing_login.as_ref().map(|left| left.seen)
+    }
+
+    /// The Escs aterm pressed at a person's own `/login` ([`super::login::over_limit_act`]) since a
+    /// screen last read no `/login` dialog.
+    #[must_use]
+    pub fn login_over_limit_backs(&self) -> u32 {
+        self.standing_login.as_ref().map_or(0, |left| left.backs)
+    }
+
     /// The loop's Esc out of the dialog of the `/login` it typed went in at `now`: the turn end's
     /// ([`TurnEndAction::Cancel`]), or the approval loop's at the method picker
     /// ([`super::login::back_out_of_picker`]).
@@ -15796,6 +15843,25 @@ impl TurnEndState {
         self.resumed = None;
     }
 
+    /// A RESTART PROMPT'S SHORT REPLY MEASURES ITS BACK-OFF FROM THE REPLY ([`HostTurn::CarryOn`], or
+    /// [`HostTurn::Check`] where the agent's last words claimed the work done): the prompt may have
+    /// waited minutes behind a draft or under Off, and the point before it would have the loop's own
+    /// prompt straight after this one. A reply nobody saw work is measured from the prompt, which
+    /// is where an unheld prompt's own wait starts. One prompt per relaunch moves it, so no run of
+    /// them can hold the loop's own prompt back. An upgrade's notice ([`HostTurn::Notice`]) asks
+    /// again at its own pace and leaves the clock where it is.
+    fn back_off_from_restart_reply(
+        &mut self,
+        typed: Option<Instant>,
+        worked: Duration,
+        now: Instant,
+    ) {
+        if let Some(typed) = typed {
+            let reply = later(typed, worked).min(now);
+            self.point_at = self.point_at.map(|at| at.max(reply));
+        }
+    }
+
     /// A BOX WAS READ UP (a permission box, a dialog).
     pub fn box_up(&mut self) {
         self.esc_at = None;
@@ -16721,6 +16787,15 @@ impl TurnEndState {
             (true, Some(_)) => Some(now),
             (true, None) => Some(self.esc_at.or(seeded_esc).unwrap_or(now)),
         };
+        if reading.login_screen.is_some() {
+            self.standing_login.get_or_insert(StandingLogin {
+                seen: now,
+                backed_out: None,
+                backs: 0,
+            });
+        } else if !matches!(reading.phase, Phase::Busy | Phase::Prompt) {
+            self.standing_login = None;
+        }
         if matches!(reading.phase, Phase::Busy | Phase::Prompt) {
             return;
         }
@@ -16911,6 +16986,7 @@ impl TurnEndState {
         let own_act = self.awaiting.is_some_and(|a| a.own);
         let act_taken = self.awaiting.is_some_and(|a| a.taken) || reading.worked.is_some();
         let act_submitted = self.awaiting.is_some_and(|a| a.submitted_since(reading));
+        let act_typed = self.awaiting.map(|a| a.typed);
         let awaited = self.awaiting.take().map(|a| a.rule);
         // The switch's ask is answered at its act's point ([`SwitchAsk::Typed`]): the same answer
         // holds again there with no second prompt, as any repeat does ([`Self::repeats`]).
@@ -17056,6 +17132,8 @@ impl TurnEndState {
                     self.short = 0;
                 } else if self.point_at.is_none() {
                     self.new_point(now);
+                } else {
+                    self.back_off_from_restart_reply(act_typed, d, now);
                 }
                 self.exchange = false;
                 self.carrying = true;
@@ -17086,13 +17164,15 @@ impl TurnEndState {
                     } else if ok_to_leave {
                         self.done = self.done.max(1);
                     }
-                } else if carry_on && done && ok_to_leave {
-                    self.done = self.done.max(1);
+                } else {
+                    if carry_on && done && ok_to_leave {
+                        self.done = self.done.max(1);
+                    }
                     if self.point_at.is_none() {
                         self.new_point(now);
+                    } else if carry_on {
+                        self.back_off_from_restart_reply(act_typed, d, now);
                     }
-                } else if self.point_at.is_none() {
-                    self.new_point(now);
                 }
             }
             (Some(rule), worked) => {
@@ -18289,8 +18369,16 @@ impl TurnEndState {
             self.login_confirmed = true;
             return;
         }
-        if matches!(action, TurnEndAction::Cancel { .. }) {
-            self.login_backed_out_at(now);
+        if let TurnEndAction::Cancel { rule_id } = action {
+            if *rule_id == super::login::RULE_LOGIN_OVER_LIMIT {
+                self.standing_login = Some(StandingLogin {
+                    seen: self.login_dialog_seen().unwrap_or(now),
+                    backed_out: Some(now),
+                    backs: self.login_over_limit_backs().saturating_add(1),
+                });
+            } else {
+                self.login_backed_out_at(now);
+            }
             return;
         }
         let Some(rule) = action.rule_id() else {
@@ -20214,6 +20302,14 @@ fn decide_unridden(
                 },
             }
         };
+        // A PERSON'S OWN `/login` LEFT OVER A USAGE LIMIT is closed once the limit's act is due and
+        // the dialog stood unused ([`super::login::over_limit_act`]): it covers the composer that
+        // act, and Claude Code's own continue, would reach.
+        if act == TurnEndAction::Nothing
+            && let Some(left) = super::login::over_limit_act(state, reading, cfg, screen, now)
+        {
+            return ended_at(trace, "login-over-limit", left);
+        }
         if act.rule_id().is_some()
             && let Some((until, why)) = carry_held(state, reading, cfg, now)
         {
@@ -21592,6 +21688,62 @@ const fn moves_accounts(program: Program) -> bool {
 
 fn account_rotates(state: &TurnEndState, reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {
     cfg.accounts != crate::harness::accounts::Mode::Off && relaunch_askable(state, reading, cfg)
+}
+
+/// WHEN THE ACT A USAGE LIMIT OWES COMES DUE UNDER A `/login` DIALOG STANDING OVER IT
+/// ([`super::login::over_limit_act`]), the tab carried and its work not resting: at once where the
+/// roster advises a move onto another account that can serve and the move reaches the tab
+/// ([`account_first`]), or where it measured the limit cleared and the resume was not typed since;
+/// otherwise at the limit's named reset ([`TurnEndReading::reset_at`] for a usage or model limit
+/// the screen draws, else the one this policy waits on, [`TurnEndState::waited_limit`]) and the
+/// grace its resume waits past it ([`TurnEndTiming::grace_for`] and the reading's jitter), the
+/// moment the composer is first owed. What follows the dialog's close is the wall's own act: a
+/// wall that goes on by itself still has Claude Code's continue its grace to fire
+/// ([`TurnEndTiming::auto_resume_grace`]). `None`: no limit's act is owed under the dialog (no
+/// named limit, `resume_limits` off, Autopilot off, a fresh tab, a done task outside Cruise).
+#[must_use]
+pub(super) fn login_over_limit_due(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+) -> Option<Instant> {
+    let rests = state.task_done() && reading.autopilot != Autopilot::Cruise;
+    if reading.autopilot == Autopilot::Off
+        || !super::login::carried(reading.program)
+        || !cfg.resume_limits
+        || reading.taskless
+        || rests
+    {
+        return None;
+    }
+    let drawn = reading
+        .wall
+        .filter(|&kind| named_class(class_of(kind)))
+        .and(reading.reset_at);
+    let reset = drawn.or_else(|| state.waited_limit().map(|limit| limit.at));
+    let rotates = reset.is_some() && account_rotates(state, reading, cfg);
+    match reading.advised() {
+        Some(AccountAdvice::Move { .. })
+            if rotates && state.account_moves_of(now).0 < ACCOUNT_MOVES_PER_WINDOW =>
+        {
+            return Some(now);
+        }
+        Some(AccountAdvice::Resume { cleared_at })
+            if reset.is_some()
+                && state
+                    .account_resumed
+                    .is_none_or(|typed| typed < *cleared_at) =>
+        {
+            return Some(now);
+        }
+        _ => {}
+    }
+    let grace = state
+        .timing
+        .grace_for(reading.program)
+        .saturating_add(reading.jitter);
+    reset.map(|at| later(at, grace))
 }
 
 fn login_follows(state: &TurnEndState, reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {

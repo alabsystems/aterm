@@ -781,3 +781,122 @@ fn all_subscription_policy_interleavings_conform_and_mutants_fail() {
     );
     assert!(!model.check_invariant("ExclusionBlocks", &bad));
 }
+
+/// A new Mac whose shared catalog slots are all assigned still holds the lab registry
+/// (docs/DESIGN-alab-lab-model-2026-11-01.md §3.10). Mac 1 declares eight tables of its own,
+/// then the registry, with every shared slot of its own assigned; Mac 2, its shared slots full
+/// too, learns those declarations from Mac 1's catalog. The registry takes its reserved slot on
+/// both, ahead of the causal walk and beside the creator budget, its storage leaves the shared
+/// slots as they were (Mac 1's earlier declaration keeps its slot), and a later declaration still
+/// waits on `Capacity`.
+/// NEGATIVE CONTROLS: with the reserved pass removed from `Directory::project` (the registry
+/// walked in causal order like any table), Mac 2 leaves it waiting:
+/// `` left: Capacity, right: Subscribed ``; with its creator-limit exemption removed,
+/// `` left: CreatorLimit, right: Subscribed ``; with `publish`'s capacity check applied to it,
+/// Mac 1 cannot declare it: `` Error("subscription capacity is already assigned") ``; and with
+/// its storage counted in `catalog_count`, it takes Mac 1's earlier declaration's shared slot:
+/// `` left: Capacity, right: Subscribed `` for that declaration.
+#[test]
+fn a_full_catalog_still_gives_the_registry_its_reserved_slot() {
+    let p = Pair::new();
+    let (a, b) = (p.lab.bootstrap(0), p.lab.bootstrap(1));
+    let (sa, sb) = (Session::open(&a).unwrap(), Session::open(&b).unwrap());
+    let (da, db) = (p.directory(0), p.directory(1));
+    let mut waiting = Vec::new();
+    for (session, dir, name) in [(&sa, &da, "first"), (&sb, &db, "second")] {
+        let declared = Descriptor::fresh(p.trust, name, "data", 1).unwrap();
+        let mut catalog = dir.catalog(session).unwrap();
+        catalog
+            .commit_catalog(session, &declared.encode().unwrap())
+            .unwrap();
+        drop(catalog);
+        for _ in 1..CATALOG_SLOTS {
+            let scope = Scope::fresh(p.trust).unwrap();
+            Store::join(session, &dir.path(scope).unwrap(), scope).unwrap();
+        }
+        waiting.push(declared);
+    }
+    let mut catalog = da.catalog(&sa).unwrap();
+    for n in 0..PER_CREATOR {
+        let spam = Descriptor::application(p.trust, "spam", &format!("t{n}"), 1).unwrap();
+        catalog
+            .commit_catalog(&sa, &spam.encode().unwrap())
+            .unwrap();
+    }
+    drop(catalog);
+    let registry = reserved(p.trust)[0].clone();
+    assert_eq!(
+        (registry.application.as_str(), registry.role.as_str()),
+        ("alab", "registry")
+    );
+    da.publish(&sa, &registry).unwrap();
+    assert!(da.path(registry.scope).unwrap().exists());
+    let mine = da.snapshot(&sa).unwrap();
+    assert_eq!(
+        mine.entries[&waiting[0].scope.digest()].state,
+        State::Subscribed
+    );
+    assert_eq!(
+        mine.entries[&registry.scope.digest()].state,
+        State::Subscribed
+    );
+
+    let source = da.catalog(&sa).unwrap();
+    let mut target = db.catalog(&sb).unwrap();
+    for id in source.inventory(&sa).unwrap() {
+        target
+            .ingest(&sb, source.wire(&sa, id).unwrap().unwrap())
+            .unwrap();
+    }
+    drop((source, target));
+    let theirs = db.snapshot(&sb).unwrap();
+    assert_eq!(
+        theirs.entries[&registry.scope.digest()].state,
+        State::Subscribed
+    );
+    assert!(!db.path(registry.scope).unwrap().exists());
+    let selected = db.subscriptions(&sb, &Policy::default()).unwrap();
+    assert!(selected.contains_key(&registry.scope.digest()));
+    assert!(db.path(registry.scope).unwrap().exists());
+    db.publish(&sb, &registry).unwrap();
+    let later = Descriptor::fresh(p.trust, "later", "data", 1).unwrap();
+    let mut catalog = db.catalog(&sb).unwrap();
+    catalog
+        .commit_catalog(&sb, &later.encode().unwrap())
+        .unwrap();
+    drop(catalog);
+    let theirs = db.snapshot(&sb).unwrap();
+    assert_eq!(theirs.entries[&later.scope.digest()].state, State::Capacity);
+    assert_eq!(
+        theirs.entries[&registry.scope.digest()].state,
+        State::Subscribed
+    );
+    assert!(db.publish(&sb, &later).is_err());
+}
+
+/// A declaration at the registry's identity with another version is a conflict, not a second
+/// reserved table: the reservation matches the compiled descriptor exactly.
+/// NEGATIVE CONTROL: with the conflict arm of `Directory::project` skipped for a reserved
+/// identity, the registry reads `Subscribed`: `` left: Subscribed, right: Conflict ``.
+#[test]
+fn another_version_at_the_registrys_identity_conflicts() {
+    let p = Pair::new();
+    let a = p.lab.bootstrap(0);
+    let sa = Session::open(&a).unwrap();
+    let da = p.directory(0);
+    let registry = reserved(p.trust)[0].clone();
+    da.publish(&sa, &registry).unwrap();
+    let twin = Descriptor {
+        version: registry.version + 1,
+        ..registry.clone()
+    };
+    let mut catalog = da.catalog(&sa).unwrap();
+    catalog
+        .commit_catalog(&sa, &twin.encode().unwrap())
+        .unwrap();
+    drop(catalog);
+    assert_eq!(
+        da.snapshot(&sa).unwrap().entries[&registry.scope.digest()].state,
+        State::Conflict
+    );
+}

@@ -570,7 +570,7 @@ fn a_crashed_muse_is_relaunched_on_its_session_in_its_workspace() {
     assert!(line.contains(&format!("'{twin}'")), "{line}");
     assert!(
         line.contains(&format!(
-            "'--base-url' 'http://127.0.0.1:9' '--contributor-mode' 'off' 'resume' '{S1}'"
+            "'--base-url' 'http://127.0.0.1:9' '--yolo' '--contributor-mode' 'off' 'resume' '{S1}'"
         )),
         "{line}"
     );
@@ -578,10 +578,7 @@ fn a_crashed_muse_is_relaunched_on_its_session_in_its_workspace() {
         !line.contains("/store/muse/"),
         "never the store path: {line}"
     );
-    assert!(
-        !line.contains("--yolo") && !line.contains("my-session-name"),
-        "{line}"
-    );
+    assert!(!line.contains("my-session-name"), "{line}");
     assert!(
         typed[1].contains("[aterm harness] Relaunched: Muse Code exited"),
         "{}",

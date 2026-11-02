@@ -21,6 +21,9 @@ use crate::ai::connector::{Flow, Region, RowKeys};
 #[path = "accounts_auto_shared.rs"]
 pub mod shared_renewal;
 
+#[path = "accounts_returned.rs"]
+mod returned;
+
 /// Table name whose [`SOURCE_KEY`] names this machine's fleet accounts source.
 pub const SOURCE_TABLE: &str = "fleet";
 
@@ -852,11 +855,24 @@ const NOTE_VENDORS: [(Option<Cli>, &[&str]); 6] = [
     (None, &["google", "gemini"]),
     (None, &["meta"]),
 ];
+/// Where `google`'s words sit in [`NOTE_VENDORS`].
+const GOOGLE_NOTES: usize = 4;
+/// Where `meta`'s words sit in [`NOTE_VENDORS`].
+const META_NOTES: usize = 5;
 
 /// Whether `notes` disqualify a row's membership of `cli`'s pool: a disqualifying word
 /// ([`notes_disqualify`]) in a note that names no vendor, or names `cli`'s ([`NOTE_VENDORS`],
 /// whole words).
 fn notes_disqualify_for(cli: Cli, notes: &str) -> bool {
+    NOTE_VENDORS
+        .iter()
+        .position(|(vendor, _)| *vendor == Some(cli))
+        .is_some_and(|at| notes_disqualify_at(at, notes))
+}
+
+/// Whether `notes` disqualify the vendor at `at` in [`NOTE_VENDORS`]: a disqualifying word in a
+/// note that names no vendor, or names that one (whole words).
+fn notes_disqualify_at(at: usize, notes: &str) -> bool {
     if !notes_disqualify(notes) {
         return false;
     }
@@ -869,12 +885,83 @@ fn notes_disqualify_for(cli: Cli, notes: &str) -> bool {
         let parts: Vec<&str> = phrase.split(' ').collect();
         words.windows(parts.len()).any(|w| w == parts.as_slice())
     };
-    let named: Vec<Option<Cli>> = NOTE_VENDORS
+    let named: Vec<usize> = NOTE_VENDORS
         .iter()
-        .filter(|(_, phrases)| phrases.iter().any(|p| names(p)))
-        .map(|(vendor, _)| *vendor)
+        .enumerate()
+        .filter(|(_, (_, phrases))| phrases.iter().any(|p| names(p)))
+        .map(|(index, _)| index)
         .collect();
-    named.is_empty() || named.contains(&Some(cli))
+    named.is_empty() || named.contains(&at)
+}
+
+/// One of the accounting sheet's provider columns as the lab importer reads it (`aterm db alab
+/// import`, docs/DESIGN-alab-lab-model-2026-11-01.md §9): a pooled CLI's ([`csv_columns`]), or
+/// one of the two no pool reads, which a note scopes by its own words ([`NOTE_VENDORS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SheetColumn {
+    /// A pooled CLI's column.
+    Pool(Cli),
+    /// `google`.
+    Google,
+    /// `meta`.
+    Meta,
+}
+
+/// What one provider cell of the sheet says beside its row's notes ([`read_sheet_cell`]), as
+/// the harness's own reading of the sheet takes it ([`parse_accounting_csv_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SheetCell {
+    /// Empty, `0`, `no` or `false`: not a member.
+    Absent,
+    /// A member, with the vendor keys the cell names.
+    Member(accounts::Vendor),
+    /// A member the row's notes disqualify for this vendor (`kimi banned`), or for every vendor.
+    Disqualified(accounts::Vendor),
+    /// A Kimi Code member with no region (a bare `1`), held out of the pool
+    /// ([`CliFleet::held`]): a sign-in on the wrong region can make a new account.
+    Held,
+    /// A value the column does not take: free text, which the importer keeps as its coordinates.
+    Unread,
+}
+
+/// Read one provider cell of the accounting sheet beside its row's `notes` (the row's cells
+/// from its `notes` column on, joined by spaces, as [`parse_accounting_csv_for`] joins them),
+/// with the harness's own rules: `member_of` for a pooled CLI's column (`claude` takes only
+/// `1`, as [`parse_accounting_csv`] does), `1` for `google` and `meta`; a disqualifying note
+/// drops Claude Code's membership whatever vendor it names, and any other column's only when
+/// it names that vendor or none (`notes_disqualify_for`). A held cell its notes disqualify
+/// reads as disqualified with no region.
+#[must_use]
+pub fn read_sheet_cell(column: SheetColumn, cell: &str, notes: &str) -> SheetCell {
+    let cell = cell.trim();
+    let plain = || {
+        if cell == "1" {
+            Member::Yes(accounts::Vendor::default())
+        } else {
+            Member::No
+        }
+    };
+    let (member, disqualified) = match column {
+        SheetColumn::Pool(Cli::Claude) => (plain(), notes_disqualify(notes)),
+        SheetColumn::Pool(cli) => (member_of(cli, cell), notes_disqualify_for(cli, notes)),
+        SheetColumn::Google => (plain(), notes_disqualify_at(GOOGLE_NOTES, notes)),
+        SheetColumn::Meta => (plain(), notes_disqualify_at(META_NOTES, notes)),
+    };
+    match member {
+        Member::No
+            if cell.is_empty()
+                || ["0", "no", "false"]
+                    .iter()
+                    .any(|word| cell.eq_ignore_ascii_case(word)) =>
+        {
+            SheetCell::Absent
+        }
+        Member::No => SheetCell::Unread,
+        Member::Held if disqualified => SheetCell::Disqualified(accounts::Vendor::default()),
+        Member::Held => SheetCell::Held,
+        Member::Yes(vendor) if disqualified => SheetCell::Disqualified(vendor),
+        Member::Yes(vendor) => SheetCell::Member(vendor),
+    }
 }
 
 /// The one reading of the accounting sheet, for `cli`'s column ([`parse_accounting_csv`],
@@ -2188,6 +2275,28 @@ fn retained_login_row<'a>(existing: Option<&'a Roster>, email: &str) -> Option<&
     rows.next().is_none().then_some(row)
 }
 
+/// Whether the rows `was` and `now` are one account's: each expects a provider identity
+/// ([`Row::expected_identity_email`]: its `identity_email`, else its login address) and it is the
+/// same one, the identity [`super::accounts_pool::check_login_identity`] holds a launch to. A
+/// login address can change while the identity stays (a source that lists an alias's account by
+/// the address the provider names it by).
+fn same_account(was: &Row, now: &Row) -> bool {
+    was.expected_identity_email()
+        .zip(now.expected_identity_email())
+        .is_some_and(|(was, now)| accounts::email_matches(was, now))
+}
+
+/// The login directory `was`, a label's row in the previous roster, passes to `row`, the row a
+/// source now gives that label: its own where it was the same account ([`same_account`]), or
+/// where it was a legacy row, which names no login address (a sync assigns it one only where
+/// nothing is on record under its label, `Store::check_new_labels`); nothing where it was
+/// another account's, whose login that directory can hold ([`rows_to_choose`]).
+fn label_dir_kept<'a>(was: &'a Row, row: &Row) -> Option<&'a str> {
+    was.dir
+        .as_deref()
+        .filter(|_| was.email.is_none() || same_account(was, row))
+}
+
 fn default_identity_hint<'a>(
     existing: Option<&'a Roster>,
     observed: Option<&'a str>,
@@ -2214,6 +2323,9 @@ fn default_identity_hint<'a>(
 /// the label `existing` already gives that account where the fleet gives it to no account, else
 /// a new one ([`local_account`], unique among the fleet's labels and `existing`'s), so no label
 /// is kept on an account it is not and an account keeps its label while it can.
+/// Every other row is given the login directory its label's row in `existing` names, else its
+/// label's own (`logins/<label>`); the sync places again each row whose label's row named none or
+/// held another login address, by whose login each directory holds (`chosen_dirs`).
 /// With no observed profile email, the prior default row's declared identity remains the hint.
 /// An explicit alias expectation follows its unique login address across label changes.
 #[must_use]
@@ -3816,12 +3928,21 @@ fn sync_lock_ladder() -> Vec<Duration> {
         .collect()
 }
 
-fn default_relocation(
-    existing: &Roster,
-    next: &Roster,
-) -> Result<Option<(String, String)>, String> {
+/// The labels a sync moves this Mac's account state between where `next`, the roster it builds,
+/// gives the default login's account another label than `existing` gave it: `(from, to)` pairs,
+/// the default login's first; then, while a pair takes over a label `existing` gives another
+/// account, that row's, to the label `next` gives its account, until a pair takes a label
+/// `existing` does not use or one a pair leaves (a swap, or any cycle of labels). Empty where the
+/// default login keeps its label or now holds another account (its row was displaced, not moved).
+/// The default login's state follows its account whatever its new label held; each row moved
+/// after it keeps its login directory where it holds a login ([`relocated_dirs`]).
+/// # Errors
+/// A label taken over is another account's that `next` gives no other row of its own (an
+/// account the source no longer lists on this Mac, or a row with no unique login address), so
+/// what is on record of that account has no label to move to.
+fn default_relocation(existing: &Roster, next: &Roster) -> Result<Vec<(String, String)>, String> {
     let Some((was, now)) = existing.row_for_login(None).zip(next.row_for_login(None)) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     if was.label == now.label
         || !was
@@ -3830,15 +3951,363 @@ fn default_relocation(
             .zip(now.email.as_deref())
             .is_some_and(|(was, now)| accounts::email_matches(was, now))
     {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    if existing.row(&now.label).is_some() {
-        return Err(format!(
-            "cannot relabel `{}` to `{}`: the previous roster already uses that label; choose an unused label; no new sync was published",
-            was.label, now.label
-        ));
+    let mut moves = vec![(was.label.clone(), now.label.clone())];
+    while let Some(held) = moves.last().and_then(|(_, to)| existing.row(to)) {
+        if moves.iter().any(|(from, _)| *from == held.label) {
+            break;
+        }
+        let goes = held
+            .email
+            .as_deref()
+            .and_then(|email| retained_login_row(Some(next), email))
+            .filter(|row| {
+                row.dir.is_some() && row.label != held.label && moves.len() < existing.rows.len()
+            });
+        let Some(goes) = goes else {
+            return Err(format!(
+                "cannot relabel `{}` to `{}`: the previous roster already uses `{}` for another \
+                 account, which the source gives no other label on this Mac; give the default \
+                 login's account an unused label in the source, or list that account there under \
+                 a label of its own; no new sync was published",
+                was.label, now.label, held.label
+            ));
+        };
+        moves.push((held.label.clone(), goes.label.clone()));
     }
-    Ok(Some((was.label.clone(), now.label.clone())))
+    Ok(moves)
+}
+
+/// Every relabel a sync makes as a move: the default login's chain ([`default_relocation`])
+/// first, then one pair for each other account in both rosters whose label changed
+/// ([`same_account`]: the roster gives a provider identity one row), in the previous roster's
+/// order, no label left or taken twice. A pair runs [`accounts::move_accounts`], so the
+/// account's record and binding follow it to its new label rather than standing under the old
+/// one for the account the source gives it (ATERM-KI-1028-6). An account the source no longer
+/// lists has no pair: what it left at a destination is forgotten before the moves, and a binding
+/// it left at any other label keeps its directory only in `was`, so no row is served it.
+fn relabel_moves(
+    existing: &Roster,
+    next: &Roster,
+    chain: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut moves = chain.to_vec();
+    for was in &existing.rows {
+        if moves.iter().any(|(from, _)| from == &was.label) {
+            continue;
+        }
+        let Some(now) = next.rows.iter().find(|row| same_account(was, row)) else {
+            continue;
+        };
+        if now.label != was.label && !moves.iter().any(|(_, to)| to == &now.label) {
+            moves.push((was.label.clone(), now.label.clone()));
+        }
+    }
+    moves
+}
+
+/// The labels of `existing` whose account the source no longer lists: no row of `next` is the
+/// same account ([`same_account`]), under any label ([`relabel_moves`] pairs the rest).
+fn departed_labels(existing: &Roster, next: &Roster) -> Vec<String> {
+    existing
+        .rows
+        .iter()
+        .filter(|was| !next.rows.iter().any(|row| same_account(was, row)))
+        .map(|was| was.label.clone())
+        .collect()
+}
+
+/// Whether `dir` holds an entry, as [`accounts::login_made`] reads a login, except that a
+/// directory that cannot be read is an error rather than one that holds none: only an absent
+/// directory holds none.
+fn holds_entry(dir: &Path) -> io::Result<bool> {
+    match fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().transpose().map(|entry| entry.is_some()),
+        Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(why) => Err(why),
+    }
+}
+
+/// The bindings `logins` holds once every move of `moves` ([`default_relocation`]) is made: each
+/// follows its account from the label it leaves to the one it takes, as the sync's transaction
+/// moves them ([`accounts::move_accounts`]).
+fn bindings_after(logins: &accounts::Logins, moves: &[(String, String)]) -> accounts::Logins {
+    let mut after = logins.clone();
+    let follow: Vec<_> = moves
+        .iter()
+        .map(|(from, to)| (to.clone(), after.labels.remove(from)))
+        .collect();
+    for (to, binding) in follow {
+        if let Some(binding) = binding {
+            after.labels.insert(to, binding);
+        }
+    }
+    after
+}
+
+/// Whose login a login directory holds for a row, as the profile in it says: the provider
+/// identity a launch under that directory reads ([`super::profile::identity_in_home`]), which
+/// [`super::accounts_pool::check_login_identity`] holds the row's launch to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// The directory is absent or empty.
+    Nothing,
+    /// It holds a login whose profile names the row's account.
+    Own,
+    /// It holds an entry, and its profile names another account or none that can be read.
+    Other,
+}
+
+/// What `dir` holds for `row` ([`Held`]).
+/// # Errors
+/// `dir` cannot be read (other than being absent), as [`holds_entry`], or the profile a launch
+/// under it reads is there but cannot be read ([`super::profile::unreadable_profile_in_home`]):
+/// either way whose login it holds is unknown.
+fn held_for(dir: &Path, row: &Row) -> io::Result<Held> {
+    if !holds_entry(dir)? {
+        return Ok(Held::Nothing);
+    }
+    if let Some(profile) = super::profile::unreadable_profile_in_home(dir) {
+        return Err(io::Error::other(format!(
+            "its profile {} cannot be read",
+            profile.display()
+        )));
+    }
+    let own = row.expected_identity_email().is_some_and(|email| {
+        super::profile::identity_in_home(dir, email).email_matches == Some(true)
+    });
+    Ok(if own { Held::Own } else { Held::Other })
+}
+
+/// The login directory each row [`default_relocation`] moves after the default login has in the
+/// roster the sync publishes, by its new label, or `None` for a row [`chosen_dirs`] places. A
+/// sync moves no login, and roster directories need only be distinct, so a row keeps its own
+/// directory where that is empty or holds its own account's login ([`held_for`]); one whose own
+/// directory holds another account's login, or entries whose profile names no account, keeps
+/// none and is placed by whose login each directory holds, as a row given one by its label
+/// alone is. A row whose own directory holds nothing and whose renewal-bound login (`logins`,
+/// the bindings before the moves) holds nothing either takes its new label's own login directory
+/// (`logins/<label>`), as a new row would, where that directory is absent or empty or holds its
+/// own account's login and no other row of `next` and no binding filed under another label once
+/// every move is made (`after`, [`bindings_after`]) names it; otherwise it keeps its own too. So
+/// a moved row never takes the directory `next` gave its new label by that label alone where it
+/// holds another account's login, and no login is moved, deleted or handed to another row.
+///
+/// A directory a row keeps stays its own across syncs, not only within this one: the roster
+/// admits no two rows with one directory, a row arrives only at a directory that holds nothing
+/// or its own account's login, and every other row is placed where its label's previous row was
+/// another account's or named none ([`rows_to_choose`]), taking only a directory that holds
+/// nothing or its own account's login and that no row of another account in the previous roster
+/// names ([`chosen_dirs`]).
+/// # Errors
+/// A moved row's directory, its renewal-bound login, or its new label's directory where nothing
+/// else names that, cannot be read ([`held_for`]), so whose login it holds is unknown: the message
+/// names the labels, the directory, and what a person does.
+fn relocated_dirs(
+    store: &accounts::Store,
+    existing: &Roster,
+    next: &Roster,
+    (logins, after): (&accounts::Logins, &accounts::Logins),
+    moves: &[(String, String)],
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let Some(((first_from, first_to), rows)) = moves.split_first() else {
+        return Ok(Vec::new());
+    };
+    let unreadable = |from: &str, to: &str, dir: &str, why: io::Error| {
+        format!(
+            "cannot relabel `{first_from}` to `{first_to}`: the source also moves `{from}`'s \
+             account to `{to}`, and the login directory {dir} cannot be read ({why}), so whose \
+             login it holds is unknown; make that directory readable, or keep these accounts' \
+             current labels in the source, and run the sync again; no new sync was published"
+        )
+    };
+    let mut placed = next.clone();
+    let mut empty = Vec::new();
+    for (from, to) in rows {
+        let Some(row) = next.row(to) else {
+            continue;
+        };
+        let own = existing.row(from).and_then(|row| row.dir.clone());
+        let held = match own.as_deref() {
+            Some(dir) => {
+                held_for(Path::new(dir), row).map_err(|why| unreadable(from, to, dir, why))?
+            }
+            None => Held::Nothing,
+        };
+        let bound = match logins.get(from).and_then(|binding| binding.dir.as_deref()) {
+            Some(dir) => {
+                holds_entry(Path::new(dir)).map_err(|why| unreadable(from, to, dir, why))?
+            }
+            None => false,
+        };
+        if let Some(row) = placed.rows.iter_mut().find(|row| row.label == *to) {
+            row.dir = own.filter(|_| held != Held::Other);
+        }
+        if held == Held::Nothing && !bound {
+            empty.push((from.as_str(), to.as_str(), row));
+        }
+    }
+    // A row that takes its new label's directory can free the one another wants (a cycle). A
+    // directory a row can take is read only once nothing else names it; one that cannot be read
+    // then refuses, as it may hold the row's own login, which a row left on a new directory would
+    // never find again.
+    loop {
+        let mut took = false;
+        for (from, to, row) in &empty {
+            let Some(wanted) = store
+                .login_dir(to)
+                .and_then(|dir| dir.to_str().map(str::to_owned))
+            else {
+                continue;
+            };
+            let taken = placed
+                .row(to)
+                .is_none_or(|row| row.dir.as_deref() == Some(wanted.as_str()))
+                || !matches!(
+                    accounts::retained_directory_owner(after, &placed.rows, to, &wanted),
+                    Ok(None)
+                );
+            if taken {
+                continue;
+            }
+            let held = held_for(Path::new(&wanted), row)
+                .map_err(|why| unreadable(from, to, &wanted, why))?;
+            if let Some(row) = placed.rows.iter_mut().find(|row| row.label == *to)
+                && held != Held::Other
+            {
+                row.dir = Some(wanted);
+                took = true;
+            }
+        }
+        if !took {
+            break;
+        }
+    }
+    Ok(rows
+        .iter()
+        .map(|(_, to)| (to.clone(), placed.row(to).and_then(|row| row.dir.clone())))
+        .collect())
+}
+
+/// The labels of the rows of `next` whose login directory [`chosen_dirs`] chooses: each row with
+/// a directory that [`build_machine_roster`] gave by its label alone (`logins/<label>`), because
+/// its label's row in `existing` names none (a row new to this Mac, or the default login's
+/// previous row), or that it gave as the directory of its label's row in `existing` where that
+/// row was another account's ([`label_dir_kept`]: a label the source gave another account,
+/// whose directory holds that account's login), other than a row [`default_relocation`] moves
+/// after the default login, which [`relocated_dirs`] places.
+fn rows_to_choose(existing: &Roster, next: &Roster, moves: &[(String, String)]) -> Vec<String> {
+    next.rows
+        .iter()
+        .filter(|row| {
+            row.dir.is_some()
+                && existing
+                    .row(&row.label)
+                    .and_then(|was| label_dir_kept(was, row))
+                    .is_none()
+                && !moves.iter().skip(1).any(|(_, to)| *to == row.label)
+        })
+        .map(|row| row.label.clone())
+        .collect()
+}
+
+/// The login directory each row of `labels` ([`rows_to_choose`], and a moved row
+/// [`relocated_dirs`] gave none) has in the roster the sync publishes, chosen by whose login each
+/// directory holds ([`held_for`]). A relabel leaves a login where it is, so a label's own
+/// directory can be the one a row of another label keeps, or hold the login of an account whose
+/// row named it before. Each row takes the first of these that is free for it: the directory its
+/// account's row in `existing` names ([`same_account`], under whatever label and login address:
+/// the roster gives a provider identity one row), its label's own (`logins/<label>`), then
+/// `logins/<label>~<n>` (`n` from 1: `~` is in no label, so no label's directory, and no
+/// renewal's `<label>+<n>` staging name, is one of these). A directory is free for a row where no
+/// row of `existing` that was another account's, no other row of `next` and no binding filed
+/// under another label once every move is made (`after`, [`bindings_after`]: its `dir` or any of
+/// its `was`) names it, nor any whose ownership cannot be established, and it is absent or empty
+/// or its profile names that row's account; one that holds entries whose profile names another
+/// account or none is not. So no row is given another account's login, or a directory another
+/// row names, and an account that leaves and comes back (or whose roster was lost) finds its own
+/// login again when that login is in `logins/<label>` or a `logins/<label>~<n>`.
+/// # Errors
+/// A directory that nothing else names cannot be read ([`held_for`]), so whose login it holds is
+/// unknown and the row's own could be in it: the message names the label and the directory, and
+/// asks for it to be made readable. Or no name up to `<label>~9999` is free (each holds another
+/// account's login or is named), so the row has no directory to take; the message names the
+/// label and the directory.
+fn chosen_dirs(
+    store: &accounts::Store,
+    existing: &Roster,
+    next: &mut Roster,
+    after: &accounts::Logins,
+    labels: &[String],
+) -> Result<(), String> {
+    for row in next
+        .rows
+        .iter_mut()
+        .filter(|row| labels.contains(&row.label))
+    {
+        row.dir = None;
+    }
+    let root = store.logins_dir();
+    for label in labels {
+        let Some(row) = next.row(label).cloned() else {
+            continue;
+        };
+        let named = |next: &Roster, dir: &str| {
+            !matches!(
+                accounts::naming_row(
+                    existing.rows.iter().filter(|was| !same_account(was, &row)),
+                    dir
+                ),
+                Ok(None)
+            ) || !matches!(
+                accounts::retained_directory_owner(after, &next.rows, label, dir),
+                Ok(None)
+            )
+        };
+        let own = existing
+            .rows
+            .iter()
+            .find(|was| same_account(was, &row))
+            .and_then(|was| was.dir.clone());
+        let mut chosen = None;
+        for dir in own.into_iter().chain(
+            std::iter::once(label.clone())
+                .chain((1..=9999).map(|n| format!("{label}~{n}")))
+                .filter_map(|name| root.join(name).to_str().map(str::to_owned)),
+        ) {
+            if named(next, &dir) {
+                continue;
+            }
+            match held_for(Path::new(&dir), &row) {
+                Ok(Held::Nothing | Held::Own) => {
+                    chosen = Some(dir);
+                    break;
+                }
+                Ok(Held::Other) => {}
+                Err(why) => {
+                    return Err(format!(
+                        "cannot give `{label}` a login directory: {dir} cannot be read ({why}), \
+                         so whose login it holds is unknown, and it may be this account's own; \
+                         make that directory readable and run the sync again; no new sync was \
+                         published"
+                    ));
+                }
+            }
+        }
+        let dir = chosen.ok_or_else(|| {
+            format!(
+                "cannot give `{label}` a login directory: {} and every name beside it up to \
+                 `{label}~9999` holds another account's login or is named by another row or \
+                 binding; no new sync was published",
+                root.join(label).display()
+            )
+        })?;
+        if let Some(row) = next.rows.iter_mut().find(|row| row.label == *label) {
+            row.dir = Some(dir);
+        }
+    }
+    Ok(())
 }
 
 fn apply_pool_to_claude_roster(
@@ -4049,6 +4518,56 @@ fn persist_accounts_sync_with_pool(
             &fleet.conflicts_for(Some(machine)),
         ));
     }
+    // A default login's state follows its account to its new label, whether or not the old
+    // label is reused, and a row whose label it takes over moves to the label the source gives
+    // that row's account. Only an unchanged login address permits this metadata relocation.
+    // Every other account whose label changed moves the same way (`relabel_moves`): all the
+    // pairs move records and bindings, but only the default login's chain is placed by
+    // `relocated_dirs`; a row another pair moves is placed as a row given a directory by its
+    // label alone is, its account's own directory first. An absent account can return by
+    // matching its retained provider key and profile; its verified directory follows it.
+    let chain = default_relocation(&existing, &roster)?;
+    let mut moves = relabel_moves(&existing, &roster, &chain);
+    let (retained, _) = store.load(now)?;
+    let (logins, _) = store.load_logins(now)?;
+    let returns = returned::find(store, &existing, &roster, &retained, &logins, &moves)?;
+    moves.extend(
+        returns
+            .iter()
+            .map(|found| (found.from.clone(), found.to.clone())),
+    );
+    let departed = departed_labels(&existing, &roster);
+    // A row's login directory goes by whose login it holds, as its profile says. Each row moved
+    // after the default login keeps its own where that holds nothing or its own account's login,
+    // or takes its new label's where that is free; every other row given a directory by its label
+    // alone (new here, the default login's previous row, a label the source gave another account,
+    // or a moved row whose directory holds another's login) takes its account's directory, its
+    // label's or a new one, whichever first holds nothing or its own login and nothing else names.
+    // It reads the bindings under the lock this sync holds through publication, as the
+    // transaction below reads the ones it edits, whose directory check still refuses a row given
+    // a directory another binding retains.
+    let mut choose = rows_to_choose(&existing, &roster, &chain);
+    for found in &returns {
+        choose.retain(|label| label != &found.to);
+        if let Some(row) = roster.rows.iter_mut().find(|row| row.label == found.to) {
+            row.dir = Some(found.dir.clone());
+        }
+    }
+    if moves.len() > 1 || !choose.is_empty() || !returns.is_empty() {
+        let mut after = bindings_after(&logins, &moves);
+        for found in &returns {
+            found.restore(&mut after, &found.to);
+        }
+        for (label, dir) in relocated_dirs(store, &existing, &roster, (&logins, &after), &chain)? {
+            if dir.is_none() {
+                choose.push(label.clone());
+            }
+            if let Some(row) = roster.rows.iter_mut().find(|row| row.label == label) {
+                row.dir = dir;
+            }
+        }
+        chosen_dirs(store, &existing, &mut roster, &after, &choose)?;
+    }
     let roster_toml = format_roster_toml(&roster)
         .map_err(|why| format!("generated roster refused admission: {why}"))?;
     let (fleet_write_to, fleet_mode) = super::cli::roster_target(&fleet_path)?;
@@ -4085,15 +4604,17 @@ fn persist_accounts_sync_with_pool(
     }
     let fleet_toml = fleet.to_toml_for(Some(opt_in));
     let default_row_label = roster.row_for_login(None).map(|r| r.label.clone());
-    // The labels the fleet gave another account than the one the roster gave them: what is on
-    // record under each is the account it held before, never the one it holds now.
+    // The labels the fleet gave another account than the one the roster gave them (another
+    // provider identity: a login address changed for the same identity is the same account,
+    // `same_account`): what is on record under each is the account it held before, never the
+    // one it holds now, unless a relocation moves the account it holds now there.
     let relabelled: Vec<String> = roster
         .rows
         .iter()
         .filter(|row| {
             existing.row(&row.label).is_some_and(|was| {
                 match (was.email.as_deref(), row.email.as_deref()) {
-                    (Some(was), Some(now)) => !accounts::email_matches(was, now),
+                    (Some(_), Some(_)) => !same_account(was, row),
                     (None, Some(_)) => true,
                     _ => false,
                 }
@@ -4101,9 +4622,6 @@ fn persist_accounts_sync_with_pool(
         })
         .map(|row| row.label.clone())
         .collect();
-    // A default login retains its state when its label moves, whether or not the old
-    // label is reused. Only an unchanged login address permits this metadata relocation.
-    let default_moved = default_relocation(&existing, &roster)?;
     let legacy_assignments: Vec<&str> = roster
         .rows
         .iter()
@@ -4172,6 +4690,8 @@ fn persist_accounts_sync_with_pool(
     let fleet_held = fs::read(&fleet_write_to).ok();
     let mut state_changed = false;
     let mut copy_removed = false;
+    // The login directories under the store that moved rows leave and nothing names any longer.
+    let left_dirs = std::cell::Cell::new(Vec::<PathBuf>::new());
     let events = store
         .transact_sync_held(&held, now, &mut note, accounts::SyncTarget {
             path: &write_to,
@@ -4180,17 +4700,68 @@ fn persist_accounts_sync_with_pool(
             mode: keep_mode,
         }, |state, logins| {
             let before = (state.clone(), logins.clone());
+            for found in &returns {
+                found.recheck(state, &roster)?;
+                found.restore(logins, &found.from);
+            }
             if let Some(ctx) = pool_ctx {
                 apply_pool_execution(state, &roster.rows, Cli::Claude, ctx);
             }
-            if let Some((from, to)) = &default_moved {
-                accounts::move_account(state, logins, from, to)?;
+            // What a departed account left at a move's destination is forgotten first, binding
+            // and all, so the move is not refused for retaining it and no row is served its
+            // login; the directory itself stays where it is, unnamed.
+            for (_, to) in &moves {
+                if departed.contains(to) {
+                    accounts::forget_account(state, logins, to);
+                    logins.labels.remove(to);
+                }
             }
+            let pairs: Vec<(&str, &str)> =
+                moves.iter().map(|(from, to)| (from.as_str(), to.as_str())).collect();
+            accounts::move_accounts(state, logins, &pairs)?;
             for label in &relabelled {
-                if default_moved.as_ref().is_none_or(|(from, _)| from != label) {
+                if !moves.iter().any(|(_, to)| to == label) {
                     accounts::forget_account(state, logins, label);
                 }
             }
+            // A departed account's binding at any other label keeps its directory only in
+            // `was`: no row is given it, and it is no longer served to the label's next
+            // account (`accounts::bound`). Its record stands, for its return.
+            for label in &departed {
+                if moves.iter().any(|(_, to)| to == label) {
+                    continue;
+                }
+                if let Some(binding) = logins.labels.get_mut(label)
+                    && let Some(dir) = binding.dir.take()
+                {
+                    // Keep the most recent old logins within the store's bound, and put the
+                    // last current login where a returning account finds it, even if it was
+                    // already in history. Only metadata retires; no login file is removed.
+                    binding.was.retain(|was| was.as_deref() != Some(dir.as_str()));
+                    binding.was.truncate(accounts::MAX_LEFT - 1);
+                    binding.was.push(Some(dir));
+                }
+            }
+            let logins_root = store.logins_dir();
+            left_dirs.set(
+                moves
+                    .iter()
+                    .skip(1)
+                    .filter_map(|(from, _)| existing.row(from)?.dir.clone())
+                    .filter(|dir| {
+                        Path::new(dir).parent() == Some(logins_root.as_path())
+                            && !roster
+                                .rows
+                                .iter()
+                                .any(|row| row.dir.as_deref() == Some(dir.as_str()))
+                            && !logins.labels.values().any(|binding| {
+                                binding.dir.as_deref() == Some(dir.as_str())
+                                    || binding.was.iter().flatten().any(|was| was == dir)
+                            })
+                    })
+                    .map(PathBuf::from)
+                    .collect(),
+            );
             for row in &roster.rows {
                 if let Some(dir) = row.dir.as_deref()
                     && let Some(owner) = accounts::retained_directory_owner(logins, &roster.rows, &row.label, dir)?
@@ -4312,6 +4883,11 @@ fn persist_accounts_sync_with_pool(
             Ok(events)
         }, || {
             publishing = true;
+            // A moved row leaves its login directory only where it held nothing when the sync
+            // chose: removing only an empty directory keeps one a login has reached since.
+            for dir in left_dirs.take() {
+                let _ = fs::remove_dir(dir);
+            }
             for row in &roster.rows {
                 if let Some(dir) = &row.dir {
                     aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
@@ -9717,9 +10293,15 @@ pub(super) fn resolve_claude_program(home: &Path) -> PathBuf {
     PathBuf::from("claude")
 }
 
-fn resolve_opener_link(home: &Path, store: &accounts::Store) -> Option<PathBuf> {
+fn resolve_opener_link(
+    home: &Path,
+    store: &accounts::Store,
+) -> Result<PathBuf, super::cli::OpenerError> {
     let custom_opener = home.join(".local/bin").join(super::open_url::OPENER);
-    if custom_opener.is_file() {
+    // An explicitly installed helper that is broken or inaccessible is a setup error,
+    // not permission to replace it with this process's executable.
+    if !matches!(std::fs::symlink_metadata(&custom_opener), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    {
         struct HomeOpenerHost(PathBuf);
         impl super::cli::AccountsHost for HomeOpenerHost {
             fn stdin_is_terminal(&self) -> bool {
@@ -12534,6 +13116,13 @@ fn spawn_row_renewal(
             };
             let run_attempt = |browser: &super::cli::RenewBrowser, force_headless: bool| {
                 let snapshot = &captured_logins;
+                let route = if force_headless && has_headless_profile {
+                    "profile"
+                } else if has_mailbox {
+                    "mailbox"
+                } else {
+                    "browser"
+                };
                 if let Some(authority) = shared_authority.as_deref() {
                     let env = quiet_env(
                         &home_owned,
@@ -12546,6 +13135,13 @@ fn spawn_row_renewal(
                         mailbox: mailbox_dir.as_deref(),
                         headless: force_headless,
                     };
+                    let _activity = LoginActivityGuard::begin(
+                        &ladder_guard,
+                        &store,
+                        cli,
+                        &next_label,
+                        Some(route),
+                    );
                     let result = super::cli::shared_renewal::background(
                         &env,
                         shared_host
@@ -12588,13 +13184,6 @@ fn spawn_row_renewal(
                 met.replace(None);
                 cause.replace(None);
                 let result = {
-                    let route = if force_headless && has_headless_profile {
-                        "profile"
-                    } else if has_mailbox {
-                        "mailbox"
-                    } else {
-                        "browser"
-                    };
                     let _activity = LoginActivityGuard::begin(
                         &ladder_guard,
                         &store,
@@ -12647,15 +13236,23 @@ fn spawn_row_renewal(
                     select_auto_renew_browser(
                         next_row.browser.as_deref(),
                         mailbox_dir.as_deref(),
-                        opener.clone(),
+                        opener.as_ref().ok().cloned(),
                     )
-                    .or_else(|| allow_default_browser.then_some(super::cli::RenewBrowser::Default))
+                    .or_else(|| {
+                        (allow_default_browser && next_row.browser.is_none())
+                            .then_some(super::cli::RenewBrowser::Default)
+                    })
                 };
-                let browser = if (has_mailbox || has_headless_profile) && opener.is_some() {
-                    super::cli::RenewBrowser::Remote { opener }
+                let browser = if has_mailbox || has_headless_profile {
+                    super::cli::RenewBrowser::Remote {
+                        opener: Some(opener.map_err(|error| error.to_string())?),
+                    }
                 } else {
                     let Some(b) = non_headless_fallback.clone() else {
-                        return Err("no opener link could be made".to_owned());
+                        return Err(opener.err().map_or_else(
+                            || "no unattended sign-in route is available".to_owned(),
+                            |error| error.to_string(),
+                        ));
                     };
                     b
                 };
@@ -18390,6 +18987,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn complete_staging_renewal_records_wrong_account_and_auto_renew_advances_past_cooldown_or_unconfigured_row()
      {
@@ -18751,7 +19349,7 @@ totp = "JBSWY3DPEHPK3PXP"
                 })
             }
             fn current_exe(&self) -> Option<PathBuf> {
-                None
+                Some(std::env::current_exe().expect("the test executable"))
             }
         }
 
@@ -18811,7 +19409,9 @@ totp = "JBSWY3DPEHPK3PXP"
             recorded,
             vec![(
                 "star.m27.3@example.test".to_owned(),
-                super::super::cli::RenewBrowser::Remote { opener: None }
+                super::super::cli::RenewBrowser::Remote {
+                    opener: Some(store.dir.join("bin").join(super::super::open_url::OPENER)),
+                }
             )],
             "renew --due must skip unconfigured m27-2 and run headless-capable m27-3 with Remote browser"
         );
@@ -19881,6 +20481,7 @@ totp = "JBSWY3DPEHPK3PXP"
     /// A row to sign in on a machine with no route, as m2 was on 2026-10-24, whose session on
     /// m2-2 waits at its wall: the vault is refreshed once per wait, the failure is on record,
     /// the mailbox a refresh brings signs the row in, and the session at the wall moves to it.
+    #[cfg(unix)]
     #[test]
     fn a_vault_refresh_that_brings_a_mailbox_signs_in_the_row_a_walled_session_moves_to() {
         use super::super::sign_in_ladder::Vault;
@@ -20202,8 +20803,15 @@ mod sheet_columns_tests;
 #[path = "accounts_fleet_assignment_tests.rs"]
 mod fleet_assignment_tests;
 #[cfg(all(test, unix))]
+#[path = "accounts_sync_label_swap_tests.rs"]
+mod label_swap_tests;
+#[cfg(all(test, unix))]
 #[path = "accounts_sync_vault_sheet_tests.rs"]
 mod vault_sheet_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_lab_cell_tests.rs"]
+mod lab_cell_tests;
 
 #[cfg(all(test, unix))]
 #[path = "accounts_hardening_tests.rs"]

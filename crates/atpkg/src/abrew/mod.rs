@@ -606,7 +606,23 @@ fn native_args(
             usize::MAX,
             true,
         ),
-        "link" | "ln" | "unlink" => (
+        "link" | "ln" => (
+            &[
+                "--dry-run",
+                "-n",
+                "--force",
+                "-f",
+                "--overwrite",
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
+            ],
+            1,
+            usize::MAX,
+            true,
+        ),
+        "unlink" => (
             &[
                 "--dry-run",
                 "-n",
@@ -679,7 +695,18 @@ fn native_args(
             1,
             true,
         ),
-        "tap" => (&["--list-official"], 0, 2, false),
+        "tap" => (
+            &[
+                "--list-official",
+                "--repair",
+                "--custom-remote",
+                "--force",
+                "-f",
+            ],
+            0,
+            2,
+            false,
+        ),
         "untap" => (&[], 1, usize::MAX, false),
         "tap-info" => (
             &["--json", "--json=v1", "--installed"],
@@ -688,7 +715,7 @@ fn native_args(
             false,
         ),
         "help" | "--help" | "-h" => (&[], 0, 1, false),
-        "completions" => (&[], 1, 1, false),
+        "completions" => (&[], 0, 1, false),
         "--prefix" | "--cellar" | "--caskroom" => (&[], 0, usize::MAX, true),
         "--cache" => (&["--formula", "--cask"], 0, usize::MAX, true),
         "--repository" | "--repo" => (&[], 0, 1, false),
@@ -697,7 +724,8 @@ fn native_args(
         "doctor" | "dr" => (&["--quiet", "-q", "--list-checks"], 0, usize::MAX, false),
         "shellenv" => (&[], 0, usize::MAX, false),
         "on" | "off" | "status" | "--version" | "-v" | "--env" | "env" | "formulae" | "casks"
-        | "config" | "developer" | "update" => (&[], 0, 0, false),
+        | "config" | "update" => (&[], 0, 0, false),
+        "developer" => (&[], 0, 1, false),
         "commands" => (&["--quiet", "-q", "--include-aliases"], 0, 0, false),
         "leaves" => (
             &[
@@ -741,7 +769,7 @@ fn native_args(
                 }))
     };
     if cmd == "info" {
-        for arg in rest {
+        for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
             if let Some(version) = arg.strip_prefix("--json=")
                 && !matches!(version, "v1" | "v2")
             {
@@ -751,7 +779,11 @@ fn native_args(
             }
         }
     }
-    if rest.iter().any(|arg| arg.starts_with('-') && !flag_ok(arg)) {
+    if rest
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg.starts_with('-') && !flag_ok(arg))
+    {
         return Err(unsupported());
     }
     if cmd == "cleanup" {
@@ -763,16 +795,33 @@ fn native_args(
         operands(rest)
     };
     if cmd == "completions"
-        && !ops
-            .first()
-            .is_some_and(|shell| matches!(shell.as_str(), "bash" | "zsh" | "fish"))
+        && let Some(sub) = ops.first()
+        && !matches!(sub.as_str(), "state" | "link" | "unlink")
     {
+        return Err(InstallError::Failed(format!(
+            "Error: Invalid usage: unknown subcommand: `{sub}`"
+        )));
+    }
+    if matches!(cmd, "developer" | "analytics")
+        && let Some(sub) = ops.first()
+        && !matches!(sub.as_str(), "state" | "on" | "off")
+    {
+        return Err(InstallError::Failed(format!(
+            "Error: Invalid usage: unknown subcommand: `{sub}`"
+        )));
+    }
+    // Abrew records no analytics to toggle.
+    if cmd == "analytics" && ops.iter().any(|s| matches!(s.as_str(), "on" | "off")) {
         return Err(unsupported());
     }
     let want_formula = has_flag(rest, "--formula", "");
     let want_cask = has_flag(rest, "--cask", "");
     let valid_package_name = |s: &String| {
-        valid_component(s)
+        // Dash-leading operands only arise after `--`; brew
+        // tries to resolve them and fails with its own error,
+        // so they pass admission to reach it.
+        s.starts_with('-')
+            || valid_component(s)
             || ((want_formula || matches!(cmd, "--prefix" | "--cellar"))
                 && s.strip_prefix("homebrew/core/")
                     .is_some_and(valid_component))
@@ -1443,21 +1492,12 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        "completions" => {
-            print!("{}", completions(rest.first().map_or("", String::as_str)));
-            ExitCode::SUCCESS
-        }
+        "completions" => commands::cmd_completions(prefix, rest),
         "config" => cmd_config(prefix),
         "shellenv" => cmd_shellenv(prefix, rest),
         "doctor" | "dr" => cmd_doctor(prefix, &api, rest),
-        "analytics" => {
-            println!("abrew: analytics are always off; abrew records nothing");
-            ExitCode::SUCCESS
-        }
-        "developer" => {
-            println!("Developer mode: off (abrew has no developer mode)");
-            ExitCode::SUCCESS
-        }
+        "analytics" => commands::cmd_analytics(),
+        "developer" => commands::cmd_developer(prefix, rest),
         "install" => cmd_install(prefix, &api, args, rest),
         "uninstall" | "remove" | "rm" => cmd_uninstall(prefix, &api, args, rest),
         "zap" => cmd_zap(prefix, &api, args, rest),
@@ -1546,35 +1586,26 @@ fn each_name(rest: &[String], f: impl Fn(&str) -> Result<(), String>) -> ExitCod
 }
 
 fn operands(rest: &[String]) -> Vec<String> {
-    rest.iter()
-        .filter(|s| !s.starts_with('-'))
-        .cloned()
-        .collect()
+    // Brew's parser: `--` ends switch parsing; what follows
+    // are named operands verbatim, dashes and all.
+    let mut out = Vec::new();
+    let mut literal = false;
+    for s in rest {
+        if literal {
+            out.push(s.clone());
+        } else if s == "--" {
+            literal = true;
+        } else if !s.starts_with('-') {
+            out.push(s.clone());
+        }
+    }
+    out
 }
 
 fn has_flag(rest: &[String], long: &str, short: &str) -> bool {
     rest.iter()
+        .take_while(|s| s.as_str() != "--")
         .any(|s| s == long || (!short.is_empty() && s == short))
-}
-
-fn completions(shell: &str) -> String {
-    let words = COMMANDS
-        .iter()
-        .filter(|c| !matches!(**c, "services" | "postinstall"))
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" ");
-    match shell {
-        "zsh" => format!(
-            "#compdef abrew\n_abrew() {{\n  local -a cmds=({words})\n  _arguments '1:command:($cmds)' '*::arg:_normal'\n}}\n_abrew\n"
-        ),
-        "fish" => format!(
-            "complete -c abrew -n '__fish_use_subcommand' -a '{words}'\ncomplete -c brew -n '__fish_use_subcommand' -a '{words}'\n"
-        ),
-        _ => format!(
-            "_abrew() {{\n  COMPREPLY=( $(compgen -W \"{words} --version --help\" -- \"${{COMP_WORDS[COMP_CWORD]}}\") )\n}}\ncomplete -F _abrew abrew brew atpkg-abrew\n"
-        ),
-    }
 }
 
 const COMMANDS: &[&str] = &[
@@ -1813,7 +1844,7 @@ Common commands:
   tap, untap                      manage taps
   bundle                          native Brewfile install, check and dump
   cleanup, autoremove, fetch      housekeeping
-  completions bash|zsh|fish       print a shell completion script
+  completions [state|link|unlink] tap shell-completion linking
   on, off, status                 enable, disable or inspect native brew
 
 abrew pours bottles that need no relocation (or, on macOS with the developer
@@ -2020,10 +2051,8 @@ mod admission_tests {
                     "wget",
                 ],
             ),
-            ("link", vec!["--overwrite", "wget"]),
+            ("link", vec!["--HEAD", "wget"]),
             ("services", vec!["start", "wget"]),
-            ("completions", vec!["powershell"]),
-            ("completions", vec![]),
             ("postinstall", vec!["wget"]),
             ("cleanup", vec!["--prune=soon"]),
             ("--cache", vec!["--os=all", "wget"]),
@@ -2096,9 +2125,10 @@ mod admission_tests {
             ("deps", vec!["-n", "wget"]),
             ("deps", vec!["--topological", "--direct", "wget"]),
             ("deps", vec!["--union", "-n", "wget", "curl"]),
-            ("completions", vec!["bash"]),
-            ("completions", vec!["zsh"]),
-            ("completions", vec!["fish"]),
+            ("completions", vec![]),
+            ("completions", vec!["state"]),
+            ("completions", vec!["link"]),
+            ("completions", vec!["unlink"]),
             ("--prefix", vec!["wget"]),
             ("--prefix", vec!["homebrew/core/wget"]),
             ("--cache", vec![]),
@@ -2506,8 +2536,9 @@ mod admission_tests {
         assert!(native_args("link", &argv(&["--cask", "caffeine"])).is_ok());
         assert!(native_args("link", &argv(&["--force", "acl"])).is_ok());
         assert!(native_args("unlink", &argv(&["--formula", "-n", "acl"])).is_ok());
+        assert!(native_args("link", &argv(&["--overwrite", "acl"])).is_ok());
         assert!(matches!(
-            native_args("link", &argv(&["--overwrite", "acl"])),
+            native_args("unlink", &argv(&["--overwrite", "acl"])),
             Err(InstallError::Unsupported(_))
         ));
         assert!(matches!(
@@ -2658,5 +2689,45 @@ mod admission_tests {
             main_entry(vec![OsString::from_vec(b"not-utf8-\xff".to_vec())]),
             ExitCode::from(1)
         );
+    }
+
+    #[test]
+    fn subcommand_admission_shapes() {
+        assert!(native_args("developer", &argv(&[])).is_ok());
+        assert!(native_args("developer", &argv(&["on"])).is_ok());
+        assert!(matches!(
+            native_args("developer", &argv(&["bogus"])),
+            Err(InstallError::Failed(_))
+        ));
+        assert!(native_args("analytics", &argv(&[])).is_ok());
+        assert!(native_args("analytics", &argv(&["state"])).is_ok());
+        assert!(matches!(
+            native_args("analytics", &argv(&["on"])),
+            Err(InstallError::Unsupported(_))
+        ));
+        assert!(matches!(
+            native_args("analytics", &argv(&["bogus"])),
+            Err(InstallError::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn completions_unknown_subcommand_is_invalid_usage() {
+        assert!(matches!(
+            native_args("completions", &argv(&["bogus"])),
+            Err(InstallError::Failed(m)) if m == "Error: Invalid usage: unknown subcommand: `bogus`"
+        ));
+    }
+
+    #[test]
+    fn double_dash_ends_switch_parsing() {
+        let rest: Vec<String> = ["--json=v2", "--", "-v", "hello", "--cask"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(operands(&rest), ["-v", "hello", "--cask"]);
+        assert!(has_flag(&rest, "--json=v2", ""));
+        assert!(!has_flag(&rest, "--cask", ""));
+        assert!(!has_flag(&rest, "-v", ""));
     }
 }

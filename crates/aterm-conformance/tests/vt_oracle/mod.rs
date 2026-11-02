@@ -4,6 +4,7 @@
 //! Differential VT oracle tests against `astream-term` ([`caps::Caps`]).
 
 mod caps;
+mod clusters;
 mod corpus;
 mod engines;
 mod exclusions;
@@ -151,7 +152,7 @@ fn the_corpus_agrees_or_is_excluded() {
     );
 }
 
-/// Programs per run by default: about a second and a half in a debug build.
+/// Programs per run by default: about two and a half seconds in a debug build.
 const DEFAULT_CASES: u64 = 20_000;
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -258,6 +259,8 @@ fn the_subset_check_sees_what_a_dropped_token_rebuilds() {
         wide_glyphs: false,
         sgr_attrs: false,
         truecolour: false,
+        combining_marks: false,
+        clusters: false,
     };
     let program = |kinds: &[Kind]| Program {
         cols: 4,

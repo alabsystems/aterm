@@ -16,6 +16,9 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
   aterm secrets [status]                 this machine's vault, join code, membership,
                                          secrets, subscriber and server, and on an admin
                                          whether the approver runs
+  aterm secrets repair [--json]         migrate outdated managed vault services to this installed
+                                         release, with their arguments, health checks and rollback;
+                                         explicit pins and off records remain in force
   aterm secrets join [<url>|<path>] [--name <host>] [--password-stdin]
         [--no-agent] [--no-wait]         join a vault (neither: the ALab vault; a trailing
                                          #<signer key> pins its signer, else confirm the
@@ -197,6 +200,9 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Status,
+    Repair {
+        json: bool,
+    },
     Join {
         source: String,
         name: Option<String>,
@@ -508,6 +514,18 @@ pub(crate) fn served_by(
     Some((store, unix::local_url(&settings)))
 }
 
+/// Starts this long-lived vault job's network-place keeper candidate (`aterm_netplace::keeper`,
+/// once per process): with no window open, the subscriber or the server keeps the place, so a
+/// move is read where it happens and the lanes that read it pace and catch up on time. Never in
+/// a test, which must not touch the real state root.
+#[cfg(unix)]
+fn keep_network_place() {
+    #[cfg(not(test))]
+    if let Some(state) = aterm_types::dirs::state_dir() {
+        let _ = aterm_netplace::keeper::start(&state);
+    }
+}
+
 /// Decide the advertised mDNS name and ALab pin for one tick of `serve` (`DESIGN-fluid-swarm`
 /// §4.1 F1: evaluated on each advert tick rather than once at start).
 #[cfg(unix)]
@@ -709,6 +727,13 @@ fn parse(words: &[String]) -> Result<Command, String> {
         "status" => {
             no_operands(&flags(rest, &[], &[])?, "status")?;
             Ok(Command::Status)
+        }
+        "repair" => {
+            let f = flags(rest, &[], &["--json"])?;
+            no_operands(&f, "repair")?;
+            Ok(Command::Repair {
+                json: f.has("--json"),
+            })
         }
         "join" => {
             let f = flags(
@@ -1112,6 +1137,7 @@ mod unix {
         };
         match command {
             Command::Status => status(&paths, &subscriber),
+            Command::Repair { json } => repair(&paths, json),
             Command::Join {
                 source,
                 name,
@@ -1121,6 +1147,7 @@ mod unix {
             } => join(&paths, &source, name, agent, wait, password_stdin),
             Command::Sync { diagnostic } => sync(&paths, diagnostic),
             Command::Watch => {
+                super::keep_network_place();
                 client::watch(&paths, &|line| {
                     crate::log_line(&format!("{} {line}", stamp()));
                 })?;
@@ -1851,6 +1878,75 @@ mod unix {
         }
     }
 
+    fn repair(paths: &Paths, json: bool) -> crate::Result<ExitCode> {
+        let (rows, complete) = repair_with(&mut |job| client::mend_held(paths, job));
+        if json {
+            println!(
+                "{}",
+                aterm_json::json!({"schema":1,"services":rows,"complete":complete})
+            );
+        } else {
+            for row in rows {
+                println!(
+                    "{}: {} — {}",
+                    row["service"].as_str().unwrap_or("?"),
+                    row["outcome"].as_str().unwrap_or("?"),
+                    row["detail"].as_str().unwrap_or("?")
+                );
+            }
+        }
+        Ok(ExitCode::from(if complete { 0 } else { 3 }))
+    }
+
+    pub(super) fn repair_with(
+        repair: &mut impl FnMut(Job) -> crate::Result<client::HeldMend>,
+    ) -> (Vec<aterm_json::Value>, bool) {
+        use client::{HeldKept, HeldMend};
+        let mut complete = true;
+        let rows = [Job::Server, Job::Subscriber]
+            .into_iter()
+            .map(|job| {
+                let (outcome, detail) = match repair(job) {
+                    Ok(HeldMend::Moved(line, why)) => {
+                        ("repaired", format!("{line}; {}", why.why()))
+                    }
+                    Ok(HeldMend::NotHeld) => {
+                        ("unchanged", "no held service needs migration".into())
+                    }
+                    Ok(HeldMend::Kept(why)) => (
+                        "kept",
+                        match why {
+                            HeldKept::Pinned => "explicit service pin retained".into(),
+                            HeldKept::Development => {
+                                complete = false;
+                                "repair requires an installed release".into()
+                            }
+                            HeldKept::NoAdmin => {
+                                complete = false;
+                                "no authorized migration applies".into()
+                            }
+                            HeldKept::Reads => "service already reads this vault format".into(),
+                            HeldKept::Unknown(why) => {
+                                complete = false;
+                                why
+                            }
+                        },
+                    ),
+                    Ok(HeldMend::Unread(why)) => {
+                        complete = false;
+                        ("unavailable", why)
+                    }
+                    Err(error) => {
+                        complete = false;
+                        ("unavailable", error.to_string())
+                    }
+                };
+                aterm_json::json!({"service":job.label(),"outcome":outcome,"detail":detail})
+            })
+            .collect();
+        (rows, complete)
+    }
+
     fn status(paths: &Paths, subscriber: &Subscriber<'_>) -> crate::Result<ExitCode> {
         let status = client::status(paths)?;
         match &status.config {
@@ -1909,6 +2005,15 @@ mod unix {
                 status.names.join(", ")
             );
         }
+        match client::can_administer(paths) {
+            Ok(admin) => println!("vault admin: {admin}"),
+            Err(error) => println!("vault admin: unknown ({error})"),
+        }
+        match client::swarm_lease_holder(paths) {
+            Ok(Some(holder)) => println!("vault authority: {holder} (recorded steward)"),
+            Ok(None) => println!("vault authority: none recorded"),
+            Err(error) => println!("vault authority: unknown ({error})"),
+        }
         match client::release::signing_status(paths) {
             Ok(client::release::SigningStatus::Ready(now)) => {
                 println!("release signing: ready ({now})")
@@ -1928,6 +2033,22 @@ mod unix {
             ),
             Ok(_) => {}
             Err(error) => println!("conflict: unreadable ({error})"),
+        }
+        match client::reseal_waits(paths) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("waiting: {line}");
+                }
+            }
+            Err(error) => println!("waiting: unreadable ({error})"),
+        }
+        match client::read_after_cutoff_lines(paths) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("read while out: {line}");
+                }
+            }
+            Err(error) => println!("read while out: unreadable ({error})"),
         }
         match crate::need::peek(paths) {
             Ok(needs) => {
@@ -1957,6 +2078,18 @@ mod unix {
             Ok(service::State::Absent)
         ) {
             println!("server: {}", service_line(paths, Job::Server));
+        }
+        // Where this Mac is on the network, in the words every reporter uses: a vault that does
+        // not answer from a phone hotspot is the network's doing, and this line says so.
+        #[cfg(unix)]
+        if let Some(state) = aterm_types::dirs::state_dir() {
+            println!(
+                "{}",
+                aterm_netplace::words::header(
+                    &aterm_netplace::read(&state),
+                    &aterm_netplace::words::Words::now()
+                )
+            );
         }
         Ok(ExitCode::SUCCESS)
     }
@@ -3261,12 +3394,12 @@ mod unix {
         Ok(admitted)
     }
 
-    /// Render the configured source's queue after `client::requests` applies any
-    /// available administrator document. Missing metadata leaves code-only state
-    /// unknown and may leave already-admitted members in the queue.
+    /// Render the queue after authenticated membership filtering. Administrator
+    /// metadata is needed only to describe code-only holds.
     pub(super) fn requests_json(
         pending: &[client::Request],
         doc: Option<&text::Document>,
+        known_members_filtered: bool,
     ) -> aterm_json::Value {
         let code_only = doc.map(text::Document::code_only);
         let requests: Vec<_> = pending
@@ -3288,16 +3421,16 @@ mod unix {
             "schema": 1,
             "kind": "vault-join-requests",
             "scope": "configured-vault-source",
-            "known_members_filtered": doc.is_some(),
+            "known_members_filtered": known_members_filtered,
             "requests": requests,
         })
     }
 
     fn requests(paths: &Paths, json: bool) -> crate::Result<ExitCode> {
         let admin = client::admin_open(paths).ok();
-        let pending = client::requests(paths, admin.as_ref().map(|a| &a.doc))?;
+        let (pending, filtered) = client::inspect_requests(paths, admin.as_ref().map(|a| &a.doc))?;
         if json {
-            let value = requests_json(&pending, admin.as_ref().map(|a| &a.doc));
+            let value = requests_json(&pending, admin.as_ref().map(|a| &a.doc), filtered);
             println!(
                 "{}",
                 aterm_json::to_string(&value)
@@ -3603,6 +3736,7 @@ mod unix {
                         .0
                 }) as crate::server::RoleDecider
             });
+        super::keep_network_place();
         crate::server::serve_with_role(
             crate::server::Options {
                 listen: settings.listen,
@@ -3751,7 +3885,7 @@ mod tests {
             allowed: Some("private-member-allow".into()),
             proof: Some("private-password-proof".into()),
         };
-        let report = unix::requests_json(&[request], None);
+        let report = unix::requests_json(&[request], None, false);
         assert_eq!(report["known_members_filtered"].as_bool(), Some(false));
         let row = &report["requests"][0];
         assert_eq!(row["host"].as_str(), Some("new-machine"));
@@ -3791,7 +3925,7 @@ mod tests {
                 proof: None,
             })
             .collect();
-        let report = unix::requests_json(&requests, Some(&doc));
+        let report = unix::requests_json(&requests, Some(&doc), true);
         assert_eq!(report["known_members_filtered"].as_bool(), Some(true));
         assert_eq!(report["requests"][0]["code_only"].as_bool(), Some(true));
         assert_eq!(report["requests"][1]["code_only"].as_bool(), Some(false));
@@ -6187,6 +6321,43 @@ mod tests {
                 b"protocol=https\nhost=github.com\nusername=alabsystems\n\n"
             ),
             "quit=1\n"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod repair_tests {
+    #[test]
+    fn a_repair_without_an_installed_release_or_authority_is_incomplete() {
+        use crate::client::{HeldKept, HeldMend};
+        for reason in [HeldKept::Development, HeldKept::NoAdmin] {
+            let (_, complete) =
+                super::unix::repair_with(&mut |_| Ok(HeldMend::Kept(reason.clone())));
+            assert!(!complete);
+        }
+    }
+
+    #[test]
+    fn repair_continues_after_one_unavailable_service_and_preserves_holds() {
+        use crate::{
+            client::{HeldKept, HeldMend},
+            service::Job,
+        };
+        let mut calls = Vec::new();
+        let (rows, complete) = super::unix::repair_with(&mut |job| {
+            calls.push(job);
+            Ok(match job {
+                Job::Server => HeldMend::Unread("busy".into()),
+                Job::Subscriber => HeldMend::Kept(HeldKept::Pinned),
+            })
+        });
+        assert_eq!(calls, [Job::Server, Job::Subscriber]);
+        assert!(!complete);
+        assert_eq!(rows[0]["outcome"].as_str(), Some("unavailable"));
+        assert_eq!(rows[1]["outcome"].as_str(), Some("kept"));
+        assert_eq!(
+            super::parse(&["repair".into(), "--json".into()]),
+            Ok(super::Command::Repair { json: true })
         );
     }
 }

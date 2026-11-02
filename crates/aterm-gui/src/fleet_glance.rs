@@ -643,8 +643,10 @@ pub(crate) fn should_poll(
 /// THE READ'S BACKOFF WHILE AWAY (docs/DESIGN-fluid-swarm-2026-10-28.md F4): a read that reached
 /// no peer of those it dialled (a Mac on a hotspot, every peer dark) doubles the wait before the
 /// next, from [`POLL_EVERY`] up to [`QUIET_MAX`]; a read that reached one, and a move of this
-/// Mac's network ([`Kick::Moved`]), start it again from [`POLL_EVERY`]. A read that failed says
-/// nothing of the peers and leaves it.
+/// Mac's network ([`Kick::Moved`]), start it again from [`POLL_EVERY`]. Away from the ALab LAN a
+/// read that reached no peer waits [`QUIET_MAX`] at once: the doubling would dial members behind
+/// the ALab LAN five more times for nothing, and the move back, which ends the wait, reads at
+/// once. A read that failed says nothing of the peers and leaves it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Quiet {
     every: Duration,
@@ -662,10 +664,13 @@ impl Quiet {
         self.every
     }
 
-    /// A read answered `read`: whether the wait changed.
-    pub(crate) fn after(&mut self, read: &Result<FleetSnapshot, String>) -> bool {
+    /// A read answered `read`, `away` from the ALab LAN or not: whether the wait changed.
+    pub(crate) fn after(&mut self, read: &Result<FleetSnapshot, String>, away: bool) -> bool {
         let before = self.every;
         match read {
+            Ok(read) if read.answered() == 0 && !read.unanswered.is_empty() && away => {
+                self.every = QUIET_MAX;
+            }
             Ok(read) if read.answered() == 0 && !read.unanswered.is_empty() => {
                 self.every = self.every.saturating_mul(2).min(QUIET_MAX);
             }
@@ -849,6 +854,10 @@ pub(crate) struct ReaderSeams {
     /// asked only for a read the tick would make ([`should_poll`]), right before it: past the
     /// step's wait it is the door that takes the dialog slot for macOS's question.
     pub(crate) lan: Box<dyn Fn() -> bool + Send>,
+    /// Whether the automatic LAN lanes pace themselves now (`aterm_netplace::routes::paced`: away
+    /// from the ALab LAN, on a hotspot, offline): a read then that reached nobody waits
+    /// [`QUIET_MAX`] at once ([`Quiet::after`]), and the move back reads at once.
+    pub(crate) away: Box<dyn Fn() -> bool + Send>,
 }
 
 /// The fleet glance's handle: the slot and the kick channel.
@@ -981,8 +990,9 @@ fn reader_loop(
                 parse(&json, no_route, seams.own_node.as_deref(), now)
             });
             // Whom a read on the old network reached says nothing of the new one.
-            if !moved_since && quiet.after(&parsed) {
-                aterm_log::info!("{}", quiet_line(quiet));
+            let away = (seams.away)();
+            if !moved_since && quiet.after(&parsed, away) {
+                aterm_log::info!("{}", quiet_line(quiet, away));
             }
             {
                 let mut slot = lock();
@@ -1030,10 +1040,16 @@ fn reader_loop(
     }
 }
 
-/// The aterm.log line for the read's wait as [`Quiet`] set it.
-pub(crate) fn quiet_line(quiet: Quiet) -> String {
+/// The aterm.log line for the read's wait as [`Quiet`] set it, `away` from the ALab LAN or not.
+pub(crate) fn quiet_line(quiet: Quiet, away: bool) -> String {
     if quiet.every() == POLL_EVERY {
         "fleet glance: a fleet Mac answered; the fleet is read every minute again".to_owned()
+    } else if away {
+        format!(
+            "fleet glance: this Mac is off the ALab LAN and no fleet Mac answered; the next read \
+             in {} min, or at once when this Mac's network moves",
+            quiet.every().as_secs() / 60
+        )
     } else {
         format!(
             "fleet glance: no fleet Mac answered; the next read in {} min, or at once when \
@@ -1148,6 +1164,8 @@ impl crate::App {
         let watch = Arc::new(std::sync::atomic::AtomicBool::new(
             self.config.fleet_watch_enabled(),
         ));
+        #[cfg(unix)]
+        let place_state = state.clone();
         let seams = ReaderSeams {
             book: Box::new(move || state.as_deref().map(read_book).unwrap_or_default()),
             watch,
@@ -1157,6 +1175,14 @@ impl crate::App {
             tick: POLL_EVERY,
             moved: Some(crate::network_moved::watch()),
             lan: Box::new(aterm_types::macos_setup::lan_first_use::may_use),
+            #[cfg(unix)]
+            away: Box::new(move || {
+                place_state
+                    .as_deref()
+                    .is_some_and(aterm_netplace::routes::paced_now)
+            }),
+            #[cfg(not(unix))]
+            away: Box::new(|| false),
         };
         self.start_fleet_glance_with(Box::new(ChildRunner::fleet()), seams);
     }

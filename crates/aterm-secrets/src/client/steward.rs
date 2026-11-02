@@ -140,7 +140,11 @@ pub fn steward_revoke_check(paths: &Paths) -> crate::Result<StewardRevoke> {
     let log_removed_machines = remove_log_revoked_machines(&mut candidate, local_log.as_ref());
     match (
         log_removed_machines.is_empty(),
-        retirement::repair_half_done_revokes_with_log(&mut candidate, local_log.as_ref())?,
+        retirement::repair_half_done_revokes_with_log(
+            &mut candidate,
+            local_log.as_ref(),
+            &BTreeSet::new(),
+        )?,
     ) {
         (true, Some(makes)) => Ok(StewardRevoke::Due {
             found: "a revoked Mac still holds swarm roster or account-pool entries".to_owned(),
@@ -216,8 +220,11 @@ pub fn steward_finish_revokes(paths: &Paths) -> crate::Result<StewardRevoke> {
     let local_log = super::log_entries::trusted_local_log(paths, &admin.config)?;
     let mut doc = admin.published_doc.clone();
     let log_removed = remove_log_revoked_machines(&mut doc, local_log.as_ref());
-    let repair_summary =
-        retirement::repair_half_done_revokes_with_log(&mut doc, local_log.as_ref())?;
+    let repair_summary = retirement::repair_half_done_revokes_with_log(
+        &mut doc,
+        local_log.as_ref(),
+        &BTreeSet::new(),
+    )?;
     let summary = match (log_removed.is_empty(), repair_summary) {
         (true, Some(s)) => s,
         (false, Some(s)) => format!(
@@ -249,8 +256,11 @@ pub fn steward_finish_revokes(paths: &Paths) -> crate::Result<StewardRevoke> {
             let refreshed_log = super::log_entries::trusted_local_log(paths, &refreshed.config)?;
             let mut again = refreshed.published_doc.clone();
             let retry_removed = remove_log_revoked_machines(&mut again, refreshed_log.as_ref());
-            let retry_repair =
-                retirement::repair_half_done_revokes_with_log(&mut again, refreshed_log.as_ref())?;
+            let retry_repair = retirement::repair_half_done_revokes_with_log(
+                &mut again,
+                refreshed_log.as_ref(),
+                &BTreeSet::new(),
+            )?;
             let retry_summary = match (retry_removed.is_empty(), retry_repair) {
                 (true, None) => None,
                 (true, Some(s)) => Some(s),

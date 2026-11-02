@@ -137,11 +137,14 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
     let me = std::process::id();
     let mut led = tty_agent(&[], None);
     let mut plain = parked().spawn().expect("spawn");
-    let mut script = pty_host(&["/bin/sleep", "120"].map(OsStr::new))
+    let dir = scratch("pty-sleep");
+    let log = dir.join("pty-host.log");
+    let mut script = pty_host(&["/bin/sleep", "120"].map(OsStr::new), &log)
         .spawn()
         .expect("spawn the pty host");
     let start = Instant::now();
     let slept = loop {
+        host_lives(&mut script, &log, "the pty host's sleep");
         if let Some((pid, _, _)) = table()
             .into_iter()
             .find(|(_, pp, name)| *pp == script.id() && name == "sleep")
@@ -150,7 +153,8 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
         }
         assert!(
             start.elapsed() < HANG,
-            "the pty host's sleep: not within {HANG:?}"
+            "the pty host's sleep: not within {HANG:?}; the pty host said:\n{}",
+            host_said(&log)
         );
         std::thread::yield_now();
     };

@@ -10,8 +10,9 @@ repository.workspace = true
 description = "aterm-gui's fabric endpoint, below the window: each session's inbox ring, outbound posts, watermarks and hold gate, and the instance's view of its bridge. Reaches a session and the registry through two traits; aterm-gui re-exports it as `crate::fabric`."
 
 [features]
-# Read `ATERM_FABRIC_STALE_AFTER_MS` in an optimized build too (`aterm-gui/dev-seams`
-# forwards it). A debug build reads it anyway; a shipped build never does.
+# Read `ATERM_FABRIC_STALE_AFTER_MS` and keep the fabric bench's handler tally in an
+# optimized build too (`aterm-gui/dev-seams` forwards it). A debug build has both anyway; a
+# shipped build has neither.
 dev-seams = ["aterm-types/dev-seams"]
 
 [dependencies]

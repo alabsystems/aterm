@@ -307,6 +307,28 @@ fn chmod(path: &std::path::Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// A cap file is outside the secret-file rule: [`read_file`] reads a ring at 0644, where
+/// [`read_private_file`] refuses the same file. What a reader may rely on for a cap file
+/// is whatever keeps the file private, never this module.
+#[cfg(unix)]
+#[test]
+fn secret_file_rule_is_not_what_read_file_reads_a_cap_file_by() {
+    let scratch = secret_scratch("cap");
+    let path = scratch.path().join("ring.cap");
+    std::fs::write(&path, format_line("ro:/f/F/pub/>", &tag_from(1)) + "\n").unwrap();
+    chmod(&path, 0o644);
+    assert_eq!(
+        read_file(&path)
+            .expect("read_file holds no owner rule")
+            .len(),
+        1
+    );
+    assert_eq!(
+        read_private_file(&path).expect_err("the owner rule").kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+}
+
 /// 0600 or tighter passes; any group/other bit is refused, as `PermissionDenied`
 /// naming the mode and the `chmod`, path first, by EACH of the three functions: the
 /// check and both readers hold the same clause on the same open, so none of them

@@ -70,10 +70,7 @@ struct Fnv(u64);
 
 impl Fnv {
     fn feed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= u64::from(b);
-            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
-        }
+        self.0 = astream_wire::hash::fnv1a_64_update(self.0, bytes);
     }
 
     fn decoded(&mut self, result: &Result<Decoded, String>) {
@@ -345,7 +342,7 @@ fn decodes_the_whole_format_matrix_to_its_pinned_digest() {
     let short_palette: Vec<u8> = vec![255, 0, 0, 0, 255, 0, 0, 0, 255];
 
     let mut cases = 0usize;
-    let mut digest = Fnv(0xcbf2_9ce4_8422_2325);
+    let mut digest = Fnv(astream_wire::hash::FNV1A_64_INIT);
     for (color, depths) in combos {
         for &depth in depths {
             for palette in [full_palette.as_slice(), short_palette.as_slice()] {

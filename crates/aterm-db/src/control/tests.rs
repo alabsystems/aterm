@@ -774,7 +774,9 @@ fn witness_and_channel_proof_must_name_the_same_exact_pinned_device() {
         key: identity.key(),
     };
     let own = lab.requests[0].binding().actor();
-    assert!(authenticate(lab.trust, own, Some(&proof), &endpoint.hello).is_ok());
+    let authenticated = authenticate(lab.trust, own, Some(&proof), &endpoint.hello).unwrap();
+    assert_eq!(authenticated.actor, endpoint.actor);
+    assert_eq!(authenticated.request.bytes(), lab.requests[1].bytes());
     assert!(authenticate(lab.trust, own, None, &endpoint.hello).is_err());
     assert!(authenticate(lab.trust, endpoint.actor, Some(&proof), &endpoint.hello).is_err());
     let impostor = lab.endpoint(0);
@@ -3154,7 +3156,8 @@ fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_write
     let ep2 = Endpoint::from_bootstrap(&b2)
         .expect("Endpoint::from_bootstrap succeeds for restored + node-rotated member")
         .expect("endpoint present");
-    verify_peer_against_local_log(Some(&m1), trust, actor_m2, &ep2.hello, Some(&peer_log))
+    let peer_request = Request::decode(&ep2.hello[84..HELLO_FIXED]).unwrap();
+    verify_peer_against_local_log(Some(&m1), trust, &peer_request, Some(&peer_log))
         .expect("restored + node-rotated member must pass verify_peer_against_local_log");
 
     // 3. Direct writer-key denial in `verify_peer_against_local_log`:
@@ -3181,9 +3184,8 @@ fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_write
         admin_publish(&m1, &admin, &doc).unwrap();
     }
 
-    let err =
-        verify_peer_against_local_log(Some(&m1), trust, actor_m2, &ep2.hello, Some(&peer_log))
-            .expect_err("peer whose writer key is in deny_nodes must be refused");
+    let err = verify_peer_against_local_log(Some(&m1), trust, &peer_request, Some(&peer_log))
+        .expect_err("peer whose writer key is in deny_nodes must be refused");
     assert!(
         err.to_string()
             .contains("Commons peer was removed from the membership log"),
@@ -3330,5 +3332,148 @@ fn witness_logs_decode_each_peer_once_round_robin_and_keep_the_hot_one() {
         WitnessLogs::new(PEERS, usize::MAX)
             .check(trust, &stranger, &witnesses[0])
             .is_err()
+    );
+}
+
+/// A roster or deny list read is kept per vault folder: none until one was read, then the last
+/// one read while a read gives none (a vault sync applying, a failed read), never another folder's,
+/// and the oldest folder's goes when more are read than it keeps.
+///
+/// NEGATIVE CONTROL (2026-11-01): with `LastRead::keep` answering nothing when a read gives
+/// nothing, this fails (`a failed read keeps the last`).
+#[test]
+fn a_last_read_answers_none_until_a_read_then_keeps_it_per_folder() {
+    let last: LastRead<Vec<String>> = LastRead::new();
+    let (a, b) = (Path::new("/vault/a"), Path::new("/vault/b"));
+    let denied = vec!["ff00".to_owned()];
+    assert_eq!(last.keep(a, None), None, "nothing read yet");
+    assert_eq!(last.keep(a, Some(denied.clone())), Some(denied.clone()));
+    assert_eq!(
+        last.keep(a, None),
+        Some(denied),
+        "a failed read keeps the last"
+    );
+    assert_eq!(
+        last.keep(b, None),
+        None,
+        "another folder's list is not this one's"
+    );
+    assert_eq!(last.keep(a, Some(Vec::new())), Some(Vec::new()));
+    assert_eq!(
+        last.keep(a, None),
+        Some(Vec::new()),
+        "a fresh read replaces it"
+    );
+    for folder in 0..LAST_READ_FOLDERS {
+        let _ = last.keep(&PathBuf::from(format!("/vault/{folder}")), Some(Vec::new()));
+    }
+    assert_eq!(last.keep(a, None), None, "the oldest folder made room");
+}
+
+/// A roster read that gives none (`Ok(None)`: a vault sync applying, or a vault with no roster
+/// entry) keeps the roster read before it, so a Mac that roster removed stays refused through the
+/// sync; with none read before it is no roster, which a failed read after it keeps. A failed read
+/// with nothing read before is `None`, which table repair refuses.
+///
+/// NEGATIVE CONTROL (2026-11-01): with `roster_after` answering no roster on `Ok(None)` (the
+/// review's finding: `swarm_roster_now(..).ok()` kept `Some(None)` as a fresh read, over the
+/// last roster), this fails (`a sync applying keeps the roster that removed m9`).
+#[test]
+fn a_roster_read_that_gives_none_keeps_the_roster_read_before_it() {
+    use aterm_secrets::swarm_roster::SwarmRoster;
+    let last: LastRead<Option<SwarmRoster>> = LastRead::new();
+    let (a, b) = (Path::new("/vault/a"), Path::new("/vault/b"));
+    let removed = SwarmRoster {
+        deny_nodes: vec!["ff00".to_owned()],
+        ..SwarmRoster::default()
+    };
+    let failed = || Err(aterm_secrets::Error::new("unreadable"));
+    assert_eq!(roster_after(&last, a, failed()), None, "nothing read yet");
+    assert_eq!(
+        roster_after(&last, a, Ok(Some(removed.clone()))),
+        Some(Some(removed.clone()))
+    );
+    assert_eq!(
+        roster_after(&last, a, Ok(None)),
+        Some(Some(removed.clone())),
+        "a sync applying keeps the roster that removed m9"
+    );
+    assert_eq!(
+        roster_after(&last, a, failed()),
+        Some(Some(removed)),
+        "a failed read keeps it too"
+    );
+    assert_eq!(
+        roster_after(&last, b, Ok(None)),
+        Some(None),
+        "a vault with no roster has none"
+    );
+    assert_eq!(
+        roster_after(&last, b, failed()),
+        Some(None),
+        "and a failed read after it keeps that answer"
+    );
+}
+
+/// A Commons peer is checked against the deny list whatever its roster read gave: with no roster
+/// read a node the vault roster's `deny_nodes` removed is still refused; a deny list that fails
+/// with none read before refuses the peer where the roster was read; one read before is used
+/// while a read fails; and an `Ok(None)` with none read before adds nothing. Neither ever read
+/// (membership records every vault read refuses) leaves the peer to the membership log, as the
+/// recovery exchange needs.
+///
+/// NEGATIVE CONTROLS (2026-11-01): with `roster_to_check` checking the deny list only where a
+/// roster was read (the shape the review found: `None => None`), this fails (`the deny list is
+/// checked while no roster is`); with `denied_after` answering an empty list after a failed read,
+/// it fails (`an unread deny list refuses`).
+#[test]
+fn a_peer_is_checked_against_the_deny_list_while_no_roster_is_read() {
+    use aterm_secrets::swarm_roster::SwarmRoster;
+    let checked = roster_to_check(None, Some(vec!["ff00".to_owned()]))
+        .expect("a deny list read")
+        .expect("the deny list is checked while no roster is");
+    assert!(checked.is_node_denied("ff00"));
+    let checked = roster_to_check(Some(None), Some(vec!["ff00".to_owned()]))
+        .expect("a deny list read")
+        .expect("and while the vault has none");
+    assert!(checked.is_node_denied("ff00"));
+    assert_eq!(roster_to_check(Some(None), Some(Vec::new())).unwrap(), None);
+    let roster = SwarmRoster {
+        deny_nodes: vec!["aa11".to_owned()],
+        ..SwarmRoster::default()
+    };
+    let checked = roster_to_check(Some(Some(roster)), Some(vec!["ff00".to_owned()]))
+        .unwrap()
+        .unwrap();
+    assert!(checked.is_node_denied("aa11") && checked.is_node_denied("ff00"));
+
+    let last: LastRead<Vec<String>> = LastRead::new();
+    let dir = Path::new("/vault/a");
+    let failed = || Err(aterm_secrets::Error::new("unreadable"));
+    let denied = denied_after(&last, dir, failed());
+    assert!(
+        roster_to_check(Some(None), denied.clone()).is_err()
+            && roster_to_check(Some(Some(SwarmRoster::default())), denied).is_err(),
+        "an unread deny list refuses"
+    );
+    assert_eq!(roster_to_check(None, None).unwrap(), None);
+    assert_eq!(
+        denied_after(&last, dir, Ok(None)),
+        Some(Vec::new()),
+        "no roster entry and none read before adds nothing"
+    );
+    assert_eq!(
+        denied_after(&last, dir, Ok(Some(vec!["ff00".to_owned()]))),
+        Some(vec!["ff00".to_owned()])
+    );
+    assert_eq!(
+        denied_after(&last, dir, failed()),
+        Some(vec!["ff00".to_owned()]),
+        "a failed read uses the one read before"
+    );
+    assert_eq!(
+        denied_after(&last, dir, Ok(None)),
+        Some(vec!["ff00".to_owned()]),
+        "and so does a sync applying"
     );
 }

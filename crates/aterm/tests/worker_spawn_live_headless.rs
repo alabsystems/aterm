@@ -629,6 +629,48 @@ fn a_worker_whose_shell_draws_no_prompt_is_stalled_and_nothing_is_typed() {
     );
 }
 
+/// How long a worker's rc file holds its first prompt below: past the 20 s a launcher used to
+/// give a shell before it stalled the task for good, which is why that test takes this long.
+const LATE_PROMPT: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// A worker whose shell is slow to its first prompt, as a loaded machine makes one (its rc file
+/// holds it here), has not failed: its task stays `working` and the prompt takes its line.
+#[test]
+fn a_worker_whose_first_prompt_comes_late_still_starts() {
+    let shell = headless_boot::login_shell();
+    let inst = boot(
+        "late",
+        shell.path,
+        Some(SUPERVISED),
+        Some((
+            shell.rc,
+            "[ -n \"$ATERM_TASK_FILE\" ] && \
+             while [ ! -e \"$HOME/prompt-cue\" ]; do sleep 0.1; done\n",
+        )),
+    );
+    let (_, manager) = boot_session(&inst);
+    let work = inst.tmp.join("work");
+    let (ok, stdout, stderr) = spawn_as(
+        &inst,
+        &manager,
+        &work,
+        &["spawn", "agent=claude", "-"],
+        b"a task its shell is slow to reach",
+    );
+    assert!(ok, "spawn agent=claude: {stdout} {stderr}");
+    let worker = sid_of(&stdout);
+    std::thread::sleep(LATE_PROMPT);
+    let record = ctl_ok(&inst, &[&format!("@{worker}"), "task"]);
+    assert!(
+        record.contains(" state=working "),
+        "its launcher waits on: {record}"
+    );
+    std::fs::write(inst.tmp.join("home/prompt-cue"), b"").expect("write the cue");
+    until(&inst, &worker, "the late prompt took the line", || {
+        inst.tmp.join("home/argv.bin").exists()
+    });
+}
+
 /// Undo the wire's pct-encoding.
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();

@@ -3242,32 +3242,13 @@ fn a_terminal_is_the_tabs_only_when_aterm_opened_it() {
 fn an_agent_on_a_pty_the_tab_does_not_own_is_never_driven_through_the_tab() {
     use std::ffi::OsStr;
     let exe = std::env::current_exe().expect("exe");
-    let child_of = |parent: u32| {
-        (0..3_000).find_map(|_| {
-            let hit = table()
-                .into_iter()
-                .find(|(_, pp, _)| *pp == parent)
-                .map(|(p, _, _)| p);
-            if hit.is_none() {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            hit
-        })
-    };
     // The agent as `visit` judges it: the stand-in by its argv (until it execs, a fork carries its
     // parent's, and the host's fork is this same binary, which `wait_exec` would pass), its group
     // its own and the pty's foreground (`ids`: `pgid == tpgid == pid`).
     let leads = |agent: u32| {
-        (0..3_000).any(|_| {
-            let led = atpkg::caller_shell::process_args(agent)
-                .is_some_and(|a| a.argv.get(1).is_some_and(|w| w == PARK[0]))
-                && ids(agent)
-                    .is_some_and(|(_, pgid, tpgid)| pgid == i64::from(agent) && tpgid == pgid);
-            if !led {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            led
-        })
+        atpkg::caller_shell::process_args(agent)
+            .is_some_and(|a| a.argv.get(1).is_some_and(|w| w == PARK[0]))
+            && ids(agent).is_some_and(|(_, pgid, tpgid)| pgid == i64::from(agent) && tpgid == pgid)
     };
     for in_shell in [true, false] {
         let dir = scratch(if in_shell { "pty" } else { "pty-own" });
@@ -3278,21 +3259,35 @@ fn an_agent_on_a_pty_the_tab_does_not_own_is_never_driven_through_the_tab() {
         }
         argv.push(exe.as_os_str());
         argv.extend(PARK.map(OsStr::new));
-        let mut host = pty_host(&argv)
+        let log = dir.join("pty-host.log");
+        let mut host = pty_host(&argv, &log)
             .env(PARK_ENV, "1")
             .env("ATERM_PARENT_SESSION_ID", TAB)
             .spawn()
             .expect("pty host");
+        let host_id = host.id();
         let agent = if in_shell {
-            let shell = child_of(host.id()).expect("the shell on the host's pty");
-            child_of(shell).expect("the agent, the shell's job")
+            let shell = hosted_child(&mut host, &log, host_id, "the shell on the host's pty");
+            hosted_child(&mut host, &log, shell, "the agent, the shell's job")
         } else {
-            child_of(host.id()).expect("the agent, the host's own program")
+            hosted_child(
+                &mut host,
+                &log,
+                host_id,
+                "the agent, the host's own program",
+            )
         };
-        assert!(
-            leads(agent),
-            "{in_shell}: the agent {agent} never led the host's pty"
-        );
+        let start = Instant::now();
+        while !leads(agent) {
+            let what = format!("{in_shell}: the agent {agent} leading the host's pty");
+            host_lives(&mut host, &log, &what);
+            assert!(
+                start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+                "{what}: not within the hang detector; the pty host said:\n{}",
+                host_said(&log)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let owner = ps_name(host.id()).expect("the host, as ps names it");
         let sf = register(&opts.home, agent, SESSION);
         let got = visit(&opts, &sf, &table(), &newer(), &Live);
@@ -16639,6 +16634,22 @@ impl Drop for TtyChild {
     }
 }
 
+/// What is left of a test's pty slave, said where a program on it failed to start or ended
+/// early. XNU can remove a new pty's node (`/dev/ttys…`) under it while another process's pty
+/// that held the same minor finishes tearing down; from then on the slave is dead (`fstat`
+/// fails, `TIOCSCTTY` says ENOENT, a write fails) though its master stays open. Measured under
+/// heavy pty churn, several test suites at once (ATERM-KI-1028-4): no test can retry it.
+#[cfg(unix)]
+fn slave_left(slave: &std::os::fd::OwnedFd) -> String {
+    match slave
+        .try_clone()
+        .and_then(|fd| std::fs::File::from(fd).metadata())
+    {
+        Ok(_) => "its pty's slave answers fstat".to_string(),
+        Err(e) => format!("its pty's slave is dead (fstat: {e}; ATERM-KI-1028-4)"),
+    }
+}
+
 /// A zsh ([`zsh_image`]) that is the session leader of a pseudo-terminal
 /// of its own and its foreground process group (`pgid == tpgid`): the shell a
 /// relaunch waits to hold its terminal again.
@@ -16674,9 +16685,10 @@ fn tty_zsh() -> TtyChild {
     }
     let child = zsh.spawn().unwrap_or_else(|err| {
         panic!(
-            "zsh spawn failed: {err:?}; exe={} ({:?})",
+            "zsh spawn failed: {err:?}; exe={} ({:?}); {}",
             exe.display(),
             std::fs::symlink_metadata(&exe).map(|m| (m.file_type(), m.len())),
+            slave_left(&slave),
         )
     });
     drop(slave);
@@ -16703,11 +16715,13 @@ fn tty_zsh() -> TtyChild {
     panic!("zsh never wrote its proof and held its terminal");
 }
 
-/// The pty host's argv: this test binary, running only [`host_a_pty_when_asked`].
+/// The pty host's argv: this test binary, running only [`host_a_pty_when_asked`], which says
+/// what it saw (its panic too) straight to its stderr ([`pty_host`]'s log).
 #[cfg(target_os = "macos")]
-const PTY_HOST: [&str; 2] = [
+const PTY_HOST: [&str; 3] = [
     "harness::upgrade_drive::tests::host_a_pty_when_asked",
     "--exact",
+    "--nocapture",
 ];
 
 /// What tells [`host_a_pty_when_asked`] to host, and the argv it runs, its words split by a
@@ -16755,16 +16769,25 @@ fn host_a_pty_when_asked() {
     }
     // SAFETY: getppid takes nothing and cannot fail.
     let parent = unsafe { libc::getppid() };
-    let mut child = hosted.spawn().expect("the hosted program");
-    drop(slave);
+    let mut child = hosted
+        .spawn()
+        .unwrap_or_else(|e| panic!("the hosted program: {e}; {}", slave_left(&slave)));
     let mut master = std::fs::File::from(master);
+    // What the hosted program (or a shell's job) writes on the pty, written again to this
+    // host's stderr: the log a test reads once the host has ended ([`host_lives`]).
     std::thread::spawn(move || {
-        let mut sink = [0_u8; 4096];
-        while std::io::Read::read(&mut master, &mut sink).is_ok_and(|n| n > 0) {}
+        let mut said = [0_u8; 4096];
+        while let Ok(n @ 1..) = std::io::Read::read(&mut master, &mut said) {
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), &said[..n]);
+        }
     });
     // SAFETY: as above.
     while unsafe { libc::getppid() } == parent {
-        if child.try_wait().ok().flatten().is_some() {
+        if let Some(status) = child.try_wait().ok().flatten() {
+            eprintln!(
+                "the hosted program exited first: {status}; {}",
+                slave_left(&slave)
+            );
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -16774,9 +16797,10 @@ fn host_a_pty_when_asked() {
 }
 
 /// `argv` on a pty a process of its own opened ([`host_a_pty_when_asked`]): the shape of
-/// `script -q /dev/null argv…`, of every tmux or screen pane.
+/// `script -q /dev/null argv…`, of every tmux or screen pane. All the host says goes to `log`:
+/// its panic, how its program ended, and what that program wrote on the pty ([`host_lives`]).
 #[cfg(target_os = "macos")]
-fn pty_host(argv: &[&std::ffi::OsStr]) -> Command {
+fn pty_host(argv: &[&std::ffi::OsStr], log: &Path) -> Command {
     use std::os::unix::ffi::OsStrExt as _;
     let mut words = Vec::new();
     for (i, word) in argv.iter().enumerate() {
@@ -16786,13 +16810,58 @@ fn pty_host(argv: &[&std::ffi::OsStr]) -> Command {
         }
         words.extend_from_slice(word.as_bytes());
     }
+    let said = std::fs::File::create(log).expect("the pty host's log");
+    let also = said.try_clone().expect("the pty host's log, again");
     let mut c = Command::new(std::env::current_exe().expect("exe"));
     c.args(PTY_HOST)
         .env(PTY_HOST_ENV, std::ffi::OsStr::from_bytes(&words))
         .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null());
+        .stdout(said)
+        .stderr(also);
     c
+}
+
+/// What the [`pty_host`] writing `log` has said so far.
+#[cfg(target_os = "macos")]
+fn host_said(log: &Path) -> String {
+    std::fs::read(log).map_or_else(
+        |e| format!("(its log {}: {e})", log.display()),
+        |said| String::from_utf8_lossy(&said).into_owned(),
+    )
+}
+
+/// Panics, naming `what` the test waits for, once the [`pty_host`] `host` writing `log` has
+/// exited: with how it ended and what it said, the moment it has, not a hang detector later.
+#[cfg(target_os = "macos")]
+fn host_lives(host: &mut aterm_uds::spawnfd::Child, log: &Path, what: &str) {
+    if let Some(status) = host.try_wait().expect("the pty host's status") {
+        panic!(
+            "{what}: the pty host exited first ({status}); it said:\n{}",
+            host_said(log)
+        );
+    }
+}
+
+/// The first process whose parent is `parent`, on the [`pty_host`] `host` writing `log`, within
+/// the hang detector, [`host_lives`] all the while.
+#[cfg(target_os = "macos")]
+fn hosted_child(host: &mut aterm_uds::spawnfd::Child, log: &Path, parent: u32, what: &str) -> u32 {
+    let start = Instant::now();
+    loop {
+        host_lives(host, log, what);
+        let rows = table();
+        if let Some((pid, _, _)) = rows.iter().find(|(_, pp, _)| *pp == parent) {
+            return *pid;
+        }
+        assert!(
+            start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "{what}: no child of {parent} within the hang detector ({} rows in the last process \
+             table read); the pty host said:\n{}",
+            rows.len(),
+            host_said(log)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// The name `ps` gives `pid` (`tty_table`, the oracle), `None` once it is gone.
@@ -16847,7 +16916,7 @@ fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> TtyChild {
     }
     let child = agent.spawn().unwrap_or_else(|err| {
         panic!(
-            "agent spawn failed: {err:?}; exe={} ({:?}); cwd={:?}; process_cwd={:?}",
+            "agent spawn failed: {err:?}; exe={} ({:?}); cwd={:?}; process_cwd={:?}; {}",
             me.display(),
             std::fs::symlink_metadata(&me).map(|m| (m.file_type(), m.len())),
             cwd.map(|p| (
@@ -16858,6 +16927,7 @@ fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> TtyChild {
                 p.display().to_string(),
                 std::fs::symlink_metadata(&p).map(|m| m.file_type()),
             )),
+            slave_left(&slave),
         )
     });
     drop(slave);

@@ -892,7 +892,8 @@ fn full_series(
 /// ([`full_series`]), as its memo spends it, `n` times each: the store and logins read; the
 /// series read whole (what the memo did before it kept a [`account_series::Tail`]) and read as
 /// the memo now reads them, a tail's refresh and the rows handed to the replay; and the replay
-/// on this machine's own clock (each instant's offset, [`outlook::Offsets::around`]).
+/// on this machine's own clock (each instant's offset,
+/// [`outlook::Offsets::around`](aterm_agent::harness::outlook::Offsets::around)).
 fn resolver_cost(n: usize) -> Result<String, Fail> {
     use aterm_agent::harness::outlook;
     let world = World::new(crate::instance::CONFIG_OFF)?;

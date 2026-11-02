@@ -598,3 +598,137 @@ fn record_bytes_is_the_plaintext_frame() {
         astream_wire::HEADER_SIZE + r.encode_payload().unwrap().len()
     );
 }
+
+/// Summary-only planning (`plan_with` over `Planned` entries whose `whole()` is `None`)
+/// calls `load(i)` ONLY for cold records a hold rule carries below `cut` — never for
+/// prefix records, superseded last-value records, records at or above `cut`, read mail,
+/// or aged mail — and fails closed (`cut == base`) if a carried record cannot be read.
+#[test]
+fn plan_with_reads_only_the_cold_records_a_cut_carries_and_refuses_an_unreadable_one() {
+    struct ColdSum {
+        off: u64,
+        subject: String,
+        bytes: u64,
+    }
+    impl Planned for ColdSum {
+        fn offset(&self) -> u64 {
+            self.off
+        }
+        fn subject(&self) -> &str {
+            &self.subject
+        }
+        fn bytes(&self) -> u64 {
+            self.bytes
+        }
+        fn whole(&self) -> Option<Arc<BrokerRecord>> {
+            None
+        }
+    }
+
+    let mail_n2 = "/f/F/in/n2/from/a";
+    let pres_b = "/f/F/pub/n1/s2/presence";
+    // Offsets 0..9:
+    // 0: PRESENCE (last_only -> not held in <log>.held)
+    // 1: MAIL n1 (read: group committed through 1 -> released without loading)
+    // 2: PRESENCE (last_only -> not held in <log>.held)
+    // 3: mail_n2 (aged -> given up without loading)
+    // 4: mail_n2 (unread, fresh -> carried into <log>.held!)
+    // 5: EV (pushes prefix past 1 EV's bytes -> cut lands just above it at 6)
+    // 6: mail_n2 (at cut -> stays in retained suffix without loading)
+    // 7: EV (newest EV -> kept in retained suffix)
+    // 8: pres_b (above cut -> stays in retained suffix)
+    let subjects = [
+        PRESENCE, MAIL, PRESENCE, mail_n2, mail_n2, EV, mail_n2, EV, pres_b,
+    ];
+    let mut full = V::new(&subjects);
+    let ev_one = record_bytes(&full.records[7]);
+    let rules = fabric(Some(ev_one), None);
+    let day_ms: u64 = 86_400 * 1_000;
+    let now: u64 = 10 * day_ms;
+    // Stamp offsets 0..4 at t=0 (so mail at offset 3 is aged past 1 day at `now`),
+    // leaving offsets 4.. unstamped (`stamped_at` = `now`, fresh).
+    stamp(&mut full.stamps, 4, 0);
+    full.groups.insert("/f/F/cur/n1/node/inbox".into(), 1);
+
+    let sums: Vec<ColdSum> = full
+        .records
+        .iter()
+        .map(|r| ColdSum {
+            off: r.seq.0,
+            subject: r.subject.clone(),
+            bytes: record_bytes(r),
+        })
+        .collect();
+
+    let whole_plan = plan(&rules, &full.view(now), None);
+    assert_eq!(
+        whole_plan.cut, 6,
+        "EV at 5 exceeds 1-record prefix budget, placing cut just above it at 6"
+    );
+
+    let cold_view = View {
+        base: 0,
+        ceiling: sums.len() as u64,
+        records: &sums,
+        record_bts: &[],
+        stamps: &full.stamps,
+        groups: &full.groups,
+        held: &full.held,
+        now,
+    };
+    let loaded = std::cell::RefCell::new(Vec::new());
+    let cold_plan = plan_with(&rules, &cold_view, None, |i| {
+        loaded.borrow_mut().push(i);
+        full.records.get(i).cloned()
+    });
+    let mut loaded = loaded.into_inner();
+    loaded.sort_unstable();
+    assert_eq!(
+        loaded,
+        vec![4],
+        "loads only the unread fresh Keep::All record below cut (offset 4)"
+    );
+    assert_eq!(cold_plan.cut, whole_plan.cut);
+    fn carry_tup(p: &Plan) -> Vec<(&BrokerRecord, u64, Option<u64>)> {
+        p.carry
+            .iter()
+            .map(|h| (&*h.rec, h.at_ms, h.bt_ms))
+            .collect()
+    }
+    assert_eq!(carry_tup(&cold_plan), carry_tup(&whole_plan));
+    assert_eq!(cold_plan.remove, whole_plan.remove);
+    assert_eq!(cold_plan.floors, whole_plan.floors);
+    assert_eq!(cold_plan.lost, whole_plan.lost);
+    assert_eq!(cold_plan.kept, whole_plan.kept);
+    assert_eq!(cold_plan.room, whole_plan.room);
+    assert_eq!(cold_plan.headroom, whole_plan.headroom);
+
+    // Byte-capped hold class: offset 6 (in the kept suffix) already fills a 1-record
+    // mail budget, so offset 4 is given up by `Why::Bytes` without ever loading it.
+    let byte_capped = fabric(Some(ev_one), Some(record_bytes(&full.records[6])));
+    let bytes_loaded = std::cell::RefCell::new(Vec::new());
+    let bytes_plan = plan_with(&byte_capped, &cold_view, None, |i| {
+        bytes_loaded.borrow_mut().push(i);
+        full.records.get(i).cloned()
+    });
+    assert!(bytes_loaded.into_inner().is_empty());
+    assert!(bytes_plan.carry.is_empty());
+    assert_eq!(
+        bytes_plan.lost.get(&(mail_n2.to_string(), Why::Bytes)),
+        Some(&1)
+    );
+
+    // NC: if a cold record a hold rule wants to carry cannot be read back, `plan_with`
+    // refuses the cut (`cut == base`) rather than compacting past an unreadable hold.
+    let refused = plan_with(&rules, &cold_view, None, |i| {
+        if i == 4 {
+            None
+        } else {
+            full.records.get(i).cloned()
+        }
+    });
+    assert_eq!(refused.cut, 0, "unreadable carried record refuses cut");
+    assert!(refused.carry.is_empty());
+    assert!(refused.remove.is_empty());
+    assert!(refused.lost.is_empty());
+}

@@ -318,8 +318,10 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
     if let Ready::Up { ctl: ctl_bin } = bring_up(ctx, r, &mut sb, bundle) {
         let subject = crate::stages::Subject::of(ctx, bundle);
         typing_burst(ctx, r, &mut sb, &ctl_bin);
-        aos_release_step(ctx, r, &mut sb, &ctl_bin, &subject);
-        settings_hardware_key_step(ctx, r, &mut sb, &ctl_bin, &subject);
+        if !ctx.cursor_pacing {
+            aos_release_step(ctx, r, &mut sb, &ctl_bin, &subject);
+            settings_hardware_key_step(ctx, r, &mut sb, &ctl_bin, &subject);
+        }
     }
     sb.teardown(r, ctx.exec_env().stage_groups);
 }

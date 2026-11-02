@@ -132,3 +132,21 @@ fn bloom_with_size_max_no_overflow() {
     assert!(bloom.num_bits() <= BloomFilter::MAX_BITS);
     assert_eq!(bloom.num_bits() % 64, 0);
 }
+
+/// `hash_pair` folds both hashes in one loop, spelled out for the Trust lane: the first is
+/// `aterm_hash`'s FNV-1a, and the second its fold from the other seed, rotated.
+#[test]
+fn hash_pair_folds_as_aterm_hash_does() {
+    let inputs: [&[u8]; 4] = [b"", b"a", b"hel", &[0, 0xff, 0x80, 0x7f, 1, 2, 3, 4, 5]];
+    for bytes in inputs {
+        let seed = aterm_hash::FNV64_OFFSET.rotate_left(17);
+        assert_eq!(
+            BloomFilter::hash_pair(bytes),
+            (
+                aterm_hash::fnv1a_64(bytes),
+                aterm_hash::fnv1a_64_extend(seed, bytes).rotate_left(31),
+            ),
+            "{bytes:02x?}"
+        );
+    }
+}

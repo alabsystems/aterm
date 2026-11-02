@@ -743,6 +743,82 @@ fn since_takes_ms_or_a_time_word() {
         Some(1_793_430_000_000),
         "zoneless date midnight 2026-10-31 00:00 PDT (07:00Z)"
     );
+
+    // `render_local` formats each instant at its own local offset across a daylight change.
+    let pre_ms = CHANGE * 1000 - 1_800_000; // 2026-11-01 01:30:00 PDT (08:30:00Z)
+    let post_ms = CHANGE * 1000 + 1_800_000; // 2026-11-01 01:30:00 PST (09:30:00Z)
+    let now_ms = CHANGE * 1000 + 2_700_000; // 2026-11-01 01:45:00 PST (09:45:00Z)
+    let mut dst = Ledger {
+        worker: WORKER.to_string(),
+        manager: Some(MANAGER.to_string()),
+        now_ms,
+        tz_offset_s: PST,
+        since_ms: Some(1_793_509_200_000), // 2026-10-31 22:00:00 PDT
+        aligned: true,
+        journaled: true,
+        journal_unreadable: false,
+        sources: Vec::new(),
+        turns: Vec::new(),
+        journal: vec![
+            JournalRecord::of_line(pre_ms, Some(WORKER), "EVENT idle seq=1 ⏺ pre", None),
+            JournalRecord::of_line(post_ms, Some(WORKER), "EVENT idle seq=2 ⏺ post", None),
+        ],
+        mail: Vec::new(),
+    };
+    let text = render_local(&dst, Format::Text, &la_at);
+    assert!(
+        text.contains(
+            "2026-11-01 01:45:00 · times UTC-08:00 · since 2026-10-31 22:00:00 UTC-07:00"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("  01:30:00 UTC-07:00  watcher  EVENT idle seq=1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  01:30:00            watcher  EVENT idle seq=2"),
+        "{text}"
+    );
+    let flat_text = render(&dst, Format::Text);
+    assert!(
+        flat_text.contains("  00:30:00   watcher  EVENT idle seq=1")
+            && !flat_text.contains("UTC-07:00"),
+        "CONTROL: flat render shifts pre-change 01:30 PDT to 00:30 PST:\n{flat_text}"
+    );
+    let md = render_local(&dst, Format::Md, &la_at);
+    assert!(
+        md.contains("since 2026-10-31 22:00:00 UTC-07:00")
+            && md.contains("| 01:30:00 UTC-07:00 | watcher | EVENT idle seq=1")
+            && md.contains("| 01:30:00 | watcher | EVENT idle seq=2"),
+        "{md}"
+    );
+    let html = render_local(&dst, Format::Html, &la_at);
+    assert!(
+        html.contains("<td class=\"t\">01:30:00 UTC-07:00</td>")
+            && html.contains("<td class=\"t\">01:30:00</td>")
+            && html.contains(&format!(
+                "\"zones\":[[{pre_ms},{PDT}],[{},{}]]",
+                CHANGE * 1000,
+                PST
+            ))
+            && html.contains(&format!("\"t\":{pre_ms},\"tz\":{PDT}"))
+            && html.contains(&format!("\"t\":{post_ms},\"tz\":{PST}")),
+        "{html}"
+    );
+    // Multi-day span computed at each row's own offset: 2026-10-31 23:30 PDT vs 2026-11-01 01:30 PST.
+    dst.journal[0] = JournalRecord::of_line(
+        1_793_514_600_000, // 2026-10-31 23:30:00 PDT (06:30:00Z)
+        Some(WORKER),
+        "EVENT idle seq=1 ⏺ eve",
+        None,
+    );
+    let dated_text = render_local(&dst, Format::Text, &la_at);
+    assert!(
+        dated_text.contains("2026-10-31 23:30:00 UTC-07:00")
+            && dated_text.contains("2026-11-01 01:30:00"),
+        "{dated_text}"
+    );
 }
 
 #[test]

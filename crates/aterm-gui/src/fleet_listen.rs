@@ -127,6 +127,18 @@ impl HeartbeatClock {
                 .is_none_or(|last| now.saturating_duration_since(last) >= self.every)
     }
 
+    /// [`Self::due`] for a caller whose last round may still be out (`busy`): while it is, this
+    /// answers nothing and takes nothing, so a move told meanwhile (the settled place's, seconds
+    /// after a route move began a round that finds the LAN still down) gets a round of its own
+    /// once that one ends, rather than being taken and dropped by a round that cannot start.
+    pub(crate) fn due_when_free(
+        &mut self,
+        now: std::time::Instant,
+        busy: bool,
+    ) -> Option<crate::network_moved::Woke> {
+        if busy { None } else { self.due(now) }
+    }
+
     /// Whether a heartbeat is due at `now`, and why: a move not yet answered and due at `now`
     /// (its source), else the interval run out ([`crate::network_moved::Woke::Timer`]). Each
     /// answers once.
@@ -394,41 +406,97 @@ fn config_now() -> Option<String> {
 }
 
 /// Cached authoritative swarm `deny_nodes`, retained across transient vault lock / I/O states.
-static DENIED_NODES: Mutex<Option<Arc<[String]>>> = Mutex::new(None);
+static DENIED_NODES: Mutex<DeniedCache> = Mutex::new(DeniedCache::new());
 
-fn update_denied_nodes_cache(
-    cache: &mut Option<Arc<[String]>>,
-    observed: aterm_secrets::Result<Option<Vec<String>>>,
-) -> Arc<[String]> {
-    match observed {
-        Ok(Some(nodes)) => {
-            let arc: Arc<[String]> = nodes.into();
-            *cache = Some(Arc::clone(&arc));
-            arc
+/// Why a listener that has never read its deny list refuses a peer it would otherwise admit:
+/// a refusal to try again, never a verdict on that peer.
+pub(crate) const DENY_LIST_UNREAD: &str =
+    "this Mac has not read its deny list yet; try again once it has";
+
+/// The last deny list a listener read, and why it has none yet as it last said so.
+pub(crate) struct DeniedCache {
+    list: Option<Arc<[String]>>,
+    /// Why no list has been read yet, as last said: a change of it is said again.
+    unread_said: Option<String>,
+}
+
+impl DeniedCache {
+    pub(crate) const fn new() -> Self {
+        Self {
+            list: None,
+            unread_said: None,
         }
-        Ok(None) | Err(_) => cache
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| Arc::from(&[][..])),
     }
 }
 
+/// The deny list after `observed`, a read of it, and the line to say now, if any: a list read now
+/// is kept in `cache` and answered; a read that gave none (mid-apply, `Ok(None)`) or failed answers
+/// the last list `cache` kept, and `None` while it has kept none, so the caller refuses whom that
+/// unread list might name ([`DENY_LIST_UNREAD`]) rather than read it as naming no one.
+///
+/// A list that stays unread is a standing cause more often than a moment (a lock another account
+/// owns, a `source.toml` other users can read, a failed apply, this Mac revoked), under which
+/// this Mac turns every peer away: the line names why, once for each new cause, and once more when
+/// a list is read at last, so the log says what keeps this Mac shut and when it opened.
+fn update_denied_nodes_cache(
+    cache: &mut DeniedCache,
+    observed: aterm_secrets::Result<Option<Vec<String>>>,
+) -> (Option<Arc<[String]>>, Option<String>) {
+    let why = match observed {
+        Ok(Some(nodes)) => {
+            let arc: Arc<[String]> = nodes.into();
+            cache.list = Some(Arc::clone(&arc));
+            let said = cache.unread_said.take().map(|_| {
+                "fleet: the deny list is read; Macs that prove the fleet secret are admitted again"
+                    .to_owned()
+            });
+            return (Some(arc), said);
+        }
+        _ if cache.list.is_some() => return (cache.list.clone(), None),
+        Ok(None) => "the vault gives none now: a sync applying, a failed or pending apply, or this                      Mac revoked (`aterm secrets sync` says which)"
+            .to_owned(),
+        Err(error) => aterm_log::sanitize_record(&error.to_string()).into_owned(),
+    };
+    if cache.unread_said.as_deref() == Some(why.as_str()) {
+        return (None, None);
+    }
+    let line = format!(
+        "fleet: every Mac that dials this one is turned away, and none is dialed:          {DENY_LIST_UNREAD} ({why})"
+    );
+    cache.unread_said = Some(why);
+    (None, Some(line))
+}
+
 /// Read the verified swarm roster's `deny_nodes`, retaining the last authoritative list when the
-/// local vault is mid-apply or unreadable. It is read again only when one of the vault files it
-/// reads changed ([`aterm_secrets::client::swarm_denied_nodes_now`]), so the listener's
-/// per-dialer lookup and each control request cost no vault decrypt.
+/// local vault is mid-apply or unreadable, and `None` until one was read
+/// ([`update_denied_nodes_cache`]). It is read again only when one of the vault files it reads
+/// changed ([`aterm_secrets::client::swarm_denied_nodes_now`]), so the listener's per-dialer
+/// lookup and each control request cost no vault decrypt. An isolated run (a test, a lab's
+/// scratch state, CI) reads no vault, and so has a deny list that names no one.
+///
+/// The window's per-connection checks ([`admit_driver`], [`register_member`], [`share_book`],
+/// [`receive_pushed_facts`], `served_live`, the vault-join judge) refuse while this answers `None`
+/// too, but they run
+/// only past the handshake gate ([`denied_under`]), which refuses every proved dialer while it
+/// does, and once a list is read this never answers `None` again: theirs is a second line, which
+/// no test reaches (a test reads no vault). The gate and the cache are what the tests hold
+/// (`denied_nodes_cache_retains_list_while_locked_and_cuts_open_drive`, and the node job's
+/// `a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has`).
 #[cfg(unix)]
-fn denied_nodes_now() -> Arc<[String]> {
+fn denied_nodes_now() -> Option<Arc<[String]>> {
     let isolated = cfg!(test)
         || std::env::var_os("ATERM_STATE_HOME").is_some()
         || std::env::var_os("CI").is_some();
     if isolated {
-        return Arc::from(&[][..]);
+        return Some(Arc::from(&[][..]));
     }
     let observed = aterm_secrets::client::Paths::live()
         .and_then(|paths| aterm_secrets::client::swarm_denied_nodes_now(&paths));
-    let mut guard = DENIED_NODES.lock_or_recover();
-    update_denied_nodes_cache(&mut guard, observed)
+    let (denied, said) = update_denied_nodes_cache(&mut DENIED_NODES.lock_or_recover(), observed);
+    if let Some(line) = said {
+        note_fleet(&line, denied.is_none());
+    }
+    denied
 }
 
 /// Whether `node` may still drive this Mac under `grants`: a grant admits it under the key `bound`
@@ -533,17 +601,22 @@ pub(crate) fn holds_in(
 }
 
 /// What the listener's handshake refuses now: the swarm roster's deny-listed nodes
-/// (`denied_nodes`), and each node key the membership log `log` holds out.
+/// (`denied_nodes`), and each node key the membership log `log` holds out; every dialer while no
+/// deny list was read yet (`None`, [`aterm_net::fleet::Denied::unread`]).
 #[cfg(unix)]
 pub(crate) fn denied_under(
-    denied_nodes: &[String],
+    denied_nodes: Option<&[String]>,
     log: Option<&aterm_net::fleet_member::MemberKeys>,
 ) -> Arc<aterm_net::fleet::Denied> {
+    let Some(denied_nodes) = denied_nodes else {
+        return Arc::new(aterm_net::fleet::Denied::not_yet_read());
+    };
     Arc::new(aterm_net::fleet::Denied {
         nodes: denied_nodes.to_vec(),
         keys: log
             .map(aterm_net::fleet_member::MemberKeys::out)
             .unwrap_or_default(),
+        unread: false,
     })
 }
 
@@ -618,50 +691,75 @@ fn holder_within() -> Duration {
 /// What this Mac finds of `hold`'s node now, for a local `hold off`: no grant here admitting it,
 /// or its place in the book disowning it under the key this Mac's keyring binds it to within
 /// [`HOLDER_WITHIN`] ([`aterm_net::fleet_member::Unreached::disowns`]), ends it; a place that does
-/// not answer never.
+/// not answer never ([`holder_after`]).
 #[cfg(unix)]
 fn remote_holder(hold: &crate::fabric::RemoteHold) -> crate::fabric::Holder {
     use crate::fabric::Holder;
     use aterm_net::fleet_member::{Keyring, Target, peer_of, proves_itself, target_of};
     let node = hold.node.as_str();
-    let gone = |why: &str| Holder::Gone(why.to_owned());
-    let denied = denied_nodes_now();
-    if aterm_net::fleet::is_denied_node(node, &denied) {
-        return gone("it is on the swarm roster's deny-list");
+    let ready = (|| {
+        let state = aterm_types::dirs::state_dir().ok_or("this Mac has no state directory")?;
+        let keys = Keyring::read(&state);
+        let grants = served_now().grants;
+        let log = window_log();
+        let key = bound_or_admitted_in(&keys, log.as_deref(), admitted_driver_key(node), node)
+            .filter(|key| aterm_net::fleet::DriveGrant::admitting(&grants, node, *key).is_some())
+            .ok_or("it may drive this Mac no more")?;
+        let secret = read_fleet_key()
+            .map_err(|_| "this Mac holds no fleet key it can use, so no node drives it")?;
+        let me = read_node_key().ok_or("this Mac proves no node, so no node drives it")?;
+        Ok((state, keys, key, secret, me))
+    })();
+    holder_after(
+        node,
+        ready,
+        |(_, _, key, _, _)| *key,
+        denied_nodes_now,
+        |(state, keys, key, secret, me)| {
+            let Some(peer) = peer_of(&state, node) else {
+                return Holder::Again("no book here records where it is".to_owned());
+            };
+            let target = Target {
+                node: Some(node.to_owned()),
+                key: Some(key),
+                ..target_of(&peer)
+            };
+            match proves_itself(&target, &keys, (&secret, &me), holder_within()) {
+                Ok(_) => Holder::Drives,
+                Err(why) if why.disowns() => Holder::Gone(why.to_string()),
+                Err(why) => Holder::Again(why.to_string()),
+            }
+        },
+    )
+}
+
+/// [`remote_holder`]'s verdict once it has read what it can without the deny list: `ready`, what
+/// a dial of `node` needs (its key `key_of` names, under a grant here that admits it), or why the
+/// node may drive this Mac no more, which ends the hold whatever the deny list says. Only then is
+/// the deny list read (`denied`): while none was ever read the hold stands, to try again, and a
+/// node or key it names ends it; otherwise `dial` judges.
+#[cfg(unix)]
+fn holder_after<T>(
+    node: &str,
+    ready: Result<T, &'static str>,
+    key_of: impl FnOnce(&T) -> aterm_net::fleet::NodeKey,
+    denied: impl FnOnce() -> Option<Arc<[String]>>,
+    dial: impl FnOnce(T) -> crate::fabric::Holder,
+) -> crate::fabric::Holder {
+    use crate::fabric::Holder;
+    let ready = match ready {
+        Ok(ready) => ready,
+        Err(why) => return Holder::Gone(why.to_owned()),
+    };
+    let Some(denied) = denied() else {
+        return Holder::Again(DENY_LIST_UNREAD.to_owned());
+    };
+    if aterm_net::fleet::is_denied_node(node, &denied)
+        || aterm_net::fleet::is_denied_key(&key_of(&ready), &denied)
+    {
+        return Holder::Gone("it is on the swarm roster's deny-list".to_owned());
     }
-    let Some(state) = aterm_types::dirs::state_dir() else {
-        return gone("this Mac has no state directory");
-    };
-    let keys = Keyring::read(&state);
-    let grants = served_now().grants;
-    let log = window_log();
-    let Some(key) = bound_or_admitted_in(&keys, log.as_deref(), admitted_driver_key(node), node)
-        .filter(|key| aterm_net::fleet::DriveGrant::admitting(&grants, node, *key).is_some())
-    else {
-        return gone("it may drive this Mac no more");
-    };
-    if aterm_net::fleet::is_denied_key(&key, &denied) {
-        return gone("it is on the swarm roster's deny-list");
-    }
-    let Ok(secret) = read_fleet_key() else {
-        return gone("this Mac holds no fleet key it can use, so no node drives it");
-    };
-    let Some(me) = read_node_key() else {
-        return gone("this Mac proves no node, so no node drives it");
-    };
-    let Some(peer) = peer_of(&state, node) else {
-        return Holder::Again("no book here records where it is".to_owned());
-    };
-    let target = Target {
-        node: Some(node.to_owned()),
-        key: Some(key),
-        ..target_of(&peer)
-    };
-    match proves_itself(&target, &keys, (&secret, &me), holder_within()) {
-        Ok(_) => Holder::Drives,
-        Err(why) if why.disowns() => Holder::Gone(why.to_string()),
-        Err(why) => Holder::Again(why.to_string()),
-    }
+    dial(ready)
 }
 
 /// A local `hold <sid> off` that meets a remote hold alone: it lifts it once that node may drive
@@ -1007,7 +1105,9 @@ pub(crate) const fn units_word(serves: Option<atpkg::peers::Serves>) -> &'static
 }
 
 fn supervise_fleet_listener() {
-    crate::qos::set_self(crate::qos::Role::Background);
+    if !cfg!(test) {
+        crate::qos::set_self(crate::qos::Role::Background);
+    }
     let mut ran = 0;
     loop {
         let (generation, wanted) = {
@@ -1025,11 +1125,13 @@ fn supervise_fleet_listener() {
 }
 
 fn run_fleet_generation(generation: u64, wanted: Option<Wanted>) {
+    // A lift admits no one: with no deny list read yet it lifts by the grants alone, and the
+    // next sweep after a read lifts by the list too.
     #[cfg(unix)]
     lift_undriving_holds(
         &grants_of(wanted.as_ref()),
         &keyring_now(),
-        &denied_nodes_now(),
+        denied_nodes_now().as_deref().unwrap_or_default(),
     );
     let Some(wanted) = wanted else {
         stand_fleet(generation, Standing::Off, "fleet listener off");
@@ -1108,7 +1210,11 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
     loop {
         if node_job_running_now() {
             let serving = served_now();
-            lift_undriving_holds(&serving.grants, &keyring_now(), &denied_nodes_now());
+            lift_undriving_holds(
+                &serving.grants,
+                &keyring_now(),
+                denied_nodes_now().as_deref().unwrap_or_default(),
+            );
             stand_fleet(
                 generation,
                 Standing::Listening,
@@ -1216,7 +1322,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                     let serving = served_now();
                     (serving.scope, serving.ops())
                 }),
-                Arc::new(|| denied_under(&denied_nodes_now(), window_log().as_deref())),
+                Arc::new(|| denied_under(denied_nodes_now().as_deref(), window_log().as_deref())),
             ),
             members_ask(),
             &running,
@@ -1262,14 +1368,18 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                     });
                 }
                 if op == FleetOp::VaultJoin {
+                    // No deny list read: the proof cannot be told from a removed Mac's, so it is
+                    // judged by none until one is (the handshake gate refuses before this).
                     let judged = aterm_types::dirs::state_dir()
                         .ok_or_else(|| "this Mac has no state directory".to_owned())
                         .and_then(|state| {
+                            let denied =
+                                denied_nodes_now().ok_or_else(|| DENY_LIST_UNREAD.to_owned())?;
                             judge_vault_join_at(
                                 &served,
                                 &join_secret,
                                 (&state, &served_now().grants),
-                                &denied_nodes_now(),
+                                &denied,
                                 window_log().as_deref(),
                                 aterm_secrets::client::Paths::live().ok().as_ref(),
                             )
@@ -1374,7 +1484,9 @@ fn share_units(
     let spawned = std::thread::Builder::new()
         .name("aterm-fleet-units".to_owned())
         .spawn(move || {
-            crate::qos::set_self(crate::qos::Role::Background);
+            if !cfg!(test) {
+                crate::qos::set_self(crate::qos::Role::Background);
+            }
             atpkg::peers::share(
                 &layout,
                 &atpkg::peers::Share {
@@ -1403,7 +1515,10 @@ fn share_units(
 /// private or link-local one ([`aterm_net::fleet::is_fleet_source`]).
 #[cfg(unix)]
 fn unit_members() -> Vec<IpAddr> {
-    let denied = denied_nodes_now();
+    // No deny list read yet: no member's address may take an archive until one is.
+    let Some(denied) = denied_nodes_now() else {
+        return Vec::new();
+    };
     let log = window_log();
     aterm_types::dirs::state_dir()
         .map(|state| {
@@ -1425,7 +1540,7 @@ fn admit_driver(
 ) -> Result<(crate::fabric::Driver, aterm_net::fleet::DriveGrant), (String, bool)> {
     let state = aterm_types::dirs::state_dir()
         .ok_or_else(|| ("this Mac has no state directory".to_owned(), false))?;
-    let denied = denied_nodes_now();
+    let denied = denied_nodes_now().ok_or_else(|| (DENY_LIST_UNREAD.to_owned(), false))?;
     let grants = served_now().grants;
     admit_driver_at(served, &state, &grants, &denied, window_log().as_deref())
 }
@@ -1491,7 +1606,7 @@ pub(crate) fn judge_vault_join_at(
     let driven = aterm_net::fleet_member::proven_driver(served, state, grants, log).is_ok();
     let bound =
         proof.and_then(|proof| aterm_net::fleet_member::Keyring::read(state).bound(&proof.node));
-    let peers = aterm_net::fleet_member::read_peers(state).unwrap_or_default();
+    let peers = aterm_net::fleet_member::read_peers(state).ok();
     aterm_agent::vault_join::judge(
         proof,
         (
@@ -1501,7 +1616,7 @@ pub(crate) fn judge_vault_join_at(
         driven,
         (bound, denied, log),
         (
-            &peers,
+            peers.as_deref(),
             served.peer_addr().map(|at| at.ip()),
             aterm_time::unix_millis().unwrap_or(0),
         ),
@@ -1514,7 +1629,9 @@ fn lists_driver(
     served: &aterm_net::fleet::Served,
     grants: &[aterm_net::fleet::DriveGrant],
 ) -> bool {
-    let denied = denied_nodes_now();
+    let Some(denied) = denied_nodes_now() else {
+        return false;
+    };
     aterm_types::dirs::state_dir().is_some_and(|state| {
         lists_driver_at(served, &state, grants, &denied, window_log().as_deref())
     })
@@ -1587,9 +1704,10 @@ impl Opened {
         let held = Self(id);
         let now = served_now();
         let holds = holds_now();
+        // No deny list read yet: nothing is served until one is.
         let denied = denied_nodes_now();
-        Ok(now
-            .serves(content, driver.as_ref(), &holds, &denied)
+        Ok(denied
+            .is_some_and(|denied| now.serves(content, driver.as_ref(), &holds, &denied))
             .then_some(held))
     }
 
@@ -1703,7 +1821,7 @@ fn register_member<S: std::io::Read + std::io::Write>(
             "a join with no peer address or no state directory",
         ));
     };
-    let denied = denied_nodes_now();
+    let denied = denied_nodes_now().ok_or_else(|| std::io::Error::other(DENY_LIST_UNREAD))?;
     let log = window_log();
     register_member_at(
         stream,
@@ -1799,7 +1917,7 @@ fn share_book<S: std::io::Write>(
     let Some(state) = aterm_types::dirs::state_dir() else {
         return Err(std::io::Error::other("a book read with no state directory"));
     };
-    let denied = denied_nodes_now();
+    let denied = denied_nodes_now().ok_or_else(|| std::io::Error::other(DENY_LIST_UNREAD))?;
     let log = window_log();
     share_book_at(stream, &state, peer, (&denied, log.as_deref()), addr)
 }
@@ -1862,7 +1980,7 @@ fn receive_pushed_facts<S: std::io::Read + std::io::Write>(
             "a facts push with no state directory",
         ));
     };
-    let denied = denied_nodes_now();
+    let denied = denied_nodes_now().ok_or_else(|| std::io::Error::other(DENY_LIST_UNREAD))?;
     let log = window_log();
     receive_pushed_facts_at(stream, &state, proof, peer, (&denied, log.as_deref()))
 }
@@ -2076,7 +2194,11 @@ fn push_facts_heartbeat(secret: &aterm_net::fleet::FleetSecret) {
         here.instances,
         false,
     );
-    let denied = denied_nodes_now();
+    // No deny list read yet: this Mac's facts go to no one until one is.
+    let Some(denied) = denied_nodes_now() else {
+        aterm_log::debug!("fleet: survey facts heartbeat push skipped: {DENY_LIST_UNREAD}");
+        return;
+    };
     let log = window_log();
     if let Err(why) =
         push_facts_to_issuer_with_denied(&state, secret, (&denied, log.as_deref()), &payload)
@@ -2225,7 +2347,9 @@ fn watch_fleet_generation(
                 // step's wait it takes the dialog slot for macOS's question.
                 let now = std::time::Instant::now();
                 let facts_due = last_facts_push.elapsed() >= FACTS_HEARTBEAT_EVERY;
-                let lan = (facts_due || heartbeat.is_due(now))
+                // A round still out takes no move: the move waits for the round after it.
+                let busy = hb_in_flight.load(Ordering::Acquire);
+                let lan = (facts_due || (!busy && heartbeat.is_due(now)))
                     && aterm_types::macos_setup::lan_first_use::may_use();
                 if lan && facts_due {
                     last_facts_push = std::time::Instant::now();
@@ -2235,7 +2359,7 @@ fn watch_fleet_generation(
                     last_census_refresh = std::time::Instant::now();
                     maybe_refresh_local_census();
                 }
-                if lan && let Some(woke) = heartbeat.due(now) {
+                if lan && let Some(woke) = heartbeat.due_when_free(now, busy) {
                     say_heartbeat_woke("fleet listener", woke);
                     spawn_member_heartbeat(addr, secret.clone(), &hb_in_flight);
                 }
@@ -2289,22 +2413,34 @@ fn spawn_member_heartbeat(
     {
         log = window_log();
     }
-    let denied = denied_nodes_now();
+    // No deny list read yet: no member is dialed until one is; the next round is due as usual.
+    let Some(denied) = denied_nodes_now() else {
+        aterm_log::debug!("fleet heartbeat skipped: {DENY_LIST_UNREAD}");
+        return;
+    };
     spawn_member_heartbeat_at(
         &state,
         addr,
         secret,
         in_flight,
         (denied, log, crate::network_moved::alab_tcp()),
+        aterm_secrets::client::Paths::live().ok(),
     );
 }
 
 /// Note a heartbeat round's `answered` members, each of which proved its node to this Mac, as
-/// evidence of the network each answered from ([`aterm_secrets::home_lan::note`]): the vault
+/// evidence of the network each answered from ([`aterm_secrets::home_lan::note`]) under `vault`,
+/// the secrets directory of the vault this round serves (none: nothing is noted): the vault
 /// server observes a join on the home ALab LAN only where members answered. Runs on the round's
 /// thread, never the event loop.
 #[cfg(unix)]
-fn note_home_lan(answered: &[aterm_net::fleet_member::Answered]) {
+fn note_home_lan(
+    vault: Option<&aterm_secrets::client::Paths>,
+    answered: &[aterm_net::fleet_member::Answered],
+) {
+    let Some(paths) = vault else {
+        return;
+    };
     if answered.is_empty() {
         return;
     }
@@ -2312,9 +2448,7 @@ fn note_home_lan(answered: &[aterm_net::fleet_member::Answered]) {
         .iter()
         .map(|done| (done.node.clone(), done.at.ip()))
         .collect();
-    let noted = aterm_secrets::client::Paths::live()
-        .and_then(|paths| aterm_secrets::home_lan::note(&paths, &heard));
-    if let Err(error) = noted {
+    if let Err(error) = aterm_secrets::home_lan::note(paths, &heard) {
         aterm_log::debug!("fleet heartbeat: the home-LAN evidence was not noted: {error}");
     }
 }
@@ -2355,7 +2489,8 @@ type HeartbeatReach = (
 /// flight (`in_flight`): its signed entry registered with up to three members
 /// ([`aterm_net::fleet_member::heartbeat_members_with_denied`]) its membership log admits (`log`;
 /// none: those its book binds) and `denied` does not list, the places `browse`'s adverts resolve to
-/// tried after the book's.
+/// tried after the book's. Its answers are noted as home-LAN evidence under `vault`, the secrets
+/// directory of the vault this Mac serves ([`note_home_lan`]).
 #[cfg(unix)]
 fn spawn_member_heartbeat_at(
     state: &std::path::Path,
@@ -2363,6 +2498,7 @@ fn spawn_member_heartbeat_at(
     secret: aterm_net::fleet::FleetSecret,
     in_flight: &Arc<AtomicBool>,
     (denied, log, browse): HeartbeatReach,
+    vault: Option<aterm_secrets::client::Paths>,
 ) {
     use aterm_net::fleet_member::{
         Registration, heartbeat_members_with_denied, read_node_identity,
@@ -2400,7 +2536,9 @@ fn spawn_member_heartbeat_at(
     let started = std::thread::Builder::new()
         .name("aterm-fleet-hb".to_owned())
         .spawn(move || {
-            crate::qos::set_self(crate::qos::Role::Background);
+            if !cfg!(test) {
+                crate::qos::set_self(crate::qos::Role::Background);
+            }
             struct Guard(Arc<AtomicBool>);
             impl Drop for Guard {
                 fn drop(&mut self) {
@@ -2429,7 +2567,7 @@ fn spawn_member_heartbeat_at(
                 Ok(answered) => {
                     // Each answer proved its node to this Mac: evidence of the network it came
                     // from, which the vault server and approver tell the home ALab LAN by.
-                    note_home_lan(&answered);
+                    note_home_lan(vault.as_ref(), &answered);
                     if !answered.is_empty()
                         && let Some((_, payload)) =
                             aterm_net::fleet_member::read_pushed_facts(&state)
@@ -2482,7 +2620,16 @@ fn spawn_member_heartbeat_at(
 fn follow_serving(generation: u64, addr: SocketAddr) {
     let serving = served_now();
     let denied = denied_nodes_now();
-    let cut = cut_unserved_with_denied(&serving, &holds_now(), &denied);
+    // No deny list read yet: every open drive or content read is cut, as the handshake refuses
+    // each new connection, until one is read.
+    let unread = Serving {
+        scope: FleetScope::Facts,
+        grants: Vec::new(),
+    };
+    let cut = match denied.as_deref() {
+        Some(denied) => cut_unserved_with_denied(&serving, &holds_now(), denied),
+        None => cut_unserved_with_denied(&unread, &holds_now(), &[]),
+    };
     if cut > 0 {
         note_fleet(
             &format!(
@@ -2492,7 +2639,11 @@ fn follow_serving(generation: u64, addr: SocketAddr) {
             false,
         );
     }
-    lift_undriving_holds(&serving.grants, &keyring_now(), &denied);
+    lift_undriving_holds(
+        &serving.grants,
+        &keyring_now(),
+        denied.as_deref().unwrap_or_default(),
+    );
     stand_fleet(generation, Standing::Listening, &serving.line(addr));
 }
 
@@ -2817,6 +2968,39 @@ mod tests {
             "at this Mac's spread"
         );
         assert_eq!(heartbeat.due(t0 + spread), None, "and only one");
+    }
+
+    /// A MOVE TOLD WHILE A HEARTBEAT ROUND IS OUT STILL GETS A ROUND: back home alone (no herd
+    /// spread), the route move starts a round at once, often while the LAN is still down, and
+    /// the settled place's move comes seconds later while that round is out. It is not taken
+    /// then (a round could not start), and once the round ends it is due, once.
+    /// NEGATIVE CONTROL: `due_when_free` taking the move whatever `busy` says (the old
+    /// `heartbeat.due(now)` at the call sites) answers it while the round is out, where the
+    /// caller drops it, and "not while a round is out" fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_move_told_while_a_round_is_out_still_gets_a_round() {
+        use crate::network_moved::{Moved, Woke};
+        let moved = std::sync::Arc::new(Moved::new());
+        let t0 = std::time::Instant::now() + Duration::from_secs(3600);
+        let every = Duration::from_secs(3 * 3600);
+        let mut heartbeat = HeartbeatClock::new(Some(t0), every, moved.watch());
+        moved.tell_at(Woke::Place, t0);
+        assert_eq!(
+            heartbeat.due_when_free(t0, true),
+            None,
+            "not while a round is out"
+        );
+        assert_eq!(
+            heartbeat.due_when_free(t0 + Duration::from_secs(3), false),
+            Some(Woke::Place),
+            "once it ended"
+        );
+        assert_eq!(
+            heartbeat.due_when_free(t0 + Duration::from_secs(3), false),
+            None,
+            "and only one"
+        );
     }
 
     /// A DRIVE IS NAMED BY ITS PROVEN NODE.
@@ -3584,26 +3768,138 @@ mod tests {
         );
     }
 
+    /// A local `hold off` ends a remote hold whose node no grant here admits (or that this Mac
+    /// cannot be driven by at all) while no deny list was ever read, without waiting for one;
+    /// where the answer turns on the deny list, the hold stands while none was read, and a list
+    /// that names the node ends it; otherwise the dial judges.
+    ///
+    /// NEGATIVE CONTROL (2026-11-01): with `holder_after` reading the deny list before it looks at
+    /// `ready` (the order the review found: an unread list stood every hold, even one no grant
+    /// admits), this fails (`left: Again(..), right: Gone("it may drive this Mac no more")`).
+    #[cfg(unix)]
+    #[test]
+    fn a_hold_off_ends_an_ungranted_remote_hold_before_any_deny_list_is_read() {
+        use crate::fabric::Holder;
+        let node = "9a".repeat(16);
+        let key = aterm_net::fleet::NodeKey::from_bytes([0xcd; 32]);
+        let unread = || None;
+        let dialed = |_| -> Holder { panic!("no dial where the deny list decides") };
+        assert_eq!(
+            holder_after(
+                &node,
+                Err("it may drive this Mac no more"),
+                |k| *k,
+                unread,
+                dialed
+            ),
+            Holder::Gone("it may drive this Mac no more".to_owned())
+        );
+        assert_eq!(
+            holder_after(&node, Ok(key), |k| *k, unread, dialed),
+            Holder::Again(DENY_LIST_UNREAD.to_owned())
+        );
+        let naming = || Some(Arc::from(vec![node.clone()]));
+        assert_eq!(
+            holder_after(&node, Ok(key), |k| *k, naming, dialed),
+            Holder::Gone("it is on the swarm roster's deny-list".to_owned())
+        );
+        assert_eq!(
+            holder_after(
+                &node,
+                Ok(key),
+                |k| *k,
+                || Some(Arc::from(Vec::new())),
+                |_| Holder::Drives
+            ),
+            Holder::Drives
+        );
+    }
+
+    /// A deny list that stays unread says why, once for each new cause and never again for the
+    /// same one (the read runs per dialer and per tick), and says so once more when a list is
+    /// read at last; a failed read after that keeps the list and says nothing.
+    ///
+    /// NEGATIVE CONTROL (2026-11-01): with `update_denied_nodes_cache` saying nothing while the
+    /// list is unread (the shape before: a standing cause looked like "try again", logged at
+    /// `debug!` where it was logged at all), this fails (`an unread list says why`).
+    #[cfg(unix)]
+    #[test]
+    fn an_unread_deny_list_says_why_once_for_each_cause() {
+        let mut cache = DeniedCache::new();
+        let failed = |why: &str| Err(aterm_secrets::Error::new(why.to_owned()));
+        let (denied, said) =
+            update_denied_nodes_cache(&mut cache, failed(".lock: owned by uid 0, not this user"));
+        assert!(denied.is_none());
+        let said = said.expect("an unread list says why");
+        assert!(
+            said.contains(DENY_LIST_UNREAD) && said.contains("owned by uid 0"),
+            "{said}"
+        );
+        assert_eq!(
+            update_denied_nodes_cache(&mut cache, failed(".lock: owned by uid 0, not this user")),
+            (None, None),
+            "the same cause is said once"
+        );
+        let said = update_denied_nodes_cache(&mut cache, Ok(None)).1;
+        assert!(
+            said.is_some_and(|said| said.contains("the vault gives none now")),
+            "a new cause is said again"
+        );
+        let (denied, said) = update_denied_nodes_cache(&mut cache, Ok(Some(Vec::new())));
+        assert!(denied.is_some());
+        assert!(
+            said.is_some_and(|said| said.contains("admitted again")),
+            "a list read at last is said"
+        );
+        assert_eq!(
+            update_denied_nodes_cache(&mut cache, failed("transient")).1,
+            None,
+            "a failed read under a kept list says nothing"
+        );
+        assert_eq!(
+            update_denied_nodes_cache(&mut cache, Ok(Some(Vec::new()))).1,
+            None,
+            "nor does the next list read"
+        );
+    }
+
+    /// No deny list until one was read, then the last one read through a mid-apply or failed
+    /// read, and an open drive cut once its node is denied.
+    ///
+    /// NEGATIVE CONTROL (2026-11-01): with `update_denied_nodes_cache` answering an empty list
+    /// while none was read (the shape before), the first read is a list (`assertion failed:
+    /// update_denied_nodes_cache(&mut cache, Ok(None)).is_none()`).
     #[cfg(unix)]
     #[test]
     fn denied_nodes_cache_retains_list_while_locked_and_cuts_open_drive() {
         let _guard = OPEN_TEST_LOCK.lock_or_recover();
-        let mut cache: Option<Arc<[String]>> = None;
-        assert!(update_denied_nodes_cache(&mut cache, Ok(None)).is_empty());
+        let mut cache = DeniedCache::new();
+        // Never read: a mid-apply read and a failed one leave no list, which the handshake reads
+        // as unread and refuses every dialer under, never as a list that names no one.
+        assert!(update_denied_nodes_cache(&mut cache, Ok(None)).0.is_none());
+        let failed =
+            update_denied_nodes_cache(&mut cache, Err(aterm_secrets::Error::new("wide"))).0;
+        assert!(failed.is_none());
+        assert!(denied_under(failed.as_deref(), None).unread);
 
         let revoked_node = "9a".repeat(16);
         let good_node = "9b".repeat(16);
-        let updated = update_denied_nodes_cache(&mut cache, Ok(Some(vec![revoked_node.clone()])));
+        let updated = update_denied_nodes_cache(&mut cache, Ok(Some(vec![revoked_node.clone()])))
+            .0
+            .expect("a list read now");
         assert_eq!(&*updated, std::slice::from_ref(&revoked_node));
+        assert!(!denied_under(Some(&updated), None).unread);
 
         // Transient lock (`Ok(None)`) or parse error retains the last authoritative deny-list.
         assert_eq!(
-            &*update_denied_nodes_cache(&mut cache, Ok(None)),
-            std::slice::from_ref(&revoked_node)
+            update_denied_nodes_cache(&mut cache, Ok(None)).0.as_deref(),
+            Some(std::slice::from_ref(&revoked_node))
         );
         assert_eq!(
-            &*update_denied_nodes_cache(&mut cache, Err(aterm_secrets::Error::new("transient"))),
-            std::slice::from_ref(&revoked_node)
+            update_denied_nodes_cache(&mut cache, Err(aterm_secrets::Error::new("transient")))
+                .0
+                .as_deref(),
+            Some(std::slice::from_ref(&revoked_node))
         );
 
         // Open drive for `revoked_node` is cut as soon as it enters `deny_nodes`, while `good_node`

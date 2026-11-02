@@ -437,7 +437,7 @@ impl Journal {
     /// The release reached its check: everything is done for R.
     #[must_use]
     pub fn finished(&self) -> bool {
-        self.has("check")
+        self.has("check") && !self.has(SITE_DEFERRED)
     }
 
     #[must_use]
@@ -511,7 +511,7 @@ pub struct Holder {
     pub handed: bool,
 }
 
-fn read_holder(path: &Path) -> Option<Holder> {
+pub(crate) fn read_holder(path: &Path) -> Option<Holder> {
     let text = crate::durable::read_regular_text(path, 64 * 1024).ok()?;
     let field = |key: &str| {
         text.lines()
@@ -729,20 +729,15 @@ pub struct CutState {
     pub finished: bool,
 }
 
-/// What the after-cut step did: the published release's shape checked as GitHub serves it, and alab.systems brought to it — or not from here.
+/// The published release's shape checked and its website verified live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AfterCut {
     /// The step's line.
     pub note: String,
-    /// `ship site` found no usable site checkout here (or one it cannot build or deploy from) and touched nothing.
-    pub site_deferred: bool,
 }
 
-/// The hand step a deferred site leaves ([`AfterCut::site_deferred`]), as the step, the final line and every later run of the release say it.
-pub const SITE_BY_HAND: &str = "alab.systems was NOT synced: this machine has no usable \
-     site checkout (ship site touched nothing), so run \
-     `targo --unverified ship site --latest` on a machine with one";
-
+// Older journals recorded an unfinished website as a completed release.
+// They must resume the website step before they can become complete.
 const SITE_DEFERRED: &str = "site-deferred";
 
 /// The engine's ledger (`mappings.json`) as the release reads it, for one commit.
@@ -881,13 +876,15 @@ pub trait Backend {
     fn ledger_versions(&mut self, rev: &str) -> Vec<String>;
     fn engine_rows(&mut self, commit: Option<&str>) -> EngineRows;
     fn engine_now(&mut self, staged: &str) -> Result<EngineNow, String>;
-    fn staging_moved(&mut self) -> Result<Option<String>, String>;
+    fn candidate_missing(&mut self) -> Result<Option<String>, String>;
     fn cut_journal(&mut self) -> Option<CutState>;
     fn is_dir(&mut self, path: &Path) -> bool;
 
     fn sync(&mut self) -> Result<String, Refusal>;
     fn bump(&mut self, from: &str, to: &str, prover: &Prover) -> Result<String, Refusal>;
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal>;
+    /// Provision the selected checkout's tools before staging or compiling the product.
+    fn validation_tools(&mut self) -> Result<String, Refusal>;
     fn own_cutter(&mut self, commit: &str) -> Result<String, crate::cutter::NotOwn>;
     /// Run this release again as R's own cutter, a fresh `targo --unverified ship` of the same
     /// arguments in the clone, and wait for it: its exit code, or why it could not start.
@@ -1136,6 +1133,14 @@ impl Run<'_> {
         let note = self.commit()?;
         self.finish(&note);
         self.own_cutter()?;
+        // The cutter now belongs to the selected commit, so its provisioning
+        // rows are that candidate's pins, not a newer launcher's defaults.
+        if !self.dry && !self.journal.as_ref().is_some_and(Journal::finished) {
+            match self.b.validation_tools() {
+                Ok(note) => self.say(&format!("        validation tools: {note}")),
+                Err(refusal) => self.refuse(refusal)?,
+            }
+        }
 
         self.refresh();
         self.plan_print();
@@ -1193,14 +1198,11 @@ impl Run<'_> {
         }
 
         self.begin(Step::AfterCut)?;
-        let shaped = self.journal_has("after-cut");
+        let shaped = self.site_complete();
         if shaped && self.facts.fixtures.yes {
             let v = self.version();
-            let site = self.site_words();
             let landed = self.facts.fixtures.words.clone();
-            self.skip(&format!(
-                "done for v{v} (this release's journal){site}; {landed}"
-            ));
+            self.skip(&format!("done for v{v} (this release's journal); {landed}"));
         } else if self.dry {
             let v = self.version();
             let mut words = Vec::new();
@@ -1246,11 +1248,30 @@ impl Run<'_> {
             .map_or_else(|| "?".to_string(), |c| c.commit.clone())
     }
 
+    fn stage_event(&mut self, outcome: &str, detail: &str) {
+        if self.dry {
+            return;
+        }
+        let at = self.b.now();
+        let elapsed = at.saturating_sub(self.cur_t0);
+        let waiting = self.waited.min(elapsed);
+        let log = self.b.log_path(self.cur);
+        let event = aterm_json::json!({
+            "schema": 1, "event": "release-stage", "stage": self.cur.name(),
+            "outcome": outcome, "source": self.commit_r(), "version": self.version(),
+            "at_unix_s": at, "waiting_s": waiting,
+            "execution_s": elapsed.saturating_sub(waiting), "log": log,
+            "detail": detail, "public": &self.public,
+        });
+        self.say(&format!("release-event: {event}"));
+    }
+
     fn begin(&mut self, step: Step) -> Flow {
         self.cur = step;
         self.b.entered(step);
         self.waited = 0;
         self.cur_t0 = self.b.now();
+        self.stage_event("started", "");
         self.halt_if_interrupted()?;
         let at = self.b.hms(self.cur_t0);
         self.say(&format!(
@@ -1324,6 +1345,7 @@ impl Run<'_> {
             }
             return;
         }
+        self.stage_event("ok", note);
         let at = self.b.hms(now);
         let eta = self.eta_words();
         self.say(&format!(
@@ -1339,6 +1361,7 @@ impl Run<'_> {
     }
 
     fn skip(&mut self, why: &str) {
+        self.stage_event("skip", why);
         let step = self.cur;
         self.say(&format!(
             "[{:>2}/{}] {:<15} skip  {why}",
@@ -1375,6 +1398,7 @@ impl Run<'_> {
 
     fn final_refusal(&mut self, r: Refusal) -> Flow {
         self.halt_if_interrupted()?;
+        self.stage_event(if r.could_not_run { "NOT RUN" } else { "FAIL" }, &r.why);
         let step = self.cur;
         let now = self.b.now();
         let at = self.b.hms(now);
@@ -2779,7 +2803,7 @@ impl Run<'_> {
                 Step::Verify => self.skip_verify().is_some(),
                 Step::Publish => self.skip_publish().is_some(),
                 Step::Cut => matches!(self.cut_mode(), CutMode::Done(_)),
-                Step::AfterCut => self.journal_has("after-cut") && self.facts.fixtures.yes,
+                Step::AfterCut => self.site_complete() && self.facts.fixtures.yes,
                 _ => false,
             };
             if skipped {
@@ -3102,7 +3126,7 @@ impl Run<'_> {
                 ),
             ),
             Some(engine) => match self.b.engine_now(engine) {
-                Ok(EngineNow::Same(_)) => match self.staging_still(&r)? {
+                Ok(EngineNow::Same(_)) => match self.candidate_still(&r)? {
                     None => return Ok(()),
                     Some(why) => (None, why),
                 },
@@ -3143,16 +3167,16 @@ impl Run<'_> {
             Ok(note) => note,
             Err(refusal) => return self.refuse(refusal),
         };
-        if let Some(why) = self.staging_still(&r)? {
+        if let Some(why) = self.candidate_still(&r)? {
             return self.refuse(
                 Refusal::new(
                     format!(
-                        "{r} was staged again right before the publish, and the staging tier \
-                         moved again: {why}"
+                        "{r} was staged again right before the publish, but its qualified \
+                         candidate is unavailable: {why}"
                     ),
                     format!(
-                        "{RELEASE_COMMAND} again once no peer is staging aterm (nothing is \
-                         public)"
+                        "{RELEASE_COMMAND} again once the qualified candidate is retained \
+                         (nothing is public)"
                     ),
                 )
                 .could_not_run(),
@@ -3162,15 +3186,15 @@ impl Run<'_> {
         Ok(())
     }
 
-    fn staging_still(&mut self, r: &str) -> Result<Option<String>, Halt> {
-        match self.b.staging_moved() {
+    fn candidate_still(&mut self, r: &str) -> Result<Option<String>, Halt> {
+        match self.b.candidate_missing() {
             Ok(moved) => Ok(moved),
             Err(why) => {
                 self.refuse(
                     Refusal::new(
                         format!(
-                            "could not ask again, right before the publish, whether the \
-                             staging tier's main is the commit {r}'s attestation names: {why}"
+                            "could not read the retained qualified candidate named by \
+                             {r}'s attestation before publishing: {why}"
                         ),
                         format!("run {RELEASE_COMMAND} again once it answers"),
                     )
@@ -3802,15 +3826,14 @@ impl Run<'_> {
     fn after_cut(&mut self) -> Flow {
         let v = self.version();
         let mut notes = Vec::new();
-        if !self.journal_has("after-cut") {
+        if !self.site_complete() {
             match self.b.after_cut(&v) {
                 Ok(done) => {
-                    if done.site_deferred {
-                        self.journal_add_all(&[SITE_DEFERRED, "after-cut"])?;
-                    } else {
-                        self.journal_add("after-cut")?;
+                    if let Some(journal) = &mut self.journal {
+                        journal.done.retain(|fact| fact != SITE_DEFERRED);
                     }
-                    notes.push(format!("{}{}", done.note, self.site_words()));
+                    self.journal_add("after-cut")?;
+                    notes.push(done.note);
                 }
                 Err(r) => return self.refuse(r),
             }
@@ -3865,12 +3888,8 @@ impl Run<'_> {
         }
     }
 
-    fn site_words(&self) -> String {
-        if self.journal_has(SITE_DEFERRED) {
-            format!("; {SITE_BY_HAND}")
-        } else {
-            String::new()
-        }
+    fn site_complete(&self) -> bool {
+        self.journal_has("after-cut") && !self.journal_has(SITE_DEFERRED)
     }
 
     fn check(&mut self) -> Flow {
@@ -3902,9 +3921,8 @@ impl Run<'_> {
             .unwrap_or_default();
         let r = self.commit_r();
         let took = self.b.now().saturating_sub(self.t_start);
-        let site = self.site_words();
         self.last = format!(
-            "RELEASED aterm {v}{build} from {} — v{v} is the channel's latest{site} — {}",
+            "RELEASED aterm {v}{build} from {} — v{v} is the channel's latest — {}",
             short(&r),
             fmt_dur(took)
         );

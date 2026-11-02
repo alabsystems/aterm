@@ -344,19 +344,27 @@ pub(crate) fn read_owner_publication(config: &Path) -> io::Result<Publication> {
     read_named(config, NAME)
 }
 
+/// Read the transport owner's relay in its leased Commons directory.
+pub(super) fn read_owner_at(dir: &Path) -> io::Result<Publication> {
+    read_in(dir, NAME)
+}
+
 fn read_named(config: &Path, name: &str) -> io::Result<Publication> {
+    read_in(&directory(config), name)
+}
+
+fn read_in(dir: &Path, name: &str) -> io::Result<Publication> {
     let requested = Instant::now();
     let deadline = requested + EXCHANGE;
-    let dir = directory(config);
-    let path = socket_path(&dir, name).map_err(|error| context("endpoint", error))?;
-    let result = read_at(&dir, &path, requested, deadline);
+    let path = socket_path(dir, name).map_err(|error| context("endpoint", error))?;
+    let result = read_at(dir, &path, requested, deadline);
     let legacy = dir.join(name);
     if result.as_ref().is_err_and(stale)
         && legacy != path
         && std::os::unix::net::SocketAddr::from_pathname(&legacy).is_ok()
     {
         // An older owner may have bound through a short alias of this directory.
-        return read_at(&dir, &legacy, requested, deadline);
+        return read_at(dir, &legacy, requested, deadline);
     }
     result
 }
@@ -1018,7 +1026,8 @@ mod tests {
             &encode(&state, None).unwrap(),
         )
         .unwrap();
-        println!("observer-ready");
+        // Keep the readiness proof on its own line even after libtest's single-thread prefix.
+        println!("\nobserver-ready");
         std::io::stdout().flush().unwrap();
         let _ = std::io::stdin().read(&mut [0; 1]);
         drop(owner);

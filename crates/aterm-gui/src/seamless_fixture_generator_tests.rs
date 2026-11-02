@@ -345,6 +345,9 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         lost: None,
         held: false,
         holds: Vec::new(),
+        claim_ended: false,
+        not_claim_worker: false,
+        claim_worker: None,
     }))
 }
 
@@ -1143,27 +1146,15 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let mut masters = Vec::new();
     let mut slaves = Vec::new();
     for session in &desk.sessions {
-        let (mut master, mut slave) = (0i32, 0i32);
-        // SAFETY: valid out-params; openpty fills them on success.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if rc != 0 {
-            let error = std::io::Error::last_os_error();
+        let (master, slave) = aterm_pty::open_pty_pair().unwrap_or_else(|error| {
             panic!(
-                "openpty: {error}; desk={} session={} completed={}/{}",
+                "open_pty_pair: {error}; desk={} session={} completed={}/{}",
                 desk.name,
                 session.record.local_id,
                 masters.len(),
                 desk.sessions.len()
             );
-        }
+        });
         masters.push(master);
         slaves.push(slave);
     }
@@ -3872,8 +3863,22 @@ fn fx_carried_state_desk() -> FxDesk {
         )));
     });
     // Session 5 carried a Gemini CLI relaunch through v0.138.0; Gemini CLI is retired (agy
-    // replaces it), so its leaf is a plain shell's and the older desks hold the reading.
-    let plain = leaf_of(5, "zsh", &|_| {});
+    // replaces it), so its leaf is a plain shell's and the older desks hold the reading. Since
+    // v0.148.0 it is the shell left in a credit-claim worker's tab after its worker ended,
+    // which the layout says (its claim folder, ended) so a restore times nothing there as the
+    // worker and the tab closes in time.
+    let claim_folder = format!(
+        "/state/{}/{}",
+        aterm_agent::harness::cli::HARNESS,
+        aterm_agent::harness::credit_offers::CLAIM_FOLDER
+    );
+    let plain = leaf_of(5, "zsh", &|leaf| {
+        leaf.claim_worker = Some(claim_folder.clone());
+        leaf.claim_ended = true;
+    });
+    // Since v0.148.0 session 6's Claude Code is a person's own, started in a credit-claim
+    // folder (a tab opened from the worker's inherits it), which the layout says is no worker's
+    // so a restore never times it as one.
     let asked = leaf_of(6, "zsh", &|leaf| {
         let mut agent = fx_agent(
             48_604,
@@ -3882,6 +3887,8 @@ fn fx_carried_state_desk() -> FxDesk {
             None,
             "",
         );
+        agent.cwd.clone_from(&claim_folder);
+        leaf.not_claim_worker = true;
         agent.version = Some("2.1.302".to_string());
         agent.home = Some("/home/dev/.claude-work".to_string());
         agent.login = Some(String::new());

@@ -88,6 +88,11 @@ impl Fixture {
     ) -> RenewalDispatch {
         let opener = self.home.join(".local/bin/aterm-open-url");
         fs::create_dir_all(opener.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        if !opener.try_exists().unwrap() {
+            std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &opener).unwrap();
+        }
+        #[cfg(not(unix))]
         fs::write(opener, b"inert opener fixture").unwrap();
         let ladder = LadderCtx {
             roster_path: self.path.clone(),

@@ -954,6 +954,12 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
         ("LC_ALL", "C".into()),
         ("TMPDIR", e.tmp.as_os_str().to_os_string()),
         ("CARGO_HOME", e.cargo_home.clone().into_os_string()),
+        // Preserve the compiler's own reason for each reused or rebuilt unit in slice logs.
+        (
+            "CARGO_LOG",
+            "cargo::core::compiler::fingerprint=info,targo::core::compiler::fingerprint=info"
+                .into(),
+        ),
         ("SOURCE_DATE_EPOCH", e.build_number.to_string().into()),
         ("ATERM_BUILD_GIT_COMMIT", e.short_commit.into()),
         ("ATERM_BUILD_GIT_COMMIT_FULL", e.commit.into()),

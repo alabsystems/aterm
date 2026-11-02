@@ -23,6 +23,8 @@ aterm-containment = { workspace = true }
 # Font/face and built-in theme introspection for diagnostic subcommands.
 aterm-render = { workspace = true }
 aterm-types = { workspace = true }
+# This Mac's network place: doctor's `network:` row, in the words every reporter uses.
+aterm-netplace = { workspace = true }
 # `aterm theme pack | install`: the community theme pack, embedded (no network).
 aterm-theme-pack = { workspace = true }
 # `aterm help rust` calls `atpkg::toolchain` discovery rather than restating it.

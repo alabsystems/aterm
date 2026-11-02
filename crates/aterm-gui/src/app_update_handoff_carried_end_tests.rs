@@ -908,6 +908,70 @@ fn a_self_claims_face_that_moves_after_the_park_stands_the_commit_down() {
     });
 }
 
+/// A session's task record that stands still holds the Commit however long after the park it
+/// comes: the claims compare the record's row without the ages it carries
+/// (`TaskRecord::carry_face`), which grow from the park's draw to the Commit's while the row the
+/// successor reads keeps them. Negative control: a mark after the park stands the Commit down.
+#[test]
+fn a_task_record_that_stands_still_holds_the_commit() {
+    use crate::task_record::{TaskMark, TaskState, mark_session_task};
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let state = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-commit")
+        .tempdir()
+        .expect("scratch state home");
+    crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+        let host = idle_host();
+        let mut parent = desk(&host);
+        let ctx = parent.pool.get(0).expect("pooled").ctx.clone();
+        mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Working)).expect("unfenced");
+        let fds = quiet(&mut parent);
+        let (attempt, transferred) = super::dry_run_capture_tests::prelaunched(
+            31,
+            ApplyMode::Immediate,
+            FreezeSeed::Default,
+        );
+        parent.update_handoff_prelaunch = Some(attempt);
+        let parked = parent.park_and_transfer_to_prelaunched_successor(Instant::now());
+        assert!(
+            matches!(parked, super::ParkAttempt::Parked),
+            "PRECONDITION: the park landed ({parked:?})"
+        );
+        let transfer = transferred.try_recv().expect("the park's capture");
+        let row = transfer.capture.manifest.sessions[0]
+            .task
+            .clone()
+            .expect("the record's row");
+        assert!(
+            row.contains(" age_ms="),
+            "PRECONDITION: the successor's row carries its age: {row}"
+        );
+        drop(transfer);
+        let drawn = parent
+            .pending_update_handoff
+            .as_ref()
+            .expect("the parked attempt")
+            .carried_claims
+            .clone();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(
+            parent.carried_claims_held(&drawn),
+            "the record stood still since the park, only older: the Commit stands"
+        );
+
+        mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Stalled)).expect("unfenced");
+        assert!(
+            !parent.carried_claims_held(&drawn),
+            "a mark after the park stands the Commit down"
+        );
+
+        parent.pending_update_handoff = None;
+        parent.update_handoff_prelaunch = None;
+        release(&mut parent, fds);
+        host.shutdown_and_join();
+    });
+}
+
 /// A carried face crosses a second update made before the claim is proven again at the
 /// successor: the session's park restates the face the first update carried
 /// (`SessionTimeline::carried_task_face`). Negative controls: a session adopted with no face

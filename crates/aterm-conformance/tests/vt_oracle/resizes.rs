@@ -78,6 +78,30 @@ const CASES: &[Case] = &[
         rows_after: &["abc    X", ""],
     },
     Case {
+        name: "marks stay on their cells across a width change",
+        cols: 6,
+        rows: 2,
+        steps: &[
+            Out("\x1b[?1049ha\u{301}\u{4e2d}\u{302}b".as_bytes()),
+            Width(10),
+            Out("\u{303}".as_bytes()),
+        ],
+        rows_after: &["a\u{301}\u{4e2d}\u{302}b\u{303}", ""],
+    },
+    Case {
+        name: "a narrowing takes the marks of what it cuts off",
+        cols: 6,
+        rows: 2,
+        steps: &[
+            Out("\x1b[?1049habc\u{301}d\u{302}".as_bytes()),
+            Width(3),
+            Out("\u{303}".as_bytes()),
+        ],
+        // The cursor's own cell is cut off, so it is clamped onto the last column: the mark takes
+        // the cell left of it.
+        rows_after: &["ab\u{303}c\u{301}", ""],
+    },
+    Case {
         name: "a cursor in a gap past the text keeps its column on a widening",
         cols: 10,
         rows: 2,

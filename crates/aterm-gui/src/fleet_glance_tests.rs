@@ -717,6 +717,64 @@ fn a_glance_that_reached_nobody_backs_off_and_a_move_resets_it() {
     assert!(read_at(at + 120));
 }
 
+/// AWAY, A GLANCE THAT REACHED NOBODY WAITS THE LONGEST AT ONCE: off the ALab LAN, after a read
+/// that reached no peer the next waits the full 30 minutes (no doubling that dials the members
+/// behind the ALab LAN five more times); the move back reads at once.
+/// NEGATIVE CONTROL: `Quiet::after` ignoring `away` doubles the wait, reads again at two minutes,
+/// and "away: the longest wait at once" fails.
+#[test]
+fn away_a_glance_that_reached_nobody_waits_the_longest_at_once() {
+    use std::sync::atomic::AtomicU64;
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let start = 1_000_000;
+    let clock = Arc::new(AtomicU64::new(start));
+    let (runs_tx, runs) = std::sync::mpsc::channel();
+    let (looks_tx, looks) = std::sync::mpsc::channel();
+    let (posts_tx, _posts) = std::sync::mpsc::channel();
+    let now = Arc::clone(&clock);
+    let glance = spawn(
+        Box::new(Nobody { runs: runs_tx }),
+        ReaderSeams {
+            tick: Duration::from_millis(20),
+            now_ms: Box::new(move || {
+                let _ = looks_tx.send(());
+                now.load(Ordering::SeqCst)
+            }),
+            away: Box::new(|| true),
+            ..seams(true, posts_tx)
+        },
+    )
+    .expect("the thread starts");
+    let read_over = |at_ms: u64| {
+        while glance.copy().tried_ms != Some(at_ms) {
+            looks.recv_timeout(hang).expect("the read ends");
+        }
+    };
+    runs.recv_timeout(hang).expect("the issuer reads at once");
+    read_over(start);
+    let read_at = |at: u64| {
+        let now = start + at * 1000;
+        clock.store(now, Ordering::SeqCst);
+        while looks.try_recv().is_ok() {}
+        for _ in 0..3 {
+            looks.recv_timeout(hang).expect("the reader looks again");
+        }
+        let read = runs.try_recv().is_ok();
+        if read {
+            read_over(now);
+        }
+        read
+    };
+    assert!(!read_at(120), "away: the longest wait at once");
+    assert!(!read_at(QUIET_MAX.as_secs() - 1));
+    assert!(read_at(QUIET_MAX.as_secs()));
+    let at = QUIET_MAX.as_secs() + 1;
+    clock.store(start + at * 1000, Ordering::SeqCst);
+    glance.kick(Kick::Moved);
+    runs.recv_timeout(hang)
+        .expect("the move back reads at once");
+}
+
 /// THE GLANCE WAITS FOR THE STEP: a read dials the fleet's Macs, so while System State's Local
 /// Network step, which asks macOS first, is still to come, the glance reads nothing by itself
 /// (its tick, a menu opening); once the step asked, it reads. A person's Read the Fleet Now reads
@@ -809,6 +867,7 @@ fn seams(minted: bool, posts: Sender<()>) -> ReaderSeams {
         tick: Duration::from_secs(3600),
         moved: None,
         lan: Box::new(|| true),
+        away: Box::new(|| false),
     }
 }
 
@@ -1108,6 +1167,7 @@ fn inert_seams() -> ReaderSeams {
         tick: Duration::from_secs(3600),
         moved: None,
         lan: Box::new(|| true),
+        away: Box::new(|| false),
     }
 }
 

@@ -685,7 +685,7 @@ fn a_busy_reader_keeps_its_pending_messages_and_forgoes_newer_work() {
     };
     let pid_of = |m: Msg| match m {
         Msg::Read(r) | Msg::Facts(r) => r.self_pid,
-        Msg::Pull | Msg::CpuPolicy(_) => 0,
+        Msg::Pull | Msg::CpuPolicy(_) | Msg::Name(_) => 0,
     };
     assert!(host.offer(request(1)));
     assert!(
@@ -4441,7 +4441,8 @@ fn the_hand_over_keeps_job_events_for_the_loop_and_says_when_one_moved() {
     );
 }
 
-/// A pull keeps the engine's cadence unless a `sys jobs` waiting on it arms the engine, and
+/// A pull keeps the engine's cadence unless a `sys jobs` waiting on it arms the engine or an
+/// explicit naming request forces a fresh jobs pass, and
 /// then its last reading alone looks: a cold pull's warm reading keeps the cadence, so the
 /// engine never takes two passes half a second apart. NEGATIVE CONTROL: a pull that never asks
 /// the engine to look leaves an armed `sys jobs` the carried view.
@@ -4464,7 +4465,7 @@ fn a_pull_looks_at_jobs_only_when_a_sys_jobs_arms_it() {
             self.armed
         }
     }
-    let looked = |armed: bool, last_whole: Option<Instant>| {
+    let looked = |armed: bool, last_whole: Option<Instant>, force: bool| {
         let mut source = Looks {
             vitals: aterm_vitals::Vitals::new(),
             armed,
@@ -4474,21 +4475,116 @@ fn a_pull_looks_at_jobs_only_when_a_sys_jobs_arms_it() {
             jobs_now: true,
             ..Request::default()
         };
-        let _ = pull(&mut source, &mut req, last_whole);
+        let _ = pull(&mut source, &mut req, last_whole, force);
         source.looked
     };
     let warm = Some(Instant::now());
     assert_eq!(
-        looked(false, warm),
+        looked(false, warm, false),
         [false],
         "unarmed: the engine's cadence"
     );
-    assert_eq!(looked(true, warm), [true], "armed: the engine looks");
-    assert_eq!(looked(false, None), [false, false], "cold, unarmed");
+    assert_eq!(looked(true, warm, false), [true], "armed: the engine looks");
+    assert_eq!(looked(false, None, false), [false, false], "cold, unarmed");
     assert_eq!(
-        looked(true, None),
+        looked(true, None, false),
         [false, true],
         "cold, armed: its last reading"
+    );
+    assert_eq!(
+        looked(false, warm, true),
+        [true],
+        "explicit naming looks without an audience"
+    );
+    assert_eq!(
+        looked(false, None, true),
+        [false, true],
+        "a cold naming pull forces only its final pass"
+    );
+}
+
+/// Distinct naming messages survive the real probe drain, canceled work never enters the
+/// engine, and the published snapshot and wake precede either reply.
+#[test]
+fn naming_requests_observe_forced_jobs_and_reply_only_after_publication() {
+    use crate::sys_naming::{Error, Operation, Request as NameRequest};
+    use aterm_vitals::jobs::{NamingError, NamingTicket};
+    use aterm_vitals::sys::query::NameTarget;
+
+    struct NamingSource {
+        model: aterm_vitals::Vitals,
+        log: Arc<Mutex<Vec<String>>>,
+        seq: u64,
+    }
+    impl Source for NamingSource {
+        fn reading(&mut self, request: &Request) -> Snapshot {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("read:{}", request.jobs_now));
+            self.seq += 1;
+            Snapshot {
+                seq: self.seq,
+                ..Snapshot::default()
+            }
+        }
+        fn model(&mut self) -> &mut aterm_vitals::Vitals {
+            &mut self.model
+        }
+        fn capture_name(
+            &self,
+            session: u64,
+            target: &NameTarget,
+        ) -> Result<NamingTicket, NamingError> {
+            assert_eq!((session, target), (7, &NameTarget::Job("first".into())));
+            self.log.lock().unwrap().push("capture".into());
+            Err(NamingError::Gone)
+        }
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let latest = Mutex::new(Handover::default());
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+    let (second_tx, second_rx) = std::sync::mpsc::sync_channel(1);
+    for (id, active, reply) in [("first", true, first_tx), ("canceled", false, second_tx)] {
+        tx.send(Msg::Name(Box::new(NameRequest::new(
+            Operation::Capture {
+                session: 7,
+                target: NameTarget::Job(id.into()),
+            },
+            Arc::new(Mutex::new(active)),
+            reply,
+        ))))
+        .unwrap();
+    }
+    drop(tx);
+    run(
+        &rx,
+        &latest,
+        &|| {
+            assert!(first_rx.try_recv().is_err() && second_rx.try_recv().is_err());
+            assert_eq!(latest.lock().unwrap().snap.as_ref().map(|s| s.seq), Some(2));
+            log.lock().unwrap().push("post".into());
+            true
+        },
+        NamingSource {
+            model: aterm_vitals::Vitals::new(),
+            log: Arc::clone(&log),
+            seq: 0,
+        },
+        None,
+        None,
+        &AtomicBool::new(false),
+        PriorRun::default(),
+    );
+    assert!(matches!(
+        first_rx.recv().unwrap(),
+        Err(Error::Engine(NamingError::Gone))
+    ));
+    assert!(matches!(second_rx.recv().unwrap(), Err(Error::Canceled)));
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["read:false", "read:true", "capture", "post"]
     );
 }
 
@@ -6465,7 +6561,7 @@ fn cold_pull_feeds_noted_gaps_and_events_once_and_facts_preserves_them() {
         noted_batches: Vec::new(),
         step: 0,
     };
-    let snap = pull(&mut src, &mut req, None);
+    let snap = pull(&mut src, &mut req, None, false);
     assert_eq!(
         src.noted_batches,
         vec![(1, 2), (0, 0)],

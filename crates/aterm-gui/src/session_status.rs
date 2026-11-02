@@ -4279,6 +4279,7 @@ impl crate::App {
         let fleet = crate::fleet_listen::fleet_status_word();
         let units = crate::fleet_listen::units_status_word();
         let setup = crate::system_state_access::setup_field(self.system_state_host.latest_status());
+        let net = crate::net_place::status_fields();
         let pin = {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             meta.presentation_value("title")
@@ -4550,7 +4551,7 @@ impl crate::App {
                  phase=unknown since_ms=- outcome=none exit_code=- signal=- detail={} \
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
-                 fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} \
+                 fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} {net} \
                  {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
                  {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} human_ms={human_ms} \
                  human_typed_ms={human_typed_ms} human_seq={human_seq} {launch} {owner} \
@@ -4584,7 +4585,7 @@ impl crate::App {
              phase={} since_ms={since_ms} outcome={} exit_code={exit_code} signal={signal} \
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
-             fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} \
+             fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} {net} \
              {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
              {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} human_ms={human_ms} \
              human_typed_ms={human_typed_ms} human_seq={human_seq} {launch} {owner} \

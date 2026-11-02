@@ -72,10 +72,13 @@ impl SyncDiagnostic {
             [PREFIX, "failed", code] => Some(Self::Failed(match *code {
                 "journal-busy" => ErrorKind::JournalBusy,
                 "custody-busy" => ErrorKind::CustodyBusy,
+                "vault-busy" => ErrorKind::VaultBusy,
+                "vault-changed" => ErrorKind::VaultChanged,
                 "local-network-pending" => ErrorKind::LocalNetworkPending,
                 "timed-out" => ErrorKind::TimedOut,
                 "not-stored" => ErrorKind::NotStored,
                 "refused" => ErrorKind::Refused,
+                "member-busy" => ErrorKind::MemberBusy,
                 "other" => ErrorKind::Other,
                 _ => return None,
             })),
@@ -89,10 +92,13 @@ pub const fn failure_reason(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::JournalBusy => "local Commons journal busy",
         ErrorKind::CustodyBusy => "local Commons custody busy",
+        ErrorKind::VaultBusy => "local vault state busy",
+        ErrorKind::VaultChanged => "local vault observation changed",
         ErrorKind::LocalNetworkPending => "local network unavailable or permission pending",
         ErrorKind::TimedOut => "request timed out",
         ErrorKind::NotStored => "source did not store the version",
         ErrorKind::Refused => "source refused the version",
+        ErrorKind::MemberBusy => "a member's vault pass held its state",
         ErrorKind::Other => "unclassified failure",
     }
 }
@@ -101,10 +107,13 @@ const fn failure_code(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::JournalBusy => "journal-busy",
         ErrorKind::CustodyBusy => "custody-busy",
+        ErrorKind::VaultBusy => "vault-busy",
+        ErrorKind::VaultChanged => "vault-changed",
         ErrorKind::LocalNetworkPending => "local-network-pending",
         ErrorKind::TimedOut => "timed-out",
         ErrorKind::NotStored => "not-stored",
         ErrorKind::Refused => "refused",
+        ErrorKind::MemberBusy => "member-busy",
         ErrorKind::Other => "other",
     }
 }
@@ -125,10 +134,13 @@ mod tests {
             SyncDiagnostic::NotIn,
             SyncDiagnostic::Failed(ErrorKind::JournalBusy),
             SyncDiagnostic::Failed(ErrorKind::CustodyBusy),
+            SyncDiagnostic::Failed(ErrorKind::VaultBusy),
+            SyncDiagnostic::Failed(ErrorKind::VaultChanged),
             SyncDiagnostic::Failed(ErrorKind::LocalNetworkPending),
             SyncDiagnostic::Failed(ErrorKind::TimedOut),
             SyncDiagnostic::Failed(ErrorKind::NotStored),
             SyncDiagnostic::Failed(ErrorKind::Refused),
+            SyncDiagnostic::Failed(ErrorKind::MemberBusy),
             SyncDiagnostic::Failed(ErrorKind::Other),
         ] {
             for ending in ["", "\n", "\r\n"] {

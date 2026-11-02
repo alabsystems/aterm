@@ -3,8 +3,9 @@
 
 //! A long-lived watch on the path this Mac's traffic takes ([`PathMonitor`]), over
 //! Network.framework's path monitor (`nw_path_monitor_t`): every update the monitor hands its
-//! handler reaches a sink as a [`PathReading`] (`nw_path_get_status`, `nw_path_is_constrained`
-//! and `nw_path_is_expensive` of that path), on a private [`SerialQueue`].
+//! handler reaches a sink as a [`PathReading`] (`nw_path_get_status`, `nw_path_is_constrained`,
+//! `nw_path_is_expensive` and the interface type `nw_path_uses_interface_type` names, of that
+//! path), on a private [`SerialQueue`].
 //!
 //! The monitor's first update is the path in use when it starts, and each later one a change
 //! of it. Network.framework is not linked: its functions are opened at the first start
@@ -40,6 +41,7 @@ struct Network {
     status: unsafe extern "C" fn(*mut c_void) -> c_int,
     constrained: unsafe extern "C" fn(*mut c_void) -> bool,
     expensive: unsafe extern "C" fn(*mut c_void) -> bool,
+    uses_interface_type: unsafe extern "C" fn(*mut c_void, c_int) -> bool,
     release: unsafe extern "C" fn(*mut c_void),
 }
 
@@ -103,6 +105,10 @@ impl Network {
                     *mut c_void,
                     unsafe extern "C" fn(*mut c_void) -> bool,
                 >(symbol(c"nw_path_is_expensive")?),
+                uses_interface_type: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void, c_int) -> bool,
+                >(symbol(c"nw_path_uses_interface_type")?),
                 release: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void)>(
                     symbol(c"nw_release")?,
                 ),
@@ -139,6 +145,44 @@ impl PathStatus {
     }
 }
 
+/// The kind of interface a path uses (`nw_interface_type_t`, `<Network/interface.h>`), as
+/// `nw_path_uses_interface_type` answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathLink {
+    /// `nw_interface_type_wifi` (1).
+    Wifi,
+    /// `nw_interface_type_cellular` (2).
+    Cellular,
+    /// `nw_interface_type_wired` (3).
+    Wired,
+    /// `nw_interface_type_loopback` (4).
+    Loopback,
+    /// `nw_interface_type_other` (0): a tunnel, a bridge, a tethering link the framework does
+    /// not name, or no interface at all.
+    Other,
+}
+
+impl PathLink {
+    /// Each kind with its `nw_interface_type_t` value, in the order a path is asked about them:
+    /// the first the path uses is its link.
+    pub const ASKED: [(Self, c_int); 4] = [
+        (Self::Wifi, 1),
+        (Self::Wired, 3),
+        (Self::Cellular, 2),
+        (Self::Loopback, 4),
+    ];
+
+    /// The link of a path that `uses` reports each `nw_interface_type_t` for: the first of
+    /// [`Self::ASKED`] it uses, else [`Self::Other`].
+    #[must_use]
+    pub fn of(uses: impl Fn(c_int) -> bool) -> Self {
+        Self::ASKED
+            .iter()
+            .find(|(_, raw)| uses(*raw))
+            .map_or(Self::Other, |(link, _)| *link)
+    }
+}
+
 /// What one update of the monitor said about the path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathReading {
@@ -146,9 +190,11 @@ pub struct PathReading {
     pub status: PathStatus,
     /// Whether the path uses an interface in Low Data Mode (`nw_path_is_constrained`).
     pub constrained: bool,
-    /// Whether the path uses an interface the system counts as expensive: cellular, or Wi-Fi
-    /// to a phone's hotspot (`nw_path_is_expensive`).
+    /// Whether the path uses an interface Apple counts as expensive (`nw_path_is_expensive`):
+    /// a cellular link or a Personal Hotspot, read with no permission and no packet.
     pub expensive: bool,
+    /// The kind of interface the path uses (`nw_path_uses_interface_type`).
+    pub link: PathLink,
 }
 
 /// A started Network.framework path monitor, which hands every update to its sink until it is
@@ -208,10 +254,14 @@ impl PathMonitor {
                     (network.expensive)(path),
                 )
             };
+            // SAFETY: the same live `nw_path_t`, read only inside this call, and a type value
+            // `<Network/interface.h>` names.
+            let link = PathLink::of(|kind| unsafe { (network.uses_interface_type)(path, kind) });
             sink(PathReading {
                 status: PathStatus::from_raw(raw),
                 constrained,
                 expensive,
+                link,
             });
         };
         // SAFETY: the monitor calls its update handler as `void (^)(nw_path_t)`, a block of one
@@ -253,7 +303,20 @@ impl Drop for PathMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::PathStatus;
+    use super::{PathLink, PathStatus};
+
+    /// A path's link is the first kind it uses in the asked order, and a path that uses none
+    /// of them (a tunnel, a bridge) is `Other`.
+    /// NEGATIVE CONTROL: answering `Other` whatever the path uses fails the Wi-Fi row.
+    #[test]
+    fn a_paths_link_is_the_first_asked_kind_it_uses() {
+        assert_eq!(PathLink::of(|kind| kind == 1), PathLink::Wifi);
+        assert_eq!(PathLink::of(|kind| kind == 3), PathLink::Wired);
+        assert_eq!(PathLink::of(|kind| kind == 2), PathLink::Cellular);
+        assert_eq!(PathLink::of(|kind| kind == 4), PathLink::Loopback);
+        assert_eq!(PathLink::of(|_| false), PathLink::Other);
+        assert_eq!(PathLink::of(|kind| kind == 1 || kind == 2), PathLink::Wifi);
+    }
 
     /// The framework opens and every function a monitor calls resolves; a started monitor
     /// reads this Mac's network path, which a test leaves alone.

@@ -362,6 +362,8 @@ pub(crate) struct DeckGeom {
 pub(crate) struct DeckInput<'a> {
     /// Host-published immutable observations; absent in resource-only fixtures.
     pub(crate) network: Option<&'a aterm_types::network_state::NetworkStateSnapshot>,
+    /// The frame's visible place words, shared by its cache key and network paint.
+    pub(crate) network_place: Option<&'a crate::network_deck::PlaceCaption>,
     /// Stable machine/service selected in the network close-up.
     pub(crate) network_target: crate::network_deck::Target,
     /// The latest snapshot, `None` before the first.
@@ -3178,6 +3180,7 @@ pub(crate) fn deck_paint_kept(
             g,
             resource_geom.h,
             snapshot,
+            input.network_place,
             &network_inks,
             input.dwc,
         );
@@ -3246,6 +3249,7 @@ pub(crate) fn prims_fp(prims: &[DrawPrim]) -> u64 {
 /// The stats card's inputs for a window, read off the App.
 pub(crate) struct DeckFrame {
     pub(crate) form: StatsBars,
+    pub(crate) network_place: Option<crate::network_deck::PlaceCaption>,
     /// The sill's plate alpha ([`DeckInput::plate`]).
     pub(crate) plate: Option<u8>,
     pub(crate) geom: DeckGeom,
@@ -3296,6 +3300,7 @@ impl crate::App {
         let inks = cached_inks(band.bar_bg, band.value, band.accent);
         Some(DeckFrame {
             form: StatsBars::Off,
+            network_place: crate::network_deck::capture_place_caption(),
             plate: None,
             geom: DeckGeom {
                 w: (ws.cols as usize * cw + 2 * pad) as f32,
@@ -3349,6 +3354,7 @@ impl crate::App {
                 let (live, needle) = self.deck_live_now(wid);
                 Some(DeckFrame {
                     form,
+                    network_place: crate::network_deck::capture_place_caption(),
                     plate: None,
                     geom: DeckGeom {
                         w: w as f32,
@@ -3386,6 +3392,11 @@ impl crate::App {
                 });
                 Some(DeckFrame {
                     form,
+                    network_place: ws
+                        .stats_lens
+                        .open
+                        .filter(|lens| lens.focus == crate::stats_paint::Instrument::NetworkState)
+                        .and_then(|_| crate::network_deck::capture_place_caption()),
                     plate,
                     geom: DeckGeom {
                         w: w as f32,
@@ -3473,6 +3484,9 @@ impl crate::App {
         self.network_snapshot.network.accounts_exchange.hash(&mut h);
         crate::network_deck::hash_peer_reachability(&self.network_snapshot, &mut h);
         self.network_snapshot.services.hash(&mut h);
+        if f.form == StatsBars::Deck {
+            f.network_place.hash(&mut h);
+        }
         self.vitals
             .prev_snapshot
             .as_ref()
@@ -3496,10 +3510,11 @@ impl crate::App {
     }
 
     /// What frame `f`'s card shows: its inputs and the App's reading.
-    pub(crate) fn deck_input(&self, f: &DeckFrame) -> DeckInput<'_> {
+    pub(crate) fn deck_input<'a>(&'a self, f: &'a DeckFrame) -> DeckInput<'a> {
         let snap = self.vitals.snapshot.as_deref();
         DeckInput {
             network: (f.form == StatsBars::Deck).then_some(self.network_snapshot.as_ref()),
+            network_place: f.network_place.as_ref(),
             network_target: crate::network_deck::Target::Overview,
             snap,
             prev_snap: self.vitals.prev_snapshot.as_deref(),
@@ -4055,6 +4070,103 @@ pub(crate) mod tests {
         ClusterSpec, GpuSample, MemSample, Pressure, ProcSample, Sample, TabRoot, Ticks,
         VolumeSample,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn place_only_changes_rekey_and_repaint_the_deck_from_one_captured_caption() {
+        let _attached = attach_stats();
+        let _place = crate::net_place::hold_scoped(Some(aterm_netplace::sample::home(1000, 1)));
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_bars = Some("deck".into());
+        let head = reserved_deck_px(
+            StatsBars::Deck,
+            app.windows[&wid].deck_form,
+            app.windows[&wid].scale,
+            app.win_cell_size(wid).1,
+        ) + 14;
+        {
+            let metrics = &mut app.windows.get_mut(&wid).unwrap().metrics;
+            metrics.head = head;
+            metrics.pad = 12;
+            metrics.pad_top = 2;
+        }
+        app.backend.set_head(head);
+        app.backend.set_pad(12);
+        app.backend.set_pad_top(2);
+        let grid = (app.windows[&wid].cols, app.windows[&wid].rows);
+        let network = app.network_snapshot.clone();
+        let before = app.deck_frame(wid).unwrap();
+        let before_key = app.deck_input_key(&before);
+        let before_prims = prims_fp(&deck_prims(&before.geom, &app.deck_input(&before)));
+        app.splice_stats_deck(wid);
+        let before_pixels = app.windows[&wid].deck_card.as_ref().unwrap().rgba.clone();
+
+        let mut away = aterm_netplace::sample::hotspot(2000, 2000);
+        crate::net_place::hold(Some(away.clone()));
+        // The same frame must keep its original words even if the next observation arrives.
+        assert_eq!(app.deck_input_key(&before), before_key);
+        assert_eq!(
+            prims_fp(&deck_prims(&before.geom, &app.deck_input(&before))),
+            before_prims
+        );
+        let after = app.deck_frame(wid).unwrap();
+        assert_ne!(app.deck_input_key(&after), before_key);
+        assert_ne!(
+            prims_fp(&deck_prims(&after.geom, &app.deck_input(&after))),
+            before_prims
+        );
+        app.splice_stats_deck(wid);
+        assert_ne!(
+            app.windows[&wid].deck_card.as_ref().unwrap().rgba,
+            before_pixels
+        );
+        assert!(std::sync::Arc::ptr_eq(&app.network_snapshot, &network));
+        assert!(app.vitals.snapshot.is_none());
+        assert_eq!((app.windows[&wid].cols, app.windows[&wid].rows), grid);
+
+        // Times not included in either rendered caption do not invalidate the card.
+        let after_key = app.deck_input_key(&after);
+        let after_pixels = app.windows[&wid].deck_card.as_ref().unwrap().rgba.clone();
+        away.since_ms = Some(9000);
+        away.alab = aterm_netplace::Alab::Away {
+            since_ms: Some(8000),
+        };
+        crate::net_place::hold(Some(away));
+        let unchanged = app.deck_frame(wid).unwrap();
+        assert_eq!(unchanged.network_place, after.network_place);
+        assert_eq!(app.deck_input_key(&unchanged), after_key);
+        app.splice_stats_deck(wid);
+        assert_eq!(
+            app.windows[&wid].deck_card.as_ref().unwrap().rgba,
+            after_pixels
+        );
+
+        // A resource-only sill has no Network row whose caption could move.
+        app.config.sys.as_mut().unwrap().stats_bars = Some("sill".into());
+        let sill = app.deck_frame(wid).unwrap();
+        assert_eq!(sill.form, StatsBars::Sill);
+        assert!(sill.network_place.is_none());
+        let sill_key = app.deck_input_key(&sill);
+        app.splice_stats_deck(wid);
+        let sill_pixels = app.windows[&wid].deck_card.as_ref().unwrap().rgba.clone();
+        crate::net_place::hold(Some(aterm_netplace::sample::home(1000, 2)));
+        let same_sill = app.deck_frame(wid).unwrap();
+        assert_eq!(same_sill.form, StatsBars::Sill);
+        assert!(same_sill.network_place.is_none());
+        assert_eq!(app.deck_input_key(&same_sill), sill_key);
+        app.splice_stats_deck(wid);
+        assert_eq!(
+            app.windows[&wid].deck_card.as_ref().unwrap().rgba,
+            sill_pixels
+        );
+        assert!(std::sync::Arc::ptr_eq(&app.network_snapshot, &network));
+        assert!(app.vitals.snapshot.is_none());
+        assert_eq!((app.windows[&wid].cols, app.windows[&wid].rows), grid);
+    }
 
     #[test]
     fn changing_the_relay_source_invalidates_the_resource_deck() {
@@ -4786,6 +4898,7 @@ pub(crate) mod tests {
     pub(crate) fn input(snap: &Snapshot) -> DeckInput<'_> {
         DeckInput {
             network: None,
+            network_place: None,
             network_target: crate::network_deck::Target::Overview,
             snap: Some(snap),
             prev_snap: None,

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use aterm_json::{Value, json};
 
+use super::auth_deadline::Deadline;
 use super::open_url::{
     DEFAULT_MAILBOX_DIR, EMAIL_FILE_MAX, MAILBOX_ENV, MailboxFlow, MetWord, decode_html_amp,
     decode_mime_base64_parts, decode_quoted_printable, email_matches_target, extract_login_hint,
@@ -112,7 +113,7 @@ fn insert_credential(values: &mut BTreeMap<String, String>, key: String, value: 
 }
 
 /// Configuration for fetching incoming OAuth verification emails (magic links or 6-digit OTPs).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct MailboxConfig {
     /// Local Maildir / spool directory containing verification message files.
     pub dir: Option<PathBuf>,
@@ -172,6 +173,12 @@ pub struct MailboxConfig {
     pub routed: bool,
     /// On such a view of an entry that is not ready, why it is never tried.
     pub unready: Option<&'static str>,
+}
+
+impl std::fmt::Debug for MailboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailboxConfig").finish_non_exhaustive()
+    }
 }
 
 impl MailboxConfig {
@@ -2119,12 +2126,21 @@ pub struct HeadlessBrowser {
 }
 
 /// Credential extracted from an incoming verification email.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum MailboxCredential {
     /// A verification / sign-in magic link URL.
     MagicLink(String),
     /// A 6-digit one-time verification code (OTP).
     Otp(String),
+}
+
+impl std::fmt::Debug for MailboxCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MagicLink(_) => f.write_str("MagicLink(<redacted>)"),
+            Self::Otp(_) => f.write_str("Otp(<redacted>)"),
+        }
+    }
 }
 
 pub(super) fn is_shell_binary(path: &Path) -> bool {
@@ -2476,7 +2492,7 @@ pub fn row_browser_profile(
 /// Scratch allocation or private profile preparation failure, a persistent profile another browser or another of aterm's
 /// launches has open ([`super::browser_window::ProfileLock::claim`], its
 /// [`super::browser_window::Refusal::brief`]), or the authorization's diagnostic, unchanged.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(super) fn with_browser_profile(
     store_dir: Option<&Path>,
     label: Option<&str>,
@@ -2568,7 +2584,7 @@ fn prepare_browser_profile_with(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn with_browser_profile_using(
     store_dir: Option<&Path>,
     label: Option<&str>,
@@ -2577,6 +2593,30 @@ fn with_browser_profile_using(
     authorize: impl FnOnce(&Path) -> Result<(), &'static str>,
     adoption_error: impl FnOnce(&std::io::Error),
 ) -> Result<(), &'static str> {
+    with_browser_profile_using_deadline(
+        store_dir,
+        label,
+        email,
+        prepare,
+        authorize,
+        adoption_error,
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn with_browser_profile_using_deadline(
+    store_dir: Option<&Path>,
+    label: Option<&str>,
+    email: Option<&str>,
+    prepare: impl FnOnce(&Path) -> std::io::Result<()>,
+    authorize: impl FnOnce(&Path) -> Result<(), &'static str>,
+    adoption_error: impl FnOnce(&std::io::Error),
+    deadline: Option<Deadline<'_>>,
+) -> Result<(), &'static str> {
+    if let Some(deadline) = deadline {
+        deadline.left()?;
+    }
     let temp_dir;
     let _claimed;
     let (profile_dir, persistent) = if let Some(store) = store_dir {
@@ -2595,6 +2635,9 @@ fn with_browser_profile_using(
             aterm_tempfile::tempdir().map_err(|_| "could not create scratch browser profile")?;
         (temp_dir.path().to_path_buf(), false)
     };
+    if let Some(deadline) = deadline {
+        deadline.left()?;
+    }
     let authorized = authorize(&profile_dir);
     if persistent
         && authorized.is_ok()
@@ -2666,11 +2709,8 @@ pub fn profile_args(profile_dir: &Path) -> Vec<OsString> {
     ] {
         args.push(flag.into());
     }
-    // Chromium requires this exception as root; ordinary Linux users keep its sandbox.
-    #[cfg(target_os = "linux")]
-    if aterm_uds::peer::our_uid() == 0 {
-        args.push("--no-sandbox".into());
-    }
+    // Never disable Chromium's sandbox to accommodate a root caller. Linux browser
+    // automation must run as an unprivileged user instead.
     args
 }
 
@@ -3708,12 +3748,7 @@ fn record_consumed_credential(
 }
 
 fn fnv1a_hex(input: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in input.as_bytes() {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{hash:016x}")
+    format!("{:016x}", aterm_hash::fnv1a_64(input.as_bytes()))
 }
 
 fn otp_flow_key(code: &str, target_email: Option<&str>) -> String {
@@ -4025,9 +4060,29 @@ fn oversized_imap_literals_cannot_turn_body_lines_into_command_responses() {
     }
 }
 
+fn auth_budget_ready(deadline: Option<Deadline<'_>>) -> Option<()> {
+    if let Some(deadline) = deadline {
+        deadline.remaining().ok()?;
+    }
+    Some(())
+}
+
+fn mailbox_curl(
+    args: &[&str],
+    options: &[(&'static str, &str)],
+    deadline: Option<Deadline<'_>>,
+) -> std::io::Result<std::process::Output> {
+    match deadline {
+        Some(deadline) => {
+            super::open_url::curl_output_until(args, options, Duration::from_secs(10), deadline)
+        }
+        None => super::open_url::curl_output(args, options),
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "TCP IMAP fetch binds host, port, mailbox, credentials, target filter, seen state and how its login went"
+    reason = "TCP IMAP fetch binds endpoint, credentials, seen state and the inherited authorization deadline"
 )]
 fn fetch_imap_tcp_credential(
     host: &str,
@@ -4041,11 +4096,21 @@ fn fetch_imap_tcp_credential(
     seen_otps: &mut BTreeSet<String>,
     filter: &MailFilter<'_>,
     login: &mut ImapLogin,
+    deadline: Option<Deadline<'_>>,
 ) -> Option<MailboxCredential> {
-    let addr = (host, port).to_socket_addrs().ok()?.next()?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    auth_budget_ready(deadline)?;
+    let addr = if deadline.is_some() {
+        super::auth_deadline::loopback_addr(host, port)?
+    } else {
+        (host, port).to_socket_addrs().ok()?.next()?
+    };
+    let stream = super::auth_deadline::Stream::connect(
+        &addr,
+        deadline,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .ok()?;
     let mut writer = stream.try_clone().ok()?;
     let mut reader = BufReader::new(stream);
 
@@ -4053,6 +4118,7 @@ fn fetch_imap_tcp_credential(
     if reader.read_line(&mut greeting).ok()? == 0 {
         return None;
     }
+    auth_budget_ready(deadline)?;
 
     let login_cmd = format!(
         "a1 LOGIN \"{}\" \"{}\"\r\n",
@@ -4061,7 +4127,9 @@ fn fetch_imap_tcp_credential(
     );
     writer.write_all(login_cmd.as_bytes()).ok()?;
     writer.flush().ok()?;
-    if !imap_read_until_tag(&mut reader, "a1")?.0 {
+    let accepted = imap_read_until_tag(&mut reader, "a1")?.0;
+    auth_budget_ready(deadline)?;
+    if !accepted {
         *login = ImapLogin::Refused;
         return None;
     }
@@ -4084,6 +4152,7 @@ fn fetch_imap_tcp_credential(
     let seqs = imap_search_sequences(search_lines.iter().map(String::as_str));
 
     for (idx, seq) in seqs.into_iter().rev().take(10).enumerate() {
+        auth_budget_ready(deadline)?;
         let tag = format!("f{idx}");
         let fetch_cmd = format!("{tag} FETCH {seq} BODY.PEEK[]\r\n");
         if writer.write_all(fetch_cmd.as_bytes()).is_err() || writer.flush().is_err() {
@@ -4179,6 +4248,7 @@ fn fetch_imap_tcp_credential(
             let _ = writer.write_all(store_cmd.as_bytes());
             let _ = writer.flush();
             let _ = imap_read_until_tag(&mut reader, "a9");
+            auth_budget_ready(deadline)?;
             record_consumed_credential(
                 seen_file,
                 seen,
@@ -4212,7 +4282,9 @@ fn fetch_imaps_curl_credential(
     seen_otps: &mut BTreeSet<String>,
     filter: &MailFilter<'_>,
     login: &mut ImapLogin,
+    deadline: Option<Deadline<'_>>,
 ) -> Option<MailboxCredential> {
+    auth_budget_ready(deadline)?;
     let userpwd = format!("{user}:{password}");
     let url_host = if parsed.host.contains(':') {
         format!("[{}]", parsed.host)
@@ -4224,7 +4296,7 @@ fn fetch_imaps_curl_credential(
         parsed.port,
         percent_encode(&parsed.mailbox)
     );
-    let out = super::open_url::curl_output(
+    let out = mailbox_curl(
         &[
             "--disable",
             "--globoff",
@@ -4235,6 +4307,7 @@ fn fetch_imaps_curl_credential(
             "10",
         ],
         &[("user", &userpwd), ("url", &search_url)],
+        deadline,
     )
     .ok()?;
     if !out.status.success() {
@@ -4247,12 +4320,13 @@ fn fetch_imaps_curl_credential(
     let search_stdout = String::from_utf8_lossy(&out.stdout);
     let seqs = imap_search_sequences(search_stdout.lines());
     for seq in seqs.into_iter().rev().take(8) {
+        auth_budget_ready(deadline)?;
         let msg_url = format!(
             "imaps://{url_host}:{}/{};MAILINDEX={seq}",
             parsed.port,
             percent_encode(&parsed.mailbox)
         );
-        let Ok(msg_out) = super::open_url::curl_output(
+        let Ok(msg_out) = mailbox_curl(
             &[
                 "--disable",
                 "--globoff",
@@ -4263,12 +4337,14 @@ fn fetch_imaps_curl_credential(
                 "10",
             ],
             &[("user", &userpwd), ("url", &msg_url)],
+            deadline,
         ) else {
             continue;
         };
         if !msg_out.status.success() {
             continue;
         }
+        auth_budget_ready(deadline)?;
         let raw_msg = String::from_utf8_lossy(&msg_out.stdout);
         let digest = fnv1a_hex(&raw_msg);
         if seen.contains(&digest) {
@@ -4277,6 +4353,7 @@ fn fetch_imaps_curl_credential(
         if let Some((cred, exhausted)) =
             extract_unseen_credential_from_email(&raw_msg, target_email, seen, seen_otps, filter)
         {
+            auth_budget_ready(deadline)?;
             record_consumed_credential(
                 seen_file,
                 seen,
@@ -4316,7 +4393,9 @@ fn fetch_imap_credential(
     target_email: Option<&str>,
     seen: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
+    deadline: Option<Deadline<'_>>,
 ) -> Option<MailboxCredential> {
+    auth_budget_ready(deadline)?;
     let cfg = &*cfg.routed_for(target_email);
     let imap_url = cfg.effective_imap_url(target_email)?;
     if cleartext_refusal(&imap_url).is_some() {
@@ -4351,6 +4430,7 @@ fn fetch_imap_credential(
             seen_otps,
             &MailFilter::of(cfg),
             &mut login,
+            deadline,
         )
     } else {
         fetch_imap_tcp_credential(
@@ -4365,6 +4445,7 @@ fn fetch_imap_credential(
             seen_otps,
             &MailFilter::of(cfg),
             &mut login,
+            deadline,
         )
     };
     let outcome = match login {
@@ -4595,7 +4676,9 @@ fn fetch_loopback_http_body(
     url: &str,
     bearer_token: Option<&str>,
     basic_auth: Option<(&str, &str)>,
+    deadline: Option<Deadline<'_>>,
 ) -> Option<String> {
+    auth_budget_ready(deadline)?;
     if bearer_token.is_some_and(|t| t.contains(['\r', '\n'])) {
         return None;
     }
@@ -4607,7 +4690,9 @@ fn fetch_loopback_http_body(
         port,
         target: path_and_query,
     } = parsed;
-    let addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+    let addr = if deadline.is_some() {
+        super::auth_deadline::loopback_addr(&host, port)?
+    } else if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if !ip.is_loopback() {
             return None;
         }
@@ -4618,9 +4703,13 @@ fn fetch_loopback_http_body(
             .ok()?
             .find(|sa| sa.ip().is_loopback())?
     };
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut stream = super::auth_deadline::Stream::connect(
+        &addr,
+        deadline,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .ok()?;
     let mut req = format!(
         "GET {path_and_query} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json, message/rfc822, text/plain\r\nConnection: close\r\n"
     );
@@ -4642,6 +4731,7 @@ fn fetch_loopback_http_body(
     stream.flush().ok()?;
     let mut buf = Vec::new();
     stream.take(EMAIL_FILE_MAX).read_to_end(&mut buf).ok()?;
+    auth_budget_ready(deadline)?;
     let raw = String::from_utf8_lossy(&buf);
     let mut cookies = BTreeMap::new();
     let resp = super::open_url::parse_raw_http_response(&raw, &mut cookies)?;
@@ -4663,7 +4753,9 @@ fn fetch_http_url_body(
     url: &str,
     cfg: &MailboxConfig,
     target_email: Option<&str>,
+    deadline: Option<Deadline<'_>>,
 ) -> Option<String> {
+    auth_budget_ready(deadline)?;
     let trimmed = url.trim();
     let cfg_pw = cfg.password_for(target_email);
     let cfg_user = cfg.webmail_user_for(target_email);
@@ -4672,7 +4764,7 @@ fn fetch_http_url_body(
         .zip(cfg_pw.as_deref())
         .filter(|(u, p)| !u.is_empty() && !p.is_empty());
     if is_loopback_http_url(trimmed) {
-        fetch_loopback_http_body(trimmed, cfg.bearer_token.as_deref(), basic_auth)
+        fetch_loopback_http_body(trimmed, cfg.bearer_token.as_deref(), basic_auth, deadline)
     } else if strip_ascii_prefix_ci(trimmed, "https://").is_some()
         || strip_ascii_prefix_ci(trimmed, "http://").is_some()
     {
@@ -4695,7 +4787,7 @@ fn fetch_http_url_body(
         if let Some((name, value)) = &credential {
             options.push((*name, value.as_str()));
         }
-        let out = super::open_url::curl_output(
+        let out = mailbox_curl(
             &[
                 "--disable",
                 "--globoff",
@@ -4707,6 +4799,7 @@ fn fetch_http_url_body(
                 "10",
             ],
             &options,
+            deadline,
         )
         .ok()?;
         if !out.status.success() {
@@ -4803,7 +4896,9 @@ fn fetch_http_mailbox_credential(
     target_email: Option<&str>,
     seen: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
+    deadline: Option<Deadline<'_>>,
 ) -> Option<MailboxCredential> {
+    auth_budget_ready(deadline)?;
     let cfg = &*cfg.routed_for(target_email);
     let filter = MailFilter::of(cfg);
     let raw_url = cfg.http_url.as_deref()?;
@@ -4812,7 +4907,7 @@ fn fetch_http_mailbox_credential(
     } else {
         raw_url.to_owned()
     };
-    let body = fetch_http_url_body(&url, cfg, target_email)?;
+    let body = fetch_http_url_body(&url, cfg, target_email, deadline)?;
 
     if body.trim().is_empty() {
         return None;
@@ -4827,6 +4922,7 @@ fn fetch_http_mailbox_credential(
         });
         if let Some(items) = items_opt {
             for item in items.iter().rev() {
+                auth_budget_ready(deadline)?;
                 let Ok(item_str) = aterm_json::to_string(item) else {
                     continue;
                 };
@@ -4841,6 +4937,7 @@ fn fetch_http_mailbox_credential(
                     seen_otps,
                     &filter,
                 ) {
+                    auth_budget_ready(deadline)?;
                     record_consumed_credential(
                         cfg.seen_file.as_deref(),
                         seen,
@@ -4858,7 +4955,9 @@ fn fetch_http_mailbox_credential(
                 {
                     let mut fetched_detail = false;
                     for detail_url in candidate_http_detail_urls(&url, msg_id) {
-                        let Some(detail_body) = fetch_http_url_body(&detail_url, cfg, target_email)
+                        auth_budget_ready(deadline)?;
+                        let Some(detail_body) =
+                            fetch_http_url_body(&detail_url, cfg, target_email, deadline)
                         else {
                             continue;
                         };
@@ -4877,6 +4976,7 @@ fn fetch_http_mailbox_credential(
                             seen_otps,
                             &filter,
                         ) {
+                            auth_budget_ready(deadline)?;
                             record_consumed_credential(
                                 cfg.seen_file.as_deref(),
                                 seen,
@@ -4894,6 +4994,7 @@ fn fetch_http_mailbox_credential(
                         break;
                     }
                     if fetched_detail {
+                        auth_budget_ready(deadline)?;
                         seen.insert(digest);
                     }
                 }
@@ -4908,6 +5009,7 @@ fn fetch_http_mailbox_credential(
     }
     let (cred, exhausted) =
         extract_unseen_credential_from_email(&body, target_email, seen, seen_otps, &filter)?;
+    auth_budget_ready(deadline)?;
     record_consumed_credential(
         cfg.seen_file.as_deref(),
         seen,
@@ -4967,6 +5069,7 @@ fn clicked_marker_for(mailbox_dir: &Path, path: &Path) -> Option<PathBuf> {
     Some(mailbox_dir.join(format!("{base_name}.clicked")))
 }
 
+#[cfg(unix)]
 fn scan_maildir_once(
     mailbox_dir: &Path,
     target_email: Option<&str>,
@@ -4976,6 +5079,33 @@ fn scan_maildir_once(
     filter: &MailFilter<'_>,
     mark_clicked: bool,
 ) -> Option<MailboxCredential> {
+    scan_maildir_once_by(
+        mailbox_dir,
+        target_email,
+        tried,
+        seen_file,
+        (seen_digests, seen_otps),
+        filter,
+        mark_clicked,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "maildir scan retains source/filter/seen inputs and one inherited authorization deadline"
+)]
+fn scan_maildir_once_by(
+    mailbox_dir: &Path,
+    target_email: Option<&str>,
+    tried: &mut BTreeSet<(PathBuf, u64, std::time::SystemTime)>,
+    seen_file: Option<&Path>,
+    (seen_digests, seen_otps): (&mut BTreeSet<String>, &mut BTreeSet<String>),
+    filter: &MailFilter<'_>,
+    mark_clicked: bool,
+    deadline: Option<Deadline<'_>>,
+) -> Option<MailboxCredential> {
+    auth_budget_ready(deadline)?;
     let mut candidates: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     if mailbox_dir.is_file()
         && let Ok(meta) = mailbox_dir.metadata()
@@ -5040,6 +5170,7 @@ fn scan_maildir_once(
     }
     candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (mtime, len, path) in candidates {
+        auth_budget_ready(deadline)?;
         let mut raw = String::new();
         let Ok(file) = std::fs::File::open(&path) else {
             tried.insert((path.clone(), len, mtime));
@@ -5049,6 +5180,7 @@ fn scan_maildir_once(
             tried.insert((path.clone(), len, mtime));
             continue;
         }
+        auth_budget_ready(deadline)?;
         if is_mbox_file(&path, &raw) {
             for msg in split_mbox_messages(&raw).into_iter().rev() {
                 let msg_digest = fnv1a_hex(msg);
@@ -5062,6 +5194,7 @@ fn scan_maildir_once(
                     seen_otps,
                     filter,
                 ) {
+                    auth_budget_ready(deadline)?;
                     record_consumed_credential(
                         seen_file,
                         seen_digests,
@@ -5089,6 +5222,7 @@ fn scan_maildir_once(
             seen_otps,
             filter,
         ) {
+            auth_budget_ready(deadline)?;
             record_consumed_credential(
                 seen_file,
                 seen_digests,
@@ -5154,6 +5288,7 @@ pub(super) fn peek_newest_credential_for_relay(
         Some(target_email),
         &mut seen_digests,
         &mut seen_otps,
+        None,
     ) {
         return Some(cred);
     }
@@ -5162,6 +5297,7 @@ pub(super) fn peek_newest_credential_for_relay(
         Some(target_email),
         &mut seen_digests,
         &mut seen_otps,
+        None,
     )
 }
 
@@ -5172,7 +5308,9 @@ fn accept_relay_credential(
     seen_file: Option<&Path>,
     seen_digests: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
+    deadline: Option<Deadline<'_>>,
 ) -> Option<MailboxCredential> {
+    auth_budget_ready(deadline)?;
     match &cred {
         MailboxCredential::MagicLink(url) => {
             let digest = fnv1a_hex(url);
@@ -5200,10 +5338,12 @@ fn poll_non_webmail_once(
     tried_files: &mut BTreeSet<(PathBuf, u64, std::time::SystemTime)>,
     seen_digests: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
+    deadline: Option<Deadline<'_>>,
 ) -> Option<MailboxCredential> {
+    auth_budget_ready(deadline)?;
     let cfg = &*cfg.routed_for(target_email);
     if let Some(dir) = cfg.dir.as_deref()
-        && let Some(cred) = scan_maildir_once(
+        && let Some(cred) = scan_maildir_once_by(
             dir,
             target_email,
             tried_files,
@@ -5211,23 +5351,28 @@ fn poll_non_webmail_once(
             (seen_digests, seen_otps),
             &MailFilter::of(cfg),
             true,
+            deadline,
         )
     {
         return Some(cred);
     }
-    if let Some(cred) = fetch_imap_credential(cfg, target_email, seen_digests, seen_otps) {
+    if let Some(cred) = fetch_imap_credential(cfg, target_email, seen_digests, seen_otps, deadline)
+    {
         return Some(cred);
     }
-    if let Some(cred) = fetch_http_mailbox_credential(cfg, target_email, seen_digests, seen_otps) {
+    if let Some(cred) =
+        fetch_http_mailbox_credential(cfg, target_email, seen_digests, seen_otps, deadline)
+    {
         return Some(cred);
     }
     #[cfg(unix)]
     if cfg.relay_enabled
         && let Some(email) = target_email
-        && let Some(cred) = super::ai_signin::fetch_relay_mail_credential(
+        && let Some(cred) = super::ai_signin::fetch_relay_mail_credential_by(
             cfg,
             email,
             super::ai_signin::MAIL_CODE_DIAL_WITHIN,
+            deadline,
         )
         && let Some(accepted) = accept_relay_credential(
             cred,
@@ -5235,6 +5380,7 @@ fn poll_non_webmail_once(
             cfg.seen_file.as_deref(),
             seen_digests,
             seen_otps,
+            deadline,
         )
     {
         return Some(accepted);
@@ -5268,6 +5414,8 @@ fn network_poll_interval(cfg: &MailboxConfig, target_email: Option<&str>) -> Dur
     }
 }
 
+const MAILBOX_TIMEOUT: &str = "timed out waiting for verification email in mailbox";
+
 /// Poll `cfg` for either a magic link or a 6-digit OTP addressed to `target_email`.
 pub fn poll_mailbox_config_for_credential(
     cfg: &MailboxConfig,
@@ -5284,6 +5432,46 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
     timeout: Duration,
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
+    let clock = Instant::now;
+    let deadline = (!timeout.is_zero()).then(|| Deadline::new(timeout, &clock));
+    poll_mailbox_config_by(
+        cfg,
+        target_email,
+        deadline,
+        timeout.is_zero(),
+        seen_otps,
+        MAILBOX_TIMEOUT,
+    )
+}
+
+pub(super) fn poll_mailbox_config_until(
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+    deadline: Deadline<'_>,
+    once: bool,
+    seen_otps: &mut BTreeSet<String>,
+) -> Result<MailboxCredential, &'static str> {
+    poll_mailbox_config_by(
+        cfg,
+        target_email,
+        Some(deadline),
+        once,
+        seen_otps,
+        super::auth_deadline::EXPIRED,
+    )
+}
+
+fn poll_mailbox_config_by(
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+    deadline: Option<Deadline<'_>>,
+    once: bool,
+    seen_otps: &mut BTreeSet<String>,
+    expiry_words: &'static str,
+) -> Result<MailboxCredential, &'static str> {
+    if let Some(deadline) = deadline {
+        deadline.remaining().map_err(|_| expiry_words)?;
+    }
     let cfg = &*cfg.routed_for(target_email);
     if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
         return Err(why);
@@ -5304,18 +5492,17 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
     // A mailbox reached over IMAP alone, whose login was refused (here or within its wait),
     // ends the poll at once with that reason instead of waiting out the timeout.
     let imap_alone = cfg.dir.is_none() && cfg.http_url.is_none() && !has_relay;
-    let now = Instant::now();
-    let deadline = now
-        .checked_add(timeout)
-        .unwrap_or_else(|| now + Duration::from_secs(86_400));
     let mut tried_files = BTreeSet::new();
     let mut seen_digests = load_seen_digests(cfg.seen_file.as_deref());
     let mut last_network_poll: Option<Instant> = None;
     let network_interval = network_poll_interval(cfg, target_email);
 
     loop {
+        if let Some(deadline) = deadline {
+            deadline.remaining().map_err(|_| expiry_words)?;
+        }
         if let Some(dir) = cfg.dir.as_deref()
-            && let Some(cred) = scan_maildir_once(
+            && let Some(cred) = scan_maildir_once_by(
                 dir,
                 target_email,
                 &mut tried_files,
@@ -5323,19 +5510,21 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
                 (&mut seen_digests, seen_otps),
                 &MailFilter::of(cfg),
                 true,
+                deadline,
             )
         {
             return Ok(cred);
         }
-        let should_poll_net =
-            last_network_poll.is_none_or(|last| last.elapsed() >= network_interval);
+        let now = deadline.map_or_else(Instant::now, Deadline::now);
+        let should_poll_net = last_network_poll
+            .is_none_or(|last| now.saturating_duration_since(last) >= network_interval);
         if should_poll_net {
             if cfg.effective_imap_url(target_email).is_some() || cfg.http_url.is_some() || has_relay
             {
-                last_network_poll = Some(Instant::now());
+                last_network_poll = Some(now);
             }
             if let Some(cred) =
-                fetch_imap_credential(cfg, target_email, &mut seen_digests, seen_otps)
+                fetch_imap_credential(cfg, target_email, &mut seen_digests, seen_otps, deadline)
             {
                 return Ok(cred);
             }
@@ -5344,18 +5533,23 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
             {
                 return Err(why);
             }
-            if let Some(cred) =
-                fetch_http_mailbox_credential(cfg, target_email, &mut seen_digests, seen_otps)
-            {
+            if let Some(cred) = fetch_http_mailbox_credential(
+                cfg,
+                target_email,
+                &mut seen_digests,
+                seen_otps,
+                deadline,
+            ) {
                 return Ok(cred);
             }
             #[cfg(unix)]
             if has_relay
                 && let Some(email) = target_email
-                && let Some(cred) = super::ai_signin::fetch_relay_mail_credential(
+                && let Some(cred) = super::ai_signin::fetch_relay_mail_credential_by(
                     cfg,
                     email,
                     super::ai_signin::MAIL_CODE_DIAL_WITHIN,
+                    deadline,
                 )
                 && let Some(accepted) = accept_relay_credential(
                     cred,
@@ -5363,15 +5557,23 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
                     cfg.seen_file.as_deref(),
                     &mut seen_digests,
                     seen_otps,
+                    deadline,
                 )
             {
                 return Ok(accepted);
             }
         }
-        if Instant::now() >= deadline {
-            return Err("timed out waiting for verification email in mailbox");
+        if deadline.is_some_and(Deadline::expired) {
+            return Err(expiry_words);
         }
-        std::thread::sleep(Duration::from_millis(25));
+        if once {
+            return Err(MAILBOX_TIMEOUT);
+        }
+        if let Some(deadline) = deadline {
+            let _ = deadline.pause(Duration::from_millis(25));
+        } else {
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }
 
@@ -5412,25 +5614,40 @@ fn pump_cdp_reader(mut from: std::io::PipeReader, tx: &Sender<Value>) {
     }
 }
 
+type CdpWrite = (Vec<u8>, std::sync::mpsc::SyncSender<bool>);
+
 /// Chrome DevTools Protocol client over `--remote-debugging-pipe` (fds 3 and 4).
 pub struct CdpClient {
-    to: std::io::PipeWriter,
+    to: std::sync::mpsc::SyncSender<CdpWrite>,
     from: Receiver<Value>,
     next_id: u64,
     events: Vec<Value>,
+    write_failed: bool,
 }
 
 impl CdpClient {
     /// Create a CDP pipe client over `to` (browser fd 3) and `from` (browser fd 4).
     #[must_use]
-    pub fn new(to: std::io::PipeWriter, from: std::io::PipeReader) -> Self {
+    pub fn new(mut to: std::io::PipeWriter, from: std::io::PipeReader) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || pump_cdp_reader(from, &tx));
+        let (commands, pending) = std::sync::mpsc::sync_channel::<CdpWrite>(1);
+        std::thread::spawn(move || {
+            while let Ok((mut bytes, done)) = pending.recv() {
+                let written = to.write_all(&bytes).and_then(|()| to.flush()).is_ok();
+                bytes.fill(0);
+                let _ = done.send(written);
+                if !written {
+                    break;
+                }
+            }
+        });
         Self {
-            to,
+            to: commands,
             from: rx,
             next_id: 0,
             events: Vec::new(),
+            write_failed: false,
         }
     }
 
@@ -5442,6 +5659,10 @@ impl CdpClient {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, &'static str> {
+        if self.write_failed {
+            return Err("browser DevTools pipe is unavailable");
+        }
+        let t0 = Instant::now();
         self.next_id += 1;
         let id = self.next_id;
         let mut msg = json!({"id": id, "method": method, "params": params});
@@ -5450,11 +5671,22 @@ impl CdpClient {
         }
         let mut bytes = aterm_json::to_vec(&msg).map_err(|_| "failed encoding CDP command")?;
         bytes.push(0);
-        self.to
-            .write_all(&bytes)
-            .and_then(|()| self.to.flush())
-            .map_err(|_| "failed writing to browser DevTools pipe")?;
-        let t0 = Instant::now();
+        let (done, written) = std::sync::mpsc::sync_channel(1);
+        if self.to.try_send((bytes, done)).is_err() {
+            self.write_failed = true;
+            return Err("browser DevTools pipe is unavailable");
+        }
+        match written.recv_timeout(timeout.saturating_sub(t0.elapsed())) {
+            Ok(true) => {}
+            Ok(false) | Err(RecvTimeoutError::Disconnected) => {
+                self.write_failed = true;
+                return Err("failed writing to browser DevTools pipe");
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.write_failed = true;
+                return Err("timed out writing to browser DevTools pipe");
+            }
+        }
         loop {
             let remaining = timeout.saturating_sub(t0.elapsed());
             if remaining.is_zero() {
@@ -5466,8 +5698,8 @@ impl CdpClient {
                         self.events.push(m);
                         continue;
                     }
-                    if m.get("error").is_some() {
-                        return Err("browser DevTools protocol returned an error");
+                    if let Some(error) = m.get("error") {
+                        return Err(cdp_response_error(error));
                     }
                     return Ok(m.get("result").cloned().unwrap_or(Value::Null));
                 }
@@ -5529,6 +5761,30 @@ impl CdpClient {
             false
         });
         found
+    }
+}
+
+/// Retain only a known navigation condition, never arbitrary provider error text.
+fn cdp_response_error(error: &Value) -> &'static str {
+    if error["code"].as_i64() == Some(-32000)
+        && error["message"].as_str().is_some_and(|message| {
+            message.contains("Execution context was destroyed")
+                || message.contains("Cannot find context with specified id")
+                || message == "Cannot find default execution context"
+        })
+    {
+        "browser execution context changed"
+    } else if matches!(error["code"].as_i64(), Some(-32000 | -32001))
+        && error["message"].as_str().is_some_and(|message| {
+            message.contains("Session with given id not found")
+                || message.contains("No target with given id found")
+                || message.contains("Target closed")
+                || message.contains("Session closed")
+        })
+    {
+        "browser DevTools session closed"
+    } else {
+        "browser DevTools protocol returned an error"
     }
 }
 
@@ -5996,6 +6252,24 @@ pub fn generate_totp_at(secret_base32: &str, unix_secs: u64) -> Option<String> {
 }
 
 pub(super) fn webmail_step_js(
+    credentials: (Option<&str>, Option<&str>, Option<&str>, Option<&str>),
+    submitted: (bool, bool, bool, bool),
+    inbox_tick: usize,
+    senders: &[String],
+) -> String {
+    webmail_script(credentials, submitted, inbox_tick, senders, true)
+}
+
+/// Drive only sign-in fields; never open a message as a side effect of signing in.
+#[cfg(unix)]
+pub(super) fn webmail_login_js(
+    credentials: (Option<&str>, Option<&str>, Option<&str>, Option<&str>),
+    submitted: (bool, bool, bool, bool),
+) -> String {
+    webmail_script(credentials, submitted, 0, &[], false)
+}
+
+fn webmail_script(
     (email, password, mailbox_password, totp_code): (
         Option<&str>,
         Option<&str>,
@@ -6010,6 +6284,7 @@ pub(super) fn webmail_step_js(
     ),
     inbox_tick: usize,
     senders: &[String],
+    open_messages: bool,
 ) -> String {
     let sender_words: Vec<String> = if senders.is_empty() {
         vec!["claude".to_owned(), "anthropic".to_owned()]
@@ -6165,7 +6440,7 @@ pub(super) fn webmail_step_js(
   }}
   const candidates = vendorAuthRows.concat(senderRows, authRows);
   let clickedRow = false;
-  if (candidates.length > 0) {{
+  if ({open_messages} && candidates.length > 0) {{
     const limit = Math.min(candidates.length, 5);
     const idx = Math.floor({inbox_tick} / 2) % limit;
     const chosen = candidates[idx] || candidates[0];
@@ -6198,6 +6473,28 @@ pub fn poll_webmail_via_cdp(
     seen_digests: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
+    let clock = Instant::now;
+    poll_webmail_until(
+        cdp,
+        cfg,
+        target_email,
+        Deadline::new(timeout, &clock),
+        poll_interval,
+        seen_digests,
+        seen_otps,
+    )
+}
+
+fn poll_webmail_until(
+    cdp: &mut CdpClient,
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+    deadline: Deadline<'_>,
+    poll_interval: Duration,
+    seen_digests: &mut BTreeSet<String>,
+    seen_otps: &mut BTreeSet<String>,
+) -> Result<MailboxCredential, &'static str> {
+    deadline.left()?;
     let cfg = &*cfg.routed_for(target_email);
     if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
         return Err(why);
@@ -6230,17 +6527,13 @@ pub fn poll_webmail_via_cdp(
         return Err(super::mailbox_routes::refused_words(login));
     }
 
-    let now = Instant::now();
-    let deadline = now
-        .checked_add(timeout)
-        .unwrap_or_else(|| now + Duration::from_secs(86_400));
-    let step_timeout = || deadline.saturating_duration_since(Instant::now());
+    let step_timeout = || deadline.left();
 
     let target = cdp.call(
         None,
         "Target.createTarget",
         json!({"url": "about:blank"}),
-        step_timeout(),
+        step_timeout()?,
     )?;
     let target_id = target
         .get("targetId")
@@ -6251,7 +6544,7 @@ pub fn poll_webmail_via_cdp(
         None,
         "Target.attachToTarget",
         json!({"targetId": target_id, "flatten": true}),
-        step_timeout(),
+        step_timeout()?,
     )?;
     let session = attached
         .get("sessionId")
@@ -6266,13 +6559,13 @@ pub fn poll_webmail_via_cdp(
     let mut signed_in = false;
     let result = (|| {
         for method in ["Page.enable", "Runtime.enable"] {
-            let _ = cdp.call(Some(&session), method, json!({}), step_timeout())?;
+            let _ = cdp.call(Some(&session), method, json!({}), step_timeout()?)?;
         }
         let _ = cdp.call(
             Some(&session),
             "Page.navigate",
             json!({"url": webmail_url}),
-            step_timeout(),
+            step_timeout()?,
         )?;
 
         let mut user_submitted = false;
@@ -6282,12 +6575,18 @@ pub fn poll_webmail_via_cdp(
         let mut tried_files = BTreeSet::new();
 
         for _ in 0..80 {
-            if let Some(cred) =
-                poll_non_webmail_once(cfg, target_email, &mut tried_files, seen_digests, seen_otps)
-            {
+            deadline.left()?;
+            if let Some(cred) = poll_non_webmail_once(
+                cfg,
+                target_email,
+                &mut tried_files,
+                seen_digests,
+                seen_otps,
+                Some(deadline),
+            ) {
                 return Ok(cred);
             }
-            if Instant::now() >= deadline {
+            if deadline.expired() {
                 return Err("timed out waiting for verification email in webmail inbox");
             }
             let now_secs = std::time::SystemTime::now()
@@ -6321,7 +6620,7 @@ pub fn poll_webmail_via_cdp(
                     "awaitPromise": true,
                     "returnByValue": true
                 }),
-                step_timeout(),
+                step_timeout()?,
             )?;
             let _ = cdp.take_matching_event_url(&session, |_| false);
             let val = eval
@@ -6384,6 +6683,7 @@ pub fn poll_webmail_via_cdp(
                                 &MailFilter::default(),
                             )
                         {
+                            deadline.left()?;
                             record_consumed_credential(
                                 cfg.seen_file.as_deref(),
                                 seen_digests,
@@ -6401,7 +6701,9 @@ pub fn poll_webmail_via_cdp(
                 _ => {}
             }
             if !poll_interval.is_zero() {
-                std::thread::sleep(poll_interval);
+                deadline
+                    .pause(poll_interval)
+                    .map_err(super::auth_deadline::Expired::words)?;
             }
         }
         Err("timed out waiting for verification email in webmail inbox")
@@ -6441,6 +6743,34 @@ pub fn poll_mailbox_or_webmail_for_credential(
     poll_interval: Duration,
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
+    if timeout.is_zero() {
+        return poll_mailbox_config_for_credential_with_seen_otps(
+            cfg,
+            target_email,
+            timeout,
+            seen_otps,
+        );
+    }
+    let clock = Instant::now;
+    poll_mailbox_or_webmail_until(
+        cdp,
+        cfg,
+        target_email,
+        Deadline::new(timeout, &clock),
+        poll_interval,
+        seen_otps,
+    )
+}
+
+fn poll_mailbox_or_webmail_until(
+    cdp: &mut CdpClient,
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+    deadline: Deadline<'_>,
+    poll_interval: Duration,
+    seen_otps: &mut BTreeSet<String>,
+) -> Result<MailboxCredential, &'static str> {
+    deadline.left()?;
     let cfg = &*cfg.routed_for(target_email);
     if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
         return Err(why);
@@ -6449,7 +6779,6 @@ pub fn poll_mailbox_or_webmail_for_credential(
         || cfg.effective_imap_url(target_email).is_some()
         || cfg.http_url.is_some();
     let result = if cfg.effective_webmail_url(target_email).is_some() {
-        let t0 = Instant::now();
         let mut seen_digests = load_seen_digests(cfg.seen_file.as_deref());
         let mut tried_files = BTreeSet::new();
         let from_non_webmail = if has_non_webmail {
@@ -6459,6 +6788,7 @@ pub fn poll_mailbox_or_webmail_for_credential(
                 &mut tried_files,
                 &mut seen_digests,
                 seen_otps,
+                Some(deadline),
             )
         } else {
             None
@@ -6466,46 +6796,42 @@ pub fn poll_mailbox_or_webmail_for_credential(
         if let Some(cred) = from_non_webmail {
             Ok(cred)
         } else {
-            let remaining = timeout.saturating_sub(t0.elapsed());
-            match poll_webmail_via_cdp(
+            deadline.left()?;
+            match poll_webmail_until(
                 cdp,
                 cfg,
                 target_email,
-                remaining,
+                deadline,
                 poll_interval,
                 &mut seen_digests,
                 seen_otps,
             ) {
                 Ok(cred) => Ok(cred),
                 Err(err) => {
-                    if !has_non_webmail || t0.elapsed() >= timeout {
+                    if !has_non_webmail || deadline.expired() {
                         Err(err)
                     } else {
-                        poll_mailbox_config_for_credential_with_seen_otps(
-                            cfg,
-                            target_email,
-                            timeout.saturating_sub(t0.elapsed()),
-                            seen_otps,
-                        )
+                        poll_mailbox_config_until(cfg, target_email, deadline, false, seen_otps)
                     }
                 }
             }
         }
     } else if has_non_webmail {
-        poll_mailbox_config_for_credential_with_seen_otps(cfg, target_email, timeout, seen_otps)
+        poll_mailbox_config_until(cfg, target_email, deadline, false, seen_otps)
     } else {
         Err(cfg
             .unready_words(target_email)
             .unwrap_or("headless browser requires sign-in, but no mailbox is configured"))
     };
     if let Ok(credential) = &result {
+        deadline.left()?;
         remember_flow_otp(credential, target_email, seen_otps);
     }
     result
 }
 
 /// Reuse the HTTP probe's consumed credential once, then resume the configured source.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(super) fn poll_mailbox_or_pending_credential(
     pending: &mut Option<MailboxCredential>,
     cdp: &mut CdpClient,
@@ -6527,6 +6853,24 @@ pub(super) fn poll_mailbox_or_pending_credential(
         poll_interval,
         seen_otps,
     )
+}
+
+#[cfg(unix)]
+fn poll_mailbox_or_pending_credential_until(
+    pending: &mut Option<MailboxCredential>,
+    cdp: &mut CdpClient,
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+    deadline: Deadline<'_>,
+    poll_interval: Duration,
+    seen_otps: &mut BTreeSet<String>,
+) -> Result<MailboxCredential, &'static str> {
+    deadline.left()?;
+    if let Some(credential) = pending.take() {
+        remember_flow_otp(&credential, target_email, seen_otps);
+        return Ok(credential);
+    }
+    poll_mailbox_or_webmail_until(cdp, cfg, target_email, deadline, poll_interval, seen_otps)
 }
 
 fn callback_delivery_result(delivery: Result<u16, &'static str>) -> Result<(), &'static str> {
@@ -6572,24 +6916,46 @@ pub const BLOCK_PAGE_MET: &str =
     "Cloudflare's block page answered the sign-in; aterm never tries to pass it";
 
 thread_local! {
-    /// What this thread's last headless Claude sign-in met where it ended without the callback
+    /// Why this thread's last headless Claude sign-in ended without the callback
     /// ([`note_met`], [`take_met`]).
     static MET: std::cell::RefCell<Option<super::open_url::Met>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Notes that this thread's headless sign-in ended on `word`, last on `host`.
+/// Notes why this thread's headless sign-in ended, with a host only for a page outcome.
 fn note_met(word: MetWord, host: Option<&str>) {
     let met = super::open_url::Met::new(word, host);
     MET.with(|slot| *slot.borrow_mut() = Some(met));
 }
 
-/// What this thread's last headless Claude sign-in met where it ended without the callback (a
-/// bot check, a block page, no callback in time), taken once; the opener writes it to the
+/// Record only a DevTools failure that ends this OAuth drive. Shared CDP operations,
+/// retained bot-check waits and best-effort cleanup do not record a terminal outcome.
+fn browser_control_failed(why: &'static str) -> &'static str {
+    note_met(MetWord::BrowserControl, None);
+    why
+}
+
+/// Why this thread's last headless Claude sign-in ended without the callback (a browser-start
+/// or control failure, bot check, block page or no callback in time), taken once; the opener writes it to the
 /// renewal's outcome file ([`super::open_url::OUTCOME_ENV`]).
 #[must_use]
 pub fn take_met() -> Option<super::open_url::Met> {
     MET.with(|slot| slot.borrow_mut().take())
+}
+
+pub(super) fn finish_deadline<T>(
+    result: Result<T, &'static str>,
+    deadline: Deadline<'_>,
+) -> Result<T, &'static str> {
+    if result.is_err() && deadline.expired() {
+        MET.with(|slot| {
+            let mut met = slot.borrow_mut();
+            if met.is_none() {
+                *met = Some(super::open_url::Met::new(MetWord::Stall, None));
+            }
+        });
+    }
+    result
 }
 
 /// Drive an active CDP session (`cdp`) through the OAuth flow for `authorize_url`, passing
@@ -6634,6 +7000,16 @@ fn oauth_out_of_time(bot: &BotCheckClock, last_host: Option<&str>, now: Instant)
     "timed out waiting for headless browser OAuth completion"
 }
 
+fn oauth_time_left(
+    deadline: Deadline<'_>,
+    bot: &BotCheckClock,
+    last_host: Option<&str>,
+) -> Result<Duration, &'static str> {
+    deadline
+        .remaining()
+        .map_err(|_| oauth_out_of_time(bot, last_host, deadline.now()))
+}
+
 /// [`drive_cdp_oauth_with_webmail`] within `timeout`, reading every `poll_interval`, with
 /// `bot_stall` how long a bot check may stand (a test's short one; else [`VENDOR_STALL`]).
 pub(super) fn drive_cdp_oauth_within(
@@ -6642,56 +7018,91 @@ pub(super) fn drive_cdp_oauth_within(
     target_email: Option<&str>,
     (timeout, poll_interval): (Duration, Duration),
     bot_stall: Duration,
+    mailbox_credential: impl FnMut(
+        &mut CdpClient,
+        Option<&str>,
+    ) -> Result<MailboxCredential, &'static str>,
+    deliver_callback: impl FnMut(&str) -> Result<u16, &'static str>,
+) -> Result<(), &'static str> {
+    let clock = Instant::now;
+    let deadline = Deadline::new(timeout, &clock);
+    finish_deadline(
+        drive_cdp_oauth_until(
+            cdp,
+            authorize_url,
+            target_email,
+            (deadline, poll_interval),
+            bot_stall,
+            mailbox_credential,
+            deliver_callback,
+        ),
+        deadline,
+    )
+}
+
+fn drive_cdp_oauth_until(
+    cdp: &mut CdpClient,
+    authorize_url: &str,
+    target_email: Option<&str>,
+    (deadline, poll_interval): (Deadline<'_>, Duration),
+    bot_stall: Duration,
     mut mailbox_credential: impl FnMut(
         &mut CdpClient,
         Option<&str>,
     ) -> Result<MailboxCredential, &'static str>,
     mut deliver_callback: impl FnMut(&str) -> Result<u16, &'static str>,
 ) -> Result<(), &'static str> {
+    let _ = take_met();
     let flow = MailboxFlow::new(authorize_url)?;
     let email = target_email
         .filter(|e| !e.trim().is_empty())
         .map(str::to_owned)
         .or_else(|| extract_login_hint(authorize_url));
-    let now = Instant::now();
-    let deadline = now
-        .checked_add(timeout)
-        .unwrap_or_else(|| now + Duration::from_secs(86_400));
-    let step_timeout = || deadline.saturating_duration_since(Instant::now());
+    let step_timeout = || deadline.left();
 
-    let target = cdp.call(
-        None,
-        "Target.createTarget",
-        json!({"url": "about:blank"}),
-        step_timeout(),
-    )?;
+    let target = cdp
+        .call(
+            None,
+            "Target.createTarget",
+            json!({"url": "about:blank"}),
+            step_timeout()?,
+        )
+        .map_err(browser_control_failed)?;
     let target_id = target
         .get("targetId")
         .and_then(Value::as_str)
-        .ok_or("browser created no targetId")?
+        .ok_or("browser created no targetId")
+        .map_err(browser_control_failed)?
         .to_owned();
-    let attached = cdp.call(
-        None,
-        "Target.attachToTarget",
-        json!({"targetId": target_id, "flatten": true}),
-        step_timeout(),
-    )?;
+    let attached = cdp
+        .call(
+            None,
+            "Target.attachToTarget",
+            json!({"targetId": target_id, "flatten": true}),
+            step_timeout()?,
+        )
+        .map_err(browser_control_failed)?;
     let session = attached
         .get("sessionId")
         .and_then(Value::as_str)
-        .ok_or("browser attached no sessionId")?
+        .ok_or("browser attached no sessionId")
+        .map_err(browser_control_failed)?
         .to_owned();
 
     for method in ["Page.enable", "Runtime.enable"] {
-        let _ = cdp.call(Some(&session), method, json!({}), step_timeout())?;
+        let _ = cdp
+            .call(Some(&session), method, json!({}), step_timeout()?)
+            .map_err(browser_control_failed)?;
     }
 
-    let _ = cdp.call(
-        Some(&session),
-        "Page.navigate",
-        json!({"url": authorize_url}),
-        step_timeout(),
-    )?;
+    let _ = cdp
+        .call(
+            Some(&session),
+            "Page.navigate",
+            json!({"url": authorize_url}),
+            step_timeout()?,
+        )
+        .map_err(browser_control_failed)?;
 
     let mut email_submitted = false;
     let mut otp_code: Option<String> = None;
@@ -6699,20 +7110,16 @@ pub(super) fn drive_cdp_oauth_within(
     let mut mailbox_polls = 0usize;
     let mut needs_mailbox_ticks = 0usize;
     const MAX_MAILBOX_POLLS: usize = 3;
-    let _ = take_met();
-
     let result = (|| {
         let mut steps = 0usize;
         let mut bot = BotCheckClock::default();
         let mut last_host: Option<String> = None;
         let pause = || {
-            if !poll_interval.is_zero() {
-                std::thread::sleep(poll_interval);
-            }
+            let _ = deadline.pause(poll_interval);
         };
         loop {
-            let now = Instant::now();
-            if now >= deadline {
+            let now = deadline.now();
+            if deadline.expired() {
                 return Err(oauth_out_of_time(&bot, last_host.as_deref(), now));
             }
             if steps >= MAX_OAUTH_STEPS {
@@ -6727,6 +7134,7 @@ pub(super) fn drive_cdp_oauth_within(
                 email_submitted,
                 otp_submitted,
             );
+            let within = oauth_time_left(deadline, &bot, last_host.as_deref())?;
             let eval = match cdp.call(
                 Some(&session),
                 "Runtime.evaluate",
@@ -6735,27 +7143,34 @@ pub(super) fn drive_cdp_oauth_within(
                     "awaitPromise": true,
                     "returnByValue": true
                 }),
-                step_timeout(),
+                within,
             ) {
                 Ok(eval) => eval,
                 // A read cut short while a bot check stood (the deadline came, or the check
                 // replaced its page under the read) is part of that wait.
                 Err(why) => {
-                    let now = Instant::now();
+                    let now = deadline.now();
                     if bot.held(now).is_none() {
-                        return Err(why);
+                        return Err(browser_control_failed(why));
                     }
-                    if now >= deadline {
+                    if now >= deadline.end() {
                         return Err(oauth_out_of_time(&bot, last_host.as_deref(), now));
                     }
                     bot.unread(now);
                     if bot.held(now).is_none() {
-                        return Err(why);
+                        return Err(browser_control_failed(why));
                     }
                     pause();
                     continue;
                 }
             };
+            if deadline.expired() {
+                return Err(oauth_out_of_time(
+                    &bot,
+                    last_host.as_deref(),
+                    deadline.now(),
+                ));
+            }
             let val = eval
                 .pointer("/result/value")
                 .cloned()
@@ -6798,7 +7213,7 @@ pub(super) fn drive_cdp_oauth_within(
                     return Err(BLOCK_PAGE_MET);
                 }
                 "bot_check" => {
-                    if bot.check(url, Instant::now()) >= bot_stall {
+                    if bot.check(url, deadline.now()) >= bot_stall {
                         note_met(MetWord::BotCheck, last_host.as_deref());
                         return Err(BOT_CHECK_UNCLEARED);
                     }
@@ -6809,7 +7224,7 @@ pub(super) fn drive_cdp_oauth_within(
                 // host and within its gap, is part of that wait and none of the drive's steps:
                 // the check reloading itself, read half-parsed.
                 _ => {
-                    let now = Instant::now();
+                    let now = deadline.now();
                     bot.other(url, state == "loading", now);
                     if bot.held(now).is_some() {
                         pause();
@@ -6826,7 +7241,7 @@ pub(super) fn drive_cdp_oauth_within(
                     }
                     needs_mailbox_ticks = 0;
                     if !poll_interval.is_zero() {
-                        std::thread::sleep(poll_interval);
+                        let _ = deadline.pause(poll_interval);
                     }
                 }
                 "wrong_account" => {
@@ -6842,12 +7257,14 @@ pub(super) fn drive_cdp_oauth_within(
                                 if !flow.admits_provider_url(&magic_url) {
                                     return Err("this OAuth destination needs the manual browser");
                                 }
-                                let _ = cdp.call(
-                                    Some(&session),
-                                    "Page.navigate",
-                                    json!({"url": magic_url}),
-                                    step_timeout(),
-                                )?;
+                                let _ = cdp
+                                    .call(
+                                        Some(&session),
+                                        "Page.navigate",
+                                        json!({"url": magic_url}),
+                                        step_timeout()?,
+                                    )
+                                    .map_err(browser_control_failed)?;
                             }
                             MailboxCredential::Otp(code) => {
                                 otp_code = Some(code);
@@ -6867,12 +7284,14 @@ pub(super) fn drive_cdp_oauth_within(
                                 if !flow.admits_provider_url(&magic_url) {
                                     return Err("this OAuth destination needs the manual browser");
                                 }
-                                let _ = cdp.call(
-                                    Some(&session),
-                                    "Page.navigate",
-                                    json!({"url": magic_url}),
-                                    step_timeout(),
-                                )?;
+                                let _ = cdp
+                                    .call(
+                                        Some(&session),
+                                        "Page.navigate",
+                                        json!({"url": magic_url}),
+                                        step_timeout()?,
+                                    )
+                                    .map_err(browser_control_failed)?;
                             }
                             MailboxCredential::Otp(code) => {
                                 otp_code = Some(code);
@@ -6882,7 +7301,7 @@ pub(super) fn drive_cdp_oauth_within(
                     } else {
                         needs_mailbox_ticks += 1;
                         if !poll_interval.is_zero() {
-                            std::thread::sleep(poll_interval);
+                            let _ = deadline.pause(poll_interval);
                         }
                     }
                 }
@@ -6890,12 +7309,12 @@ pub(super) fn drive_cdp_oauth_within(
                     otp_submitted = true;
                     needs_mailbox_ticks = 0;
                     if !poll_interval.is_zero() {
-                        std::thread::sleep(poll_interval);
+                        let _ = deadline.pause(poll_interval);
                     }
                 }
                 _ => {
                     if !poll_interval.is_zero() {
-                        std::thread::sleep(poll_interval);
+                        let _ = deadline.pause(poll_interval);
                     }
                 }
             }
@@ -6910,6 +7329,28 @@ pub(super) fn drive_cdp_oauth_within(
     );
     let _ = cdp.call(None, "Browser.close", json!({}), Duration::from_secs(2));
     result
+}
+
+#[cfg(unix)]
+fn browser_for_start(browser: Option<HeadlessBrowser>) -> Result<HeadlessBrowser, &'static str> {
+    browser.ok_or_else(|| {
+        note_met(MetWord::BrowserStart, None);
+        "no headless browser found (install Google Chrome, name a Chromium in \
+         $ATERM_BROWSER, or in an aterm checkout run `targo --unverified verify provision \
+         chrome-headless-shell`)"
+    })
+}
+
+#[cfg(unix)]
+fn start_browser(
+    cmd: aterm_uds::spawnfd::LaneCommand,
+    commands: std::os::fd::OwnedFd,
+    events: std::os::fd::OwnedFd,
+) -> Result<aterm_uds::spawnfd::LaneChild, &'static str> {
+    aterm_uds::spawnfd::spawn_with_two_fds(cmd, commands, events).map_err(|_| {
+        note_met(MetWord::BrowserStart, None);
+        "could not spawn headless browser"
+    })
 }
 
 /// Complete OAuth authorization headlessly over CDP pipes using `mailbox_cfg` when needed.
@@ -6930,27 +7371,50 @@ pub fn authorize_with_headless_browser_config(
     )
 }
 
-/// Continue an HTTP probe with its already-consumed credential before polling again. A window's
-/// pass that never ran on the profile is made up first ([`super::browser_window::make_up_tidy`]).
-#[cfg(unix)]
+/// Continue an HTTP probe with its already-consumed credential before polling again.
 pub(super) fn authorize_with_headless_browser_config_and_credential(
     authorize_url: &str,
     store_dir: Option<&Path>,
     mailbox_cfg: Option<&MailboxConfig>,
     target_email: Option<&str>,
     timeout: Duration,
+    pending_credential: Option<MailboxCredential>,
+) -> Result<(), &'static str> {
+    let _ = take_met();
+    let _flow = MailboxFlow::new(authorize_url)?;
+    let clock = Instant::now;
+    let deadline = Deadline::new(timeout, &clock);
+    finish_deadline(
+        authorize_with_headless_browser_until(
+            authorize_url,
+            store_dir,
+            mailbox_cfg,
+            target_email,
+            deadline,
+            pending_credential,
+        ),
+        deadline,
+    )
+}
+
+/// The HTTP continuation retains the original budget through profile preparation and tidy.
+#[cfg(unix)]
+pub(super) fn authorize_with_headless_browser_until(
+    authorize_url: &str,
+    store_dir: Option<&Path>,
+    mailbox_cfg: Option<&MailboxConfig>,
+    target_email: Option<&str>,
+    deadline: Deadline<'_>,
     mut pending_credential: Option<MailboxCredential>,
 ) -> Result<(), &'static str> {
-    use aterm_uds::spawnfd::spawn_with_two_fds;
     use std::os::fd::OwnedFd;
 
+    let _ = take_met();
     let _flow = MailboxFlow::new(authorize_url)?;
+    deadline.left()?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let browser = find_headless_browser(home.as_deref()).ok_or(
-        "no headless browser found (install Google Chrome, name a Chromium in \
-         $ATERM_BROWSER, or in an aterm checkout run `targo --unverified verify provision \
-         chrome-headless-shell`)",
-    )?;
+    let browser = browser_for_start(find_headless_browser(home.as_deref()))?;
+    deadline.left()?;
 
     let email = target_email
         .filter(|e| !e.trim().is_empty())
@@ -6958,11 +7422,13 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
         .or_else(|| extract_login_hint(authorize_url));
 
     let label = infer_account_label_from_env();
-    with_browser_profile(
+    with_browser_profile_using_deadline(
         store_dir,
         label.as_deref(),
         email.as_deref(),
+        prepare_browser_profile,
         |profile_dir| {
+            deadline.left()?;
             let (cmd_read, cmd_write) =
                 std::io::pipe().map_err(|_| "could not open CDP command pipe")?;
             let (out_read, out_write) =
@@ -6971,60 +7437,74 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
             let cmd =
                 headless_browser_command(&browser, profile_dir, &|name| std::env::var_os(name));
 
-            let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
-                .map_err(|_| "could not spawn headless browser")?;
+            deadline.left()?;
+            let child = start_browser(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))?;
             let _guard = BrowserChild::new(child);
             let mut cdp = CdpClient::new(cmd_write, out_read);
-            let make_up_now = Instant::now();
-            let make_up_until = make_up_now
-                .checked_add(super::browser_window::MAKE_UP_WITHIN)
-                .unwrap_or_else(|| make_up_now + Duration::from_secs(60));
+            let make_up_until = deadline
+                .limited(super::browser_window::MAKE_UP_WITHIN)
+                .end();
+            deadline.left()?;
             let _ = super::browser_window::make_up_tidy(&mut cdp, profile_dir, make_up_until);
             let mut seen_otps = BTreeSet::new();
 
-            let t0 = Instant::now();
-            drive_cdp_oauth_with_webmail(
+            deadline.left()?;
+            drive_cdp_oauth_until(
                 &mut cdp,
                 authorize_url,
                 email.as_deref(),
-                timeout,
-                Duration::from_millis(200),
+                (deadline, Duration::from_millis(200)),
+                VENDOR_STALL,
                 |cdp_inner, em| {
                     let mb = mailbox_cfg.filter(|c| c.is_configured_for(em)).ok_or(
                         mailbox_cfg.and_then(|c| c.unready_words(em)).unwrap_or(
                             "headless browser requires sign-in, but no mailbox is configured",
                         ),
                     )?;
-                    poll_mailbox_or_pending_credential(
+                    poll_mailbox_or_pending_credential_until(
                         &mut pending_credential,
                         cdp_inner,
                         mb,
                         em,
-                        timeout.saturating_sub(t0.elapsed()),
+                        deadline,
                         Duration::from_millis(200),
                         &mut seen_otps,
                     )
                 },
                 |cb_url| {
                     let mut cookies = BTreeMap::new();
-                    super::open_url::loopback_http_exchange("GET", cb_url, &mut cookies, None)
-                        .map(|r| r.status)
+                    super::open_url::loopback_http_exchange_until(
+                        "GET",
+                        cb_url,
+                        &mut cookies,
+                        None,
+                        deadline,
+                    )
+                    .map(|r| r.status)
                 },
             )
         },
+        |error| {
+            let _ = writeln!(
+                std::io::stderr(),
+                "aterm: browser authorization succeeded, but its profile remains unproven: {error}"
+            );
+        },
+        Some(deadline),
     )
 }
 
 /// Non-Unix continuation stub for [`authorize_with_headless_browser_config`].
 #[cfg(not(unix))]
-pub(super) fn authorize_with_headless_browser_config_and_credential(
+pub(super) fn authorize_with_headless_browser_until(
     _authorize_url: &str,
     _store_dir: Option<&Path>,
     _mailbox_cfg: Option<&MailboxConfig>,
     _target_email: Option<&str>,
-    _timeout: Duration,
+    _deadline: Deadline<'_>,
     _pending_credential: Option<MailboxCredential>,
 ) -> Result<(), &'static str> {
+    let _ = take_met();
     Err("headless browser OAuth is supported on Unix hosts only")
 }
 
@@ -8778,9 +9258,80 @@ impl super::login_drive::Approver for VendorApprover {
 #[path = "headless_vendor_tests.rs"]
 pub(super) mod vendor_tests;
 
+#[cfg(all(test, unix))]
+mod browser_start_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_and_rejected_browser_spawn_reach_a_hostless_outcome() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        note_met(MetWord::BotCheck, Some("old.example"));
+        assert!(browser_for_start(None).is_err());
+        assert_eq!(
+            take_met(),
+            Some(super::super::open_url::Met::new(
+                MetWord::BrowserStart,
+                None
+            ))
+        );
+
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let executable = tmp.path().join("private-launch-detail");
+        std::fs::write(&executable, b"not executable").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let browser = browser_for_start(find_headless_browser_with(
+            None,
+            &|name| (name == BROWSER_BIN_ENV).then(|| executable.as_os_str().to_owned()),
+            false,
+        ))
+        .unwrap();
+        note_met(MetWord::BlockPage, Some("old.example"));
+        let cmd = headless_browser_command(&browser, tmp.path(), &|_| None);
+        let (cmd_read, _cmd_write) = std::io::pipe().unwrap();
+        let (_out_read, out_write) = std::io::pipe().unwrap();
+        let error = start_browser(cmd, cmd_read.into(), out_write.into()).unwrap_err();
+        assert!(!error.contains("private"));
+        let expected = super::super::open_url::Met::new(MetWord::BrowserStart, None);
+        let produced = take_met().unwrap();
+        assert_eq!(produced, expected);
+        let path = tmp.path().join("outcome");
+        super::super::open_url::write_outcome(&path, &produced);
+        let retained = super::super::open_url::read_outcome(&path).unwrap();
+        assert_eq!(retained, expected);
+        let history = super::super::sign_in_ladder::how_it_ended(
+            super::super::cli::Renewal::Failed,
+            None,
+            Some(&retained),
+        );
+        assert!(history.ends_with(&expected.words()));
+        assert!(!history.contains("private") && !history.contains("old.example"));
+        assert_eq!(take_met(), None);
+    }
+
+    #[test]
+    fn a_new_headless_flow_clears_an_old_outcome_before_url_validation() {
+        note_met(MetWord::BotCheck, Some("old.example"));
+        let result = authorize_with_headless_browser_config_and_credential(
+            "not-an-authorization-url",
+            None,
+            None,
+            None,
+            Duration::ZERO,
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(take_met(), None);
+    }
+}
+
 #[cfg(test)]
 #[path = "headless_mailbox_tests.rs"]
 mod mailbox_tests;
+
+#[cfg(test)]
+#[path = "auth_mailbox_deadline_tests.rs"]
+mod auth_deadline_tests;
 
 #[cfg(test)]
 mod uri_authority_tests {
@@ -8883,6 +9434,113 @@ mod uri_authority_tests {
                 ),
                 plain,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cdp_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_command_pipe_times_out_and_cannot_accept_later_commands() {
+        let (command_read, command_write) = std::io::pipe().unwrap();
+        let (event_read, event_write) = std::io::pipe().unwrap();
+        let (done, result) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut client = CdpClient::new(command_write, event_read);
+            let first = client.call(
+                None,
+                "Runtime.evaluate",
+                json!({"expression":"x".repeat(1024*1024)}),
+                Duration::from_millis(20),
+            );
+            let next = client.call(None, "Runtime.evaluate", json!({}), Duration::from_secs(1));
+            done.send((first, next)).unwrap();
+        });
+        let answer = result.recv_timeout(Duration::from_secs(60));
+        drop(command_read);
+        drop(event_write);
+        worker.join().unwrap();
+        let (first, next) = answer.expect("command deadline hung");
+        assert_eq!(
+            first.unwrap_err(),
+            "timed out writing to browser DevTools pipe"
+        );
+        assert_eq!(next.unwrap_err(), "browser DevTools pipe is unavailable");
+    }
+
+    #[test]
+    fn navigation_errors_are_distinct_from_protocol_failures() {
+        for message in [
+            "Execution context was destroyed.",
+            "Cannot find context with specified id",
+            "Cannot find default execution context",
+        ] {
+            assert_eq!(
+                cdp_response_error(&json!({"code":-32000,"message":message})),
+                "browser execution context changed"
+            );
+        }
+        for message in [
+            "Session with given id not found.",
+            "No target with given id found",
+            "Target closed",
+            "Session closed",
+        ] {
+            assert_eq!(
+                cdp_response_error(&json!({"code":-32001,"message":message})),
+                "browser DevTools session closed"
+            );
+        }
+        for error in [
+            json!({"code":-32602,"message":"Invalid parameters"}),
+            json!({"code":-32000,"message":"Arbitrary private page error"}),
+        ] {
+            assert_eq!(
+                cdp_response_error(&error),
+                "browser DevTools protocol returned an error"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::{MailboxConfig, MailboxCredential};
+
+    #[test]
+    fn mailbox_credential_debug_hides_codes_and_magic_links() {
+        for credential in [
+            MailboxCredential::Otp("674291".into()),
+            MailboxCredential::MagicLink("https://example.invalid/synthetic-private-link".into()),
+        ] {
+            for output in [format!("{credential:?}"), format!("{credential:#?}")] {
+                assert!(!output.contains("674291"));
+                assert!(!output.contains("synthetic-private-link"));
+                assert!(output.contains("<redacted>"));
+            }
+        }
+    }
+
+    #[test]
+    fn mailbox_debug_does_not_disclose_credentials_or_identity() {
+        let marker = "synthetic-private-mailbox-value";
+        let config = MailboxConfig {
+            bearer_token: Some(marker.into()),
+            password: Some(marker.into()),
+            mailbox_password: Some(marker.into()),
+            totp_secret: Some(marker.into()),
+            user: Some(marker.into()),
+            http_url: Some(marker.into()),
+            passwords: [(marker.into(), marker.into())].into(),
+            mailbox_passwords: [(marker.into(), marker.into())].into(),
+            totp_secrets: [(marker.into(), marker.into())].into(),
+            ..MailboxConfig::default()
+        };
+        for output in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!output.contains(marker));
+            assert!(output.contains("MailboxConfig"));
         }
     }
 }

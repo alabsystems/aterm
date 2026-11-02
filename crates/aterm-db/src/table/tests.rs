@@ -1103,3 +1103,40 @@ fn newly_admitted_machines_replay_durable_tables_and_relay_historical_access_off
             .is_err()
     );
 }
+
+/// Table repair refuses a peer while this device has never read its roster (it could name that
+/// peer), admits it once a read succeeds, and keeps that answer through a read that fails after
+/// it. The read is made to fail by leaving the scratch vault's `source.toml` readable by other
+/// users, which every vault read refuses.
+///
+/// NEGATIVE CONTROL (2026-11-01): with `Session::peer` reading the roster as
+/// `swarm_roster(..).ok().flatten()` again (a failed read checks no roster), this fails (`a peer
+/// is refused while no roster was ever read`).
+#[test]
+fn table_repair_refuses_a_peer_until_its_roster_is_read_then_keeps_the_last() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let peer = lab.bootstrap(1).request().unwrap().binding().actor();
+    let session = Session::observe(&bootstrap).unwrap();
+    let source = lab.paths[0].dir.join("source.toml");
+    let set = |mode| std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode));
+    set(0o644).unwrap();
+    let refused = session.peer(peer);
+    set(0o600).unwrap();
+    let Err(why) = refused else {
+        panic!("a peer is refused while no roster was ever read");
+    };
+    assert!(
+        why.to_string().contains("has not read its roster yet"),
+        "{why}"
+    );
+    assert!(session.peer(peer).is_ok(), "admitted once a read succeeds");
+    set(0o644).unwrap();
+    let kept = session.peer(peer);
+    set(0o600).unwrap();
+    assert!(
+        kept.is_ok(),
+        "a failed read keeps the last answer: {kept:?}"
+    );
+}

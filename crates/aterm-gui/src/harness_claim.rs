@@ -114,6 +114,40 @@ pub(crate) fn image_in(layout: &atpkg::store::Layout, row: &Row, exe: &Path) -> 
         .is_some_and(|checkout| checkout.parent().is_some() && exe.starts_with(&checkout))
 }
 
+/// The development seam that makes this aterm answer as one predating contract 3:
+/// `ATERM_DEV_NO_CONTRACT3=1` in a debug or dev-seams build's environment
+/// ([`aterm_types::dev_seam`]; a shipped aterm reads no such variable). `lab harness-proof`'s
+/// negative control (`docs/DESIGN-harness-repos-2026-10-24.md` §9 step 2) runs its instance under
+/// it, so a harness must pass through (§8.2) where no `contract=` is served.
+pub(crate) const NO_CONTRACT3_SEAM: &str = "ATERM_DEV_NO_CONTRACT3";
+
+/// The `contract=` value this aterm answers `harness policy` with ([`served_with`] of the seam,
+/// read once).
+#[must_use]
+pub(crate) fn served() -> Option<&'static str> {
+    static SERVED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SERVED
+        .get_or_init(|| served_with(aterm_types::dev_seam!(NO_CONTRACT3_SEAM).as_deref()))
+        .as_deref()
+}
+
+/// The `contract=` value for a seam value `seam`: the contracts this aterm serves
+/// ([`aterm_agent::harness::contract::served_word`], `2,3`), or `None` under
+/// `ATERM_DEV_NO_CONTRACT3=1` ([`NO_CONTRACT3_SEAM`]), where the reply carries no `contract=` key
+/// at all, as an aterm predating contract 3 answers. Any other value serves.
+#[must_use]
+pub(crate) fn served_with(seam: Option<&std::ffi::OsStr>) -> Option<String> {
+    (seam != Some(std::ffi::OsStr::new("1"))).then(aterm_agent::harness::contract::served_word)
+}
+
+/// Whether a `meta set supervisor <holder> <words…>` is refused as an aterm predating contract 3
+/// refuses it: it serves no contract 3 (`serves` false, [`served`]) and a word names `contract=`,
+/// which the v2 grammar (`[ttl=<ms>]`) never took. A v2 claim is read as before either way.
+#[must_use]
+pub(crate) fn refused_before_v3(serves: bool, words: &[&str]) -> bool {
+    !serves && words.iter().any(|w| w.starts_with("contract="))
+}
+
 /// Whether process `pid` runs a build of `row`'s program ([`image_in`], this user's configured
 /// atpkg prefix).
 #[must_use]
@@ -131,6 +165,23 @@ mod tests {
 
     fn grok_alab() -> &'static Row {
         contract::row_named("grok-alab").expect("rostered")
+    }
+
+    /// THE NEGATIVE CONTROL'S aterm (`ATERM_DEV_NO_CONTRACT3=1`): it serves no `contract=` and
+    /// refuses a claim naming one as the v2 grammar's usage error; unset, or any other value, it
+    /// serves `2,3` and reads every claim as before; a v2 claim is read as before either way.
+    #[test]
+    fn the_seam_answers_as_an_aterm_before_contract_three() {
+        use std::ffi::OsStr;
+        assert_eq!(served_with(None).as_deref(), Some("2,3"));
+        assert_eq!(served_with(Some(OsStr::new("0"))).as_deref(), Some("2,3"));
+        assert_eq!(served_with(Some(OsStr::new(""))).as_deref(), Some("2,3"));
+        assert_eq!(served_with(Some(OsStr::new("1"))), None);
+        let v3 = ["contract=3", "scope=relaunch,upgrade"];
+        assert!(refused_before_v3(false, &v3));
+        assert!(!refused_before_v3(true, &v3), "the serving aterm reads it");
+        assert!(!refused_before_v3(false, &["ttl=5000"]), "a v2 lease");
+        assert!(!refused_before_v3(false, &[]), "a v2 claim");
     }
 
     /// A layout in a scratch prefix holding `store/grok-alab/<build>/bin/grok-alab`, complete

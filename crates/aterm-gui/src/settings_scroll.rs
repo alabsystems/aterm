@@ -527,6 +527,9 @@ pub(super) struct ScrollPlan {
     drawn_bands: Shared<Vec<DrawnPart>>,
     spans: Shared<Vec<(UiKey, f32, f32)>>,
     words: Shared<Option<(UiKey, Words)>>,
+    /// What each stop draws of its setting rows' names, and whose each control is
+    /// ([`Self::name_above`]).
+    names: Shared<RowNames>,
     ink: Shared<f32>,
     ink_top: Shared<f32>,
     first_controls: Shared<Option<f32>>,
@@ -691,6 +694,7 @@ impl ScrollPlan {
             control_rows: shared(stops),
             spans: shared(stops),
             words: shared(stops),
+            names: shared(stops),
             ink: shared(stops),
             ink_top: shared(stops),
             first_controls: shared(stops),
@@ -830,6 +834,7 @@ impl ScrollPlan {
         std::sync::Arc::make_mut(&mut self.within).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.spans).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.words).push(None);
+        std::sync::Arc::make_mut(&mut self.names).push(RowNames::default());
         self.heights.len() - 1
     }
 
@@ -861,6 +866,7 @@ impl ScrollPlan {
         std::sync::Arc::make_mut(&mut self.within).insert(index, Vec::new());
         std::sync::Arc::make_mut(&mut self.spans).insert(index, Vec::new());
         std::sync::Arc::make_mut(&mut self.words).insert(index, None);
+        std::sync::Arc::make_mut(&mut self.names).insert(index, RowNames::default());
     }
 
     /// A group card.
@@ -1035,12 +1041,174 @@ impl ScrollPlan {
         }
     }
 
+    /// Say what the last stop added draws of its setting rows' names ([`RowNames`]).
+    pub(super) fn set_names(&mut self, names: RowNames) {
+        self.kept_limit.forget();
+        if let Some(last) = std::sync::Arc::make_mut(&mut self.names).last_mut() {
+            *last = names;
+        }
+    }
+
     /// Span of stop `index` revealed for control `key` ([`Self::revealed_span`]).
     pub(super) fn span_of(&self, index: usize, key: Option<&UiKey>, reveal: Reveal) -> (f32, f32) {
         let pressed = matches!(reveal, Reveal::Pressed | Reveal::Hold) && self.gives_to_status();
         key.filter(|_| pressed)
             .and_then(|key| self.control_span(index, key))
             .unwrap_or_else(|| self.revealed_span(index, reveal))
+    }
+
+    /// Where the first and the last line of the name over control `key` of stop `index` stand,
+    /// down from the stop's top: its setting row's name, on the stop's own lines over the
+    /// control, else on the nearest stop before it, of the same row, in its run (a row split
+    /// across stops, [`named_row_parts`]), up from the stop's top. None where the stop draws a
+    /// line of the row's name beside or under the control, or no stop of the row before it
+    /// draws one, or the control is no setting row's.
+    fn name_above(&self, index: usize, key: &UiKey) -> Option<(f32, f32)> {
+        let control = self.resolve(key);
+        let row = &self
+            .names
+            .get(index)?
+            .controls
+            .iter()
+            .find(|(held, _)| held == key || held == control)?
+            .1;
+        let lines = |stop: usize| {
+            self.names[stop]
+                .lines
+                .iter()
+                .filter(move |(named, _, _)| named == row)
+                .map(|(_, top, bottom)| (*top, *bottom))
+        };
+        let reach = |stop: usize, offset: f32, under: f32| {
+            let mut tops = lines(stop)
+                .filter(|(_, bottom)| *bottom <= under + 0.5)
+                .map(|(top, _)| top + offset);
+            let first = tops.next()?;
+            Some(tops.fold((first, first), |(least, most), top| {
+                (least.min(top), most.max(top))
+            }))
+        };
+        if lines(index).next().is_some() {
+            let (top, _) = self
+                .whole_control(index, key)
+                .unwrap_or_else(|| self.controls_of(index));
+            let over = lines(index)
+                .filter(|(_, bottom)| *bottom <= top + 0.5)
+                .count();
+            return (over == lines(index).count())
+                .then(|| reach(index, 0.0, top))
+                .flatten();
+        }
+        let mut stop = index;
+        let mut offset = 0.0;
+        while stop > 0 && !self.starts_run(stop) {
+            stop -= 1;
+            offset -= self.heights[stop];
+            if lines(stop).next().is_some() {
+                return reach(stop, offset, f32::INFINITY);
+            }
+            let of_row = self.ids[stop]
+                .iter()
+                .any(|id| setting_row_of(id.as_str()).as_ref() == Some(row));
+            if !of_row {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Where control `key` of stop `index` begins and ends in it, whole: a segmented control's
+    /// every segment.
+    fn whole_control(&self, index: usize, key: &UiKey) -> Option<(f32, f32)> {
+        let control = self.resolve(key);
+        self.spans
+            .get(index)?
+            .iter()
+            .filter(|(span, _, _)| self.resolve(span) == control)
+            .map(|(_, at, tall)| (*at, at + tall))
+            .reduce(|(top, bottom), (at, end)| (top.min(at), bottom.max(end)))
+    }
+
+    /// The stop a span of stop `index` starting `from` down its top starts in: up its run
+    /// where `from` is over its top; none where that leaves the run.
+    fn span_start(&self, index: usize, from: f32) -> Option<usize> {
+        let (mut stop, mut from) = (index, from);
+        while from < -0.01 {
+            if stop == 0 || self.starts_run(stop) {
+                return None;
+            }
+            stop -= 1;
+            from += self.heights[stop];
+        }
+        Some(stop)
+    }
+
+    /// THE KEYBOARD LANDS ON A CONTROL WITH A LINE OF ITS NAME: the screen nearest `top` that
+    /// shows control `key` of stop `index` whole with a line of the name over it
+    /// ([`Self::name_above`]), where one does, seated on it: the whole name, the stop's controls
+    /// and the words under them, else the name and the stop's controls, else the name and the
+    /// control, else the name's last line and the control. None, nothing seated anew, where no
+    /// screen shows a line of the name with the control whole. Landed on the stop's controls and
+    /// the words under them, Tab to a row split from its name showed the control and the note
+    /// under it with no word of what it set (Harness at 248x222: Question priority's segments and
+    /// "With Answer questions on,"); a screen seated into a row cut the name over its switch
+    /// (Sound at 234x418 with 0.85x text, Shift-Tab to Music effects).
+    pub(super) fn land_named(&mut self, index: usize, key: &UiKey, top: usize) -> Option<usize> {
+        let (first, last) = self.name_above(index, key)?;
+        let (controls, end) = self.controls_of(index);
+        let (own, under) = self.whole_control(index, key)?;
+        if last > own - 0.01 {
+            return None;
+        }
+        let ink = self.ink[index].max(end);
+        let held = self.seated;
+        let top = top.min(self.limit());
+        let spans = [
+            (first.min(controls), ink),
+            (first.min(controls), end),
+            (first, under),
+            (last, under),
+        ];
+        for span in spans {
+            if span.1 - span.0 > self.room + 0.01 {
+                continue;
+            }
+            if self.shows_span(index, top, span) {
+                return Some(top);
+            }
+            self.seated = None;
+            let at = self.nearest_showing(index, top, span);
+            self.seated = self.seat_span(index, at, span);
+            if self.shows_span(index, at, span) {
+                return Some(at);
+            }
+            self.seated = held;
+        }
+        None
+    }
+
+    /// The screen nearest `top` that shows span `span` of stop `index` whole as it draws
+    /// ([`Self::shows_span`]): `top` where it does; up the list, the screen that starts with the
+    /// stop the span starts in ([`Self::span_start`]); down it, the first that does, else the one
+    /// that starts with that stop. Judged by the room under the strip a status's bar takes
+    /// instead ([`Self::reveal_span`]), a Tab passed over the screen that showed the control with
+    /// its name and words and landed a whole stop on, the rows before it gone (Security at
+    /// 304x420: Allow programs to show desktop notifications went to the top under PERMISSIONS,
+    /// 134pt further than the screen that showed it whole under the row before).
+    fn nearest_showing(&self, index: usize, top: usize, span: (f32, f32)) -> usize {
+        let limit = self.limit();
+        let top = top.min(limit);
+        if self.shows_span(index, top, span) {
+            return top;
+        }
+        let start = self.span_start(index, span.0).unwrap_or(index);
+        if start <= top {
+            return start.min(limit);
+        }
+        (top + 1..start)
+            .find(|&first| self.shows_span(index, first, span))
+            .unwrap_or(start)
+            .min(limit)
     }
 
     fn control_span(&self, index: usize, key: &UiKey) -> Option<(f32, f32)> {
@@ -1055,6 +1223,85 @@ impl ScrollPlan {
             .map(|(_, top, height)| (*top, top + height))
     }
 
+    /// Add `card` as a group of the stops a list `room` tall lists its rows in
+    /// ([`SplitCard::stops`]), each measured where `measured` ([`Self::measure_rows`]): the group,
+    /// and the rows each stop holds. A PAGE OF FIELDS LISTS A CARD AS EVERY PAGE DOES: built by a
+    /// copy of this, a fields page's card split across screens recorded no line of its rows'
+    /// names, so a Tab landed on Cursor & Motion's split rows with no line of their names; the
+    /// copy recorded neither what else each stop draws nor the head's keys over the first.
+    pub(super) fn split_stops(
+        &mut self,
+        card: &SplitCard,
+        room: f32,
+        measured: bool,
+    ) -> (usize, Vec<Range<usize>>) {
+        let group = self.group(card.height_of_head(), card.height_of_lead());
+        self.set_row_gap(group, card.gap);
+        if let Some((top, bottom)) = card.caption() {
+            self.set_caption(group, top, bottom);
+        }
+        let parts = card.stops(room);
+        for (part, rows) in parts.iter().cloned().enumerate() {
+            // A head that is a control (Themes' open Community disclosure) is the keyboard's on
+            // the card's first stop, reached and revealed as every stop is.
+            let head = card.head.iter().filter(|_| part == 0);
+            self.row(
+                group,
+                card.rows[rows.clone()]
+                    .iter()
+                    .map(|(_, height)| height + card.gap)
+                    .sum(),
+                if measured {
+                    head.clone()
+                        .chain(&card.rows[rows.clone()])
+                        .flat_map(|(node, _)| focus_keys(node))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            );
+            self.set_stop_lead(card.stop_lead(&rows));
+            if !measured {
+                continue;
+            }
+            self.set_ids(
+                card.rows[rows.clone()]
+                    .iter()
+                    .map(|(node, _)| node.key.clone())
+                    .collect(),
+            );
+            let mut within = Vec::new();
+            for (node, _) in head {
+                within.push(node.key.clone());
+                keys_within(node, &mut within);
+            }
+            for (node, _) in &card.rows[rows.clone()] {
+                keys_within(node, &mut within);
+            }
+            self.set_within(within);
+            self.measure_rows(card, rows.clone());
+            self.note_previews(card.rows[rows.clone()].iter().map(|(node, _)| node));
+            for (node, _) in &card.rows[rows] {
+                self.add_segments(node);
+            }
+        }
+        (group, parts)
+    }
+
+    /// Measure the last stop added from `rows` of `card`, the rows it holds.
+    fn measure_rows(&mut self, card: &SplitCard, rows: Range<usize>) {
+        self.set_control_rows(card.control_rows(rows.clone()));
+        self.set_drawn_bands(card.drawn_bands(rows.clone()));
+        let (spans, words) = card.control_spans(rows.clone());
+        self.set_control_spans(spans);
+        self.set_keyboard_words(words);
+        self.set_names(card.row_names(rows.clone()));
+        self.set_note(card.notes_only(rows.clone()));
+        self.set_ink(card.ink(rows.clone()));
+        self.set_ink_top(card.ink_top(rows.clone()));
+        self.set_first_controls(card.first_controls(rows));
+    }
+
     /// Measure the last stop added from `node`, laid out `height` tall.
     pub(super) fn measure(&mut self, node: &UiNode, height: f32) {
         self.kept_limit.forget();
@@ -1064,6 +1311,7 @@ impl ScrollPlan {
         let (spans, words) = control_spans_in(node, height);
         self.set_control_spans(spans);
         self.set_keyboard_words(words);
+        self.set_names(row_names_in(node, height));
         self.set_control_rows(control_rows_in(node, height));
         self.set_drawn_bands(drawn_bands_in(node, height));
         self.set_first_controls(first_control_row(node, height).map(|(top, tall)| top + tall));
@@ -1147,6 +1395,7 @@ impl ScrollPlan {
         std::sync::Arc::make_mut(&mut self.within).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.spans).push(Vec::new());
         std::sync::Arc::make_mut(&mut self.words).push(None);
+        std::sync::Arc::make_mut(&mut self.names).push(RowNames::default());
         self.heights.len() - 1
     }
 
@@ -1288,7 +1537,12 @@ impl ScrollPlan {
     /// the caption of the run it starts in kept as that stop's own seat
     /// keeps it ([`Self::starts_bare`]). The caller weighs where that screen's end stands,
     /// `anchor` ([`Self::last_anchor`], none where the list's foot is whole); this reads the
-    /// screen's seat alone, no live band.
+    /// screen's seat alone, no live band. THE LAST SCREEN STARTS WITH A ROW'S WORDS ONLY UNDER
+    /// THE ROW'S NAME: seated past the name a stop of a row's words draws over itself
+    /// ([`Self::stop_leads`]), where the name and every stop after it do not fit, it is no last
+    /// screen, and the screen before it shows the stop under its name: the last screen drew the
+    /// words alone at its top (Terminal at 2x in 288x236: Rewind's "Applies to new", its
+    /// three-line name scrolled off over it).
     fn ends_on_at(&self, top: usize, anchor: Option<f32>) -> bool {
         let n = self.len();
         let Some(anchor) = anchor else {
@@ -1296,6 +1550,11 @@ impl ScrollPlan {
         };
         let seat = self.last_seat(top, anchor);
         if seat.bare && !self.starts_bare(top) {
+            return false;
+        }
+        let first = seat.drawn.start;
+        let head = self.groups[first].map_or(0.0, |group| self.leads[group]);
+        if self.stop_leads[first] > 0.01 && seat.offset > head + 0.01 {
             return false;
         }
         let shown = self.shown_on(&seat.drawn, seat.offset, seat.caption);
@@ -1519,19 +1778,59 @@ impl ScrollPlan {
                     (part.top - at).abs() < 0.5 && (part.bottom - (at + height)).abs() < 0.5
                 })
         });
-        let Some(veiled) = self.control_rows.get(index).and_then(|rows| {
-            rows.iter()
-                .filter(|(_, at, height)| {
-                    top + at < offset - 0.5 && (name_cut || top + at + height - offset < PEEK_MIN)
-                })
-                .map(|(_, at, height)| top + at + height)
-                .reduce(f32::max)
-        }) else {
+        let rows = controls
+            .iter()
+            .filter(|(_, at, height)| {
+                top + at < offset - 0.5 && (name_cut || top + at + height - offset < PEEK_MIN)
+            })
+            .map(|(_, at, height)| top + at + height);
+        // Nor is a control cut from its name, or through its own words ([`Self::cut_unseen`]).
+        let unnamed = self
+            .spans
+            .get(index)
+            .into_iter()
+            .flatten()
+            .filter(|(key, at, height)| {
+                top + at < offset - 0.5
+                    && top + at + height > offset + 0.5
+                    && self.cut_unseen(index, key, top + at, offset)
+            })
+            .map(|(_, at, height)| top + at + height);
+        let Some(veiled) = rows.chain(unnamed).reduce(f32::max) else {
             return false;
         };
         parts
             .iter()
             .any(|part| part.whole && top + part.top >= veiled.max(offset) - 0.5)
+    }
+
+    /// Whether a screen starting `offset` down the list cuts control `key` of stop `index`,
+    /// standing `at` down it, so the list does not draw it: a control its setting row names,
+    /// with a line of that name over the cut; a button that names itself, through or past its
+    /// own words. THE LIST DRAWS A CONTROL ITS EDGE CUTS ONLY WITH ITS ROW'S WORDS WHOLE ON
+    /// SCREEN, A BUTTON THAT NAMES ITSELF WITH ITS OWN: the last screen seated into a stacked
+    /// row's control, its name scrolled off over it, drew the control not at all and the note
+    /// under it alone under a band of blank card (Security at 0.85x in 372x320, Secure Keyboard
+    /// Entry's switch: "Secure Keyboard Entry hides what you type from other apps."; Appearance
+    /// at 490x460, Background material's menu: "GPU only: CPU window stays opaque").
+    fn cut_unseen(&self, index: usize, key: &UiKey, at: f32, offset: f32) -> bool {
+        let Some(names) = self.names.get(index) else {
+            return false;
+        };
+        if let Some((_, words)) = names.self_named.iter().find(|(held, _)| held == key) {
+            return at + words < offset - 0.5;
+        }
+        let top = self.stop_top(index, index);
+        names
+            .controls
+            .iter()
+            .find(|(held, _)| held == key)
+            .is_some_and(|(_, row)| {
+                names
+                    .lines
+                    .iter()
+                    .any(|(named, line, _)| named == row && top + line < offset - 0.5)
+            })
     }
 
     /// How many of the list's stops the screen that starts with each cuts.
@@ -1741,9 +2040,15 @@ impl ScrollPlan {
         self.shows_span_on(&self.screen(top.min(self.limit())), index, span)
     }
 
+    /// A span over the stop's top, in stops of its run before it ([`Self::span_start`]), is shown
+    /// where the screen draws the stop it starts in.
     fn shows_span_on(&self, screen: &Screen, index: usize, (from, to): (f32, f32)) -> bool {
         self.live_band(screen, index)
             .is_some_and(|(at, floor, live)| at + from >= floor - 0.01 && at + to <= live + 0.01)
+            && (from >= -0.01
+                || self
+                    .span_start(index, from)
+                    .is_some_and(|start| screen.drawn.start <= start))
     }
 
     /// What `screen` paints of `key`'s `span` in stop `index`: none for a sliver or a cut word.
@@ -2788,7 +3093,7 @@ impl ScrollPlan {
             let holds = |screen: &Screen| {
                 self.live_band(screen, index)
                     .is_some_and(|(then, floor, live)| {
-                        (then + from - at).abs() < 0.5
+                        (then + from - at).abs() < 0.01
                             && then + from >= floor - 0.01
                             && then + to <= live + 0.01
                     })
@@ -3736,35 +4041,45 @@ impl SettingsViewState {
             if landing {
                 landed.clone_from(&self.page_reveal);
             }
-            if plan.seated.is_none() || !plan.shows_span(index, top, span) {
-                let pressed = if reveal_as == Reveal::Pressed {
-                    plan.press_seat_span(index, top, span)
-                } else {
-                    None
-                };
-                let nudge = pressed.map(|seat| seat.nudge);
-                plan.seated = pressed;
-                let reached = (nudge.is_none() && reveal_as == Reveal::Pressed)
-                    .then(|| plan.seat_span(index, top, span))
-                    .flatten();
-                if let Some(seat) = reached {
-                    plan.seated = Some(seat);
-                } else if nudge.is_none() {
-                    top = match reveal_as {
-                        Reveal::Keep => plan.reveal(index, top),
-                        Reveal::Pressed | Reveal::Land | Reveal::Hold => {
-                            plan.reveal_span(index, top, span)
-                        }
-                        Reveal::LandWhole => {
-                            let (landed, seat) = plan.land_selected(index, top);
-                            plan.seated = seat;
-                            landed
-                        }
+            // The keyboard lands on a control with a line of its name where a screen shows both;
+            // a page turn's screen, which the keyboard follows, stands as it turned.
+            let named = (reveal_as == Reveal::Keep && !self.list_keys_carried())
+                .then(|| key.or(keyboard_stop.and(focus)))
+                .flatten()
+                .and_then(|key| plan.land_named(index, key, top));
+            if let Some(named) = named {
+                top = named;
+            } else {
+                if plan.seated.is_none() || !plan.shows_span(index, top, span) {
+                    let pressed = if reveal_as == Reveal::Pressed {
+                        plan.press_seat_span(index, top, span)
+                    } else {
+                        None
                     };
+                    let nudge = pressed.map(|seat| seat.nudge);
+                    plan.seated = pressed;
+                    let reached = (nudge.is_none() && reveal_as == Reveal::Pressed)
+                        .then(|| plan.seat_span(index, top, span))
+                        .flatten();
+                    if let Some(seat) = reached {
+                        plan.seated = Some(seat);
+                    } else if nudge.is_none() {
+                        top = match reveal_as {
+                            Reveal::Keep => plan.reveal(index, top),
+                            Reveal::Pressed | Reveal::Land | Reveal::Hold => {
+                                plan.reveal_span(index, top, span)
+                            }
+                            Reveal::LandWhole => {
+                                let (landed, seat) = plan.land_selected(index, top);
+                                plan.seated = seat;
+                                landed
+                            }
+                        };
+                    }
                 }
-            }
-            if plan.seated.is_none() && reveal_as != Reveal::LandWhole {
-                plan.seated = plan.seat_span(index, top, span);
+                if plan.seated.is_none() && reveal_as != Reveal::LandWhole {
+                    plan.seated = plan.seat_span(index, top, span);
+                }
             }
             // A reveal of the keyboard's control that cannot show it whole shows the most of it
             // (R2, R5).
@@ -3799,7 +4114,12 @@ impl SettingsViewState {
                 Reveal::Pressed
             };
             let span = plan.span_of(index, Some(key), reveal);
-            if !plan.shows_span(index, top, span) {
+            let named = first_screen
+                .then(|| plan.land_named(index, key, top))
+                .flatten();
+            if let Some(named) = named {
+                top = named;
+            } else if !plan.shows_span(index, top, span) {
                 let (place, seat) = (top, plan.seated);
                 let at_place = Left::on(plan, key, place);
                 let pressed = (reveal == Reveal::Pressed)
@@ -4783,7 +5103,7 @@ impl SettingsViewState {
         let now = plan
             .live_band(&screen, index)
             .map(|(then, _, _)| then + span.0);
-        if now.is_some_and(|now| (now - at).abs() < 0.5) {
+        if now.is_some_and(|now| (now - at).abs() < 0.01) {
             return None;
         }
         plan.seat_holding(index, top, span, at)
@@ -4798,10 +5118,10 @@ impl SettingsViewState {
             let key = self.pressed_key().unwrap_or_else(|| at.key.clone());
             at.list_top
                 .zip(list_top)
-                .is_some_and(|(was, now)| (was - now).abs() > 0.5)
+                .is_some_and(|(was, now)| (was - now).abs() > 0.01)
                 || self
                     .drawn_span(&key)
-                    .is_none_or(|(_, bottom)| (bottom - at.bottom).abs() > 0.5)
+                    .is_none_or(|(_, bottom)| (bottom - at.bottom).abs() > 0.01)
         })
     }
 
@@ -5541,6 +5861,115 @@ pub(super) fn drawn_bands_in(node: &UiNode, height: f32) -> Vec<DrawnPart> {
     }
     let mut out = Vec::new();
     walk(node, 0.0, height, &mut out);
+    out
+}
+
+/// What a stop draws of its setting rows' names, and whose each control is
+/// ([`row_names_in`], [`ScrollPlan::name_above`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct RowNames {
+    /// Each line of a row's name the stop draws (its label's, or a caption of it,
+    /// [`named_row_parts`]): the row, and where the line's box stands from the stop's top.
+    lines: Vec<(UiKey, f32, f32)>,
+    /// Each control a setting row holds in the stop, and the row.
+    controls: Vec<(UiKey, UiKey)>,
+    /// Each of those controls that names itself, a button outside a segmented control, and where
+    /// its own words start down it: the list draws it cut by its edge without its row's name,
+    /// while the cut leaves its words whole ([`ScrollPlan::cut_unseen`]).
+    self_named: Vec<(UiKey, f32)>,
+}
+
+impl RowNames {
+    /// `other`, laid out `top` under this, after this.
+    fn extend_at(&mut self, other: Self, top: f32) {
+        self.lines.extend(
+            other
+                .lines
+                .into_iter()
+                .map(|(row, from, to)| (row, from + top, to + top)),
+        );
+        self.controls.extend(other.controls);
+        self.self_named.extend(other.self_named);
+    }
+}
+
+/// The setting row a node keyed `key` is, a part of it known by the row's own key, else none.
+fn setting_row_of(key: &str) -> Option<UiKey> {
+    let mut row = key.starts_with("settings/row/").then_some(key)?;
+    while let Some((whole, part)) = row.rsplit_once("/part-")
+        && !part.is_empty()
+        && part.chars().all(|c| c.is_ascii_digit())
+    {
+        row = whole;
+    }
+    Some(UiKey::new(row))
+}
+
+/// What `node`, laid out `height` tall, draws of its setting rows' names, and whose each control
+/// is ([`RowNames`]): a line of a row's name stands in its box, a screen showing it whole where it
+/// shows all of the box.
+pub(super) fn row_names_in(node: &UiNode, height: f32) -> RowNames {
+    fn walk(
+        node: &UiNode,
+        (top, height): (f32, f32),
+        (row, segmented): (Option<&UiKey>, bool),
+        out: &mut RowNames,
+    ) {
+        let own = setting_row_of(node.key.as_str());
+        let row = own.as_ref().or(row);
+        let key = node.key.as_str();
+        match &node.content {
+            UiContent::Text(spec) => {
+                if let Some(row) = row
+                    && height > 0.01
+                    && !spec.text.trim().is_empty()
+                    && (key.starts_with("settings/label/") || key.starts_with(ROW_CAPTION))
+                {
+                    out.lines.push((row.clone(), top, top + height));
+                }
+                return;
+            }
+            _ if is_control(node) && !node.paint_only => {
+                if let Some(row) = row {
+                    out.controls.push((node.key.clone(), row.clone()));
+                    if matches!(node.content, UiContent::Button(_)) && !segmented {
+                        let words = crate::native_ui::words_bands(&node.key, &node.content, height)
+                            .and_then(|bands| bands.iter().map(|(top, _)| top).reduce(f32::min));
+                        out.self_named
+                            .push((node.key.clone(), words.unwrap_or(height)));
+                    }
+                }
+            }
+            _ => {}
+        }
+        let segmented = segmented || node.segmented;
+        let layout = &node.layout;
+        let inner = (height - layout.padding.top - layout.padding.bottom).max(0.0);
+        if layout.flow == Flow::Column {
+            let mut y = top + layout.padding.top - layout.offset;
+            for (child, tall) in node.children.iter().zip(column_heights(node, height)) {
+                walk(child, (y, tall), (row, segmented), out);
+                y += tall + layout.gap;
+            }
+        } else {
+            for child in &node.children {
+                let tall = match child.layout.height {
+                    Length::Fill => inner,
+                    Length::Fixed(value) => value.min(inner),
+                    Length::Fraction(value) => (inner * value).min(inner),
+                }
+                .max(0.0);
+                walk(
+                    child,
+                    (top + layout.padding.top, tall),
+                    (row, segmented),
+                    out,
+                );
+            }
+        }
+    }
+    let mut out = RowNames::default();
+    walk(node, (0.0, height), (None, false), &mut out);
     out
 }
 
@@ -6298,6 +6727,17 @@ impl SplitCard {
         out
     }
 
+    /// What `rows` draw of their setting rows' names, from the top of the first ([`RowNames`]).
+    pub(super) fn row_names(&self, rows: Range<usize>) -> RowNames {
+        let mut top = 0.0;
+        let mut out = RowNames::default();
+        for (node, height) in &self.rows[rows] {
+            out.extend_at(row_names_in(node, *height), top);
+            top += height + self.gap;
+        }
+        out
+    }
+
     /// Where each control `rows` hold sits, from the top of the first, and the words naming the
     /// keyboard's there.
     pub(super) fn control_spans(&self, rows: Range<usize>) -> ControlSpans {
@@ -6371,6 +6811,7 @@ impl SplitCard {
 
     /// The card's rows grouped into list stops.
     pub(super) fn stops(&self, room: f32) -> Vec<Range<usize>> {
+        let list = room;
         let room = room - self.height_of_head();
         let height = |rows: Range<usize>| {
             self.rows[rows]
@@ -6378,6 +6819,16 @@ impl SplitCard {
                 .map(|(_, height)| height + self.gap)
                 .sum::<f32>()
         };
+        // A STOP OF A ROW'S WORDS JOINS THE ROWS AFTER IT ONLY AS FAR AS THEY FIT UNDER THE
+        // ROW'S NAME: a screen that starts with it draws the name over it ([`Self::stop_lead`]),
+        // its card's head dropped where all of it does not fit, and the name too where the stop
+        // does not fit under the name alone ([`ScrollPlan::starts_bare`]). Two parts of a note,
+        // each cut to fit under the name, joined to fit under the card's head, so the words
+        // stood alone at the top of their screen: Ai at 2x in 335x306, Fleet document's note
+        // ("One document for every machine"); Harness at 1.9x in 328x320, Approve permission
+        // boxes' ("All says yes").
+        let named =
+            |rows: Range<usize>| height(rows.clone()) + self.stop_lead(&rows) <= list + 0.01;
         let controls: Vec<bool> = self
             .rows
             .iter()
@@ -6420,7 +6871,8 @@ impl SplitCard {
                         && !under_control(stop.start)
                         && !notes(stop.start)
                         && controls[row..].iter().any(|control| *control)
-                        && height(stop.start..row + 1) <= room + 0.01 =>
+                        && height(stop.start..row + 1) <= room + 0.01
+                        && named(stop.start..row + 1) =>
                 {
                     stop.end = row + 1;
                 }
@@ -6851,13 +7303,6 @@ fn plan_items_measured(
         .sum();
     let mut plan = ScrollPlan::with_stops(gap, stops_at_most);
     let mut stops: ItemStops = Vec::with_capacity(stops_at_most);
-    let keys = |node: &UiNode| {
-        if measured {
-            focus_keys(node)
-        } else {
-            Vec::new()
-        }
-    };
     for (index, item) in items.iter().enumerate() {
         match item {
             ListItem::Card(_, height) if !measured => {
@@ -6885,62 +7330,8 @@ fn plan_items_measured(
                 stops.push((index, None));
             }
             ListItem::Split(card) => {
-                let group = plan.group(card.height_of_head(), card.height_of_lead());
-                plan.set_row_gap(group, card.gap);
-                if let Some((top, bottom)) = card.caption() {
-                    plan.set_caption(group, top, bottom);
-                }
-                for (part, rows) in card.stops(room).into_iter().enumerate() {
-                    // A head that is a control (Themes' open Community disclosure) is the
-                    // keyboard's on the card's first stop, reached and revealed as every stop is.
-                    plan.row(
-                        group,
-                        card.rows[rows.clone()]
-                            .iter()
-                            .map(|(_, height)| height + card.gap)
-                            .sum(),
-                        card.head
-                            .iter()
-                            .filter(|_| part == 0)
-                            .chain(&card.rows[rows.clone()])
-                            .flat_map(|(node, _)| keys(node))
-                            .collect(),
-                    );
-                    plan.set_stop_lead(card.stop_lead(&rows));
-                    if !measured {
-                        stops.push((index, Some(rows)));
-                        continue;
-                    }
-                    plan.set_ids(
-                        card.rows[rows.clone()]
-                            .iter()
-                            .map(|(node, _)| node.key.clone())
-                            .collect(),
-                    );
-                    let mut within = Vec::new();
-                    for (node, _) in card.head.iter().filter(|_| part == 0) {
-                        within.push(node.key.clone());
-                        keys_within(node, &mut within);
-                    }
-                    for (node, _) in &card.rows[rows.clone()] {
-                        keys_within(node, &mut within);
-                    }
-                    plan.set_within(within);
-                    plan.set_control_rows(card.control_rows(rows.clone()));
-                    plan.set_drawn_bands(card.drawn_bands(rows.clone()));
-                    let (spans, words) = card.control_spans(rows.clone());
-                    plan.set_control_spans(spans);
-                    plan.set_keyboard_words(words);
-                    plan.set_note(card.notes_only(rows.clone()));
-                    plan.set_ink(card.ink(rows.clone()));
-                    plan.set_ink_top(card.ink_top(rows.clone()));
-                    plan.set_first_controls(card.first_controls(rows.clone()));
-                    plan.note_previews(card.rows[rows.clone()].iter().map(|(node, _)| node));
-                    for (node, _) in &card.rows[rows.clone()] {
-                        plan.add_segments(node);
-                    }
-                    stops.push((index, Some(rows)));
-                }
+                let (_, parts) = plan.split_stops(card, room, measured);
+                stops.extend(parts.into_iter().map(|rows| (index, Some(rows))));
             }
         }
     }

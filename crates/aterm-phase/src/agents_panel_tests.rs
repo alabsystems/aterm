@@ -486,3 +486,15 @@ fn reads_agy_subagent_panel_rows_with_unwrapped_name_and_activity_clock() {
     assert_eq!(nested.activity_hash, text_hash("Reading file"));
     assert_eq!(nested.elapsed.map(|e| e.1), Some(clock(25_000, 1000)));
 }
+
+/// `text_hash` spells out its fold and its two constants, and matches FNV-1a from `aterm_hash`.
+#[test]
+fn a_text_hash_is_aterm_hashs_fold() {
+    for text in ["", "a", "foobar", "stall-probe", "é \u{1F600}"] {
+        assert_eq!(
+            text_hash(text),
+            aterm_hash::fnv1a_64(text.as_bytes()),
+            "{text:?}"
+        );
+    }
+}

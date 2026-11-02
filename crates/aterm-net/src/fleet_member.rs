@@ -3278,8 +3278,8 @@ struct BookLock {
 /// read-modify-write is milliseconds of work, and a person's verb waits [`LOCK_WAIT`] at most for
 /// it: a holder at a class a loaded Mac starves of a core (an aterm window's member heartbeat, at
 /// utility) kept it for seconds and the verb was refused, the inversion `aterm-gui`'s fork lift
-/// prevents for a fork. The node job (`aterm node serve`) runs in macOS's background band, which
-/// no class a thread asks for lifts: its heartbeat holds the lock at the band's priority still.
+/// prevents for a fork. No class a thread asks for lifts the band launchd holds the node job
+/// (`aterm node serve`) in: its heartbeat holds the lock at the band's priority still.
 #[cfg(target_os = "macos")]
 struct ClassLift(Option<(std::thread::ThreadId, aterm_uds::qos::Lifted)>);
 
@@ -3974,10 +3974,23 @@ pub fn heartbeat_members_with_denied(
                     .is_some_and(|(node, key)| admits(node, key))
         })
         .collect();
+    let began_ms = unix_ms_now().unwrap_or_default();
+    let book_members: Vec<(String, Option<IpAddr>)> = members
+        .iter()
+        .filter_map(|peer| Some((peer.node.clone()?, peer.addr)))
+        .collect();
+    // Away from the ALab LAN the round passes over the members behind it, save the first round
+    // on each network and one every half hour (`aterm_netplace::routes::Round`).
+    let mut pace = Pace::begin(state_dir);
+    let members: Vec<&Peer> = members
+        .into_iter()
+        .filter(|peer| pace.dials(peer))
+        .collect();
     let members = round_order(
         members,
         (&read_answered(state_dir), &read_missed(state_dir)),
     );
+    let mut dialled = 0_usize;
     let reg = reg.clone().signed_by(me, unix_ms_now().unwrap_or_default());
     let capped_within = within.min(MAX_WITHIN);
     let deadline = (deadline_after(capped_within), within);
@@ -3990,18 +4003,29 @@ pub fn heartbeat_members_with_denied(
     };
     let mut answered: Vec<(Answered, Option<Book>, Option<NodeKey>)> = Vec::new();
     let mut missed: Vec<String> = Vec::new();
+    // Dials that met something other than silence (`dial_blocked`): a round of only those is no
+    // evidence, for this Mac's network place, that the members are elsewhere.
+    let mut blocked = 0_usize;
     for member in members {
         if answered.len() >= HEARTBEAT_MEMBERS || Instant::now() >= members_until {
             break;
         }
         let target = target_of(member);
-        if let Ok((reached, node)) =
-            reach_node(&target, &keys, (secret, me), FleetOp::Join, dial_by())
-            && let Some(beat) = beat(reached, &node, (secret, me), &reg, deadline)
-        {
-            answered.push(beat);
-        } else if let Some(node) = &member.node {
-            missed.push(node.clone());
+        dialled += 1;
+        match reach_node(&target, &keys, (secret, me), FleetOp::Join, dial_by()) {
+            Ok((reached, node)) => match beat(reached, &node, (secret, me), &reg, deadline) {
+                Some(beat) => answered.push(beat),
+                None => {
+                    blocked += 1;
+                    missed.extend(member.node.clone());
+                }
+            },
+            Err(why) => {
+                if dial_blocked(&why, |addr| pace.on_this_network(addr)) {
+                    blocked += 1;
+                }
+                missed.extend(member.node.clone());
+            }
         }
     }
     // The member this Mac joined through, while it served no entry it signed (an aterm before
@@ -4019,7 +4043,9 @@ pub fn heartbeat_members_with_denied(
                 .zip(peer.key.as_ref())
                 .is_some_and(|(node, key)| admits(node, key))
     }) && Instant::now() < members_until
+        && pace.dials(issuer)
     {
+        dialled += 1;
         match reach_node(
             &target_of(issuer),
             &keys,
@@ -4029,9 +4055,17 @@ pub fn heartbeat_members_with_denied(
         ) {
             Ok((reached, node)) => match beat(reached, &node, (secret, me), &reg, deadline) {
                 Some(beat) => answered.push(beat),
-                None => missed.extend(issuer.node.clone()),
+                None => {
+                    blocked += 1;
+                    missed.extend(issuer.node.clone());
+                }
             },
-            Err(_) => missed.extend(issuer.node.clone()),
+            Err(why) => {
+                if dial_blocked(&why, |addr| pace.on_this_network(addr)) {
+                    blocked += 1;
+                }
+                missed.extend(issuer.node.clone());
+            }
         }
     }
     // The adverts are resolved only for a round the book's members did not fill.
@@ -4048,15 +4082,22 @@ pub fn heartbeat_members_with_denied(
             continue;
         }
         let ip = hint.ip().to_canonical();
-        let Ok(reached) = dial(
+        dialled += 1;
+        let reached = match dial(
             &ip.to_string(),
             Some(ip),
             hint.port(),
             (secret, Some(me)),
             FleetOp::Join,
             dial_by().1,
-        ) else {
-            continue;
+        ) {
+            Ok(reached) => reached,
+            Err(why) => {
+                if dial_blocked(&why, |addr| pace.on_this_network(addr)) {
+                    blocked += 1;
+                }
+                continue;
+            }
         };
         let Some(proof) = reached.peer.clone() else {
             continue;
@@ -4073,6 +4114,8 @@ pub fn heartbeat_members_with_denied(
     }
     // A member a hint reached answered, whatever its dial from the book came to.
     missed.retain(|node| !answered.iter().any(|(done, _, _)| done.node == *node));
+    let network = pace.network();
+    pace.end(state_dir);
     let is_barred = |peer: &Peer| {
         peer.node
             .as_deref()
@@ -4186,7 +4229,163 @@ pub fn heartbeat_members_with_denied(
             }
         },
     );
-    Ok(answered.into_iter().map(|(done, _, _)| done).collect())
+    let answered: Vec<Answered> = answered.into_iter().map(|(done, _, _)| done).collect();
+    #[cfg(unix)]
+    note_place(
+        state_dir,
+        &answered,
+        (&book_members, dialled, blocked),
+        (began_ms, now, network.as_ref()),
+    );
+    #[cfg(not(unix))]
+    let _ = (&book_members, began_ms, dialled, blocked, &network);
+    Ok(answered)
+}
+
+/// WHETHER A DIAL THAT GOT NO ANSWER MET SOMETHING OTHER THAN SILENCE, for the network place's
+/// silent-round rule (`aterm_netplace::Round::blocked`): a host at the address answered (a
+/// refused connect, a connect that went on to a handshake, a proof or an exchange that failed or
+/// ran out of time), or this Mac's own way onto this network refused the connect (no route, no
+/// network or not permitted, to an address `on_this_network` says lies on the network this Mac
+/// is on: macOS's Local Network privacy, a sandbox, a firewall). Silence is the rest: a connect
+/// that timed out, a host down (no ARP answer), no route to an address off this network (the
+/// home LAN's addresses from a phone hotspot), and no address or lookup at all.
+#[must_use]
+pub fn dial_blocked(why: &Unreached, on_this_network: impl Fn(IpAddr) -> bool) -> bool {
+    match why {
+        Unreached::Connect(at, e) => match e.kind() {
+            io::ErrorKind::ConnectionRefused => true,
+            io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::PermissionDenied => on_this_network(at.ip()),
+            _ => false,
+        },
+        Unreached::Deadline(stage, _) => *stage != Stage::Connect,
+        Unreached::Handshake(..)
+        | Unreached::Reply(..)
+        | Unreached::OtherNode { .. }
+        | Unreached::Impostor { .. }
+        | Unreached::Misnamed { .. }
+        | Unreached::Unproved { .. }
+        | Unreached::Unbound { .. } => true,
+        Unreached::Resolve(_)
+        | Unreached::Lookup(..)
+        | Unreached::NotFleet(_)
+        | Unreached::Local(_) => false,
+    }
+}
+
+/// A heartbeat round's pacing: on unix, away from the ALab LAN, it passes over the members behind
+/// it, save the first round on each network and one every half hour
+/// ([`aterm_netplace::routes::Round`]); elsewhere it dials every member.
+struct Pace {
+    #[cfg(unix)]
+    round: aterm_netplace::routes::Round,
+}
+
+impl Pace {
+    fn begin(state_dir: &Path) -> Self {
+        #[cfg(not(unix))]
+        let _ = state_dir;
+        Self {
+            #[cfg(unix)]
+            round: aterm_netplace::routes::Round::begin(state_dir, "fleet"),
+        }
+    }
+
+    /// Whether this round dials `peer`.
+    fn dials(&mut self, peer: &Peer) -> bool {
+        #[cfg(unix)]
+        return self.round.dials(peer.node.as_deref(), peer.addr);
+        #[cfg(not(unix))]
+        {
+            let _ = peer;
+            true
+        }
+    }
+
+    /// The network (strong id) this round began on, which the book's answers are booked on;
+    /// `None` off unix, where no place is read.
+    fn network(&self) -> Option<String> {
+        #[cfg(unix)]
+        return self
+            .round
+            .routes()
+            .network()
+            .filter(|network| network.is_strong())
+            .map(|network| network.as_str().to_owned());
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Whether `addr` lies on the network this round began on (never off unix, where no place
+    /// is read).
+    fn on_this_network(&self, addr: IpAddr) -> bool {
+        #[cfg(unix)]
+        return self.round.on_this_network(addr);
+        #[cfg(not(unix))]
+        {
+            let _ = addr;
+            false
+        }
+    }
+
+    /// Ends the round (the log says once per network what it passed over).
+    fn end(self, state_dir: &Path) {
+        #[cfg(unix)]
+        self.round.end(state_dir);
+        #[cfg(not(unix))]
+        let _ = state_dir;
+    }
+}
+
+/// Tells this Mac's network place (`aterm_netplace`, under `state_dir`) what a heartbeat round
+/// heard: each member that answered (every one proved its key, [`reach_node`]) and where, the
+/// round itself (how many of the members it dialled answered), and the book's admitted members
+/// with where each was and when it last answered, which the place reads a home network from
+/// before it has learned one. A round that dialled no member (`dialled`: none, or every one
+/// passed over away from the ALab LAN) notes no round: its silence is no member's. `blocked`
+/// counts its dials that met something other than silence ([`dial_blocked`]).
+#[cfg(unix)]
+fn note_place(
+    state_dir: &Path,
+    answered: &[Answered],
+    (book_members, dialled, blocked): (&[(String, Option<IpAddr>)], usize, usize),
+    (began_ms, now, network): (u64, u64, Option<&String>),
+) {
+    let dir = aterm_netplace::record::dir(state_dir);
+    for done in answered {
+        aterm_netplace::heard::note_answer(
+            &dir,
+            aterm_netplace::Lane::Fleet,
+            &done.node,
+            Some(done.at.ip()),
+            (began_ms, now),
+        );
+    }
+    if !book_members.is_empty() {
+        if dialled > 0 {
+            aterm_netplace::heard::note_round(
+                &dir,
+                aterm_netplace::Lane::Fleet,
+                (answered.len(), blocked),
+                (began_ms, now),
+            );
+        }
+        let stamps = read_answered(state_dir);
+        let network = network.and_then(|id| aterm_netplace::NetworkId::parse(id));
+        let _ = aterm_netplace::heard::write_book(
+            &dir,
+            book_members.iter().map(|(node, addr)| {
+                (
+                    node.clone(),
+                    *addr,
+                    stamps.get(&node_answer_key(node)).copied(),
+                )
+            }),
+            network.as_ref(),
+        );
+    }
 }
 
 /// The order a heartbeat round asks `members` in, given when each last answered this Mac and
@@ -5196,6 +5395,20 @@ impl Unreached {
         )
     }
 
+    /// Whether the listener took the connection and only could not serve this dial just then: it
+    /// hung up mid-handshake ([`Self::hung_up`]), let the handshake's time pass, or was at a cap
+    /// ([`FleetError::AddressBusy`]) or between reads of its deny list
+    /// ([`FleetError::DenyListUnread`]). The same dial a moment later may be served ([`passes`]).
+    #[must_use]
+    pub fn served_later(&self) -> bool {
+        self.hung_up()
+            || matches!(
+                self,
+                Self::Handshake(_, FleetError::AddressBusy | FleetError::DenyListUnread)
+                    | Self::Deadline(Stage::Handshake, _)
+            )
+    }
+
     /// Whether the failure matches an overloaded listener at its connection or per-address slot
     /// cap: `NO capacity` ([`FleetError::AddressBusy`]), an immediate mid-handshake drop when all
     /// listener slots are occupied ([`Self::hung_up`]), a TCP reset/timeout while connecting, a
@@ -5339,8 +5552,7 @@ impl fmt::Display for Unreached {
             },
             Self::Handshake(addr, _) if self.hung_up() => write!(
                 f,
-                "{addr} hung up mid-handshake: its fleet listener restarting, or no aterm; try \
-                 again"
+                "{addr} hung up mid-handshake: listener busy, restarting, or not aterm; try again"
             ),
             Self::Handshake(addr, e) => match e {
                 FleetError::ListenerWrongSecret => write!(
@@ -5356,6 +5568,11 @@ impl fmt::Display for Unreached {
                 FleetError::DeniedNode => write!(
                     f,
                     "{addr} refused this machine's node: it is on the swarm roster's deny-list"
+                ),
+                FleetError::DenyListUnread => write!(
+                    f,
+                    "{addr} has not read its deny list yet, so it admits no one: try again once \
+                     it has"
                 ),
                 FleetError::Alpn => write!(f, "{addr} is a pre-fleet aterm listener (update it)"),
                 FleetError::AddressBusy => write!(
@@ -5567,6 +5784,66 @@ fn dial_avoiding(
     )
 }
 
+/// The pause before each further pass of a drive's dial ([`passes`]).
+const AGAIN_AFTER: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_millis(750),
+    Duration::from_secs(2),
+];
+
+/// How far into a drive's deadline its dial may go on trying: the longest turn a drive takes
+/// (`aterm_types::control_verbs::DRIVE_TURN_MAX_MS`) after this still fits a 28 s drive, which
+/// `aterm-agent` holds it to where it compiles against both, and a leg's wait stays its own. No
+/// further pass runs past it, so a late handshake refuses with nothing sent rather than leave a typed
+/// turn too little time to answer.
+pub const DRIVE_DIAL_WITHIN: Duration = Duration::from_secs(6);
+
+/// When a further pass of a drive by `deadline` must end ([`DRIVE_DIAL_WITHIN`]).
+fn further_passes_end((by, within): (Instant, Duration)) -> Instant {
+    by.checked_sub(within)
+        .map_or(by, |started| (started + DRIVE_DIAL_WITHIN).min(by))
+}
+
+/// A person's drive `pass`ed over its addresses by `deadline`, and again after each of
+/// [`AGAIN_AFTER`] while the listener only could not serve it just then
+/// ([`Unreached::served_later`]) and `dial_by`, the end of each further pass, leaves more than that
+/// pause: a listener at its slots drops a dial at once, and a loaded one lets
+/// [`crate::fleet::HANDSHAKE_WITHIN`] pass, while the same dial a moment later is served. No request
+/// goes before a dial is reached, so a new connection replays nothing. Every other dial takes one
+/// pass, as a round repeats it and a join's next place waits on it. A later pass's own answer stands
+/// where it says more of the listener than the first's; when none serves the reason is the first's.
+fn passes<R>(
+    (deadline, dial_by): (Instant, Instant),
+    mut pass: impl FnMut(Instant) -> Result<R, Unreached>,
+) -> Result<R, Unreached> {
+    let first = match pass(deadline) {
+        Ok(reached) => return Ok(reached),
+        Err(why) => why,
+    };
+    if !first.served_later() {
+        return Err(first);
+    }
+    for pause in AGAIN_AFTER {
+        if dial_by.saturating_duration_since(Instant::now()) <= pause {
+            return Err(first);
+        }
+        std::thread::sleep(pause);
+        match pass(dial_by) {
+            Ok(reached) => return Ok(reached),
+            Err(why) if why.served_later() => {}
+            Err(
+                Unreached::Resolve(_)
+                | Unreached::Lookup(..)
+                | Unreached::Connect(..)
+                | Unreached::Local(_)
+                | Unreached::Deadline(Stage::Connect, _),
+            ) => return Err(first),
+            Err(why) => return Err(why),
+        }
+    }
+    Err(first)
+}
+
 /// What one address of a dial came to ([`walk`]).
 enum AtAddr<R> {
     /// It answered: what the dial asks of an address.
@@ -5637,10 +5914,12 @@ fn walk<R>(
         match attempt(to) {
             AtAddr::Reached(reached) => Some(Ok(reached)),
             AtAddr::Passed(why) => {
-                if first
-                    .as_ref()
-                    .is_none_or(|had| had.before_proof() && !why.before_proof())
-                {
+                // What a listener did says more than an address that did not connect, and whether
+                // a drive dials again turns on it ([`passes`]).
+                if first.as_ref().is_none_or(|had| {
+                    (had.before_proof() && !why.before_proof())
+                        || (matches!(had, Unreached::Connect(..)) && why.served_later())
+                }) {
                     *first = Some(why);
                 }
                 None
@@ -5848,6 +6127,19 @@ pub fn resolve_ipv4_hints_within(places: &[(String, u16)], within: Duration) -> 
     resolve_ipv4_hints_with(places, within, resolve)
 }
 
+/// The addresses a [`dial`] of `host` walks after its recorded one, in its order (IPv4 first, at
+/// most four; for a name with no dot, those of `host` or of `<host>.local`, whichever lookup
+/// answers first), looked up within `within` through the bounded fleet resolver pool and the
+/// loopback guard: an IP literal is itself, and a lookup that found nothing, was refused or ran
+/// past `within` is empty.
+#[must_use]
+pub fn addresses_within(host: &str, within: Duration) -> Vec<IpAddr> {
+    match resolve_within(host, 0, within, resolve) {
+        Lookup::Found(found) => found.iter().map(SocketAddr::ip).collect(),
+        Lookup::Late | Lookup::Unstarted(_) | Lookup::Refused(_) => Vec::new(),
+    }
+}
+
 fn resolve_ipv4_hints_with(
     places: &[(String, u16)],
     within: Duration,
@@ -5974,6 +6266,47 @@ pub struct Checked {
     pub node: Option<String>,
     /// Whether that node is proved ([`Surveyed::proven`]).
     pub proven: bool,
+    /// The instance that answered, as its reply's `instance` line says it ([`Answerer::of`]).
+    pub answerer: Answerer,
+}
+
+/// The instance that answered a survey, as the reply's first `instance` line says it. A Mac's
+/// node job (`aterm node serve`) signs that Mac's book entry with its own version and relays a
+/// survey to a live window, whose own version the line then says, so after an update the two can
+/// differ (`aterm fleet peers`' NODE VERSION and WINDOW VERSION).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answerer {
+    /// A window answered, running this aterm version: its line says `window=1`, or no `window=`
+    /// word at all (an older aterm's, whose window held the fleet port itself).
+    Window(String),
+    /// The node job answered with no window open (`window=0`).
+    Windowless,
+    /// The reply has no `instance` line, or its line has no version word ([`version_word`]) or a
+    /// `window=` word other than `0` or `1`.
+    Unsaid,
+}
+
+impl Answerer {
+    /// What `lines` (a survey reply after its `OK <n>` head) say of the instance that answered:
+    /// its first `instance` line's `window=` and `version=` words.
+    #[must_use]
+    pub fn of(lines: &[String]) -> Self {
+        let Some(line) = lines.iter().find_map(|line| line.strip_prefix("instance ")) else {
+            return Self::Unsaid;
+        };
+        let said = fields(line);
+        let word = |key: &str| said.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+        let window = || {
+            word("version")
+                .and_then(|v| version_word(&aterm_codec::pct::decode(v)))
+                .map_or(Self::Unsaid, Self::Window)
+        };
+        match word("window") {
+            Some("0") => Self::Windowless,
+            Some("1") | None => window(),
+            Some(_) => Self::Unsaid,
+        }
+    }
 }
 
 /// One peer's survey, as it answered it ([`survey_all`]).
@@ -5997,7 +6330,8 @@ pub struct Surveyed {
 }
 
 impl Surveyed {
-    /// What a check reads of it: the level, the address, the node and whether it is proved.
+    /// What a check reads of it: the level, the address, the node, whether it is proved, and
+    /// what its `instance` line says of the instance that answered.
     #[must_use]
     pub fn checked(&self) -> Checked {
         Checked {
@@ -6005,6 +6339,7 @@ impl Surveyed {
             addr: self.addr,
             node: self.node.clone(),
             proven: self.proven,
+            answerer: Answerer::of(&self.lines),
         }
     }
 }
@@ -6727,14 +7062,18 @@ impl Drop for Driven {
 /// and this machine's node `me` (a drive with no node is never admitted), by one `deadline` (set
 /// from the `within` its reasons name) for the dial and every exchange after it. A stalled
 /// handshake or an answer from a different node gives way to the host name's other addresses;
-/// each address must still prove the target's bound node key.
+/// each address must still prove the target's bound node key. A listener that only could not serve
+/// the dial just then is dialled again ([`passes`]).
 pub fn drive(
     target: &Target,
     keys: &Keyring,
     (secret, me): (&FleetSecret, &NodeIdentity),
     deadline: (Instant, Duration),
 ) -> Result<Driven, Unreached> {
-    let (reached, node) = reach_node(target, keys, (secret, me), FleetOp::Drive, deadline)?;
+    let (by, within) = deadline;
+    let (reached, node) = passes((by, further_passes_end(deadline)), |by| {
+        reach_node(target, keys, (secret, me), FleetOp::Drive, (by, within))
+    })?;
     driven(reached, node, deadline)
 }
 

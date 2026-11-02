@@ -87,6 +87,8 @@ pub(crate) const HANDOFF_ENV_KEYS: &[HandoffName] = &[
     #[cfg(unix)]
     crate::descriptor_limit::ENV_LAUNCHER_NOFILE,
     #[cfg(unix)]
+    crate::descriptor_limit::ENV_NODE_LAUNCHER_NOFILE,
+    #[cfg(unix)]
     crate::descriptor_limit::ENV_PARK_RAISED_FROM,
 ];
 

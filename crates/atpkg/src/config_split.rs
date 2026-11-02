@@ -159,7 +159,17 @@ impl Split {
     fn shown(path: &Path, home: &Path) -> String {
         path.strip_prefix(home).map_or_else(
             |_| path.display().to_string(),
-            |rest| format!("~/{}", rest.display()),
+            |rest| {
+                let rel: Vec<_> = rest
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect();
+                if rel.is_empty() {
+                    "~".to_owned()
+                } else {
+                    format!("~/{}", rel.join("/"))
+                }
+            },
         )
     }
 

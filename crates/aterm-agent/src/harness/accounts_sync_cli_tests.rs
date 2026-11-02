@@ -2824,6 +2824,7 @@ region = \"global\"
 
 /// The upkeep's renewal of Kimi's pool over `bed` at `now` ([`renew_pool_due`]) under `guard`,
 /// its renewals started by a seam that runs nothing; whether one started.
+#[cfg(unix)]
 fn kimi_pool_upkeep(bed: &Bed, guard: &Arc<Mutex<AutoRenewGuard>>, now: i64) -> bool {
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
@@ -2857,11 +2858,13 @@ fn kimi_pool_upkeep(bed: &Bed, guard: &Arc<Mutex<AutoRenewGuard>>, now: i64) -> 
 /// A renewal host standing in for [`super::super::cli::LiveAccounts`] under
 /// `spawn_vendor_renewal_with`'s worker: its vendor sign-in runs no child and ends `outcome` on
 /// www.kimi.ai at `now`, leaving Kimi's login file in the staging home where it signed in.
+#[cfg(unix)]
 struct EndsOn {
     outcome: super::super::login_drive::Outcome,
     now: i64,
 }
 
+#[cfg(unix)]
 impl super::super::cli::AccountsHost for EndsOn {
     fn stdin_is_terminal(&self) -> bool {
         false
@@ -2900,6 +2903,7 @@ impl super::super::cli::AccountsHost for EndsOn {
 /// `spawn_vendor_renewal_with`'s worker runs it (the row and records [`renew_pool_due`] reads,
 /// the roster's own directory), its sign-in ending `outcome` at `now`: what it ended, its line
 /// on record written as a real renewal writes it.
+#[cfg(unix)]
 fn kimi_renewal_ending(
     bed: &Bed,
     label: &str,
@@ -2933,6 +2937,7 @@ fn kimi_renewal_ending(
 }
 
 /// The bot check [`kimi_renewal_ending`] meets.
+#[cfg(unix)]
 fn kimi_bot_check() -> super::super::login_drive::Outcome {
     super::super::login_drive::Outcome::BotCheck(
         "Cloudflare's bot check on `www.kimi.ai/code/authorize_device` did not clear in 90 s"
@@ -2952,6 +2957,7 @@ fn kimi_bot_check() -> super::super::login_drive::Outcome {
 /// CONTROL: a plain failure is tried again once its cooldown has passed; the bot-checked row
 /// once after a new signed-in `accounts browser` window, at once on a person's own selection
 /// ([`renew_requested_pin_for`]), and after a restart once [`PERSON_BACKOFF_SECS`] has passed.
+#[cfg(unix)]
 #[test]
 fn a_pool_rows_bot_check_is_left_alone_past_the_cooldown() {
     use super::super::cli::Renewal;
@@ -3105,6 +3111,7 @@ region = \"global\"
 /// new login (its login signed out again after) is the newest end on record, so a restarted
 /// upkeep tries the row again before [`PERSON_BACKOFF_SECS`] has passed. CONTROL: with only the
 /// bot check on record, a restart is held.
+#[cfg(unix)]
 #[test]
 fn a_later_renewal_or_wrong_account_lifts_the_bot_check_hold_after_a_restart() {
     use super::super::cli::Renewal;

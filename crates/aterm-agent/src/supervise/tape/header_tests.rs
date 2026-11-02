@@ -611,6 +611,7 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
                 "beside_idle_min=",
                 "occupancy.nudge_after=",
                 "occupancy.k_looks=",
+                "occupancy.nudge_wake=",
                 "wait_step=",
                 "box_call_step=",
                 "turn_end.refused_backoff=",
@@ -643,8 +644,12 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
     );
     assert_eq!(
         back.setup,
-        watched_with(|s| s.set_occupancy_k_looks(crate::supervise::occupancy::due::K_NEVER)),
-        "each knob at its shipped value, and no K clock: the build that wrote it had none"
+        watched_with(|s| {
+            s.set_occupancy_k_looks(crate::supervise::occupancy::due::K_NEVER);
+            s.set_occupancy_nudge_wake(false);
+        }),
+        "each knob at its shipped value, no K clock and slice 1's nudge: the build that wrote it \
+         had neither"
     );
     assert_eq!(
         back.opts.policy,

@@ -2144,6 +2144,9 @@ fn net_summary_words(s: &Snapshot, net: &crate::model::NetView) -> String {
 }
 
 fn net_text(q: &SysQuery, s: &Snapshot, lines: &mut Vec<Line>) {
+    if let Some(place) = s.place.as_ref() {
+        lines.push(line("place", format!("place   {}", place.line)));
+    }
     let Some(net) = s.net.as_ref() else {
         lines.push(line(
             "net",
@@ -2748,6 +2751,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             o.set("cores", cores_json(s));
             o.set("mem", mem_json(q, ctx, s));
             o.set("gpu", gpu_json(q, ctx, s));
+            o.set("place", place_json(s));
             o.set("net", net_json(q, s));
             let tab = tabs_fig(s, &scope_keys(ctx, ScopeArg::Tab), ctx.target.key);
             o.set("split_mc", split_json(s, &tab));
@@ -2878,7 +2882,10 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             }
         }
         View::Disk => o.set("disk", disk_json(q, ctx, s)),
-        View::Net => o.set("net", net_json(q, s)),
+        View::Net => {
+            o.set("place", place_json(s));
+            o.set("net", net_json(q, s));
+        }
         View::Procs => {
             let sc = scope.unwrap_or(ScopeArg::Tab);
             o.set("procs", procs_json(q, ctx, s, sc));
@@ -3719,6 +3726,38 @@ fn tcp_counts_json(t: crate::model::TcpCounts) -> Jv {
         ("connecting", Jv::u(u64::from(t.connecting()))),
         ("closing_total", Jv::u(u64::from(t.closing_total()))),
     ])
+}
+
+/// A [`crate::model::PlaceValue`] as JSON.
+fn place_value_json(value: &crate::model::PlaceValue) -> Jv {
+    use crate::model::PlaceValue;
+    match value {
+        PlaceValue::Text(text) => Jv::s(text.clone()),
+        PlaceValue::Count(n) => Jv::u(*n),
+        PlaceValue::Flag(flag) => Jv::Bool(*flag),
+        PlaceValue::Absent(why) => Jv::why(why),
+        PlaceValue::Object(fields) => Jv::obj(
+            fields
+                .iter()
+                .map(|(key, value)| (*key, place_value_json(value))),
+        ),
+    }
+}
+
+/// The `place` object of `sys --json`'s net view: the host's [`crate::model::PlaceView`] as it
+/// came, or `{"why":"not_sampled"}` with none.
+fn place_json(s: &Snapshot) -> Jv {
+    s.place.as_ref().map_or_else(
+        || Jv::why("not_sampled"),
+        |place| {
+            Jv::obj(
+                place
+                    .fields
+                    .iter()
+                    .map(|(key, value)| (*key, place_value_json(value))),
+            )
+        },
+    )
 }
 
 fn net_json(q: &SysQuery, s: &Snapshot) -> Jv {

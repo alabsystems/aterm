@@ -655,6 +655,7 @@ impl DesktopKind {
                 (FINDER, "CreateDesktop", Wanted::Bool(true)),
             ],
             Self::Dock => &[
+                (DOCK, "autohide", Wanted::Bool(true)),
                 (DOCK, "persistent-apps", Wanted::DockApps),
                 (DOCK, "persistent-others", Wanted::Empty),
                 (DOCK, "static-apps", Wanted::Empty),
@@ -1096,7 +1097,8 @@ impl Item for Desktop {
                 "Desktop icons visible; clicking wallpaper keeps windows in place".into()
             }
             DesktopKind::Dock => {
-                "Dock pins: aterm, System Settings, Safari; no stacks or recent apps".into()
+                "Dock auto-hides; pins: aterm, System Settings, Safari; no stacks or recent apps"
+                    .into()
             }
         }
     }
@@ -1908,6 +1910,7 @@ pub(crate) mod tests {
         assert_eq!(
             keys,
             [
+                "autohide",
                 "persistent-apps",
                 "persistent-others",
                 "static-apps",
@@ -2914,11 +2917,15 @@ pub(crate) mod tests {
     }
 
     /// One whole desktop pass (widgets, desktop and Dock, at the console) waits in this process
-    /// and reads each preference domain once per reading: no `sleep` child, one Dock relaunch
-    /// without a `launchctl print`, no command for the account or the Mac, no full flush; a
-    /// pass with nothing to change relaunches nothing. Before (05b421fb69) the same pass ran 2
-    /// `sleep` children, 85 exports, 35 full flushes, 3 `launchctl print`s and 5 context
-    /// commands among 187 runs, and the no-op pass 45 exports among 59.
+    /// and reads each preference domain once per reading: one write per changed key, no `sleep`
+    /// child, one Dock relaunch without a `launchctl print`, no command for the account or the Mac,
+    /// no full flush; a pass with nothing to change writes and relaunches nothing. Before
+    /// (05b421fb69) the same pass ran 2 `sleep` children, 85 exports, 35 full flushes,
+    /// 3 `launchctl print`s and 5 context
+    /// commands, and the no-op pass 45 exports.
+    ///
+    /// Negative control: repeat a write in `Desktop::apply`; the extra write has no matching
+    /// snapshot entry and the comparison fails, even though the final preference value is right.
     #[test]
     fn a_whole_desktop_pass_waits_in_process_and_reads_each_domain_once_per_reading() {
         let who = user("alice", 501);
@@ -2926,20 +2933,21 @@ pub(crate) mod tests {
         for setting in [Setting::Widgets, Setting::Desktop, Setting::Dock] {
             selected.set(setting, true);
         }
-        let (mut sys, _desk) = desktop_of(&who, Desk::before());
+        let (mut sys, desk) = desktop_of(&who, Desk::before());
         sys.full_disk_access = Some(true);
         at_console(&sys, &who);
         let count =
             |calls: &[String], what: &str| calls.iter().filter(|c| c.contains(what)).count();
-        for (changes, exports, runs) in [(true, 34, 120), (false, 18, 28)] {
+        for (changes, exports) in [(true, 34), (false, 18)] {
             let before = sys.calls().len();
+            let before_events = desk.lock().unwrap().events.len();
             let mut prepared = crate::init::prepare_workstation_selected(
                 &sys,
                 crate::init::WorkstationGroup::All,
                 selected,
             )
             .unwrap();
-            prepared.preference_changes(&sys).unwrap();
+            let preferences = prepared.preference_changes(&sys).unwrap();
             let run = prepared.run_recording(&sys, Mode::Apply).unwrap();
             let expected = if changes {
                 Outcome::Changed
@@ -2970,7 +2978,20 @@ pub(crate) mod tests {
             let read =
                 count(calls, "defaults export") + count(calls, "defaults -currentHost export");
             assert!(read <= exports, "{read} exports: {calls:?}");
-            assert!(calls.len() <= runs, "{} runs: {calls:?}", calls.len());
+            // The work grows with the selected preferences. Compare the actual writes to the
+            // snapshot instead of counting a fixed number of commands from an older selection.
+            let mut expected_writes: Vec<_> = preferences
+                .iter()
+                .map(|(target, _)| format!("write {} {}", target.domain, target.key))
+                .collect();
+            let mut writes: Vec<_> = desk.lock().unwrap().events[before_events..]
+                .iter()
+                .filter(|event| event.starts_with("write "))
+                .cloned()
+                .collect();
+            expected_writes.sort_unstable();
+            writes.sort_unstable();
+            assert_eq!(writes, expected_writes, "one write per changed key");
         }
     }
 

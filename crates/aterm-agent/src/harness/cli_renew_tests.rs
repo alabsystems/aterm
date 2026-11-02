@@ -130,11 +130,12 @@ fn renew_env(tag: &str) -> (Tmp, Env) {
     let work = tmp.path().join("logins-own").join("work-2");
     std::fs::create_dir_all(&work).expect("mkdir");
     std::fs::write(work.join("a-login-file"), "{}").expect("write");
-    std::fs::write(
-        env.accounts_roster().expect("a config dir"),
-        roster_text(work.to_str().expect("utf-8")),
-    )
-    .expect("write");
+    let roster = roster_text(work.to_str().expect("utf-8"));
+    // Portable renewal semantics use the system browser where no opener is supported.
+    // Explicit named-profile admission is covered separately and must never fall back.
+    #[cfg(not(unix))]
+    let roster = roster.replace("browser = \"Claude main\"\n", "");
+    std::fs::write(env.accounts_roster().expect("a config dir"), roster).expect("write");
     (tmp, env)
 }
 
@@ -182,7 +183,7 @@ impl RenewHost {
         RenewHost {
             tty: true,
             ssh_session: false,
-            exe: Some(PathBuf::from("/opt/aterm/bin/aterm")),
+            exe: Some(std::env::current_exe().expect("the test executable")),
             flow: 0,
             flow_after_first: None,
             signs_in_as: None,
@@ -338,6 +339,185 @@ fn no_address(env: &Env, said: &[&str]) {
 
 fn logins_of(env: &Env) -> accounts::Logins {
     env.accounts_store().load_logins(env.now).expect("reads").0
+}
+
+#[cfg(unix)]
+#[test]
+fn renewal_opener_failures_refuse_before_provider_or_binding_changes() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    for fault in [
+        "unavailable",
+        "missing",
+        "directory",
+        "nonexec",
+        "otherexec",
+        "bin",
+        "alias",
+    ] {
+        // Root's access check intentionally permits any executable bit. The owner-only
+        // permission regression applies to an ordinary user, as the shipped app runs.
+        // SAFETY: getuid has no arguments or pointer preconditions.
+        if fault == "otherexec" && unsafe { libc::getuid() } == 0 {
+            continue;
+        }
+        let (tmp, env) = renew_env(&format!("renew-opener-{fault}"));
+        let store = env.accounts_store();
+        let bin = store.dir.join("bin");
+        let link = bin.join(crate::harness::open_url::OPENER);
+        let mut host = RenewHost::new();
+        host.tty = false;
+        host.env_mailbox = Some(tmp.path().to_owned());
+        let source = tmp.path().join("private-opener-source");
+        let (stage, kind) = match fault {
+            "unavailable" => {
+                host.exe = None;
+                (OpenerStage::Executable, None)
+            }
+            "missing" => {
+                host.exe = Some(source.clone());
+                (OpenerStage::Executable, Some(io::ErrorKind::NotFound))
+            }
+            "directory" => {
+                std::fs::create_dir(&source).unwrap();
+                host.exe = Some(source.clone());
+                (OpenerStage::Executable, Some(io::ErrorKind::InvalidInput))
+            }
+            "nonexec" | "otherexec" => {
+                std::fs::write(&source, b"not executed").unwrap();
+                let mode = if fault == "otherexec" { 0o601 } else { 0o600 };
+                std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode)).unwrap();
+                host.exe = Some(source.clone());
+                (
+                    OpenerStage::Executable,
+                    Some(io::ErrorKind::PermissionDenied),
+                )
+            }
+            "bin" => (OpenerStage::HelperDirectory, None),
+            "alias" => (OpenerStage::Publication, None),
+            _ => unreachable!(),
+        };
+        std::fs::create_dir_all(&store.dir).unwrap();
+        if fault == "bin" {
+            std::fs::write(&bin, b"retained obstruction").unwrap();
+        } else {
+            std::fs::create_dir(&bin).unwrap();
+            if fault == "alias" {
+                std::fs::create_dir(&link).unwrap();
+                std::fs::write(link.join("retained"), b"untouched").unwrap();
+            } else {
+                symlink(std::env::current_exe().unwrap(), &link).unwrap();
+            }
+        }
+        let before_link = std::fs::read_link(&link).ok();
+        let paths = [store.state_file(), store.logins_file(), store.ledger_path()];
+        let before = paths.each_ref().map(|path| std::fs::read(path).ok());
+        let error = opener_link(&store, &host).unwrap_err();
+        assert_eq!(error.stage, stage, "{fault}");
+        if kind.is_some() || fault == "unavailable" {
+            assert_eq!(error.kind, kind, "{fault}");
+        }
+        let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
+        assert_eq!(code, exit(1), "{fault}: {out}{err}");
+        assert!(err.contains(&error.to_string()), "{fault}: {err}");
+        assert!(!err.contains(source.to_str().unwrap()), "{fault}: {err}");
+        assert!(host.flows.borrow().is_empty(), "{fault}");
+        assert!(host.checked.borrow().is_empty(), "{fault}");
+        assert!(host.remotes.borrow().is_empty(), "{fault}");
+        assert_eq!(
+            paths.each_ref().map(|path| std::fs::read(path).ok()),
+            before,
+            "{fault}"
+        );
+        assert!(!store.logins_dir().exists(), "{fault}");
+        assert_eq!(std::fs::read_link(&link).ok(), before_link, "{fault}");
+        if fault == "bin" {
+            assert_eq!(std::fs::read(&bin).unwrap(), b"retained obstruction");
+        } else if fault == "alias" {
+            assert_eq!(std::fs::read(link.join("retained")).unwrap(), b"untouched");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn renewal_ready_opener_runs_the_selected_headless_route() {
+    let (tmp, env) = renew_env("renew-opener-ready");
+    let mut host = RenewHost::new();
+    host.tty = false;
+    host.env_mailbox = Some(tmp.path().to_owned());
+    let target = std::fs::canonicalize(host.exe.as_ref().unwrap()).unwrap();
+    let mut relative = PathBuf::new();
+    for component in std::env::current_dir().unwrap().components() {
+        if matches!(component, std::path::Component::Normal(_)) {
+            relative.push("..");
+        }
+    }
+    relative.push(target.strip_prefix("/").unwrap());
+    assert!(!relative.is_absolute());
+    host.exe = Some(relative);
+    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    let opener = env
+        .accounts_store()
+        .dir
+        .join("bin")
+        .join(crate::harness::open_url::OPENER);
+    assert_eq!(std::fs::read_link(&opener).unwrap(), target);
+    let calls = host.flows.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, WORK);
+    assert_eq!(
+        calls[0].2,
+        RenewBrowser::Remote {
+            opener: Some(opener)
+        }
+    );
+    assert_eq!(host.checked.borrow().as_slice(), [calls[0].0.clone()]);
+    assert!(logins_of(&env).get("main").is_none());
+}
+
+#[test]
+fn renewal_manual_routes_do_not_require_an_unavailable_opener() {
+    for ssh in [false, true] {
+        let (_tmp, env) = renew_env("renew-opener-manual");
+        let mut host = RenewHost::new();
+        host.exe = None;
+        host.ssh_session = ssh;
+        let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
+        assert_eq!(code, exit(0), "{out}{err}");
+        let calls = host.flows.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].2,
+            if ssh {
+                RenewBrowser::Remote { opener: None }
+            } else {
+                RenewBrowser::Default
+            }
+        );
+        assert!(!env.accounts_store().dir.join("bin").exists());
+    }
+    let (_tmp, env) = renew_env("renew-opener-explicit-profile");
+    let path = env.accounts_roster().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    if !text.contains("browser =") {
+        std::fs::write(
+            &path,
+            text.replacen(
+                "label = \"main\"",
+                "label = \"main\"\nbrowser = \"Claude main\"",
+                1,
+            ),
+        )
+        .unwrap();
+    }
+    let mut host = RenewHost::new();
+    host.exe = None;
+    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert!(host.flows.borrow().is_empty());
+    assert!(host.checked.borrow().is_empty());
 }
 
 #[test]
@@ -546,7 +726,7 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     #[cfg(unix)]
     assert_eq!(
         std::fs::read_link(&opener).expect("the opener's link"),
-        PathBuf::from("/opt/aterm/bin/aterm")
+        std::fs::canonicalize(host.exe.as_ref().unwrap()).unwrap()
     );
     let logins = logins_of(&env);
     let main = logins.get("main").expect("bound");
@@ -752,6 +932,9 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
         (137, true),
         (143, true),
     ] {
+        if cached && !cfg!(unix) {
+            continue;
+        }
         let (_tmp, env) = renew_env(&format!("renew-cancel-{flow}-{cached}"));
         if cached {
             cached_profile_only(&env);
@@ -779,6 +962,7 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_replacement_login_stops_a_stale_manual_authentication_fallback() {
     let (_tmp, env) = renew_env("renew-stale-fallback");
@@ -835,6 +1019,7 @@ fn a_replacement_login_stops_a_stale_manual_authentication_fallback() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_cached_profile_authentication_failure_falls_back_once_to_the_interactive_browser() {
     let (_tmp, env) = renew_env("renew-headless-auth-fallback");
@@ -877,16 +1062,17 @@ fn a_cached_profile_authentication_failure_falls_back_once_to_the_interactive_br
 #[test]
 fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstructed() {
     let (_tmp, env) = renew_env("renew-checkpoint-obstructed");
+    #[cfg(unix)]
     cached_profile_only(&env);
     let mut host = RenewHost::new();
     host.obstruct_checkpoint = true;
     let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
     assert_eq!(code, exit(1), "{out}{err}");
     assert_eq!(host.flows.borrow().len(), 1);
-    assert!(matches!(
-        &host.flows.borrow()[0].2,
-        RenewBrowser::Remote { .. }
-    ));
+    assert_eq!(
+        matches!(&host.flows.borrow()[0].2, RenewBrowser::Remote { .. }),
+        cfg!(unix)
+    );
     assert_eq!(host.checked.borrow().len(), 1);
     let store = env.accounts_store();
     let staging = store.logins_dir().join("main+1");
@@ -909,6 +1095,7 @@ fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstr
 #[test]
 fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
     let (_tmp, env) = renew_env("renew-published-ledger-failure");
+    #[cfg(unix)]
     cached_profile_only(&env);
     let store = env.accounts_store();
     store.ensure().expect("store");
@@ -933,10 +1120,10 @@ fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
     let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(host.flows.borrow().len(), 1);
-    assert!(matches!(
-        &host.flows.borrow()[0].2,
-        RenewBrowser::Remote { .. }
-    ));
+    assert_eq!(
+        matches!(&host.flows.borrow()[0].2, RenewBrowser::Remote { .. }),
+        cfg!(unix)
+    );
     assert_eq!(host.checked.borrow().len(), 1);
 
     let logins = logins_of(&env);
@@ -968,6 +1155,20 @@ fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
 #[test]
 fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     let (_tmp, env) = renew_env("renew-ssh");
+    #[cfg(not(unix))]
+    {
+        let path = env.accounts_roster().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            text.replacen(
+                "label = \"main\"",
+                "label = \"main\"\nbrowser = \"Claude main\"",
+                1,
+            ),
+        )
+        .unwrap();
+    }
     let mut host = RenewHost::new();
     host.ssh_session = true;
     let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
@@ -1364,6 +1565,7 @@ fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
 /// to another account answers `wrong-account` every time. NEGATIVE CONTROLS: the same row with
 /// `Failed` goes headless, and a `Blocked` one goes headless too with nobody at a terminal, over
 /// SSH, or at an agent's terminal, since no window may open on this Mac for any of them.
+#[cfg(unix)]
 #[test]
 fn a_person_signs_a_row_its_page_stopped_in_its_own_browser() {
     use accounts::AttemptOutcome::{Blocked, Failed};
@@ -1452,6 +1654,7 @@ fn an_agents_terminal_opens_no_browser_for_a_row() {
         assert_eq!(got, exit(code), "{out}{err}");
         assert_eq!(host.flows.borrow().len(), flows, "{out}{err}");
     }
+    #[cfg(unix)]
     for (agent, flows) in [(false, 2), (true, 1)] {
         let (_tmp, env) = renew_env("renew-agent-fallback");
         cached_profile_only(&env);
@@ -1706,6 +1909,9 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
     impl AccountsHost for StandIn {
         fn stdin_is_terminal(&self) -> bool {
             true
+        }
+        fn current_exe(&self) -> Option<PathBuf> {
+            Some(std::env::current_exe().expect("the test executable"))
         }
         fn auth_status(&self, login: &str) -> Result<Captured, String> {
             panic!("asked under {login:?}");
@@ -2017,6 +2223,16 @@ fn an_unattended_renewal_keeps_the_safe_browser_outcome_after_capture_fails() {
             "bot-check https://claude.ai/login?code=private-code\n",
             None,
         ),
+        (
+            "browser-start\n",
+            Some(Met::new(MetWord::BrowserStart, None)),
+        ),
+        ("browser-start private-code\n", None),
+        (
+            "browser-control\n",
+            Some(Met::new(MetWord::BrowserControl, None)),
+        ),
+        ("browser-control private-code\n", None),
     ] {
         let mut cmd = aterm_uds::spawnfd::Command::new("unused-provider");
         cmd.env(OUTCOME_ENV, &stale);
@@ -2038,9 +2254,8 @@ fn an_unattended_renewal_keeps_the_safe_browser_outcome_after_capture_fails() {
         let diagnostic = failure.to_string();
         assert!(diagnostic.contains(reason), "{diagnostic}");
         assert!(!diagnostic.contains("private-code"), "{diagnostic}");
-        if expected.is_some() {
-            assert!(diagnostic.contains("Cloudflare"), "{diagnostic}");
-            assert!(diagnostic.contains("claude.ai"), "{diagnostic}");
+        if let Some(expected) = expected {
+            assert!(diagnostic.contains(&expected.words()), "{diagnostic}");
         } else {
             assert_eq!(diagnostic, reason);
         }
@@ -2076,6 +2291,7 @@ fn an_unattended_provider_exit_keeps_its_browser_outcome() {
 /// `accounts renew`'s choice of rows reads the machine through its host alone: a row whose
 /// mailbox only the host's environment names renews with no terminal. CONTROL: under a host
 /// whose environment names none, the same row is only reported due and nothing runs.
+#[cfg(unix)]
 #[test]
 fn renews_choice_of_rows_reads_the_environment_through_its_host() {
     let (tmp, env) = renew_env("renew-host-env");
@@ -2102,6 +2318,7 @@ fn renews_choice_of_rows_reads_the_environment_through_its_host() {
     assert_eq!(renewed, [WORK], "{out}{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn renews_profile_route_uses_only_the_browser_its_host_names() {
     let (tmp, env) = renew_env("renew-host-browser");
@@ -2128,6 +2345,7 @@ fn renews_profile_route_uses_only_the_browser_its_host_names() {
     assert_eq!(named.flows.borrow().len(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_repaired_browser_reopens_noninteractive_renewal_without_proving_its_identity() {
     for (repaired, reported) in [(false, WORK), (true, WORK), (true, OWNER)] {

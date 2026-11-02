@@ -233,6 +233,8 @@ fn spec_xref_closure() {
                 u64,
             ) -> aterm_secrets::Result<aterm_secrets::client::StewardLease>,
         aterm_secrets::client::ledger_publish_environment as fn(),
+        // `KeyedEpochs`' waivers' host, beside its anchors in the client's log entries.
+        aterm_secrets::client::keyed_epochs_environment as fn(),
     ));
     #[cfg(unix)]
     {
@@ -241,6 +243,16 @@ fn spec_xref_closure() {
             Log::insert as fn(&mut Log, Record) -> aterm_secrets::Result<Inserted>,
             Log::membership as fn(&Log) -> Membership,
             aterm_secrets::membership_log::membership_log_environment as fn(),
+        ));
+        // `SwarmRecordsFile`'s anchors: the server's start, which reaches the look at a
+        // records file and the records POST, and the waivers' host.
+        std::hint::black_box((
+            aterm_secrets::server::start
+                as fn(
+                    std::net::TcpListener,
+                    &aterm_secrets::server::Options,
+                ) -> aterm_secrets::Result<aterm_secrets::server::Running>,
+            aterm_secrets::server::records_file_environment as fn(),
         ));
     }
     #[expect(

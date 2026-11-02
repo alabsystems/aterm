@@ -2578,7 +2578,7 @@ mod tests {
                 .unwrap()
                 .task()
                 .expect("a task")
-                .carry_row();
+                .carry_row(std::time::Instant::now());
             let status = rows
                 .iter()
                 .find_map(|(id, row)| (*id == local).then(|| row.clone()));

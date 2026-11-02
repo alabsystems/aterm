@@ -870,3 +870,67 @@ fn a_writer_open_waits_out_a_held_lock_within_its_bound() {
     let successor = successor.unwrap();
     assert_eq!(successor.read_range(Offset::ZERO, 8).unwrap().len(), 1);
 }
+
+/// A journal as `Log` wrote it at astream `94f7b77`: three appends and a clean drop, its
+/// lock left out. These files stand for a log on a person's disk, so they are never
+/// regenerated: a format that moves reads them first.
+const FROZEN: [(&str, &[u8]); 4] = [
+    (
+        "test.anchor",
+        include_bytes!("../tests/fixtures/frozen-journal/test.anchor"),
+    ),
+    (
+        "test.astream",
+        include_bytes!("../tests/fixtures/frozen-journal/test.astream"),
+    ),
+    (
+        "test.astream.id",
+        include_bytes!("../tests/fixtures/frozen-journal/test.astream.id"),
+    ),
+    (
+        "test.checkpoint",
+        include_bytes!("../tests/fixtures/frozen-journal/test.checkpoint"),
+    ),
+];
+
+/// Every other test here writes and reads through the one pin, so a bump that moves the
+/// BREC record or the frame without reading the old bytes stays green in all of them, and
+/// strands every person's journal. This one reads bytes an earlier pin wrote, by the
+/// reader that decodes them itself and by the writer's open through astream, then goes on
+/// appending after them and leaves them as they were.
+#[test]
+fn a_journal_an_earlier_pin_wrote_opens_and_reads_at_this_pin() {
+    let written: [(&str, &[u8]); 3] = [
+        ("app/1", b"signed ciphertext"),
+        ("app/2", &[0, 1, 2, 255]),
+        ("app/1", b"third"),
+    ];
+    let holds = |records: &[&BrokerRecord]| {
+        assert_eq!(records.len(), written.len());
+        for (at, (record, (subject, body))) in records.iter().zip(written).enumerate() {
+            assert_eq!(record.seq, Offset(at as u64));
+            assert_eq!(record.subject, subject);
+            assert_eq!(record.body, body);
+        }
+    };
+    let dir = aterm_tempfile::tempdir().unwrap();
+    for (name, bytes) in FROZEN {
+        write_private_durable(dir.path(), name, bytes).unwrap();
+    }
+    let (read, _) = rebuilt(dir.path());
+    holds(&read.iter().collect::<Vec<_>>());
+
+    let mut log = Log::open(dir.path(), "test", b"pinned", true, limits()).unwrap();
+    log.finish_open().unwrap();
+    let replay = log.read_range(Offset::ZERO, 8).unwrap();
+    holds(&replay.iter().map(AsRef::as_ref).collect::<Vec<_>>());
+    assert_eq!(log.append("app/3", vec![7]).unwrap(), Offset(3));
+    drop(log);
+
+    let (read, _) = rebuilt(dir.path());
+    holds(&read[..3].iter().collect::<Vec<_>>());
+    assert_eq!(read[3].body, [7]);
+    let frozen = FROZEN[1].1;
+    let on_disk = std::fs::read(dir.path().join("test.astream")).unwrap();
+    assert_eq!(&on_disk[..frozen.len()], frozen);
+}

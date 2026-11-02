@@ -109,21 +109,14 @@ fn names(fd: i32) -> Option<(u64, u64)> {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use std::ffi::{CStr, c_char, c_void};
+    use std::ffi::{CStr, c_void};
     use std::io;
 
     use super::{Asleep, Thread};
+    use crate::darwin_loader;
 
     type MachPort = u32;
     type KernReturn = i32;
-
-    #[repr(C)]
-    struct DlInfo {
-        fname: *const c_char,
-        fbase: *mut c_void,
-        sname: *const c_char,
-        saddr: *mut c_void,
-    }
 
     unsafe extern "C" {
         static mach_task_self_: MachPort;
@@ -146,7 +139,6 @@ mod imp {
             info: *mut i32,
             count: *mut u32,
         ) -> KernReturn;
-        fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
     }
 
     const THREAD_BASIC_INFO: u32 = 3;
@@ -266,16 +258,9 @@ mod imp {
     }
 
     fn symbol(pc: u64) -> Option<String> {
-        let mut info = DlInfo {
-            fname: std::ptr::null(),
-            fbase: std::ptr::null_mut(),
-            sname: std::ptr::null(),
-            saddr: std::ptr::null_mut(),
-        };
         let addr = usize::try_from(pc).ok()? as *const c_void;
-        // SAFETY: `dladdr` reads only the loader's tables for `addr`, which it does not
-        // dereference, and fills the live `info`.
-        if unsafe { dladdr(addr, &raw mut info) } == 0 || info.sname.is_null() {
+        let info = darwin_loader::lookup(addr)?;
+        if info.sname.is_null() {
             return None;
         }
         // SAFETY: a non-null `dli_sname` is a NUL-terminated string the loader owns for as long

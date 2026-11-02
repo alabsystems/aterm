@@ -19,6 +19,7 @@ use aterm_types::fabric_grammar::{
 use aterm_gui_timing::now_ms;
 
 pub mod fleet_mail;
+pub mod handler_tally;
 
 /// What the fabric needs of a session.
 pub trait FabricSession: Send + Sync {
@@ -775,6 +776,8 @@ pub struct Inbox {
     /// log's `mail-gap` mark is the record that lasts.
     topic_given_up: BTreeMap<String, GivenUp>,
     closed: bool,
+    /// When the newest row arrived, for the handler tally (a parked `await inbox`'s wake).
+    arrived: handler_tally::Stamp,
 }
 
 /// Records the broker's retention gave up: offsets `from..to` of the log, and `records` of them
@@ -5287,6 +5290,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
     };
     evict_for(&mut inbox);
     inbox.rows.push_back(row);
+    inbox.arrived = handler_tally::stamp();
     inbox.bus_head = inbox.bus_head.max(off);
     if is_addressed {
         inbox.addressed_head = Some(inbox.addressed_head.map_or(off, |h| h.max(off)));
@@ -5985,6 +5989,7 @@ const WAIT_MAX_MS: u64 = 600_000;
 /// `post` — queue one outbound message and, for the kinds that need a correlation id, wait for
 /// the offset it landed at.
 pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> String {
+    let began = handler_tally::stamp();
     if serving_driver().is_some() || fleet_mail::is_reply(rest) {
         return if body.is_none() {
             fleet_mail::post(ctx, rest)
@@ -6146,6 +6151,7 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
     drop(inbox);
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
+    handler_tally::note_since(handler_tally::Row::Post, began);
 
     let Some(wait) = wait else {
         return format!("OK {id}\n");
@@ -6307,6 +6313,7 @@ fn wait_is_futile() -> bool {
 /// `await inbox since=<id> [kinds=<k|hold,...>] [topic=<t>] | await inbox re=<off> [since=<id>]
 /// [kinds=<k|hold,...>] [topic=<t>]` (the caller strips `timeout=<ms>`).
 pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) -> String {
+    let mut spans = handler_tally::AwaitSpans::begin(timeout_ms);
     const USAGE: &str = "ERR usage: await inbox since=<id|f-id> [fleet_since=f<id>] [kinds=<k|hold,...>] [topic=<t>] \
                          [timeout=<ms>] | await inbox re=<off> [since=<id>] [kinds=<k|hold,...>] \
                          [topic=<t>] [timeout=<ms>]\n";
@@ -6419,6 +6426,7 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         if !direct_only
             && let Some(id) = guard.rows.iter().filter(|r| latches(r)).map(|r| r.id).max()
         {
+            spans.answers(&mut guard.arrived);
             return format!("OK inbox {id}\n");
         }
         let direct = match direct {
@@ -6448,6 +6456,7 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         } else {
             deadline
         };
+        spans.parks();
         guard = aterm_control::park::park_guarded(
             &ctx.fabric().changed,
             guard,

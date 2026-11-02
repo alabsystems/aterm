@@ -68,6 +68,19 @@ impl Api {
         max_age_s: u64,
         allow_stale: bool,
     ) -> Result<Value, fetch::GetError> {
+        let bytes = self.doc_bytes(rel_url, cache_file, max_age_s, allow_stale)?;
+        parse_json(&bytes).map_err(fetch::GetError::other)
+    }
+
+    /// The checked document's bytes (cache or fetch), for
+    /// callers that need the source key order `Value` drops.
+    fn doc_bytes(
+        &self,
+        rel_url: &str,
+        cache_file: &str,
+        max_age_s: u64,
+        allow_stale: bool,
+    ) -> Result<Vec<u8>, fetch::GetError> {
         if self.writable {
             self.prefix
                 .ensure_api_cache()
@@ -76,24 +89,25 @@ impl Api {
         let path = self.cache_path(cache_file);
         if Self::fresh(&path, Duration::from_secs(max_age_s))
             && let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, API_BYTES)
-            && let Ok(v) = parse_json(&bytes)
+            && parse_json(&bytes).is_ok()
         {
-            return Ok(v);
+            return Ok(bytes);
         }
         match get_document(rel_url) {
             Ok(bytes) => {
-                let value = parse_json(&bytes).map_err(fetch::GetError::other)?;
+                parse_json(&bytes).map_err(fetch::GetError::other)?;
                 if self.writable {
                     let _ = write_metadata(&path, &bytes);
                 }
-                Ok(value)
+                Ok(bytes)
             }
             Err(e) => {
                 if allow_stale
                     && let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, API_BYTES)
                 {
                     eprintln!("abrew: offline; using stale API cache for {cache_file}");
-                    parse_json(&bytes).map_err(fetch::GetError::other)
+                    parse_json(&bytes).map_err(fetch::GetError::other)?;
+                    Ok(bytes)
                 } else {
                     Err(e)
                 }
@@ -244,6 +258,38 @@ impl Api {
     pub(super) fn cask_value(&self, token: &str) -> Result<Value, String> {
         let _ = self.cask(token)?;
         self.cask_doc(token)
+    }
+
+    /// The API record's source bytes, for key-order recovery
+    /// at `info --json` emission.
+    pub(super) fn formula_value_bytes(&self, name: &str) -> Result<Vec<u8>, String> {
+        let short = Formula::short_name(name);
+        if !super::valid_component(short) {
+            return Err(format!("abrew: no such formula: {short}"));
+        }
+        self.doc_bytes(
+            &format!("formula/{short}.json"),
+            &format!("formula-{short}.json"),
+            3600,
+            true,
+        )
+        .map_err(|e| not_found_error(e, "formula", short))
+    }
+
+    /// [`Api::formula_value_bytes`] for a cask token.
+    pub(super) fn cask_value_bytes(&self, token: &str) -> Result<Vec<u8>, String> {
+        let raw_short = Formula::short_name(token);
+        let short = canonical_cask_token(raw_short);
+        if !super::valid_component(short) {
+            return Err(format!("abrew: no such cask: {raw_short}"));
+        }
+        self.doc_bytes(
+            &format!("cask/{short}.json"),
+            &format!("cask-{short}.json"),
+            3600,
+            true,
+        )
+        .map_err(|e| not_found_error(e, "cask", raw_short))
     }
 
     /// Index rows already in the cache, without any fetch (`None` when no cached index stands).

@@ -392,6 +392,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 }
 
+/// The duty that may ANSWER a dialog of this kind. A dialog of no kind aterm reads has none, so no
+/// key goes to it; telling a person of it still needs one (`Session::escalate_point`).
 pub(super) fn prompt_scope(kind: aterm_phase::PromptKind) -> Option<Scope> {
     use aterm_phase::PromptKind;
     Some(match kind {

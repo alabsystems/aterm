@@ -144,6 +144,9 @@ pub mod sharded;
 pub mod sticky_fence;
 mod storage;
 pub mod store;
+mod tier;
+#[cfg(test)]
+mod tier_tests;
 
 pub use astream_wire::{
     CausalCut, CausalEdge, CutViolation, FabricReceipt, ReceiptError, ReceiptVerdict, V1Receipt,

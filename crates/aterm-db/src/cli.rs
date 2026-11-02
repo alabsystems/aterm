@@ -17,12 +17,18 @@ use std::{
 #[path = "cli_lineage.rs"]
 mod lineage;
 
+#[path = "cli_network_place.rs"]
+mod network_place;
+
 /// Command help. Mutation request IDs are caller-held, so lost replies are safely retried.
 pub const USAGE: &str = "aterm db — encrypted embedded application databases (Unix)\n\
   Commons tables use enrolled secrets and default LAN repair (no --dir):\n\
+  table <verb> ...                     typed ATT/1 tables: ls, schema, get, scan, history,\n\
+                                       check, revert, export, apply, edit (table --help)\n\
+  alab <verb> ...                      the ALab lab model: import, check, adopt (alab --help)\n\
   commons-status                       local membership, control history and sharing setting\n\
   commons-lineage                      verified predecessor-to-current public writer identities\n\
-  network-state                        live local observer or retained history; never grants access\n\
+  network-state                        local place, observer and retained history; never grants access\n\
   commons-authority                    inspect cached admin control metadata; changes nothing\n\
   commons-tables                       list declarations, provenance and subscriptions\n\
   commons-inventory --table <digest>    local retained operation counts and fingerprints\n\
@@ -124,6 +130,14 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             return aterm_uds::stdout::answer_exit("aterm db", "arguments must be UTF-8\n", 2);
         }
     };
+    if words.first().is_some_and(|w| w == "table") {
+        return crate::att::command::main_entry(&words[1..]);
+    }
+    if words.first().is_some_and(|w| w == "alab") {
+        // The `aterm` executable routes `alab` itself, with the harness's sheet reading; this
+        // path serves `check` and `adopt`, and `import` names where it runs.
+        return crate::alab::command::main_entry(&words[1..], None);
+    }
     if words.is_empty() || words.iter().any(|w| w == "--help" || w == "-h") {
         return aterm_uds::stdout::answer_exit("aterm db", USAGE, 0);
     }
@@ -193,9 +207,9 @@ pub fn run(words: &[String]) -> Result<Value> {
         empty(&options)?;
         let config = aterm_types::dirs::aterm_config_path()
             .ok_or_else(|| Error::new("network observation path unavailable"))?;
-        let network = crate::network_state::read_live_publication(&config);
         let paths = aterm_secrets::client::Paths::live()
             .map_err(|_| Error::new("service observation path unavailable"))?;
+        let network = crate::runtime::read_live_publication(&paths, &config);
         return read_network_state_with(
             network,
             || {
@@ -205,6 +219,7 @@ pub fn run(words: &[String]) -> Result<Value> {
                 ))
             },
             || crate::service_state::observe_publication(&paths, &config),
+            network_place::current,
             || (std::time::Instant::now(), aterm_time::unix_millis()),
         );
     }
@@ -583,6 +598,7 @@ fn read_network_state_with(
     network: std::io::Result<crate::network_state::Publication>,
     read_history: impl FnOnce() -> Result<crate::network_state::Publication>,
     read_services: impl FnOnce() -> crate::service_state::Publication,
+    read_place: impl FnOnce() -> Option<aterm_netplace::Place>,
     clock: impl FnOnce() -> (std::time::Instant, Option<u64>),
 ) -> Result<Value> {
     let (network, error) = match network {
@@ -599,6 +615,7 @@ fn read_network_state_with(
         network,
         error,
         read_services,
+        read_place,
         clock,
     ))
 }
@@ -607,10 +624,12 @@ fn network_state_value_with(
     network: crate::network_state::Publication,
     live_error: Option<LiveObservationError>,
     read_services: impl FnOnce() -> crate::service_state::Publication,
+    read_place: impl FnOnce() -> Option<aterm_netplace::Place>,
     clock: impl FnOnce() -> (std::time::Instant, Option<u64>),
 ) -> Value {
     let services = read_services();
-    // Both leases include service I/O and are judged at the same final clock sample.
+    let place = read_place();
+    // Both leases include service and place I/O and use the same final clock sample.
     let (now, wall) = clock();
     let network = network.current_at(now, wall);
     let services = services.current_at(now, wall);
@@ -649,7 +668,8 @@ fn network_state_value_with(
             "completed_at_ms":refresh.completed_at_ms,
         }))})
     };
-    json!({"live_observation":network.via_local_process.is_some(),
+    json!({"place":network_place::value(place.as_ref()),
+        "live_observation":network.via_local_process.is_some(),
         "live_observation_error":live_error.map(|error|format!("{:?}",error.kind)),
         "live_observation_error_stage":live_error.and_then(|error|error.stage),
         "live_network":network.via_local_process.is_some() && network.visibility == aterm_types::network_state::Visibility::Active,
@@ -660,7 +680,7 @@ fn network_state_value_with(
 fn take<'a>(options: &mut BTreeMap<&'a str, &'a str>, name: &str) -> Result<&'a str> {
     options
         .remove(name)
-        .ok_or_else(|| Error(format!("missing required database option {name}")))
+        .ok_or_else(|| Error::new(&format!("missing required database option {name}")))
 }
 fn empty(options: &BTreeMap<&str, &str>) -> Result<()> {
     if options.is_empty() {
@@ -735,6 +755,105 @@ mod network_state_tests {
     }
 
     #[test]
+    fn unavailable_network_place_is_reported_explicitly() {
+        let at = Instant::now();
+        let value = network_state_value_with(
+            network(at, 100_000),
+            None,
+            || services(at, 100_000),
+            || None,
+            || (at, Some(100_000)),
+        );
+        assert_eq!(value.get("place"), Some(&json!({"why":"not_sampled"})));
+        assert_eq!(value["live_network"], json!(true));
+    }
+
+    #[test]
+    fn network_place_uses_the_common_fields_without_rewriting_access() {
+        let at = Instant::now();
+        let value = network_state_value_with(
+            network(at, 100_000),
+            None,
+            || services(at, 100_000),
+            || Some(aterm_netplace::sample::hotspot(100_000, 90_000)),
+            || (at, Some(100_000)),
+        );
+        let place = &value["place"];
+        assert_eq!(place["state"], json!("remote"));
+        assert_eq!(place["kind"], json!("hotspot"));
+        assert_eq!(place["address"], json!("172.20.10.2"));
+        assert_eq!(place["network_strong"], json!(true));
+        assert_eq!(place["expensive"], json!(true));
+        assert_eq!(place["constrained"], json!(false));
+        assert_eq!(place["internet"]["state"], json!("path-up"));
+        assert_eq!(place["internet"]["source"], json!("path"));
+        assert_eq!(
+            place["internet"]["checked_ms"],
+            json!({"why":"not_sampled"})
+        );
+        assert_eq!(place["alab"]["state"], json!("away"));
+        assert_eq!(place["alab"]["known"], json!(41));
+        assert_eq!(place["alab"]["reachable"], json!(0));
+        assert_eq!(place["alab"]["since_ms"], json!(90_000));
+        assert_eq!(value["live_network"], json!(true));
+        assert_eq!(
+            value["services"]["accounts"]["availability"],
+            json!("Cached")
+        );
+    }
+
+    #[test]
+    fn a_known_network_place_does_not_grant_observer_or_service_access() {
+        let at = Instant::now();
+        let value = network_state_value_with(
+            crate::network_state::Publication::new(
+                NetworkObservation {
+                    observed_at_ms: 100_000,
+                    history: HistoryState::Ready,
+                    visibility: Visibility::Unavailable,
+                    ..NetworkObservation::default()
+                },
+                at,
+            ),
+            None,
+            || crate::service_state::Publication::new(ServiceStates::default(), at),
+            || Some(aterm_netplace::sample::home(100_000, 12)),
+            || (at, Some(100_000)),
+        );
+        assert_eq!(value["place"]["state"], json!("alab-lan"));
+        assert_eq!(value["place"]["alab"]["reachable"], json!(12));
+        assert_eq!(value["live_observation"], json!(false));
+        assert_eq!(value["live_network"], json!(false));
+        for service in ["accounts", "secrets"] {
+            assert_eq!(value["services"][service]["availability"], json!("Unknown"));
+        }
+    }
+
+    #[test]
+    fn network_place_io_cannot_renew_observer_or_service_leases() {
+        let at = Instant::now();
+        let now = Cell::new((at, Some(100_000)));
+        let value = network_state_value_with(
+            network(at, 100_000),
+            None,
+            || services(at, 100_000),
+            || {
+                now.set((at + Duration::from_secs(61), Some(161_000)));
+                Some(aterm_netplace::sample::hotspot(100_000, 90_000))
+            },
+            || now.get(),
+        );
+        assert_eq!(value["place"]["state"], json!("remote"));
+        assert_eq!(value["live_network"], json!(false));
+        assert_eq!(value["network"]["visibility"], json!("Unavailable"));
+        assert_eq!(value["network"]["observed_at_ms"], json!(100_000));
+        for service in ["accounts", "secrets"] {
+            assert_eq!(value["services"][service]["availability"], json!("Unknown"));
+            assert_eq!(value["services"][service]["observed_at_ms"], json!(100_000));
+        }
+    }
+
+    #[test]
     fn vault_network_receipt_json_remains_historical_after_local_observation_expires() {
         use aterm_types::network_state::{
             VaultNetworkMaterialization, VaultNetworkRefresh, VaultNetworkRefreshOutcome,
@@ -758,6 +877,7 @@ mod network_state_tests {
             network(at, 100_000),
             None,
             || crate::service_state::Publication::new(states, at),
+            || None,
             || (at + Duration::from_secs(61), Some(161_000)),
         );
         assert_eq!(
@@ -808,6 +928,7 @@ mod network_state_tests {
             network(at, 100_000),
             None,
             || crate::service_state::Publication::new(states, at),
+            || None,
             || (at + Duration::from_secs(61), Some(161_000)),
         );
         let secrets = &value["services"]["secrets"];
@@ -844,6 +965,7 @@ mod network_state_tests {
                 now.set((at + Duration::from_secs(16), Some(116_000)));
                 publication
             },
+            || None,
             || now.get(),
         );
         assert_eq!(value["live_network"], json!(false));
@@ -880,6 +1002,7 @@ mod network_state_tests {
                     now,
                 )
             },
+            || None,
             || (now, Some(114_000)),
         );
         assert_eq!(current["live_network"], json!(true));
@@ -905,6 +1028,7 @@ mod network_state_tests {
             retained,
             None,
             || services(now, 114_000),
+            || None,
             || (now, Some(114_000)),
         );
         assert_eq!(history["live_observation"], json!(false));
@@ -936,6 +1060,7 @@ mod network_state_tests {
                     ))
                 },
                 || services(at, 100_000),
+                || None,
                 || (at, Some(100_000)),
             )
             .unwrap();
@@ -955,6 +1080,7 @@ mod network_state_tests {
             Ok(network(at, 100_000)),
             || panic!("a live read must not open retained history"),
             || services(at, 100_000),
+            || None,
             || (at, Some(100_000)),
         )
         .unwrap();
@@ -986,6 +1112,7 @@ mod network_state_tests {
                 ))
             },
             || services(at, 100_000),
+            || None,
             || (at, Some(100_000)),
         )
         .unwrap();
@@ -1004,6 +1131,7 @@ mod network_state_tests {
             Err(std::io::ErrorKind::NotFound.into()),
             || Err(Error::new("history unavailable")),
             || panic!("failed history must be returned before service reads"),
+            || panic!("failed history must be returned before place reads"),
             || panic!("failed history supplies no publication"),
         );
         assert!(result.is_err());

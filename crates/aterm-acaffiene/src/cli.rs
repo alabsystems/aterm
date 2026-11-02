@@ -479,6 +479,41 @@ pub fn installed_startup_turned_off() -> bool {
     }
 }
 
+/// Labels of the old `aterm caffeine` name's login jobs no aterm will run again
+/// ([`crate::legacy::retired_jobs`]), writing nothing and taking no lock: the converge pass reads
+/// them so an old job whose `aterm` is gone or answers no to `aterm help caffeine` (0.145.0) is
+/// retired even when the mug already runs.
+#[must_use]
+pub fn retired_old_jobs() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::login_paths()
+            .ok()
+            .map_or_else(Vec::new, |paths| mac::retired_old_jobs(&paths))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Retire the old `aterm caffeine` name's login jobs no aterm will run again
+/// ([`crate::legacy::retire_jobs`]), starting no mug and touching no Enable at Startup.
+///
+/// # Errors
+/// This process is not the login's, this executable's path cannot be read, or a retired job's
+/// plist could not be removed.
+pub fn retire_old_jobs() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        mac::login_paths().and_then(|paths| mac::retire_old_jobs_only(&paths))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("aCaffiene is macOS only".to_string())
+    }
+}
+
 /// The mug's files, when this process has the login's own roots ([`mac::login_paths`]).
 /// # Errors
 /// Why this process is not the login's.
@@ -879,6 +914,65 @@ mod mac {
             Ok(exe) => crate::legacy::retire_jobs(paths, &exe),
             Err(e) => vec![format!("this executable's path cannot be read: {e}")],
         }
+    }
+
+    /// Labels of the old name's login jobs no aterm will run again for this executable, writing
+    /// nothing.
+    pub(super) fn retired_old_jobs(paths: &Paths) -> Vec<String> {
+        let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) else {
+            return Vec::new();
+        };
+        retired_old_jobs_with(paths, &exe, crate::legacy::has_old_verb)
+    }
+
+    /// [`retired_old_jobs`], asking another program whether it has the old verb with `has_verb`.
+    pub(super) fn retired_old_jobs_with(
+        paths: &Paths,
+        exe: &Path,
+        has_verb: impl Fn(&Path) -> Option<bool>,
+    ) -> Vec<String> {
+        crate::legacy::retired_jobs_with(paths, exe, has_verb)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect()
+    }
+
+    /// [`super::retire_old_jobs`] under `paths`: retires only the old name's login jobs no aterm
+    /// will run again, starting no mug.
+    pub(super) fn retire_old_jobs_only(paths: &Paths) -> Result<String, String> {
+        let exe = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .map_err(|e| format!("this executable's path cannot be read: {e}"))?;
+        retire_old_jobs_only_with(
+            paths,
+            &exe,
+            crate::legacy::has_old_verb,
+            launchd::unload_idle,
+        )
+    }
+
+    /// [`retire_old_jobs_only`], asking another program whether it has the old verb with
+    /// `has_verb` and unloading each retired job with `unload`.
+    pub(super) fn retire_old_jobs_only_with(
+        paths: &Paths,
+        exe: &Path,
+        has_verb: impl Fn(&Path) -> Option<bool>,
+        unload: impl Fn(&str),
+    ) -> Result<String, String> {
+        let jobs = crate::legacy::retired_jobs_with(paths, exe, has_verb);
+        if jobs.is_empty() {
+            return Ok("no old `aterm caffeine` login item remained".to_string());
+        }
+        let labels: Vec<String> = jobs.iter().map(|(label, _)| label.clone()).collect();
+        let failed = launchd::retire_with(jobs, unload);
+        if !failed.is_empty() {
+            return Err(failed.join("; "));
+        }
+        let noun = if labels.len() == 1 { "item" } else { "items" };
+        Ok(format!(
+            "retired old `aterm caffeine` login {noun}: {}",
+            labels.join(", ")
+        ))
     }
 
     /// Keep this Mac awake with `here`'s mug unless the person turned keep-awake off: an
@@ -1879,6 +1973,83 @@ mod tests {
         );
         assert!(retired(&plists), "retired, and the mug started");
         assert_eq!(STARTED.get(), 1);
+    }
+
+    /// When a mug already runs, `sync.awake` reads and retires the old `aterm caffeine` login jobs
+    /// no aterm will run again without starting a mug, while keeping an 0.144 job whose `aterm`
+    /// still answers `help caffeine` (`Some(true)`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retired_old_jobs_reads_and_retires_only_dead_or_post_rename_login_items() {
+        use std::cell::RefCell;
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = scratch(dir.path());
+        std::fs::create_dir_all(paths.launch_agents()).expect("agents");
+        let post_rename = dir.path().join("0.145.0/aterm");
+        let pre_rename = dir.path().join("0.144.0/aterm");
+        for bin in [&post_rename, &pre_rename] {
+            std::fs::create_dir_all(bin.parent().expect("parent")).expect("mkdir");
+            std::fs::write(bin, b"exe").expect("exe");
+        }
+        for (label, program) in [
+            ("com.aterm.aterm.caffeine", post_rename.clone()),
+            (
+                "com.aterm.aterm.caffeine.dev.0000000a",
+                dir.path().join("gone/aterm"),
+            ),
+            ("com.aterm.aterm.caffeine.dev.0000000b", pre_rename.clone()),
+        ] {
+            let text = crate::launchd::plist_text(label, &program, &paths.log_file(), None)
+                .replace("<string>acaffiene</string>", "<string>caffeine</string>");
+            std::fs::write(paths.startup_plist(label), text).expect("plist");
+        }
+        let this_exe = std::path::Path::new("/nonexistent/this-aterm");
+        let has_verb = |program: &std::path::Path| Some(program == pre_rename);
+        let found = mac::retired_old_jobs_with(&paths, this_exe, has_verb);
+        assert_eq!(
+            found,
+            [
+                "com.aterm.aterm.caffeine",
+                "com.aterm.aterm.caffeine.dev.0000000a"
+            ]
+        );
+        assert!(
+            paths.startup_plist("com.aterm.aterm.caffeine").exists(),
+            "reading retired jobs writes nothing"
+        );
+        let unloaded = RefCell::new(Vec::new());
+        let said = mac::retire_old_jobs_only_with(&paths, this_exe, has_verb, |label| {
+            unloaded.borrow_mut().push(label.to_owned());
+        })
+        .expect("retires dead and 0.145.0 jobs");
+        assert_eq!(
+            said,
+            "retired old `aterm caffeine` login items: com.aterm.aterm.caffeine, \
+             com.aterm.aterm.caffeine.dev.0000000a"
+        );
+        assert_eq!(
+            *unloaded.borrow(),
+            [
+                "com.aterm.aterm.caffeine",
+                "com.aterm.aterm.caffeine.dev.0000000a"
+            ]
+        );
+        assert!(!paths.startup_plist("com.aterm.aterm.caffeine").exists());
+        assert!(
+            !paths
+                .startup_plist("com.aterm.aterm.caffeine.dev.0000000a")
+                .exists()
+        );
+        assert!(
+            paths
+                .startup_plist("com.aterm.aterm.caffeine.dev.0000000b")
+                .exists(),
+            "NEGATIVE CONTROL: 0.144 job whose aterm still has `caffeine` is kept"
+        );
+        assert_eq!(
+            mac::retired_old_jobs_with(&paths, this_exe, has_verb),
+            Vec::<String>::new()
+        );
     }
 
     /// An exceptions entry an earlier process raised (before a quit, or an update's relaunch) is

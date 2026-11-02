@@ -171,6 +171,15 @@ pub fn resumes_by_itself(message: &str) -> bool {
         || lower.contains(&aterm_phase::anchor!("wall.goal_auto").to_ascii_lowercase())
 }
 
+/// Whether `message`, a usage wall's words, draws Claude Code's own continue as at hand
+/// (`Continuing shortly`): its countdown has run out, so the reset it was armed for is at most
+/// [`SHORTLY`] away, whatever bare clock time the footer still draws beside it (2.1.302's `limit
+/// resets 12am — Continuing shortly`, measured a day and more past that midnight).
+#[must_use]
+pub fn continues_shortly(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("continuing shortly")
+}
+
 /// `3h`, `2h 30m`, `45m`, `3 hours`, `1h30m`, `90 minutes` → a span.
 fn parse_span(s: &str) -> Option<Duration> {
     let mut secs: u64 = 0;

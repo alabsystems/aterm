@@ -16,6 +16,7 @@ use aterm_agent::supervise::policy::needs::NEEDS_ACK;
 use aterm_agent::supervise::policy::turn_end;
 use aterm_agent::supervise::tape::show;
 
+use crate::composer_turn::DRAFT_HANG;
 use crate::door::{Door, Reply};
 use crate::pyjson::J;
 use crate::run::{Run, is_run};
@@ -108,9 +109,11 @@ const CONTRADICTED_KEY: &str = turn_end::LAND_CONTRADICTED_HEAD;
 /// than [`CLEAN`]'s, so it is no same reply.
 pub const LANDED_NOTES: &str = "Committed wip-notes.txt and pushed it to origin/main.\n\
                                 Nothing left: the parser and its notes are on origin/main.";
-/// The head of Land's nudge quoting the agent's own list ([`land_check::LISTED_OPEN`]).
+/// The head of Land's nudge quoting the agent's own list
+/// ([`land_check::LISTED_OPEN`](aterm_agent::supervise::policy::land_check::LISTED_OPEN)).
 const LISTED_KEY: &str = aterm_agent::supervise::policy::land_check::LISTED_OPEN;
-/// The hinted check's quote opening ([`land_check::LAND_CHECK_HINT_OPEN`]).
+/// The hinted check's quote opening
+/// ([`land_check::LAND_CHECK_HINT_OPEN`](aterm_agent::supervise::policy::land_check::LAND_CHECK_HINT_OPEN)).
 const HINT_OPEN: &str = aterm_agent::supervise::policy::land_check::LAND_CHECK_HINT_OPEN;
 /// L2's list, its answer to the check: its report's leftover, said alone.
 pub const CHECK_LIST: &str = "The docs PR is still open.";
@@ -191,7 +194,6 @@ pub const PERSON_REPLY: &str = "The repository holds a README and nothing else y
 const ORCHESTRATED: &str = "now write the parser for this repository and land it";
 const ORCHESTRATED_KEY: &str = "now write the parser";
 const PERSON_STAND_MS: u64 = 8_000;
-const DRAFT_HANG: Duration = Duration::from_secs(60);
 const EXCHANGE_WATCH_MS: i64 = QUIET_UNDER_OFF_MS + 30_000;
 
 /// P2's replies, each opening `Wrote ` (Muse Code's tool-row head) with a plain word after it:
@@ -1058,7 +1060,7 @@ pub enum Scenario {
     /// ([`sysmsg::judge`]); the expired login's are [`sysmsg::login::judge`]'s.
     SysLand(sysmsg::Form),
     /// The person's sign-in after an expired login (v6 §14.17.5.6), `true` under Land: the lab
-    /// plays it last ([`sysmsg::login::step`]), and the tab goes on once
+    /// plays it last ([`sysmsg::login`]'s `step`), and the tab goes on once
     /// ([`sysmsg::login::judge_signed_in`]).
     SignedIn(bool),
 }
@@ -2718,7 +2720,7 @@ pub struct Cover {
     /// `--mode sysmsg`'s witness lab: when the lab prompted its second tab into the standing wall
     /// ([`sysmsg::mate_step`]).
     pub mate_ms: Option<i64>,
-    /// `--mode sysmsg`'s expired login: the lab's play of the person ([`sysmsg::login::step`]).
+    /// `--mode sysmsg`'s expired login: the lab's play of the person ([`sysmsg::login`]'s `step`).
     pub login: Option<sysmsg::login::Played>,
 }
 
@@ -5941,10 +5943,25 @@ fn at_composer(door: &Door<'_>, sid: &str, agent: &str) -> Option<String> {
     crate::screen::composer_row(agent, &on(door, sid, &["text"]))
 }
 
+/// What stands for `agent` on `text`, tab `sid`'s screen: [`crate::composer_turn::stand_of`], over
+/// the composer row's `ctl cell` replies. Every gate here that asks whether an agent's composer
+/// stands empty before the lab types reads it so, a placeholder no one typed read as empty.
+fn stand_on(door: &Door<'_>, sid: &str, agent: &str, text: &str) -> Stand {
+    crate::composer_turn::stand_of(agent, text, cell_on(door, sid))
+}
+
+/// Tab `sid`'s `ctl cell <row> <col>` reply, where it answered.
+fn cell_on<'a>(
+    door: &'a Door<'_>,
+    sid: &'a str,
+) -> impl FnMut(usize, usize) -> Option<String> + 'a {
+    move |row, col| reading_on(door, sid, &["cell", &row.to_string(), &col.to_string()]).ok()
+}
+
 /// A hang detector for a tab coming to its agent's empty composer ([`empty_composer`]): a
 /// minute in which the tab's screen did not change, never a budget, since a starved agent may
 /// take minutes to draw.
-const COMPOSER_HANG: Duration = Duration::from_secs(60);
+pub(crate) const COMPOSER_HANG: Duration = Duration::from_secs(60);
 
 /// How a wait for an agent's empty composer ended ([`composer_wait`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5982,13 +5999,17 @@ impl ComposerWait {
 
 /// What one look at a tab found ([`composer_wait`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Stand {
+pub(crate) enum Stand {
     /// The agent's composer, its first row holding this text (empty: nothing in it).
     Composer(String),
     /// An editor holding the tab, its status row ([`crate::screen::editor_row`]).
     Editor(String),
     /// Neither: the agent is still starting.
     Starting,
+    /// A composer holding text whose first glyph's cell said neither typed nor placeholder (no
+    /// `ctl cell` reply, or an unfinished frame's): no evidence yet of what it holds
+    /// ([`crate::composer_turn::stand_of`]).
+    Unknown,
 }
 
 /// Looks at a tab until its composer stands empty: each `look` gives the screen (any value that
@@ -5999,7 +6020,7 @@ enum Stand {
 ///
 /// # Errors
 /// The run was interrupted.
-fn composer_wait<S: PartialEq>(
+pub(crate) fn composer_wait<S: PartialEq>(
     mut look: impl FnMut() -> (S, Stand),
     hang: Duration,
     start: Instant,
@@ -6013,7 +6034,7 @@ fn composer_wait<S: PartialEq>(
             Stand::Composer(text) if text.is_empty() => return Ok(ComposerWait::Ready),
             Stand::Composer(text) => return Ok(ComposerWait::Draft(text)),
             Stand::Editor(row) => return Ok(ComposerWait::Editor(row)),
-            Stand::Starting => {}
+            Stand::Starting | Stand::Unknown => {}
         }
         let since = match still.take() {
             Some((seen, since)) if seen == screen => {
@@ -6032,8 +6053,8 @@ fn composer_wait<S: PartialEq>(
     }
 }
 
-/// Waits for `agent`'s empty composer in tab `sid` ([`composer_wait`] over `ctl text`, looking
-/// every 100 ms).
+/// Waits for `agent`'s empty composer in tab `sid` ([`composer_wait`] over `ctl text`, read by
+/// [`crate::composer_turn::stand_of`], looking every 100 ms).
 ///
 /// # Errors
 /// The run was interrupted.
@@ -6045,10 +6066,7 @@ pub(crate) fn empty_composer(
     Ok(composer_wait(
         || {
             let text = on(door, sid, &["text"]);
-            let stand = match crate::screen::composer_row(agent, &text) {
-                Some(row) => Stand::Composer(row),
-                None => crate::screen::editor_row(&text).map_or(Stand::Starting, Stand::Editor),
-            };
+            let stand = stand_on(door, sid, agent, &text);
             (text, stand)
         },
         COMPOSER_HANG,
@@ -6111,16 +6129,25 @@ pub(crate) struct Started {
     pub(crate) last: Input,
 }
 
-/// What one look at a starting tab's program stands at: its composer row as [`crate::screen`]
-/// reads it (`None`: none drawn), an editor's status row in its place, and its input. A composer
-/// drawn empty over input the program has not read is still starting: the lab's first prompt
-/// would wait behind that input, and the chain's clock with it.
-fn start_stand(composer: Option<String>, editor: Option<String>, input: &Input) -> Stand {
-    match composer {
-        Some(row) if row.is_empty() && input.unread() => Stand::Starting,
-        Some(row) => Stand::Composer(row),
-        None => editor.map_or(Stand::Starting, Stand::Editor),
+/// What one look at a starting tab's program stands at: what stands on its screen (`stand`) and
+/// its input. A composer drawn empty over input the program has not read is still starting: the
+/// lab's first prompt would wait behind that input, and the chain's clock with it.
+fn start_stand(stand: Stand, input: &Input) -> Stand {
+    match stand {
+        Stand::Composer(row) if row.is_empty() && input.unread() => Stand::Starting,
+        stand => stand,
     }
+}
+
+/// [`start_stand`] for `agent` on `text`, its screen, read as every empty-composer gate reads one
+/// ([`crate::composer_turn::stand_of`] over `cell`, the composer row's `ctl cell` replies).
+fn start_look(
+    agent: &str,
+    text: &str,
+    input: &Input,
+    cell: impl FnMut(usize, usize) -> Option<String>,
+) -> Stand {
+    start_stand(crate::composer_turn::stand_of(agent, text, cell), input)
 }
 
 /// THE LAB PROMPTS A PROGRAM ONLY ONCE IT HAS FINISHED STARTING (v6 §14.10.1, slice at1): its empty
@@ -6144,11 +6171,7 @@ pub(crate) fn started_composer(door: &Door<'_>, sid: &str, agent: &str) -> Resul
                 held = Some(input.clone());
             }
             last.clone_from(&input);
-            let stand = start_stand(
-                crate::screen::composer_row(agent, &text),
-                crate::screen::editor_row(&text),
-                &input,
-            );
+            let stand = start_look(agent, &text, &input, cell_on(door, sid));
             ((text, input.word, input.bytes), stand)
         },
         COMPOSER_HANG,
@@ -6191,36 +6214,19 @@ pub(crate) fn started_line(s: &Started) -> String {
     )
 }
 
+/// Types `text` as `agent`'s turn in tab `sid` ([`crate::composer_turn::turn`]: only into its
+/// empty composer, then Enter once the text stands there); whether the composer took it, the why
+/// on stderr where it did not.
+///
+/// # Errors
+/// The client could not run, or the run was interrupted.
 pub(crate) fn tab_turn(door: &Door<'_>, sid: &str, agent: &str, text: &str) -> Result<bool, Fail> {
-    let at = format!("@{sid}");
-    if door.ctl(&[&at, "send", text])?.code != 0 {
-        return Ok(false);
+    let turned =
+        crate::composer_turn::turn(&crate::composer_turn::Target::tab(door, sid, agent), text)?;
+    if let Some(why) = turned.why(agent, text) {
+        eprintln!("aterm-lab: turn @{sid}: {why}");
     }
-    let standing = |door: &Door<'_>| at_composer(door, sid, agent).as_deref() == Some(text);
-    // A HANG DETECTOR, not a latency budget: Claude Code 2.1.316 can leave a fresh tab's input
-    // unread for more than 10 s while it starts (`status input=pending`), and the draft stands
-    // once it reads it.
-    if !crate::wait_until(DRAFT_HANG, || standing(door)) {
-        return Ok(false);
-    }
-    // Enter once, and again if the draft still stands 5 s on; then A HANG DETECTOR, not a
-    // latency budget: Claude Code 2.1.316, starting beside fifteen more tabs, left a drafted
-    // first prompt standing for more than 10 s past both Enters (slice 9c's labs), and takes it
-    // once it reads its input. A second Enter the program reads late lands on an empty composer.
-    for press in 0..2 {
-        if door.ctl(&[&at, "key", "enter"])?.code != 0 {
-            return Ok(false);
-        }
-        if press == 0 {
-            for _ in 0..20 {
-                stop::sleep(Duration::from_millis(250))?;
-                if !standing(door) {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-    Ok(crate::wait_until(DRAFT_HANG, || !standing(door)))
+    Ok(turned == crate::composer_turn::Turned::Taken)
 }
 
 fn person_turn(
@@ -7475,13 +7481,14 @@ fn hide_step(door: &Door<'_>, h: Harness, tab: &mut Tab, now: i64) -> Result<(),
             ));
             break;
         }
-        let composer = match h {
+        let empty = match h {
             Harness::Claude => {
-                claude_composer(&text.lines().map(str::to_string).collect::<Vec<_>>())
+                claude_composer(&text.lines().map(str::to_string).collect::<Vec<_>>()).as_deref()
+                    == Some("")
             }
-            _ => crate::screen::composer_row(h.name(), &text),
+            _ => stand_on(door, &tab.sid, h.name(), &text) == Stand::Composer(String::new()),
         };
-        if composer.as_deref() != Some("") {
+        if !empty {
             why = Some("the composer was not empty: nothing entered".to_string());
             break;
         }
@@ -8771,7 +8778,8 @@ fn run_check(
             if let Some(ask) = tab.chain.asks()
                 && !tab.ask_tried
                 && ask_due(&tab.seen, now)
-                && at_composer(&door, &tab.sid, h.name()).is_some_and(|c| c.is_empty())
+                && stand_on(&door, &tab.sid, h.name(), &on(&door, &tab.sid, &["text"]))
+                    == Stand::Composer(String::new())
             {
                 tab.ask_tried = true;
                 let asked = now_ms();

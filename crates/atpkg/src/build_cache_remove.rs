@@ -2533,8 +2533,57 @@ mod sys {
         }
     }
 
+    fn clear_readonly(path: &Path, meta: &std::fs::Metadata) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "this #[cfg(not(unix))] module builds off Unix, clearing Windows FILE_ATTRIBUTE_READONLY on git packfiles"
+            )]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+
+    fn clear_readonly_tree(top: &Path) {
+        let mut stack = vec![top.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            clear_readonly(&path, &meta);
+            if meta.is_dir()
+                && let Ok(entries) = std::fs::read_dir(&path)
+            {
+                stack.extend(entries.flatten().map(|e| e.path()));
+            }
+        }
+    }
+
     pub(super) fn tree(top: &Path) -> Left {
-        match std::fs::remove_dir_all(top) {
+        let meta = match std::fs::symlink_metadata(top) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Left::default(),
+            Err(_) => {
+                return Left {
+                    stayed: 1,
+                    freed: 0,
+                };
+            }
+        };
+        let removed = if meta.file_type().is_symlink() {
+            std::fs::remove_file(top).or_else(|_| std::fs::remove_dir(top))
+        } else if meta.is_dir() {
+            clear_readonly_tree(top);
+            std::fs::remove_dir_all(top)
+        } else {
+            clear_readonly(top, &meta);
+            std::fs::remove_file(top)
+        };
+        match removed {
             Ok(()) => Left::default(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Left::default(),
             Err(_) => Left {

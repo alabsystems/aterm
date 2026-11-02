@@ -83,6 +83,10 @@ pub struct UpOpts {
     /// owner's processes cannot be read, and such a scan rules out no path while one stands
     /// unread, so `aterm harness disk free` frees nothing in a lab without it.
     pub jail_scan: bool,
+    /// The agent under test is the lab's own stand-in ([`crate::occupancy_standin`]): no real
+    /// agent is looked for or run, not even for its version (no `LAB_*` variable: a scenario's
+    /// [`crate::scn::LabKw`] alone asks for it).
+    pub standin: bool,
     /// `up --fabric`: the lab's own bus ([`crate::bus::lay`]): a private broker in the lab's jail
     /// and socket dir, the node's and an observer's caps, the instance's `[fabric]` table, the
     /// rendezvous file `aterm link` reads, and the bridge connected before `up` returns.
@@ -124,6 +128,7 @@ impl UpOpts {
             jail_scan: set("LAB_JAIL_SCAN"),
             fabric: false,
             tab_strip: false,
+            standin: false,
         }
     }
 }
@@ -1477,7 +1482,9 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
             aterm.display()
         )));
     }
-    run.claude_bin = find_claude()?;
+    if !o.standin {
+        run.claude_bin = find_claude()?;
+    }
     let stores: Vec<String> = homes
         .iter()
         .map(|h| format!("{h}/Library/Application Support/aterm/"))
@@ -1490,20 +1497,22 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         }
         Ok(c)
     };
-    if let Some(c) = find_codex() {
-        run.codex_bin = outside("Codex", c)?;
-    }
-    if let Some(c) = find_agy() {
-        run.agy_bin = outside("agy", c)?;
-    }
-    if let Some(c) = find_muse() {
-        run.muse_bin = outside("Muse Code", c)?;
-    }
-    if let Some(c) = find_grok() {
-        run.grok_bin = outside("Grok Build", c)?;
-    }
-    if let Some(c) = find_kimi() {
-        run.kimi_bin = outside("Kimi Code", c)?;
+    if !o.standin {
+        if let Some(c) = find_codex() {
+            run.codex_bin = outside("Codex", c)?;
+        }
+        if let Some(c) = find_agy() {
+            run.agy_bin = outside("agy", c)?;
+        }
+        if let Some(c) = find_muse() {
+            run.muse_bin = outside("Muse Code", c)?;
+        }
+        if let Some(c) = find_grok() {
+            run.grok_bin = outside("Grok Build", c)?;
+        }
+        if let Some(c) = find_kimi() {
+            run.kimi_bin = outside("Kimi Code", c)?;
+        }
     }
     run.agent = "claude".into();
     run.cols.clone_from(&o.cols);
@@ -1581,6 +1590,12 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
             &[],
             &format!("cannot lay the lab's program in {}: {e}", run.run.display()),
         ));
+    }
+    if o.standin {
+        run.claude_bin = crate::occupancy_standin::lay(&run.run, &p.exe)
+            .map_err(|e| abort(&run, &[], &format!("cannot lay the stand-in: {e}")))?
+            .to_string_lossy()
+            .into_owned();
     }
     run.mark = crate::jail::new_mark(tag);
     if o.jail_scan {
@@ -2164,6 +2179,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
         "relay.log",
         "open.log",
         crate::settings_witness::LOG,
+        crate::occupancy_standin::LOG,
     ] {
         if let Ok(Some(b)) = crate::sys::scratch_read(&r.w.join(f)) {
             let _ = fs::write(keep.join(f), b);

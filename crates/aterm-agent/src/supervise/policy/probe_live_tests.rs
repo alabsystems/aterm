@@ -123,10 +123,12 @@ fn on_own_thread<T: Send + 'static>(
         .expect("the probe answered within the hang detector's minute")
 }
 
+#[cfg(unix)]
 fn comps_of(path: &Path) -> Vec<String> {
     abs_components(&path.to_string_lossy()).expect("an absolute path")
 }
 
+#[cfg(unix)]
 fn real_dir(tree: &aterm_tempfile::TempDir) -> PathBuf {
     std::fs::canonicalize(tree.path()).expect("the test's temp dir resolves")
 }
@@ -189,10 +191,16 @@ fn a_look_the_disk_does_not_answer_refuses_what_it_would_have_proved() {
 fn a_look_left_out_refuses_the_next_at_once_until_it_ends() {
     let gate = LookGate::shut();
     let _opens = OpensAtEnd(Arc::clone(&gate));
-    let tree = aterm_tempfile::tempdir().expect("the test's temp dir");
-    let dir = real_dir(&tree).join("a");
-    std::fs::create_dir(&dir).expect("a folder");
-    let comps = comps_of(&dir);
+    #[cfg(unix)]
+    let (_tree, comps) = {
+        let tree = aterm_tempfile::tempdir().expect("the test's temp dir");
+        let dir = real_dir(&tree).join("a");
+        std::fs::create_dir(&dir).expect("a folder");
+        (tree, comps_of(&dir))
+    };
+    #[cfg(not(unix))]
+    let comps = vec!["aterm-nonexistent-probe-dir".to_string()];
+    let expected = comps.clone();
     let held = Arc::clone(&gate);
     let (first, second, looks_while_out, third) = on_own_thread(Some(gate), SHORT, move || {
         let first = LiveProbe.rm_physical(&comps);
@@ -227,7 +235,7 @@ fn a_look_left_out_refuses_the_next_at_once_until_it_ends() {
     assert_eq!(looks_while_out, 1, "the refusal started no second look");
     assert_eq!(
         third.map(|on_disk| on_disk.comps),
-        Ok(comps_of(&dir)),
+        Ok(expected),
         "the loop looks again once the look left out ends"
     );
 }
@@ -235,6 +243,7 @@ fn a_look_left_out_refuses_the_next_at_once_until_it_ends() {
 /// The rm circuit breaker's whole proof through the live probe: with the disk answering, an rm
 /// inside a scratch root resolves where the disk leads it (the negative control); with the disk
 /// not answering, the same line escalates within the bound instead of hanging the loop.
+#[cfg(unix)]
 #[test]
 fn an_rm_escalates_when_the_disk_does_not_answer_and_resolves_when_it_does() {
     let tree = aterm_tempfile::tempdir().expect("the test's temp dir");
@@ -270,4 +279,24 @@ fn an_rm_escalates_when_the_disk_does_not_answer_and_resolves_when_it_does() {
         refused.as_ref().is_err_and(|why| why.contains("answer")),
         "{refused:?}"
     );
+}
+
+#[cfg(not(unix))]
+#[test]
+fn an_rm_on_a_non_unix_temp_root_has_no_unix_scratch_root() {
+    let tree = aterm_tempfile::tempdir().expect("the test's temp dir");
+    assert!(
+        ScratchRoot::dir(tree.path()).is_none(),
+        "ScratchRoot::dir proves only /-rooted Unix paths"
+    );
+    let refused = resolve_rm_line(
+        "rm -rf /tmp/out",
+        &RmScope {
+            cwd: tree.path(),
+            home: None,
+            roots: &[],
+            probe: &LiveProbe,
+        },
+    );
+    assert!(refused.is_err(), "{refused:?}");
 }

@@ -1372,6 +1372,15 @@ const RECORD_PATHS: usize = 256;
 /// The most of a shallow clone's `shallow` file [`shallow_roots`] reads.
 const SHALLOW_BYTES: u64 = 16 * 1024 * 1024;
 
+/// The most of a repository's `FETCH_HEAD` file [`remote_fetch_heads`] reads.
+const FETCH_HEAD_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most configured remotes [`remote_fetch_heads`] queries for fetch URLs.
+const FETCH_REMOTES: usize = 32;
+
+/// The most fetched commit tips [`remote_fetch_heads`] passes to `rev-list`.
+const FETCH_HEAD_COMMITS: usize = 256;
+
 /// The most commits one read of [`submodules_unpushed`] or [`parked_on`] lists.
 const BEYOND_COMMITS: usize = 4096;
 
@@ -1390,7 +1399,9 @@ struct Beyond {
 /// before a push that recurses: a superproject that pushes its record of one leaves the remote
 /// main pointing at a commit nobody can fetch. A record the submodule never fetched is not read
 /// ([`record_available`]); its checkout and remote refs must still answer without omissions.
-/// A shallow clone's boundary commits came from a remote ([`shallow_roots`]),
+/// A shallow clone's boundary commits ([`shallow_roots`]) and commits `FETCH_HEAD` records as
+/// fetched from a configured remote of that submodule ([`remote_fetch_heads`], as
+/// `git submodule update --depth N` writes) came from a remote,
 /// and nothing is fetched ([`git_offline`]). Every submodule is read, each read under its own
 /// limit; each level is a folder below the last, so the walk ends. `None` where a read is refused
 /// or cut.
@@ -1416,11 +1427,23 @@ fn submodules_unpushed(
                 args.push(record);
             }
             args.extend(["--not", "--remotes"]);
-            let listing = git_offline_count(&dir, &args, reads)?;
+            let mut listing = git_offline_count(&dir, &args, reads)?;
             let mut commits: Vec<&str> = listing.lines().filter(|l| !l.trim().is_empty()).collect();
             if !commits.is_empty() {
-                let fetched = shallow_roots(&dir, reads)?;
-                commits.retain(|c| !fetched.contains(c.trim()));
+                let shallow = shallow_roots(&dir, reads)?;
+                commits.retain(|c| !shallow.contains(c.trim()));
+                if !commits.is_empty() {
+                    let fetched = remote_fetch_heads(&dir, reads)?;
+                    if !fetched.is_empty() {
+                        args.extend(fetched.iter().map(String::as_str));
+                        listing = git_offline_count(&dir, &args, reads)?;
+                        commits = listing
+                            .lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .filter(|c| !shallow.contains(c.trim()))
+                            .collect();
+                    }
+                }
             }
             let named = format!("{prefix}{path}");
             if !commits.is_empty() {
@@ -1550,6 +1573,146 @@ fn shallow_roots(dir: &Path, reads: &Reads<'_>) -> Option<std::collections::Hash
             .map(str::to_string)
             .collect(),
     )
+}
+
+/// The commits `FETCH_HEAD` at `dir` (its first [`FETCH_HEAD_BYTES`]) records as fetched from one
+/// of `dir`'s configured remotes, resolved to present commit objects ([`commits_available`]) and
+/// capped at [`FETCH_HEAD_COMMITS`]. `git submodule update --depth N` (`N > 1`) at a commit no
+/// remote-tracking ref reaches writes the fetched tip here rather than to `refs/remotes/*`, while
+/// `shallow` holds only the boundary `N - 1` commits below it. `None` where a read is refused or
+/// cut.
+fn remote_fetch_heads(dir: &Path, reads: &Reads<'_>) -> Option<Vec<String>> {
+    let at = git_offline(dir, &["rev-parse", "--git-path", "FETCH_HEAD"], reads, None)?;
+    let Ok(file) = std::fs::File::open(dir.join(at.trim_end_matches(['\n', '\r']))) else {
+        return Some(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    let _ =
+        std::io::Read::read_to_end(&mut std::io::Read::take(file, FETCH_HEAD_BYTES), &mut bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    if text.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let remotes = git_offline_count(dir, &["remote"], reads)?;
+    let mut urls: Vec<String> = Vec::new();
+    for remote in remotes
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .take(FETCH_REMOTES)
+    {
+        if let Some(configured) =
+            git_offline(dir, &["remote", "get-url", "--all", remote], reads, None)
+        {
+            for raw in configured.lines().map(str::trim).filter(|u| !u.is_empty()) {
+                let display = fetch_head_display_url(raw);
+                if !display.is_empty() && !urls.contains(&display) {
+                    urls.push(display);
+                }
+            }
+        } else if reads.cut.get() {
+            return None;
+        }
+    }
+    if urls.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut shas: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if shas.len() >= FETCH_HEAD_COMMITS {
+            break;
+        }
+        let Some((sha, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some((merge, note)) = rest.split_once('\t') else {
+            continue;
+        };
+        if !is_head(sha) || !matches!(merge, "" | "not-for-merge") {
+            continue;
+        }
+        let note = note.trim_end_matches('\r');
+        let from_remote = urls
+            .iter()
+            .any(|u| note == u || note.ends_with(&format!("' of {u}")));
+        if from_remote && !shas.iter().any(|s| s == sha) {
+            shas.push(sha.to_string());
+        }
+    }
+    commits_available(dir, &shas, reads)
+}
+
+/// Those of `shas` that resolve in `dir` to present commit objects (`<sha>^{commit}`); missing or
+/// non-commit objects are skipped, and any malformed or incomplete `cat-file` reply returns
+/// `None`.
+fn commits_available(dir: &Path, shas: &[String], reads: &Reads<'_>) -> Option<Vec<String>> {
+    if shas.is_empty() {
+        return Some(Vec::new());
+    }
+    let input = aterm_tempfile::tempdir().ok()?;
+    let path = input.path().join("fetch-heads");
+    let mut query = String::new();
+    for sha in shas {
+        query.push_str(sha);
+        query.push_str("^{commit}\n");
+    }
+    std::fs::write(&path, query).ok()?;
+    let feed = std::fs::File::open(&path).ok()?;
+    let reply = run_git(
+        dir,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        reads,
+        false,
+        true,
+        Some(feed),
+        Diagnostics::Refuse,
+    )?;
+    let lines: Vec<&str> = reply.lines().collect();
+    if lines.len() != shas.len() {
+        return None;
+    }
+    let mut commits: Vec<String> = Vec::new();
+    for (sha, line) in shas.iter().zip(lines) {
+        let line = line.trim_end_matches('\r');
+        if let Some(resolved) = line.strip_suffix(" commit")
+            && is_head(resolved)
+        {
+            if !commits.iter().any(|c| c == resolved) {
+                commits.push(resolved.to_string());
+            }
+        } else if line == format!("{sha}^{{commit}} missing") {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    Some(commits)
+}
+
+/// The anonymized, suffix-trimmed URL Git's `store_updated_refs` writes into `FETCH_HEAD` for a
+/// configured remote URL `raw`: `scheme://user@host/...` without `user@`, trailing `/` stripped
+/// once, then a trailing `.git` stripped once.
+fn fetch_head_display_url(raw: &str) -> String {
+    let anon = match raw.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest
+                .split_once('/')
+                .map_or((rest, None), |(a, p)| (a, Some(p)));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            match path {
+                Some(p) => format!("{scheme}://{host}/{p}"),
+                None => format!("{scheme}://{host}"),
+            }
+        }
+        None => raw.to_string(),
+    };
+    let trimmed = anon.strip_suffix('/').unwrap_or(&anon);
+    let stripped = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    if stripped.is_empty() {
+        anon
+    } else {
+        stripped.to_string()
+    }
 }
 
 /// The branches the session used ([`Used`]) besides `HEAD`'s own: those this worktree's `HEAD`

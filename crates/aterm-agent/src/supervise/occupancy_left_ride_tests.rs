@@ -592,7 +592,8 @@ fn a_wake_told_at_the_look_paces_the_next_as_a_typed_one_does() {
 /// owner's `stuck_break_note` and its Enter refused, stands as the break's line: the rule's nudge
 /// due at the same break is held by it (`held:host-line`), its door making no `status` read.
 /// NEGATIVE CONTROL: `StuckLeftNotTheLine` runs the nudges' door at that break, its `status` read
-/// made and the nudge held only by the person's keys (`held:person`).
+/// made and the nudge held only by the line standing as a draft (`held:draft`), which is the loop's
+/// own line and so no person typing (slice pl1).
 #[test]
 fn the_stuck_line_left_is_the_breaks_one_line() {
     let run = |tag: &str| {
@@ -641,7 +642,7 @@ fn the_stuck_line_left_is_the_breaks_one_line() {
     assert_eq!(two.sent[1], [stuck(BORN)], "{:#?}", two.sent);
     assert_eq!(
         nudge(&two),
-        ["held:person"],
+        ["held:draft"],
         "NEGATIVE CONTROL: {:#?}",
         two.ran.noted
     );

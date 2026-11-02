@@ -598,6 +598,13 @@ pub enum FleetError {
     AddressBusy,
     /// Peer's node id is on the swarm roster's deny-list (`NO denied`).
     DeniedNode,
+    /// The listener has not read its deny list yet, so it refuses every peer until it has: a
+    /// refusal to dial again later, never a verdict on this machine. A listener names it to
+    /// itself; on the wire it answers `NO capacity` ([`Self::AddressBusy`]), which every dialer,
+    /// one older than this build included, takes as "busy, dial again" and which disowns no one.
+    /// A dialer from this build on also reads `NO unread` as this, so a later listener can name it
+    /// on the wire once no older dialer is left.
+    DenyListUnread,
     /// Peer presented a proof signed with this end's own role key.
     Reflection,
     /// Listener does not serve the requested operation (`NO op`).
@@ -640,6 +647,7 @@ impl FleetError {
             Self::Refused => Self::Refused,
             Self::AddressBusy => Self::AddressBusy,
             Self::DeniedNode => Self::DeniedNode,
+            Self::DenyListUnread => Self::DenyListUnread,
             Self::Reflection => Self::Reflection,
             Self::UnknownOp(op) => Self::UnknownOp(op.clone()),
             Self::UnknownScope(scope) => Self::UnknownScope(scope.clone()),
@@ -684,6 +692,10 @@ impl fmt::Display for FleetError {
             Self::DeniedNode => f.write_str(
                 "the listener refused this machine's node (deny-listed, or out of its \
                      membership log)",
+            ),
+            Self::DenyListUnread => f.write_str(
+                "the listener has not read its deny list yet, so it admits no one; try again \
+                 once it has",
             ),
             Self::Reflection => f.write_str("the peer sent back a proof of this end's own role"),
             Self::UnknownOp(op) => write!(f, "the listener does not serve fleet op `{op}`"),
@@ -886,12 +898,17 @@ pub fn is_denied_key(key: &NodeKey, denied_nodes: &[String]) -> bool {
 /// Whom a listener refuses before any op (`NO denied`): node ids on the swarm roster's deny-list,
 /// and the node keys this Mac's membership log took out (`docs/DESIGN-fluid-swarm-2026-10-28.md`
 /// §3.3.7, F17: "the node key in the removed Mac's `Admit` is refused by every listener at once").
+/// While `unread`, the listener has never read its deny list, so it refuses every dialer that
+/// proved the fleet secret ([`FleetError::DenyListUnread`], `NO capacity` on the wire) rather than
+/// admit one the list it could not read names.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Denied {
     /// Node ids, as [`is_denied_node`] matches them.
     pub nodes: Vec<String>,
     /// Node keys.
     pub keys: Vec<NodeKey>,
+    /// No deny list has been read yet: every proved dialer is refused, to dial again later.
+    pub unread: bool,
 }
 
 impl Denied {
@@ -901,26 +918,37 @@ impl Denied {
         Self {
             nodes: nodes.to_vec(),
             keys: Vec::new(),
+            unread: false,
         }
     }
 
-    /// Whether it refuses no one.
+    /// A listener's that has not read its deny list yet: it refuses every proved dialer.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && self.keys.is_empty()
+    pub fn not_yet_read() -> Self {
+        Self {
+            unread: true,
+            ..Self::default()
+        }
     }
 
-    /// Whether it refuses a dialer that proved `peer`: while it names anyone, both a named node
-    /// id or key and an unproved peer (`None`) are refused, so a removed machine cannot pass by
-    /// stripping its node key.
+    /// Whether it refuses no one: it names no one, and a list was read.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.unread && self.nodes.is_empty() && self.keys.is_empty()
+    }
+
+    /// Whether it refuses a dialer that proved `peer`: every one while `unread`; while it names
+    /// anyone, both a named node id or key and an unproved peer (`None`) are refused, so a removed
+    /// machine cannot pass by stripping its node key.
     #[must_use]
     pub fn refuses(&self, peer: Option<&NodeProof>) -> bool {
-        !self.is_empty()
-            && peer.is_none_or(|proof| {
-                is_denied_node(&proof.node, &self.nodes)
-                    || is_denied_key(&proof.key, &self.nodes)
-                    || self.keys.contains(&proof.key)
-            })
+        self.unread
+            || (!self.is_empty()
+                && peer.is_none_or(|proof| {
+                    is_denied_node(&proof.node, &self.nodes)
+                        || is_denied_key(&proof.key, &self.nodes)
+                        || self.keys.contains(&proof.key)
+                }))
     }
 }
 
@@ -1248,7 +1276,10 @@ fn client_handshake_by_on(
         refused_by: refused_by.filter(|_| {
             matches!(
                 error,
-                FleetError::UnknownOp(_) | FleetError::AddressBusy | FleetError::DeniedNode
+                FleetError::UnknownOp(_)
+                    | FleetError::AddressBusy
+                    | FleetError::DeniedNode
+                    | FleetError::DenyListUnread
             )
         }),
         error,
@@ -1542,6 +1573,9 @@ impl Served {
     /// As [`tls::relay_answers`], or if native locality evidence changed.
     pub fn relay_answers(self, local: aterm_uds::CtlStream) -> io::Result<()> {
         self.admission.recheck()?;
+        self.release
+            .tenure
+            .relays_to(aterm_uds::kept_out(|| local.try_clone())?);
         let result = tls::relay_answers(self.transport, local, self.release);
         self.admission.recheck()?;
         result
@@ -1691,8 +1725,11 @@ pub fn serve_offering<H, E>(
 }
 
 /// [`serve_offering`], also refusing any dialer `deny()` refuses ([`Denied::refuses`]) with
-/// [`FleetError::DeniedNode`] (`NO denied`). `deny` is called once per dialer that proved the
-/// fleet secret, past its proofs, and never for a connection that proved nothing.
+/// [`FleetError::DeniedNode`] (`NO denied`), and every one while its answer is unread
+/// ([`Denied::unread`]) with [`FleetError::DenyListUnread`] (`NO capacity` on the wire, so every
+/// dialer, an older one included, dials again later). `deny` is called once
+/// per dialer that proved the fleet secret, past its proofs, and never for a connection that
+/// proved nothing.
 pub fn serve_offering_with_denied<H, E>(
     listener: &TcpListener,
     listening: &Listening,
@@ -2108,8 +2145,21 @@ struct Live {
     id: u64,
     source: IpAddr,
     line: TcpStream,
+    /// The local end a relay of this connection answers from ([`LiveTenure::relays_to`]).
+    local: Option<aterm_uds::CtlStream>,
     proved: Option<Instant>,
     drive: bool,
+}
+
+impl Live {
+    /// Hang up both ends: a relay holds its slot until its local end closes too, so a local server
+    /// that never answers would otherwise outlive the cut.
+    fn cut(&self) {
+        aterm_uds::hangup::hang_up(&self.line);
+        if let Some(local) = &self.local {
+            aterm_uds::hangup::hang_up(local);
+        }
+    }
 }
 
 impl LiveConnections {
@@ -2124,6 +2174,7 @@ impl LiveConnections {
             id,
             source,
             line,
+            local: None,
             proved: None,
             drive: false,
         });
@@ -2140,7 +2191,7 @@ impl LiveConnections {
                 .proved
                 .is_some_and(|at| now.saturating_duration_since(at) >= lifetime);
             if overdue {
-                aterm_uds::hangup::hang_up(&live.line);
+                live.cut();
             }
             !overdue
         });
@@ -2148,7 +2199,7 @@ impl LiveConnections {
 
     fn cut_all(&self) {
         for live in std::mem::take(&mut *self.lock()) {
-            aterm_uds::hangup::hang_up(&live.line);
+            live.cut();
         }
     }
 }
@@ -2159,6 +2210,16 @@ struct LiveTenure {
 }
 
 impl LiveTenure {
+    /// This connection is relayed to `local` from here on: a cut reaches it too. If a cut
+    /// already removed the connection, close this late attachment immediately.
+    fn relays_to(&self, local: aterm_uds::CtlStream) {
+        if let Some(live) = self.live.lock().iter_mut().find(|live| live.id == self.id) {
+            live.local = Some(local);
+        } else {
+            aterm_uds::hangup::hang_up(&local);
+        }
+    }
+
     fn proved(&self, drive: bool, most: usize) -> bool {
         let now = Instant::now();
         let mut held = self.live.lock();
@@ -2400,7 +2461,13 @@ fn listener_proves<S: Read + Write, D: std::ops::Deref<Target = Denied>>(
     // Past both proofs of the secret, a refusal names this node as `OK` does, so the dialer knows
     // which node refused it.
     let node = nodes.then(|| node_line(me, Signer::Listener, exporter));
-    if deny().refuses(peer.as_ref()) {
+    let denied = deny();
+    if denied.unread {
+        // `NO capacity`, not `NO unread`: a dialer older than this build reads any other `NO
+        // <word>` as a refused proof ("another fleet's secret") and disowns this node.
+        return refuse_as(stream, "capacity", FleetError::DenyListUnread, node);
+    }
+    if denied.refuses(peer.as_ref()) {
         return refuse_as(stream, "denied", FleetError::DeniedNode, node);
     }
     let Some(op) = FleetOp::from_word(word).filter(|op| serves.contains(op)) else {
@@ -2471,6 +2538,7 @@ fn dialer_proves<S: Read + Write>(
         Some("NO op") => Some(FleetError::UnknownOp(word.to_owned())),
         Some("NO capacity") => Some(FleetError::AddressBusy),
         Some("NO denied") => Some(FleetError::DeniedNode),
+        Some("NO unread") => Some(FleetError::DenyListUnread),
         Some("NO node") => return Err(FleetError::NodeProof),
         Some(verdict) if verdict.strip_prefix("NO ").is_some_and(is_word) => {
             return Err(FleetError::Refused);
@@ -3337,6 +3405,79 @@ mod tests {
         assert_eq!(sent, None);
     }
 
+    /// A listener that has not read its deny list refuses a dialer that proved the fleet secret
+    /// with `NO capacity` on the wire, naming [`FleetError::DenyListUnread`] to itself, so every
+    /// dialer, one older than this build included, reads it as busy ([`FleetError::AddressBusy`])
+    /// and dials again; a dialer from this build on reads `NO unread` as
+    /// [`FleetError::DenyListUnread`].
+    ///
+    /// NEGATIVE CONTROL (2026-11-01): with the listener answering `NO unread` (the review's
+    /// finding: a dialer older than this build reads it as a refused proof, "another fleet's
+    /// secret", and disowns the node), this fails (`left: Some("NO unread"), right: Some("NO
+    /// capacity")`).
+    #[test]
+    fn an_unread_deny_list_answers_busy_on_the_wire() {
+        const E: &[u8] = &[0xa5; EXPORTER_LEN];
+        let keys = secret(7);
+        let (mut listener, mut dialer) = CtlStream::pair().unwrap();
+        dialer.set_read_timeout(Some(HANG)).unwrap();
+        let listening = std::thread::spawn(move || {
+            listener.set_read_timeout(Some(HANG)).unwrap();
+            listener_proves(
+                &mut listener,
+                E,
+                (&secret(7), None, false),
+                FleetScope::Content,
+                EVERY_OP,
+                || Box::new(Denied::not_yet_read()),
+                |_| true,
+            )
+        });
+        let _hello = read_line(&mut dialer).unwrap();
+        dialer
+            .write_all(proof_line("survey", &tag(&keys.client, E, "survey")).as_bytes())
+            .unwrap();
+        let answer = read_line(&mut dialer).unwrap();
+        let heard = listening.join().unwrap();
+        assert!(
+            matches!(heard, Err(FleetError::DenyListUnread)),
+            "{heard:?}"
+        );
+        assert_eq!(answer.as_deref(), Some("NO capacity"));
+
+        let busy = |e: &FleetError| matches!(e, FleetError::AddressBusy);
+        let unread = |e: &FleetError| matches!(e, FleetError::DenyListUnread);
+        for (said, read) in [
+            ("NO capacity\n", &busy as &dyn Fn(&FleetError) -> bool),
+            ("NO unread\n", &unread),
+        ] {
+            let (mut dialer, mut listener) = CtlStream::pair().unwrap();
+            listener.set_read_timeout(Some(HANG)).unwrap();
+            let dialing = std::thread::spawn(move || {
+                dialer.set_read_timeout(Some(HANG)).unwrap();
+                dialer_proves(
+                    &mut dialer,
+                    E,
+                    (&secret(7), None, false),
+                    FleetOp::Survey,
+                    &mut None,
+                )
+                .map(|(scope, _)| scope)
+            });
+            listener
+                .write_all(proof_line("facts", &tag(&keys.server, E, "facts")).as_bytes())
+                .unwrap();
+            let _proof = read_line(&mut listener).unwrap();
+            listener.write_all(said.as_bytes()).unwrap();
+            drop(listener);
+            let heard = dialing.join().unwrap();
+            assert!(
+                heard.as_ref().err().is_some_and(read),
+                "{said:?}: {heard:?}"
+            );
+        }
+    }
+
     fn listener_tls(cert: &[u8], key: &[u8], alpn: &[&[u8]]) -> Arc<ServerConfig> {
         tls::init_crypto();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec()));
@@ -3860,8 +4001,60 @@ mod tests {
         second
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_relay_attached_after_its_connection_was_cut_is_closed() {
+        drop(over_loopback(
+            |tcp| {
+                let live = Arc::new(LiveConnections::default());
+                let tenure = live.hold(1, tcp.peer_addr().unwrap().ip(), tcp);
+                live.cut_all();
+                let (local, mut peer) = aterm_uds::kept_out(CtlStream::pair).unwrap();
+                peer.set_nonblocking(true).unwrap();
+                tenure.relays_to(aterm_uds::kept_out(|| local.try_clone()).unwrap());
+                assert!(
+                    matches!(peer.read(&mut [0]), Ok(0)),
+                    "a cut must also close a relay attached after its live entry was removed"
+                );
+            },
+            |tcp| tcp,
+        ));
+    }
+
     #[test]
     fn the_cut_frees_the_slot_of_a_peer_that_sent_its_fin_and_reads_nothing() {
+        the_cut_frees_the_slot_of(|local, answering| {
+            let answerer = std::thread::spawn(move || {
+                let chunk = vec![b'a'; 64 * 1024];
+                while (&answering).write_all(&chunk).is_ok() {}
+            });
+            let relayed = local();
+            let _ = answerer.join();
+            relayed
+        });
+    }
+
+    /// A local server that never answers holds its end open: the cut reaches that end too, or the
+    /// relay outlives it and keeps the slot.
+    #[test]
+    fn the_cut_frees_the_slot_of_a_relay_whose_local_end_stays_silent() {
+        the_cut_frees_the_slot_of(|local, answering| {
+            let relayed = local();
+            drop(answering);
+            relayed
+        });
+    }
+
+    /// One slot, a short lifetime and a member that sends its FIN and reads nothing: `relaying`
+    /// runs the relay (its first argument) beside the local end that answers it. The connection
+    /// closes at its lifetime and the next dial is served.
+    fn the_cut_frees_the_slot_of(
+        relaying: impl Fn(Box<dyn FnOnce() -> io::Result<()>>, CtlStream) -> io::Result<()>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+    ) {
         use std::sync::mpsc;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3885,15 +4078,9 @@ mod tests {
                     &listening,
                     &running,
                     HANG,
-                    |served: Served, _op| {
+                    move |served: Served, _op| {
                         let (local, answering) = CtlStream::pair()?;
-                        let answerer = std::thread::spawn(move || {
-                            let chunk = vec![b'a'; 64 * 1024];
-                            while (&answering).write_all(&chunk).is_ok() {}
-                        });
-                        let relayed = served.relay_answers(local);
-                        let _ = answerer.join();
-                        relayed
+                        relaying(Box::new(move || served.relay_answers(local)), answering)
                     },
                     move |event| {
                         let _ = events.lock().unwrap().send(event);

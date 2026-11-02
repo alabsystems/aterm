@@ -18,6 +18,9 @@ mod repair;
 /// Fixed headroom, independent of the number or state of peers.
 pub(crate) const HEIGHT_PT: f64 = 30.0;
 
+/// Rendered long and short place captions, captured together before a frame is keyed.
+pub(crate) type PlaceCaption = (String, String);
+
 pub(crate) fn inactive_snapshot() -> std::sync::Arc<NetworkStateSnapshot> {
     let mut snapshot = NetworkStateSnapshot::default();
     snapshot.network.visibility = Visibility::Unavailable;
@@ -273,12 +276,50 @@ fn observation_time(at_ms: u64) -> String {
     }
 }
 
+/// The band's words for this Mac's network place where it is off the ALab LAN (another network,
+/// offline: [`aterm_netplace::words::off_the_alab_lan`]), long and short
+/// ([`aterm_netplace::words::band`]); `None` on the ALab LAN, while checking, with no fleet to
+/// learn a home from, or before a place was read, where the observer's words (Commons' reachable
+/// count among them) stand.
+pub(crate) fn place_caption(place: Option<&aterm_netplace::Place>) -> Option<PlaceCaption> {
+    place
+        .filter(|place| aterm_netplace::words::off_the_alab_lan(place))
+        .map(aterm_netplace::words::band)
+}
+
+/// Capture only the visible place words; paint never reads the changing place cache.
+pub(crate) fn capture_place_caption() -> Option<PlaceCaption> {
+    place_caption(crate::net_place::cached().as_ref())
+}
+
+/// A test summary with the place as last read, without starting a read.
+#[cfg(test)]
 pub(crate) fn summary(snapshot: &NetworkStateSnapshot) -> String {
+    summary_with_caption(snapshot, capture_place_caption().as_ref())
+}
+
+/// [`summary`] with this Mac's network place `place`: away from the ALab LAN, the place's words
+/// lead ([`place_caption`]).
+#[cfg(test)]
+pub(crate) fn summary_at(
+    snapshot: &NetworkStateSnapshot,
+    place: Option<&aterm_netplace::Place>,
+) -> String {
+    summary_with_caption(snapshot, place_caption(place).as_ref())
+}
+
+pub(crate) fn summary_with_caption(
+    snapshot: &NetworkStateSnapshot,
+    caption: Option<&PlaceCaption>,
+) -> String {
     let mut text = status_summary(snapshot);
     if network_status(snapshot) != NetworkStatus::Visibility(Visibility::Active)
         && !snapshot.network.peers.is_empty()
     {
         text.push_str(&format!(" · {} known", snapshot.network.peers.len()));
+    }
+    if let Some((long, _)) = caption {
+        text.clone_from(long);
     }
     if snapshot.network.retention_limited {
         text.push_str(" · partial history");
@@ -368,6 +409,14 @@ fn observed_reachability(visibility: Visibility, reachability: Reachability) -> 
 }
 
 pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(String, String)> {
+    details_with_caption(snapshot, target, capture_place_caption().as_ref())
+}
+
+pub(crate) fn details_with_caption(
+    snapshot: &NetworkStateSnapshot,
+    target: Target,
+    caption: Option<&PlaceCaption>,
+) -> Vec<(String, String)> {
     let network = &snapshot.network;
     let observer_first = target == Target::Overview
         && (network.visibility != Visibility::Active || network.history != HistoryState::Ready)
@@ -378,7 +427,7 @@ pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(S
         // service metadata consumes the available panel height.
         rows.push(("Observer".into(), network.detail.clone()));
     }
-    rows.push(("Network".into(), summary(snapshot)));
+    rows.push(("Network".into(), summary_with_caption(snapshot, caption)));
     if target == Target::Overview {
         rows.insert(
             1,
@@ -646,6 +695,7 @@ pub(crate) fn paint_with_inks(
     g: &DeckGeom,
     top: f32,
     snapshot: &NetworkStateSnapshot,
+    caption: Option<&PlaceCaption>,
     inks: &aterm_vitals::ink::VitalsInks,
     dwc: bool,
 ) -> (Vec<DrawPrim>, Vec<Hit>) {
@@ -866,6 +916,14 @@ pub(crate) fn paint_with_inks(
             if p.ui_text_w(&known, false) <= room {
                 text = known;
             }
+        }
+        // Away from the ALab LAN, the frame's captured words explain its place.
+        if let Some((long, short)) = caption {
+            text = if p.ui_text_w(long, false) <= room {
+                long.clone()
+            } else {
+                short.clone()
+            };
         }
         if snapshot.network.retention_limited {
             let partial = format!("{text} · partial history");
@@ -1146,7 +1204,7 @@ mod tests {
             font_px: 14.0,
         };
         let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
-        let (prims, _) = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+        let (prims, _) = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
         assert!(prims.iter().any(|prim| matches!(prim,
             DrawPrim::Text { s, .. } if s == "Waiting · 1 known"
         )));
@@ -1305,11 +1363,11 @@ mod tests {
             font_px: 14.0,
         };
         let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
-        let before = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+        let before = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
         let before_summary = summary(&snapshot);
         let before_details = details(&snapshot, Target::Overview);
         snapshot.network.retention_limited = true;
-        let limited = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+        let limited = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
         assert_ne!(summary(&snapshot), before_summary);
         assert_ne!(
             crate::stats_deck::prims_fp(&limited.0),
@@ -1358,13 +1416,13 @@ mod tests {
             font_px: 14.0,
         };
         let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
-        let first = paint_with_inks(&g, 170.0, &snapshot, &inks, false).1;
+        let first = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false).1;
         snapshot.network.peers.reverse();
         snapshot.network.peers[0].reachability = Reachability::Unknown;
-        let second = paint_with_inks(&g, 170.0, &snapshot, &inks, false).1;
+        let second = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false).1;
         assert_eq!(first, second);
         snapshot.network.via_local_process = Some(42);
-        let (relayed, relayed_hits) = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+        let (relayed, relayed_hits) = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
         assert_eq!(second, relayed_hits);
         assert!(relayed.iter().any(|prim| {
             matches!(prim, DrawPrim::Text { s, face, .. }
@@ -1386,7 +1444,7 @@ mod tests {
             let inks =
                 crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
             let (prims, hits) =
-                paint_with_inks(&g, 170.0 * scale, &inactive_snapshot(), &inks, false);
+                paint_with_inks(&g, 170.0 * scale, &inactive_snapshot(), None, &inks, false);
             for prim in &prims {
                 if let DrawPrim::Text { face, px, .. } = prim {
                     assert_ne!(*face, crate::widget::TextFace::Mono);
@@ -1593,11 +1651,11 @@ mod tests {
                 for relay in [None, Some(42)] {
                     snapshot.network.via_local_process = relay;
                     snapshot.network.history = HistoryState::Ready;
-                    let ready = paint_with_inks(&g, top, &snapshot, &inks, false);
+                    let ready = paint_with_inks(&g, top, &snapshot, None, &inks, false);
                     let ready_summary = summary(&snapshot);
                     assert!(!local_warning(&ready.0, &ready.1, scale, inks.over));
                     snapshot.network.history = HistoryState::Unavailable;
-                    let failed = paint_with_inks(&g, top, &snapshot, &inks, false);
+                    let failed = paint_with_inks(&g, top, &snapshot, None, &inks, false);
                     assert!(local_warning(&failed.0, &failed.1, scale, inks.over));
                     assert_eq!(failed.1, ready.1);
                     assert_ne!(summary(&snapshot), ready_summary);
@@ -1669,12 +1727,12 @@ mod tests {
             snapshot.network.visibility = visibility;
             snapshot.network.history = HistoryState::Ready;
             snapshot.network.retention_limited = false;
-            let ready = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+            let ready = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
             for history in [HistoryState::Restoring, HistoryState::Unavailable] {
                 snapshot.network.history = history;
                 for limited in [false, true] {
                     snapshot.network.retention_limited = limited;
-                    let painted = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+                    let painted = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
                     assert_eq!(painted.1, ready.1);
                     assert_eq!(
                         local_warning(&painted.0, &painted.1, 1.0, inks.over),

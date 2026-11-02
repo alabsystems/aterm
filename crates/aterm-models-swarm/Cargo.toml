@@ -8,10 +8,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "aterm's formal models of ALab swarm ledger publishing, lease, pool assignment, join phrases and the membership log (ty_model!)"
+description = "aterm's formal models of ALab swarm ledger publishing, lease, pool assignment, join phrases, the membership log and a vault server's records file (ty_model!)"
 # No tests of its own: `aterm-models` sweeps these models, and `aterm-secrets` holds ledger
-# publishing, lease coordination, its join phrase book and the membership log to them in
-# conformance tests.
+# publishing, lease coordination, its join phrase book, the membership log and the server's
+# records file to them in conformance tests.
 autotests = false
 
 [lib]

@@ -434,14 +434,16 @@ impl Args {
 
     /// Cargo arguments naming the benchmark target and profile for this run.
     pub(crate) fn build_args(&self) -> Vec<&'static str> {
-        vec![
+        let mut args = vec![
             "--profile",
             self.profile.cargo_profile(),
             "-p",
             "aterm",
             "--bench",
             "fabric_bench",
-        ]
+        ];
+        args.extend_from_slice(self.profile.cargo_features());
+        args
     }
 }
 
@@ -1027,11 +1029,35 @@ mod tests {
             "out=/s burst=150 durability=ordered horizon_ms=100"
         );
 
-        for bad in ["", "release", "opt-test", "OPT"] {
+        let mut o = BTreeMap::new();
+        o.insert("--profile", "shipped".to_string());
+        let shipped = Args::from_options(&o).expect("parses");
+        assert_eq!(shipped.profile, Profile::Shipped);
+        assert_eq!(
+            shipped.build_args(),
+            [
+                "--profile",
+                "fabric-shipped",
+                "-p",
+                "aterm",
+                "--bench",
+                "fabric_bench",
+                "--features",
+                "dev-seams"
+            ],
+            "the shipped arm's seams come from the feature, not from debug assertions"
+        );
+        assert_eq!(
+            shipped.command_line(Arm::shipped()),
+            "targo --unverified verify perf fabric --profile shipped --durability ordered \
+             --horizon-ms 100"
+        );
+
+        for bad in ["", "release", "opt-test", "fabric-shipped", "OPT"] {
             let mut o = BTreeMap::new();
             o.insert("--profile", bad.to_string());
             let why = Args::from_options(&o).expect_err(bad);
-            assert!(why.contains("`dev` or `opt`"), "{bad}: {why}");
+            assert!(why.contains("`dev`, `opt` or `shipped`"), "{bad}: {why}");
         }
     }
 }

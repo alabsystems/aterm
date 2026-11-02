@@ -21,7 +21,8 @@ fn observed(outcome: Outcome) -> Observation {
 }
 
 fn checkpoint() -> ! {
-    println!("resource-dispatch-checkpoint");
+    // Keep the readiness proof on its own line even after libtest's single-thread prefix.
+    println!("\nresource-dispatch-checkpoint");
     std::io::stdout().flush().unwrap();
     assert_eq!(std::io::stdin().read(&mut [0; 1]).unwrap(), 1);
     aterm_uds::process::kill_self_now();

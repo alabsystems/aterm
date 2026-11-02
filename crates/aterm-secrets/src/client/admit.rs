@@ -411,20 +411,21 @@ pub fn admit_by_phrase(
     name: &str,
     now_ms: u64,
 ) -> crate::Result<ByLog> {
-    log_path(paths, request, node, name, now_ms, true, false)
+    log_path(paths, request, node, name, now_ms, (true, false), None)
 }
 
 /// [`admit_by_phrase`] where `sign`; otherwise only whether the log keeps the Mac out, read
 /// without the state lock (the records file is written whole), for a new Mac that takes F10's
-/// files: [`ByLog::KeptOut`] or [`ByLog::NotHere`].
+/// files: [`ByLog::KeptOut`] or [`ByLog::NotHere`]. Signing takes the state lock, unless `held`
+/// holds it already for this run (a member's desk took it before the run touched its phrase).
 fn log_path(
     paths: &Paths,
     request: &Request,
     node: [u8; 32],
     name: &str,
     now_ms: u64,
-    sign: bool,
-    restore: bool,
+    (sign, restore): (bool, bool),
+    held: Option<&super::HandoverHold>,
 ) -> crate::Result<ByLog> {
     if !sign {
         return Ok(
@@ -432,9 +433,13 @@ fn log_path(
                 .map_or(ByLog::NotHere, ByLog::KeptOut),
         );
     }
-    let Some(_lock) = StateLock::try_take_until(paths, Instant::now() + super::HANDOVER_LOCK_WAIT)?
-    else {
-        return Ok(ByLog::Busy);
+    let _lock = match held.filter(|held| held.holds(paths)) {
+        Some(_) => None,
+        None => match StateLock::try_take_until(paths, Instant::now() + super::HANDOVER_LOCK_WAIT)?
+        {
+            Some(lock) => Some(lock),
+            None => return Ok(ByLog::Busy),
+        },
     };
     let Some((mut store, mut log, _, opened)) = held_log(paths)? else {
         return Ok(
@@ -681,12 +686,14 @@ pub fn log_admitted_actors(paths: &Paths) -> BTreeSet<crate::membership_log::Mem
 /// path applies, else F10's `[everyone]` files ([`handover_bundle`]). Where this Mac holds a log
 /// that removed the new Mac or left it out on purpose, neither: the run ends with the reason. A
 /// log path that fails here (a records file this Mac cannot read, a store at its bound) hands
-/// F10's files too, as where no log applies, and says why in [`Handout::note`].
+/// F10's files too, as where no log applies, and says why in [`Handout::note`]. Both are built
+/// under [`Handing::held`] where the desk holds this Mac's state for the run (it took it before
+/// the run touched its phrase), which neither takes again.
 ///
 /// # Errors
 /// The log keeps the new Mac out ([`ByLog::KeptOut`]), a vault pass holds this Mac's state past
-/// [`super::HANDOVER_LOCK_WAIT`] ([`ByLog::Busy`]), or neither path can hand a bundle from this
-/// Mac's state.
+/// [`super::HANDOVER_LOCK_WAIT`] where the desk holds none for the run ([`ByLog::Busy`]), or
+/// neither path can hand a bundle from this Mac's state.
 pub fn hand_over(paths: &Paths, handing: &Handing<'_>) -> crate::Result<Handout> {
     let note = match log_path(
         paths,
@@ -694,11 +701,15 @@ pub fn hand_over(paths: &Paths, handing: &Handing<'_>) -> crate::Result<Handout>
         handing.node,
         handing.name,
         aterm_time::unix_millis().unwrap_or(0),
-        handing.reads_log,
-        handing.restore,
+        (handing.reads_log, handing.restore),
+        handing.held,
     ) {
         Ok(ByLog::Admitted(admission)) => {
-            let bundle = log_bundle(paths, handing.allowed, admission)?;
+            let policy = handing.held.filter(|held| held.holds(paths)).map_or_else(
+                || handover::policy_servers(paths),
+                |held| held.policy.clone(),
+            );
+            let bundle = log_bundle(paths, handing.allowed, admission, policy)?;
             return Ok(Handout {
                 bundle: bundle.encode()?,
                 logged: true,
@@ -715,7 +726,7 @@ pub fn hand_over(paths: &Paths, handing: &Handing<'_>) -> crate::Result<Handout>
         Err(error) => Some(format!("the membership log path failed here: {error}")),
     };
     Ok(Handout {
-        bundle: handover_bundle(paths, handing.allowed)?.encode()?,
+        bundle: handover::handover_bundle_held(paths, handing.allowed, handing.held)?.encode()?,
         logged: false,
         note,
     })
@@ -725,6 +736,7 @@ pub(super) fn log_bundle(
     paths: &Paths,
     allowed: &Allowed,
     admission: LogAdmission,
+    policy: Vec<String>,
 ) -> crate::Result<Bundle> {
     let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
     let signer = config
@@ -739,7 +751,7 @@ pub(super) fn log_bundle(
         vault: config.name.clone(),
         signer,
         followed: config.followed.clone(),
-        servers: handover::bundle_servers(paths, &config, url),
+        servers: handover::bundle_servers(url, policy),
         allowed: allowed.clone(),
         handed: Handed::Log {
             admit: admission.admit,
@@ -802,12 +814,61 @@ pub fn post_records_to_servers(paths: &Paths) -> crate::Result<usize> {
 /// This Mac is already in a vault, the bundle is not a log bundle for this Mac's key, any check
 /// above fails, or a write failed.
 pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report> {
+    let _lock = StateLock::take(paths)?;
+    let CheckedLog {
+        config,
+        mut state,
+        store,
+        entries,
+        digest,
+    } = checked_log_bundle(paths, bundle)?;
+    save_config(paths, &config)?;
+    fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
+    let report = apply_entries(paths, &mut state, &entries)?;
+    state.membership = Stored::In;
+    state.failed = apply_failed(&report);
+    state.records_digest = Some(digest);
+    state.proof = None;
+    state.refused = None;
+    state.source_identity = (!state.failed).then(|| source_identity(&config));
+    // The first subscriber pass posts the `Allowed` at once.
+    state.requested = 0;
+    save_state(paths, &state)?;
+    handover::keep_allowed(paths, &bundle.allowed)?;
+    Ok(report)
+}
+
+/// Whether this Mac takes a member's join bundle, by every check its write runs
+/// ([`write_from_log_bundle`] for a log bundle, [`write_from_bundle`] for F10's files), with
+/// nothing written: a joining Mac acknowledges a bundle only once this holds, so a bundle it
+/// would refuse leaves the member's row allowed and a person's Allow again works at once. The
+/// write checks again under the state lock.
+///
+/// # Errors
+/// The write would refuse the bundle: why.
+pub fn accepts_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<()> {
+    match &bundle.handed {
+        Handed::Log { .. } => checked_log_bundle(paths, bundle).map(drop),
+        Handed::Files(_) => handover::checked_files_bundle(paths, bundle).map(drop),
+    }
+}
+
+/// What a log bundle this Mac takes writes ([`checked_log_bundle`]).
+struct CheckedLog {
+    config: Config,
+    state: State,
+    store: membership_log::Store,
+    entries: Vec<Entry>,
+    digest: [u8; 32],
+}
+
+/// [`write_from_log_bundle`]'s checks, writing nothing.
+fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLog> {
     let Handed::Log { admit, records } = &bundle.handed else {
         return Err(Error::new("the member's bundle carries no membership log"));
     };
-    let _lock = StateLock::take(paths)?;
     let current = config(paths)?;
-    let mut state = load_state(paths)?;
+    let state = load_state(paths)?;
     if current.is_some() && state.membership == Stored::In {
         return Err(Error::new(
             "this Mac is already in a vault; leave it first (aterm secrets leave)",
@@ -918,20 +979,13 @@ pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Re
         .open_entries(&identity)?
         .ok_or_else(|| Error::new("the member's records hand this Mac no key"))?;
     let digest = log_entries::records_heads_digest(log);
-    save_config(paths, &config)?;
-    fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
-    let report = apply_entries(paths, &mut state, &entries)?;
-    state.membership = Stored::In;
-    state.failed = apply_failed(&report);
-    state.records_digest = Some(digest);
-    state.proof = None;
-    state.refused = None;
-    state.source_identity = (!state.failed).then(|| source_identity(&config));
-    // The first subscriber pass posts the `Allowed` at once.
-    state.requested = 0;
-    save_state(paths, &state)?;
-    handover::keep_allowed(paths, &bundle.allowed)?;
-    Ok(report)
+    Ok(CheckedLog {
+        config,
+        state,
+        store,
+        entries,
+        digest,
+    })
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ type RingCapture = (u16, u16, Option<[u8; 3]>, Option<[u8; 3]>, Option<char>);
 impl Grid {
     /// Write BCE truecolor background into `RgbColorRing` for a column range.
     #[inline]
-    pub(in crate::grid) fn fill_bce_rgb_range(&mut self, row: u16, col_start: u16, col_end: u16) {
+    pub fn fill_bce_rgb_range(&mut self, row: u16, col_start: u16, col_end: u16) {
         if let Some(bg_rgb) = self.storage.cursor_template_bg_rgb {
             let vis = self.storage.visible_rows;
             let cols = self.storage.cols;

@@ -23,14 +23,17 @@ use aterm_secrets::membership_log::{Body, Entrant, Log, NodeStanding, Record, en
 
 use super::{
     NodeServeConfig, RelayHeader, WindowLauncher, arm_claims_off_on_quit, claims_off_on_quit,
-    claims_upkeep, has_live_window_relay, keeps_port_after, query_window_survey_facts,
-    read_line_raw, relay_ask, relay_socket_path, run_node_serve_with, serve_window_relay_at,
-    wanted_for_node,
+    claims_upkeep, has_live_window_relay, keeps_port_after, node_vault_paths,
+    query_window_survey_facts, read_line_raw, relay_ask, relay_socket_path, run_node_serve_with,
+    serve_window_relay_at, wanted_for_node,
 };
 
 const SECRET_BYTES: [u8; 24] = [0x5a; 24];
 /// The node job each test dials is its own, which serves: a dial waits the hang detector.
 const DIAL_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
+
+#[path = "node_serve_tests/fresh_enrollment.rs"]
+mod fresh_enrollment;
 
 struct MockWindowLauncher {
     logged_in: AtomicBool,
@@ -434,6 +437,18 @@ fn serve_node_on(
     state: &Path,
     members: Option<Arc<LocalLog>>,
 ) -> (Arc<AtomicBool>, std::thread::JoinHandle<ExitCode>) {
+    serve_node_reading(prebound, root, relay_dir, state, (members, None))
+}
+
+/// [`serve_node_on`], its deny list read from the vault at `vault_paths` (`None`: none, so it
+/// names no one).
+fn serve_node_reading(
+    prebound: TcpListener,
+    root: &Path,
+    relay_dir: &Path,
+    state: &Path,
+    (members, vault_paths): (Option<Arc<LocalLog>>, Option<aterm_secrets::client::Paths>),
+) -> (Arc<AtomicBool>, std::thread::JoinHandle<ExitCode>) {
     let addr = prebound.local_addr().unwrap();
     let config_path = root.join(format!("node-{}.toml", addr.port()));
     crate::test_scratch::write_config(
@@ -446,7 +461,7 @@ fn serve_node_on(
         relay_dir: relay_dir.to_path_buf(),
         home_dir: None,
         config_path: Some(config_path),
-        vault_paths: None,
+        vault_paths,
         members,
         alab_browse: None,
         prebound_listener: Some(prebound),
@@ -518,10 +533,13 @@ fn until_dialed(listener: &TcpListener) {
     // SAFETY: one pollfd, of a listener the caller holds open across the call; a minute is a hang
     // detector, not a budget.
     let polled = unsafe { libc::poll(&mut ready, 1, within) };
+    if polled == 0 {
+        panic!("no dial came within {:?}", aterm_spec::wait::MUST_HAPPEN);
+    }
     assert_eq!(
         polled,
         1,
-        "no dial came: {}",
+        "poll for dial failed: {}",
         std::io::Error::last_os_error()
     );
 }
@@ -691,6 +709,83 @@ fn a_removed_node_is_refused_with_the_old_fleet_secret() {
     assert_eq!(server.join().expect("join"), ExitCode::SUCCESS);
 }
 
+/// A node job that has never read its deny list (its vault's `source.toml` other users may read,
+/// which the read refuses) refuses a Mac that proved the fleet secret, answering busy (`NO
+/// capacity`, which every dialer dials again after), and records nothing of it; once a read succeeds (no vault configured: a list that names
+/// no one) the same Mac joins, and a read that fails again after it keeps that list, so another
+/// Mac joins too.
+///
+/// NEGATIVE CONTROL (2026-11-01): with `update_denied_nodes_cache` answering an empty list while
+/// none was read (the shape before), the first join is admitted (`a node job with no deny list
+/// read must refuse a proven peer, got Ok(..)`).
+#[test]
+fn a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let relay_scratch = crate::test_scratch::short_dir("node-serve-unread");
+    let state = root.path().join("node-state");
+    let (secret, _host_id) = seed_fleet_node(&state);
+    let vault = aterm_secrets::client::Paths::for_home(&root.path().join("home"));
+    aterm_secrets::fsx::ensure_private_dir(&vault.dir).expect("vault dir");
+    let source = vault.dir.join("source.toml");
+    let unreadable = || {
+        std::fs::write(&source, b"name = \"team\"\n").expect("source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).expect("widen");
+        assert!(
+            aterm_secrets::client::swarm_denied_nodes(&vault).is_err(),
+            "the fixture's deny list must not read"
+        );
+    };
+    unreadable();
+    let prebound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind node job");
+    let addr = prebound.local_addr().unwrap();
+    let (stop, server) = serve_node_reading(
+        prebound,
+        root.path(),
+        relay_scratch.path(),
+        &state,
+        (None, Some(vault.clone())),
+    );
+    let dial_join = |id: &NodeIdentity| {
+        let tcp = TcpStream::connect(addr).expect("connect");
+        client_handshake_as(tcp, &secret, Some(id), FleetOp::Join, DIAL_WITHIN).map(|_| ())
+    };
+
+    let early = seed_id(&root.path().join("early-state"));
+    match dial_join(&early) {
+        Err(error) => assert!(
+            matches!(error, aterm_net::fleet::FleetError::AddressBusy),
+            "expected a busy answer to dial again, got {error:?}"
+        ),
+        Ok(()) => panic!("a node job with no deny list read must refuse a proven peer, got Ok(..)"),
+    }
+    assert!(
+        !read_peers(&state)
+            .expect("book")
+            .iter()
+            .any(|p| p.node.as_deref() == Some(early.node())),
+        "a refused Mac must stay out of the book"
+    );
+
+    std::fs::remove_file(&source).expect("unconfigure the vault");
+    let joined = join_as(addr, &secret, &early, "m31.local");
+    assert!(
+        joined.is_ok(),
+        "once a read succeeds the Mac joins: {joined:?}"
+    );
+
+    unreadable();
+    let later = seed_id(&root.path().join("later-state"));
+    let kept = join_as(addr, &secret, &later, "m32.local");
+    assert!(
+        kept.is_ok(),
+        "a failed read after a good one keeps that list: {kept:?}"
+    );
+
+    stop.store(true, Ordering::Release);
+    assert_eq!(server.join().expect("join"), ExitCode::SUCCESS);
+}
+
 #[test]
 fn a_moved_member_is_found_by_its_alab_tcp_advert() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -823,10 +918,8 @@ fn a_moved_member_is_found_by_its_alab_tcp_advert() {
     assert_eq!(moved_server.join().expect("join moved"), ExitCode::SUCCESS);
 }
 
-/// A Mac with no fleet secret that asks the node job's port is refused while no window runs,
-/// and once one does its request reaches the window's members desk through the relay, under
-/// the address it asked from (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10: until C20 ships,
-/// the window serves ask).
+/// A node with no vault to serve refuses an ask while no window runs. Once one does, the
+/// request reaches the window's members desk through the relay under its original address.
 #[test]
 fn an_ask_on_the_node_jobs_port_reaches_the_windows_desk_or_is_refused_with_none() {
     use aterm_secrets::client::Paths;
@@ -1758,5 +1851,197 @@ fn an_unreadable_swarm_switch_ends_the_node_jobs_generation() {
     assert!(
         super::fleet_turned_off_or_swarm_disabled(&cfg_at(unreadable)),
         "a switch that cannot be read holds sharing off, so the generation's LAN uses end"
+    );
+}
+
+/// A live node job reads its deny list from this user's vault, and one whose vault cannot be found
+/// (no home directory) does not start, rather than serve with a deny list that names no one, as
+/// only an isolated run (a test, a lab, CI) does.
+///
+/// NEGATIVE CONTROL (2026-11-01): with `node_vault_paths` reading a live failure as no vault
+/// (`live().ok()`, the shape the review found: `vault_paths` `None` meant isolated), this fails
+/// (`a live job with no vault must not start`).
+#[test]
+fn a_live_node_job_with_no_vault_does_not_start() {
+    let home = aterm_tempfile::tempdir().expect("tempdir");
+    let paths = aterm_secrets::client::Paths::for_home(home.path());
+    assert_eq!(
+        node_vault_paths(true, || panic!("an isolated job reads no vault")),
+        Ok(None)
+    );
+    assert!(
+        node_vault_paths(false, || Err(aterm_secrets::Error::new(
+            "no home directory"
+        )))
+        .is_err(),
+        "a live job with no vault must not start"
+    );
+    assert_eq!(
+        node_vault_paths(false, || Ok(paths.clone())),
+        Ok(Some(paths))
+    );
+}
+
+/// launchd starts the node job at a soft limit of 256, which shares out half the fleet slots: the
+/// real entry serves a loopback handshake before its capacity is read. A window child is told
+/// the launcher's limit, which is what that window's shells get. The serving child proves both
+/// assertions before ending by SIGKILL, so no node thread outlives its private state.
+/// NEGATIVE CONTROLS: remove the raise from `run_node_serve`: the node has too few slots. Omit
+/// `window_launcher_limit` on the window's command: its launcher limit reads `None`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_node_job_raises_launchds_descriptor_limit_to_serve_every_fleet_slot() {
+    use aterm_sysprobe::jobs::{FdKind, JobsReader, ReadReq, TcpState};
+    use std::os::unix::process::ExitStatusExt as _;
+
+    const CHILD: &str = "ATERM_TEST_NODE_DESCRIPTOR_CHILD";
+    const WINDOW: &str = "ATERM_TEST_NODE_DESCRIPTOR_WINDOW";
+    const PROVED: &str = "node served with every fleet slot and carried launcher limit 256";
+    let name = std::thread::current()
+        .name()
+        .expect("a test thread is named")
+        .to_owned();
+    let run = |command: &mut aterm_uds::spawnfd::Command| {
+        aterm_uds::deadline::output_until(command, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+            .expect("the child ends within the hang detector")
+    };
+    if std::env::var_os(WINDOW).is_some() {
+        crate::descriptor_limit::settle_incoming_descriptor_limit(
+            &crate::handoff_env::HandoffEnv::capture(),
+        );
+        assert_eq!(
+            crate::descriptor_limit::launcher_soft_descriptor_limit(),
+            Some(256),
+            "a window the job launched hands its shells the launcher's limit"
+        );
+        return;
+    }
+    if std::env::var_os(CHILD).is_some() {
+        let state = aterm_types::dirs::state_dir().expect("the child's private state");
+        let (secret, node) = seed_fleet_node(&state);
+        let config = crate::app_config::config_path().expect("the child's private config");
+        aterm_uds::private_file::ensure_private_dir(config.parent().unwrap())
+            .expect("private config directory");
+        crate::test_scratch::write_config(
+            &config,
+            "[swarm]\nenabled = true\n[fleet]\nlisten = \"127.0.0.1:0\"\nallow = \"facts\"\n\
+             [packages]\nenabled = false\nauto_install = false\npeers = []\n",
+        );
+        let home = aterm_types::dirs::home_dir().expect("the child's private home");
+        let store = atpkg::store::resolve_configured().expect("the child's private store");
+        assert!(store.prefix.starts_with(home));
+        atpkg::peers::turn_off(&store).expect("no auxiliary toolset listener");
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid resource id and a writable out-parameter.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+            0
+        );
+        limit.rlim_cur = 256;
+        // SAFETY: a change to this child alone that keeps the hard limit as it was.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) },
+            0
+        );
+        assert!(
+            crate::fleet_listen::fleet_slots() < aterm_net::fleet::MAX_SLOTS,
+            "CONTROL: launchd's limit serves fewer"
+        );
+        let server = std::thread::spawn(super::run_node_serve);
+        let mut reader = JobsReader::new();
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let port = loop {
+            assert!(
+                !server.is_finished(),
+                "the node entry returned before serving"
+            );
+            let listeners: Vec<_> = reader
+                .read(ReadReq {
+                    pid: std::process::id(),
+                    fds: true,
+                })
+                .and_then(|process| process.fds)
+                .into_iter()
+                .flatten()
+                .filter_map(|fd| match fd.kind {
+                    FdKind::Tcp {
+                        state: TcpState::Listen,
+                        local_port,
+                        ..
+                    } => Some(local_port),
+                    _ => None,
+                })
+                .collect();
+            assert!(listeners.len() <= 1, "unexpected listeners: {listeners:?}");
+            if let [port] = listeners.as_slice() {
+                break *port;
+            }
+            assert!(Instant::now() < deadline, "the node never listened");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect to the node");
+        let dialed = client_handshake_as(tcp, &secret, None, FleetOp::Facts, DIAL_WITHIN)
+            .expect("the real node entry serves a fleet handshake");
+        assert_eq!(
+            dialed.peer.as_ref().map(|proof| proof.node.as_str()),
+            Some(node.node()),
+            "the listener proves this child's node identity"
+        );
+        drop(dialed);
+        assert_eq!(
+            crate::fleet_listen::fleet_slots(),
+            aterm_net::fleet::MAX_SLOTS
+        );
+        let mut window = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        window.envs(crate::descriptor_limit::window_launcher_limit());
+        window
+            .args([name.as_str(), "--exact", "--nocapture"])
+            .env(WINDOW, "1");
+        let output = run(&mut window);
+        assert!(
+            output.status.success(),
+            "{}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!("\n{PROVED}");
+        std::io::stdout().flush().expect("flush the success proof");
+        aterm_uds::process::kill_self_now();
+    }
+    let scratch = aterm_tempfile::tempdir().expect("the node child's private state");
+    let home = scratch.path().join("home");
+    aterm_uds::private_file::ensure_private_dir(&home).expect("private home");
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    child
+        .env_clear()
+        .args([name.as_str(), "--exact", "--nocapture"])
+        .env(CHILD, "1")
+        .env("HOME", &home)
+        .env("ATERM_STATE_HOME", scratch.path().join("state"))
+        .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+        .env("XDG_CACHE_HOME", scratch.path().join("cache"))
+        .env("XDG_DATA_HOME", scratch.path().join("data"))
+        .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+        .env("TMPDIR", scratch.path())
+        .env("CI", "1")
+        .env(aterm_net::loopback::SEAM, "1")
+        .current_dir(scratch.path());
+    let output = run(&mut child);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGKILL),
+        "{}\n{stdout}\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.lines().any(|line| line == PROVED),
+        "the child died without proving its assertions\n{stdout}\n{stderr}"
     );
 }

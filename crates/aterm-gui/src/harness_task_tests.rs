@@ -401,6 +401,9 @@ fn a_word_carried_from_before_this_process_starts_no_span() {
         held: false,
         holds: Vec::new(),
         theme: None,
+        claim_ended: false,
+        not_claim_worker: false,
+        claim_worker: None,
     };
     assert!(app.graft_restored_user_meta(0, &leaf("land")));
     claim(&mut app, &ctx, true);

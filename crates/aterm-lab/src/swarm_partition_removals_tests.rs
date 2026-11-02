@@ -53,7 +53,44 @@ fn whole() -> Evidence {
             end("b1", true, true),
             end("b2", false, false),
         ],
+        kept: Some(kept()),
         ms: 4_000,
+    }
+}
+
+fn kept_end(mac: &str, member: bool) -> KeptEnd {
+    KeptEnd {
+        mac: mac.to_owned(),
+        has_log: true,
+        member,
+        cut_member: false,
+        reads_value: member,
+        keyed: true,
+        covered: true,
+        rotation_due: false,
+    }
+}
+
+/// What F21 promises after a1 removes b3 and a3 on island A while b3 removes a3 and b1 writes
+/// under b3's epoch on island B: after the heal and the tender's pass every member reads b1's
+/// value, b3's epoch is keyed and covered, and nothing wraps a newest epoch to b3.
+fn kept() -> Kept {
+    Kept {
+        skipped: None,
+        removals: vec![act("a1", "b3"), act("a1", "a3"), act("b3", "a3")],
+        put: Some(Ok(())),
+        leaked: false,
+        under_cut_epoch: true,
+        minted: vec!["b1 minted 9 records in round 1".to_owned()],
+        wrapped_to_cut: Vec::new(),
+        ends: vec![
+            kept_end("a1", true),
+            kept_end("a2", true),
+            kept_end("b1", true),
+            kept_end("b2", false),
+            kept_end("b3", false),
+            kept_end("a3", false),
+        ],
     }
 }
 
@@ -88,4 +125,35 @@ fn an_undo_short_of_its_quorum_fails_undone() {
     ev.ends[2].undone = false;
     ev.ends[2].remover_out_by_quorum = false;
     assert_eq!(failed(&ev), vec![UNDONE]);
+}
+
+/// b3's epoch left uncovered on one Mac (no F21 reseal ran there), though every member reads
+/// b1's value, fails [`KEPT`] alone.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): drop
+/// `judge_kept`'s `!e.covered` arm: fails with left `[]`, right `["removals: a write on the
+/// removed Mac's side survives the heal"]`.
+#[test]
+fn an_epoch_kept_readable_but_never_resealed_fails_kept() {
+    let mut ev = whole();
+    if let Some(k) = ev.kept.as_mut() {
+        k.ends[1].covered = false;
+    }
+    assert_eq!(failed(&ev), vec![KEPT]);
+}
+
+/// A split that leaked (b1 held a1's removal of b3 before it wrote, so its write keys nothing
+/// and measures no write on the removed Mac's side) fails [`KEPT`] though every Mac reads as it
+/// should.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): drop
+/// `judge_kept`'s `leaked` arm: fails with left `[]`, right `["removals: a write on the removed
+/// Mac's side survives the heal"]`.
+#[test]
+fn a_split_that_leaked_fails_kept() {
+    let mut ev = whole();
+    if let Some(k) = ev.kept.as_mut() {
+        k.leaked = true;
+    }
+    assert_eq!(failed(&ev), vec![KEPT]);
 }

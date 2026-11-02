@@ -145,6 +145,28 @@ pub struct Waiting {
     /// Whether every holder it waits behind had made no progress for its waiter's bound, as it
     /// last said.
     pub stuck: Option<Stuck>,
+    identity: Option<LiveMark>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveMark {
+    path: PathBuf,
+    file: aterm_sysprobe::volumes::FileId,
+}
+
+impl Waiting {
+    /// Whether both snapshots came from the same observed locked mark and record identity.
+    /// Text and elapsed duration are not identity. Unavailable file identity never confirms
+    /// another observation, and this comparison does not establish that a past mark is still live.
+    #[must_use]
+    pub fn same_mark(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && self.since == other.since
+            && self
+                .identity
+                .as_ref()
+                .is_some_and(|identity| Some(identity) == other.identity.as_ref())
+    }
 }
 
 /// The holders a wait is behind, every one of which has made no progress ([`crate::stall`]) for
@@ -186,13 +208,39 @@ fn live(path: &Path) -> Option<Waiting> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let mut file = options.open(path).ok()?;
-    if !file.metadata().is_ok_and(|m| m.is_file()) {
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
         return None;
     }
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(LiveMark {
+            path: path.to_owned(),
+            file: aterm_sysprobe::volumes::FileId {
+                dev: metadata.dev(),
+                ino: u128::from(metadata.ino()),
+            },
+        })
+    };
+    #[cfg(windows)]
+    let identity = {
+        use std::os::windows::io::AsHandle as _;
+        aterm_sysprobe::volumes::file_id_of_handle(file.as_handle()).map(|file| LiveMark {
+            path: path.to_owned(),
+            file,
+        })
+    };
+    #[cfg(not(any(unix, windows)))]
+    let identity = None;
     let mut head = Vec::new();
     (&mut file).take(RECORD).read_to_end(&mut head).ok()?;
     match RecordLock::try_lock(file, RECORD) {
-        Err(std::fs::TryLockError::WouldBlock) => parse(&String::from_utf8_lossy(&head)),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut waiting = parse(&String::from_utf8_lossy(&head))?;
+            waiting.identity = identity;
+            Some(waiting)
+        }
         Ok(_) | Err(std::fs::TryLockError::Error(_)) => None,
     }
 }
@@ -243,6 +291,7 @@ fn parse(text: &str) -> Option<Waiting> {
                 .filter(|h| !h.is_empty())?;
             Some(Stuck { holders, span })
         }),
+        identity: None,
     })
 }
 
@@ -330,6 +379,100 @@ mod tests {
             assert_eq!(waiting(dir.path()).len(), 1);
             drop(held);
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_live_marks_identity_survives_words_and_elapsed_duration() {
+        let dir = scratch("identity");
+        let mut mark = Mark::at(dir.path(), "waiting behind a working holder").unwrap();
+        let first = live(&mark.path).unwrap();
+        assert!(first.same_mark(&first));
+        for seconds in [900, 901] {
+            mark.say_stuck(
+                &format!("the holder has made no progress for {seconds} seconds"),
+                Some(&Stuck {
+                    holders: vec![7],
+                    span: Duration::from_secs(seconds),
+                }),
+            );
+            let next = live(&mark.path).unwrap();
+            assert!(first.same_mark(&next));
+            assert!(next.same_mark(&first));
+            let mut other_record = next.clone();
+            other_record.pid += 1;
+            assert!(!next.same_mark(&other_record));
+            other_record = next.clone();
+            other_record.since += 1;
+            assert!(!next.same_mark(&other_record));
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn distinct_live_files_and_paths_never_share_a_mark_identity() {
+        let dir = scratch("distinct-marks");
+        let mut first = Mark::at(dir.path(), "same wait").unwrap();
+        let mut other = Mark::at(dir.path(), "same wait").unwrap();
+        // Make the otherwise coarsely timestamped records exactly equal without a wall-clock race.
+        first.since = 1;
+        other.since = 1;
+        first.say("same wait");
+        other.say("same wait");
+        let before = live(&first.path).unwrap();
+        let simultaneous = live(&other.path).unwrap();
+        assert_eq!(
+            (before.pid, before.since),
+            (simultaneous.pid, simultaneous.since)
+        );
+        assert!(!before.same_mark(&simultaneous));
+
+        let alias = dir.path().join("alias.wait");
+        std::fs::hard_link(&first.path, &alias).unwrap();
+        let aliased = live(&alias).unwrap();
+        assert_eq!(
+            before.identity.as_ref().unwrap().file,
+            aliased.identity.as_ref().unwrap().file
+        );
+        assert!(
+            !before.same_mark(&aliased),
+            "a file alias is not the same mark path"
+        );
+        std::fs::remove_file(alias).unwrap();
+
+        let path = first.path.clone();
+        std::fs::rename(&other.path, &path).unwrap();
+        other.path = path;
+        let replaced = live(&other.path).unwrap();
+        assert_eq!((before.pid, before.since), (replaced.pid, replaced.since));
+        assert_eq!(
+            before.identity.as_ref().unwrap().path,
+            replaced.identity.as_ref().unwrap().path
+        );
+        assert!(
+            !before.same_mark(&replaced),
+            "replacing a path cannot inherit its old confirmation"
+        );
+        // The original open handle remains alive, so its inode cannot have been recycled.
+        assert!(first.lock.metadata().is_ok());
+        drop(other);
+        drop(first);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn an_unidentified_record_cannot_confirm_any_mark() {
+        let dir = scratch("unidentified");
+        let mark = Mark::at(dir.path(), "waiting").unwrap();
+        let current = live(&mark.path).unwrap();
+        let parsed = parse(&record(current.pid, current.since, &current.text, None)).unwrap();
+        assert!(!parsed.same_mark(&parsed));
+        assert!(!parsed.same_mark(&current));
+        assert!(!current.same_mark(&parsed));
+        let mut unavailable = current.clone();
+        unavailable.identity = None;
+        assert!(!unavailable.same_mark(&current));
+        assert!(!unavailable.same_mark(&unavailable));
     }
 
     #[test]

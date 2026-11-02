@@ -1261,9 +1261,45 @@ toolset_deferral() { # <console_uid> <euid> <sudo_uid>
 # What a root run that left the toolset deferred says in its place.
 ROOT_TOOLSET_LINE="not installed as root: it lives in the home of the account that uses it — run \`aterm pkg install --default-set\` as that user, or it installs on their first aterm launch at this Mac's console"
 
+# The stat numbers at <fields> (comma-joined indexes into perl's stat list:
+# 0 device, 1 inode, 4 owner, 6 raw device) of each <path> that reads,
+# space-joined on a line apiece, as /usr/bin/stat prints them; status 1 where
+# one does not read, or perl does not stand. <mode> l reads the path itself,
+# s reads through links. perl's stat asks the kernel only. /usr/bin/stat
+# names a device operand by reading every node in /dev (devname), so one
+# node that never answers hangs it — and a look built never to hang with it
+# (measured: stat of /dev, of a disk node and of /dev/console each in
+# devname's lstat on a Mac with a wedged /dev node). There is no stat
+# fallback on macOS: where perl does not stand a look reads as nothing and
+# its caller refuses, which ends, where stat might not.
+file_numbers() { # <mode> <fields> <path>...
+	[[ -x /usr/bin/perl ]] || return 1
+	local mode="$1" fields="$2"
+	shift 2
+	/usr/bin/env -i LC_ALL=C /usr/bin/perl -T -e '
+my $follow = shift(@ARGV) eq "s";
+my @ix = split(/,/, shift(@ARGV));
+my $bad = 0;
+for my $p (@ARGV) {
+    my @s = $follow ? stat($p) : lstat($p);
+    if (!@s) { $bad = 1; next; }
+    print join(" ", map { $s[$_] } @ix), "\n";
+}
+exit($bad);
+' -- "$mode" "$fields" "$@"
+}
+
+lstat_numbers() { # <fields> <path>...
+	file_numbers l "$@"
+}
+
+stat_numbers() { # <fields> <path>...
+	file_numbers s "$@"
+}
+
 # The uid that owns /dev/console: the login at this Mac's screen, or root at the
-# loginwindow; empty when it cannot be read. /usr/bin/stat by path, since a GNU
-# stat first on PATH (Homebrew's coreutils) reads -f as --file-system.
+# loginwindow; empty when it cannot be read (lstat_numbers reads it without
+# naming the device).
 # ATERM_INSTALL_CONSOLE_UID names it instead (an install_sh test's stand-in for
 # another login at the screen); it moves only when the toolset installs, under
 # the same consent.
@@ -1272,7 +1308,7 @@ console_owner_uid() {
 		printf '%s\n' "$ATERM_INSTALL_CONSOLE_UID"
 		return 0
 	fi
-	/usr/bin/stat -f %u /dev/console 2>/dev/null || true
+	lstat_numbers 4 /dev/console 2>/dev/null || true
 }
 
 # The command lines of <uid>'s processes, one a line: the seam install_sh's
@@ -4149,16 +4185,17 @@ macos_mount_disks() {
 }
 
 # Each /dev/disk <node>'s device number on a line apiece (a test replaces
-# it).
+# it), read without naming the node (lstat_numbers).
 disk_devices() { # <node>...
-	stat -f %r -- "$@"
+	lstat_numbers 6 "$@"
 }
 
 # Each <path>'s device and inode, `<dev> <ino>` on a line apiece (a test
-# replaces it).
+# replaces it). On macOS read without naming a device (lstat_numbers): a way
+# can stand in /dev, whose own stat reads every node in it.
 folder_ids() { # <path>...
 	if [[ "$OSTYPE" == darwin* ]]; then
-		stat -f '%d %i' -- "$@"
+		lstat_numbers 0,1 "$@"
 	else
 		stat -c '%d %i' -- "$@"
 	fi
@@ -4668,11 +4705,11 @@ ask_bounded() { # <exe> [args…]
 ASKED=""
 
 # The `<device> <inode>` of the file <exe> names, read through links, or
-# nothing: with no ASKED, or when stat cannot read it.
+# nothing: with no ASKED, or when the file cannot be read.
 asked_id() { # <exe>
 	[[ -n "${ASKED:-}" ]] || return 0
 	if [[ "$OSTYPE" == darwin* ]]; then
-		/usr/bin/stat -L -f '%d %i' -- "$1" 2>/dev/null || true
+		stat_numbers 0,1 "$1" 2>/dev/null || true
 	else
 		stat -L -c '%d %i' -- "$1" 2>/dev/null || true
 	fi

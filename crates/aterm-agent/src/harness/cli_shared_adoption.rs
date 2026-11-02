@@ -816,10 +816,7 @@ fn browser(
     match row.browser.as_ref() {
         Some(_) => Err(super::super::account_catalog::NAMED_BROWSER_UNSUPPORTED.into()),
         None if cli == Cli::Claude => Ok(RenewBrowser::Remote {
-            opener: Some(
-                opener_link(store, host)
-                    .ok_or("automatic Claude sign-in has no headless opener")?,
-            ),
+            opener: Some(opener_link(store, host).map_err(|error| error.to_string())?),
         }),
         None => Ok(RenewBrowser::Default),
     }

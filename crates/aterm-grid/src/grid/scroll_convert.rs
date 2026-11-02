@@ -569,6 +569,10 @@ pub(crate) struct LazyBuffer {
     /// ([`take_arrivals`](Self::take_arrivals)): the stream's rate, as
     /// `Grid::trickle_lazy_bounded` judges it.
     arrivals_since_drain: u64,
+    /// `lines[..held]` are rows a drain left staged ([`hold`](Self::hold)): a
+    /// replay trimmed between input slices discards them first, so they count as
+    /// drained and [`should_drain`](Self::should_drain) weighs only the rest.
+    held: usize,
 }
 
 /// A hole at the front of the staged lines (the rows the flood path dropped
@@ -748,6 +752,7 @@ impl LazyBuffer {
             link_bytes: 0,
             linkless_front: 0,
             arrivals_since_drain: 0,
+            held: 0,
         }
     }
 
@@ -892,6 +897,7 @@ impl LazyBuffer {
                 .all(|line| line.link_bytes() == 0),
             "a staged row before the strip cursor still holds a link"
         );
+        assert!(self.held <= self.lines.len(), "more rows held than staged");
     }
 
     /// Whether a flood cut is open at the front (see [`FloodCut`]).
@@ -901,11 +907,27 @@ impl LazyBuffer {
         self.cut.is_some()
     }
 
-    /// Whether the buffer has exceeded the drain threshold.
+    /// Whether the rows staged since the last drain, held ones apart ([`hold`](Self::hold)), have exceeded the drain threshold.
     #[inline]
     #[must_use]
     pub(crate) fn should_drain(&self) -> bool {
-        self.lines.len() > DRAIN_THRESHOLD
+        self.lines.len() - self.held > DRAIN_THRESHOLD
+    }
+
+    /// Whether a drain due now may [`hold`](Self::hold) the staged rows instead for a replay that trims history to `trim` rows: no more than `trim` rows and one drain's worth are staged, they weigh no more than `headroom` bytes, and none is a flood marker or holds a link or an image, which the store and the link budget treat otherwise than staging does.
+    #[must_use]
+    pub(crate) fn may_hold(&self, trim: usize, headroom: usize) -> bool {
+        self.cut.is_none()
+            && self.link_bytes == 0
+            && self.staged_bytes <= headroom
+            && self.lines.len() <= trim.saturating_add(DRAIN_THRESHOLD)
+            && !self.any_image(&|_| true)
+    }
+
+    /// Leave every staged row in place as though drained: the rows the replay's next trim discards first ([`Grid::trim_replay_history`](crate::Grid::trim_replay_history)), which a drain would store only for that trim to drop.
+    #[inline]
+    pub(crate) fn hold(&mut self) {
+        self.held = self.lines.len();
     }
 
     /// Drain all pending lines as materialized [`Line`]s, oldest first.
@@ -914,6 +936,7 @@ impl LazyBuffer {
         self.staged_bytes = 0;
         self.link_bytes = 0;
         self.linkless_front = 0;
+        self.held = 0;
         let pool = &mut self.pool;
         marker.into_iter().chain(
             self.lines
@@ -935,6 +958,7 @@ impl LazyBuffer {
             link_bytes: std::mem::take(&mut self.link_bytes),
             linkless_front: std::mem::take(&mut self.linkless_front),
             arrivals_since_drain: 0,
+            held: std::mem::take(&mut self.held),
         }
     }
 
@@ -954,6 +978,7 @@ impl LazyBuffer {
         self.staged_bytes -= leaving;
         self.link_bytes -= leaving_links;
         self.linkless_front = self.linkless_front.saturating_sub(n);
+        self.held = self.held.saturating_sub(n);
         let pool = &mut self.pool;
         marker.into_iter().chain(
             self.lines
@@ -974,6 +999,7 @@ impl LazyBuffer {
         self.staged_bytes -= leaving;
         self.link_bytes -= leaving_links;
         self.linkless_front = self.linkless_front.min(start);
+        self.held = self.held.min(start);
         let pool = &mut self.pool;
         self.lines
             .drain(start..)
@@ -1037,6 +1063,7 @@ impl LazyBuffer {
         self.staged_bytes = 0;
         self.link_bytes = 0;
         self.linkless_front = 0;
+        self.held = 0;
         self.pool.clear();
         self.cut = None;
     }
@@ -1103,6 +1130,7 @@ impl LazyBuffer {
             pool.put(std::mem::take(&mut deferred.cells));
         }
         self.linkless_front = self.linkless_front.saturating_sub(n);
+        self.held = self.held.saturating_sub(n);
         n
     }
 

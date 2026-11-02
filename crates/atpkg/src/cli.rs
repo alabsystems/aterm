@@ -240,6 +240,8 @@ const TABLE: &[Verb] = &[
                 nothing\n\
                 aterm pkg machine cache clean     — run that cleanup, without applying host \
                 settings\n\
+                aterm pkg machine cache retire ABS — retire one registered ordinary cache, with \
+                                                    identity, Cargo lock and process-use checks\n\
                 aterm pkg machine cache retain ABS — keep one existing exact cache root; no \
                 deletion permission (ordinary cleaners older than this capability must first \
                 be updated)",
@@ -6523,6 +6525,7 @@ pub(crate) fn cache_plan_words(why: crate::build_cache::Unused) -> String {
         }
     };
     match why {
+        Unused::Requested => "explicit retirement of one registered ordinary cache".to_owned(),
         Unused::Gone { idle, after } => format!(
             "candidate for the whole folder: its workspace is gone and nothing wrote it for {} \
              (age threshold {})",
@@ -6771,6 +6774,42 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
                 println!("no unused Rust build cache entries removed");
             }
             ExitCode::SUCCESS
+        }
+        [sub, action, root] if sub == "cache" && action == "retire" => {
+            let Some(home) = aterm_types::dirs::home_dir() else {
+                eprintln!("atpkg: cache retirement needs a home directory");
+                return ExitCode::from(2);
+            };
+            match crate::build_cache::registered::retire(
+                &home,
+                std::path::Path::new(root),
+                &mut |path, why| {
+                    println!("retiring {}: {}", path.display(), cache_plan_words(why));
+                    true
+                },
+            ) {
+                Ok(outcomes) => {
+                    let complete = outcomes.iter().all(|(_, why)| {
+                        matches!(
+                            why,
+                            crate::build_cache::Unused::Requested
+                                | crate::build_cache::Unused::Unfinished
+                        )
+                    });
+                    for (path, why) in outcomes {
+                        println!("{}: {}", path.display(), cache_plan_words(why));
+                    }
+                    if complete {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(75)
+                    }
+                }
+                Err(error) => {
+                    eprintln!("atpkg: cache not retired: {error}");
+                    ExitCode::from(75)
+                }
+            }
         }
         [sub, action, flag] if sub == "cache" && action == "retain" && flag == "--capabilities" => {
             println!("{}", crate::build_cache::registered::RETAIN_CAPABILITY);

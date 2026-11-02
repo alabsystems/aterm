@@ -921,16 +921,10 @@ pub const DESKTOP_UP: &str = "lane-desktop-up";
 /// The plan's fingerprint (fnv-1a over every step), which [`STAMP`] holds once it ran.
 #[must_use]
 pub fn fingerprint(steps: &[Step]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h = astream_wire::hash::FNV1A_64_INIT;
     for s in steps {
-        for b in s
-            .script
-            .bytes()
-            .chain([u8::from(s.runner), u8::from(s.reboot), 0x1f])
-        {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        h = astream_wire::hash::fnv1a_64_update(h, s.script.as_bytes());
+        h = astream_wire::hash::fnv1a_64_update(h, &[u8::from(s.runner), u8::from(s.reboot), 0x1f]);
     }
     format!("{h:016x}")
 }
@@ -1344,6 +1338,28 @@ mod tests {
         let without = provision_plan(None);
         assert!(without.iter().all(|s| s.label != "web2"));
         assert_ne!(fingerprint(&plan), fingerprint(&without));
+    }
+
+    /// A guest's [`STAMP`] holds this value: a fold that moved it would provision every guest
+    /// again.
+    #[test]
+    fn a_stamped_fingerprint_does_not_move() {
+        let steps = [
+            Step {
+                label: "one",
+                script: "Write-Output é".to_owned(),
+                runner: false,
+                reboot: true,
+            },
+            Step {
+                label: "two",
+                script: String::new(),
+                runner: true,
+                reboot: false,
+            },
+        ];
+        assert_eq!(fingerprint(&steps), "c8b6e042f2c6b27c");
+        assert_eq!(fingerprint(&[]), "cbf29ce484222325");
     }
 
     #[test]

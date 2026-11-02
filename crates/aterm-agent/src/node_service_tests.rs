@@ -255,6 +255,12 @@ fn node_units_stay_separate_from_secrets_and_put_atpkg_bin_first_on_path() {
         "plist PATH must put atpkg pkg/bin first: {plist}"
     );
     assert_eq!(kept_program_in_unit(&plist).as_deref(), Some(prog));
+    // A dialer waits on this job's handshakes for 3 s: launchd's Background band holds every thread
+    // at priority 4, which a loaded Mac starves past that (docs/measured/fleet-lan-m100-2026-11-02.md).
+    assert!(
+        plist.contains("<key>ProcessType</key>\n\t<string>Standard</string>\n"),
+        "{plist}"
+    );
 
     let unit = node_systemd_unit_text(prog, Path::new("/home/alice"));
     assert!(

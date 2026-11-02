@@ -3,6 +3,468 @@
 
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
+    use aterm_agent::harness::account_progress::{
+        ProgressPhase, RECOVERY_HISTORY_PREFIX, RECOVERY_RESUME_FINDING,
+        SESSION_AUTOPILOT_OFF_FINDING,
+    };
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+    let mut app = crate::App::headless_for_test();
+    app.proxy = None;
+    let local = app.focused_session_id(crate::WindowId(0)).unwrap();
+    let sid = app.session_sid(local).unwrap();
+    let ctx = app.pool.get(local).unwrap().ctx.clone();
+    let (a, idle, mut host, born) = execution_fixture(&sid);
+    let now = aterm_time::unix_secs()
+        .and_then(|at| i64::try_from(at).ok())
+        .unwrap();
+    a.now.store(now, Ordering::SeqCst);
+    // This account passes the real execution gate: a different execution receipt must not
+    // mask the normal decision whose recheck disappears when the session is switched Off.
+    assert_eq!(idle.account_execution_hold(), None);
+    assert!(
+        idle.kept
+            .lock()
+            .unwrap()
+            .account
+            .execution_progress
+            .is_none()
+    );
+    idle.switches
+        .account_controls
+        .store(ACCOUNTS_WALL, Ordering::SeqCst);
+    // The gate fixture binds the real test process. Its limit must be observed after that
+    // kernel birth, rather than using the fixture's older synthetic process-era timestamp.
+    a.wall_of(ACCT_TALK_A, now, Some("five_hour"), Some(now + 3600));
+    let roster = a.roster();
+    a.store()
+        .transact(now, &mut None, |state| {
+            let mut events = Vec::new();
+            for row in &roster.rows {
+                events.extend(accounts::note_wall(
+                    state,
+                    &row.label,
+                    "five_hour",
+                    Some(now + 3600),
+                    now,
+                    now,
+                ));
+            }
+            Ok(events)
+        })
+        .unwrap();
+    assert!(matches!(
+        idle.account(usage_wall()),
+        Some(AccountAdvice::Wait { .. })
+    ));
+    let retained = idle
+        .kept
+        .lock()
+        .unwrap()
+        .account
+        .progress
+        .as_ref()
+        .unwrap()
+        .value
+        .clone();
+    assert_eq!(retained.phase, ProgressPhase::Waiting);
+    assert!(retained.next_at.is_some());
+    {
+        let mut timeline = ctx.timeline.lock().unwrap();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        timeline.note_foreground_group(pid);
+        timeline.set_program(pid, Some("claude".into()));
+        timeline.set_agent_reader_program_for_test(Some(Program::Claude));
+        timeline.set_claude_footer(
+            pid,
+            Some(born),
+            Some(FooterFacts {
+                owner: Some(FactsOwner {
+                    floor: Some(born),
+                    session_id: ACCT_TALK_A.into(),
+                }),
+                ..Default::default()
+            }),
+        );
+    }
+    let notes = Arc::new(Mutex::new(Vec::new()));
+    let queued = Arc::clone(&notes);
+    host.hooks.note = Arc::new(move |note| queued.lock().unwrap().push(note));
+    let context = Arc::clone(&ctx);
+    let session = sid.clone();
+    host.hooks.autopilot = Arc::new(move || {
+        context
+            .meta
+            .lock()
+            .unwrap()
+            .autopilot_word()
+            .map(|word| HashMap::from([(session.clone(), word)]))
+            .unwrap_or_default()
+    });
+    app.harness = Some(host.clone());
+    let model = aterm_models_harness::account_progress_policy_model();
+    let mut policy = model.init_state();
+    let mut epochs = vec![Arc::clone(
+        &idle.kept.lock().unwrap().account.progress_policy,
+    )];
+    let check = |state: &aterm_spec::interp::State,
+                 epochs: &[Arc<()>],
+                 producer: Option<&AdviceRequest>| {
+        let index = |token: &Arc<()>| {
+            i64::try_from(
+                epochs
+                    .iter()
+                    .position(|epoch| Arc::ptr_eq(epoch, token))
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let (epoch, record_epoch, value) = {
+            let kept = idle.kept.lock().unwrap();
+            let record = kept.account.progress.as_ref().unwrap();
+            (
+                index(&kept.account.progress_policy),
+                i64::try_from(
+                    epochs
+                        .iter()
+                        .position(|epoch| record.policy_is(epoch))
+                        .unwrap(),
+                )
+                .unwrap(),
+                i64::from(record.value.observed_at != retained.observed_at),
+            )
+        };
+        let off = host.shared.lock().off.contains(&sid);
+        let view = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap());
+        for (field, actual) in [
+            (
+                "turn",
+                if off {
+                    1
+                } else {
+                    i64::try_from(epochs.len() - 1).unwrap()
+                },
+            ),
+            ("epoch", epoch),
+            ("record_epoch", record_epoch),
+            ("record_value", value),
+            (
+                "producer_epoch",
+                producer.map_or(3, |producer| index(&producer.turn.progress_policy)),
+            ),
+            (
+                "view",
+                view.as_ref().map_or(0, |view| match view.phase {
+                    ProgressPhase::Waiting => 1,
+                    ProgressPhase::Paused => 2,
+                    ProgressPhase::Unknown => 3,
+                    _ => panic!("the policy trace has no in-flight work"),
+                }),
+            ),
+            (
+                "next",
+                i64::from(view.as_ref().is_some_and(|view| view.next_at.is_some())),
+            ),
+        ] {
+            assert_eq!(state[field], actual, "{field}: {state:?}");
+        }
+        for invariant in &model.invariants {
+            assert!(
+                model.check_invariant(invariant.name, state),
+                "{}: {state:?}",
+                invariant.name
+            );
+        }
+    };
+    let read = |app: &mut crate::App| {
+        app.harness_progress_next_poll = None;
+        app.service_harness_account_progress_with_reader(
+            Instant::now(),
+            |host, sid, pid, birth, talk| {
+                host.account_progress_read_with_activity(
+                    sid,
+                    pid,
+                    birth,
+                    talk,
+                    || (Instant::now(), Some(now)),
+                    |_, _, _| Some(Vec::new()),
+                )
+            },
+        );
+    };
+    check(&policy, &epochs, None);
+    assert!(model.fire("Read", &mut policy));
+    read(&mut app);
+    assert!(model.fire("Deliver", &mut policy));
+    check(&policy, &epochs, None);
+    assert_eq!(
+        crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()),
+        Some(retained.clone())
+    );
+    let wanted = HashMap::from([(sid.clone(), Program::Claude)]);
+    let mut worker = idle_worker();
+    worker.agent = Program::Claude;
+    worker.kept = Arc::clone(&idle.kept);
+    let mut workers = Workers(HashMap::from([(sid.clone(), worker)]));
+    let set = |app: &mut crate::App,
+               workers: &mut Workers,
+               word: Autopilot,
+               policy: &mut aterm_spec::interp::State,
+               epochs: &mut Vec<Arc<()>>,
+               producer: Option<&AdviceRequest>| {
+        crate::session_timeline::apply_autopilot(
+            &ctx,
+            Some(word.word().into()),
+            None,
+            aterm_slog::Actor::Human,
+            None,
+        );
+        let off = OffSessions::read(&host.hooks, Autopilot::Cruise);
+        let steps = StepsSeen::read(workers);
+        visit_workers(
+            &host.shared,
+            workers,
+            &steps,
+            &mut BTreeSet::new(),
+            &wanted,
+            &off,
+            true,
+            0,
+            &host.hooks,
+        );
+        publish_off(&host.shared, workers, &wanted, &off, &host.hooks);
+        epochs.push(Arc::clone(
+            &idle.kept.lock().unwrap().account.progress_policy,
+        ));
+        assert!(model.fire(if word == Autopilot::Off { "Off" } else { "On" }, policy));
+        check(policy, epochs, producer);
+        // A real host note must bypass an already armed future GUI poll.
+        app.harness_progress_next_poll = Some(Instant::now() + Duration::from_secs(3600));
+        let pending = std::mem::take(&mut *notes.lock().unwrap());
+        assert!(
+            pending
+                .iter()
+                .any(|note| matches!(note, HostNote::AccountProgress))
+        );
+        for note in pending {
+            assert!(matches!(note, HostNote::AccountProgress));
+            assert!(model.fire("Read", policy));
+            app.note_harness_host(note);
+            assert!(model.fire("Deliver", policy));
+            check(policy, epochs, producer);
+        }
+        let progress =
+            crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
+        assert_eq!(progress.phase, ProgressPhase::Paused);
+        assert_eq!(
+            progress.details.first().map(String::as_str),
+            Some(if word == Autopilot::Off {
+                SESSION_AUTOPILOT_OFF_FINDING
+            } else {
+                RECOVERY_RESUME_FINDING
+            })
+        );
+        assert_eq!(progress.next_at, None);
+    };
+    let before_off = AdviceTurn::begin(&idle.kept).capture(&idle.kept).unwrap();
+    assert!(model.fire("CaptureChanged", &mut policy));
+    check(&policy, &epochs, Some(&before_off));
+    set(
+        &mut app,
+        &mut workers,
+        Autopilot::Off,
+        &mut policy,
+        &mut epochs,
+        Some(&before_off),
+    );
+    assert!(workers.0[&sid].stop.load(Ordering::SeqCst));
+    read(&mut app);
+    let paused = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
+    assert_eq!(paused.phase, ProgressPhase::Paused);
+    // Former presentation kept the same normal wait/deadline despite a known Off verdict.
+    let mut former = policy.clone();
+    former.insert("view", 1);
+    former.insert("next", 1);
+    assert!(
+        model
+            .invariants
+            .iter()
+            .any(|law| !model.check_invariant(law.name, &former))
+    );
+    assert_eq!((paused.eligible, paused.next_at), (None, None));
+    assert_eq!(
+        (
+            paused.observed_at,
+            &paused.account,
+            paused.known,
+            &paused.wall,
+            paused.own_claim
+        ),
+        (
+            retained.observed_at,
+            &retained.account,
+            retained.known,
+            &retained.wall,
+            retained.own_claim
+        )
+    );
+    assert_eq!(
+        paused.details.first().map(String::as_str),
+        Some(SESSION_AUTOPILOT_OFF_FINDING)
+    );
+    for detail in &retained.details {
+        assert!(
+            paused
+                .details
+                .contains(&format!("{RECOVERY_HISTORY_PREFIX}{detail}"))
+        );
+    }
+    assert_eq!(app.harness_progress_next_poll, None);
+    app.open_fact_menu(
+        crate::WindowId(0),
+        local,
+        crate::claude_lights::Fact::Account,
+        (0, 0),
+        false,
+    );
+    let menu = &app.autopilot_menu.as_ref().unwrap().rows;
+    assert!(menu.iter().any(|row| matches!(row,
+        crate::autopilot_menu::MenuRow::Note { text, .. } if text == SESSION_AUTOPILOT_OFF_FINDING)));
+    let lab = app.harness_state().lab;
+    let lab = lab
+        .sessions
+        .iter()
+        .find(|session| session.local_id == local)
+        .unwrap();
+    assert!(
+        lab.facts
+            .iter()
+            .any(|(_, value)| value == SESSION_AUTOPILOT_OFF_FINDING)
+    );
+    let reply = crate::harness_recovery_verb::cmd("recovery", true, || Ok(Some(paused.clone())));
+    for field in ["phase=paused", "eligible=-", "next_at=-"] {
+        assert!(
+            reply.split_whitespace().any(|word| word == field),
+            "{reply}"
+        );
+    }
+    // A calculation begun before Off may still return; it changes neither the retained
+    // observation nor the separate action/advice policy when its display epoch is retired.
+    let mut obsolete = idle
+        .kept
+        .lock()
+        .unwrap()
+        .account
+        .progress
+        .as_ref()
+        .unwrap()
+        .clone();
+    obsolete.value.observed_at += 1;
+    before_off.publish_progress(&idle.kept, None, usage_wall(), Some(obsolete.clone()));
+    assert!(model.fire("Publish", &mut policy));
+    check(&policy, &epochs, None);
+    assert_eq!(
+        idle.kept
+            .lock()
+            .unwrap()
+            .account
+            .progress
+            .as_ref()
+            .unwrap()
+            .value,
+        retained
+    );
+    let while_off = AdviceTurn::begin(&idle.kept).capture(&idle.kept).unwrap();
+    assert!(model.fire("CaptureChanged", &mut policy));
+    check(&policy, &epochs, Some(&while_off));
+    let mut obsolete_off = idle
+        .read_account_progress(&while_off, usage_wall(), None, None)
+        .unwrap();
+    obsolete_off.value = obsolete.value;
+    set(
+        &mut app,
+        &mut workers,
+        Autopilot::Cruise,
+        &mut policy,
+        &mut epochs,
+        Some(&while_off),
+    );
+    while_off.publish_progress(&idle.kept, None, usage_wall(), Some(obsolete_off));
+    assert!(model.fire("Publish", &mut policy));
+    check(&policy, &epochs, None);
+    read(&mut app);
+    let resumed = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
+    assert_eq!(resumed.phase, ProgressPhase::Paused);
+    assert_eq!(resumed.observed_at, retained.observed_at);
+    assert_eq!(
+        resumed.details.first().map(String::as_str),
+        Some(RECOVERY_RESUME_FINDING)
+    );
+    assert_eq!(resumed.next_at, None);
+    // The real account publication may legitimately emit identical data in the same second.
+    let request = AdviceTurn::begin(&idle.kept).capture(&idle.kept).unwrap();
+    assert!(model.fire("CaptureSame", &mut policy));
+    check(&policy, &epochs, Some(&request));
+    let mut same = idle
+        .read_account_progress(&request, usage_wall(), None, None)
+        .unwrap();
+    same.value = retained.clone();
+    request.publish_progress(&idle.kept, None, usage_wall(), Some(same));
+    assert!(model.fire("Publish", &mut policy));
+    check(&policy, &epochs, None);
+    assert!(model.fire("Read", &mut policy));
+    read(&mut app);
+    assert!(model.fire("Deliver", &mut policy));
+    check(&policy, &epochs, None);
+    let fresh = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
+    assert_eq!(fresh, retained);
+    assert!(
+        idle.kept
+            .lock()
+            .unwrap()
+            .account
+            .execution_progress
+            .is_none()
+    );
+    // Current work is independently observed and intentionally outside the policy model.
+    // It remains visible under Off without promising a later selection or retry.
+    publish_off(
+        &host.shared,
+        &workers,
+        &wanted,
+        &OffSessions {
+            words: HashMap::new(),
+            default: Autopilot::Off,
+        },
+        &host.hooks,
+    );
+    let origin = a.seat().context();
+    {
+        let mut kept = idle.kept.lock().unwrap();
+        kept.account.moved = Some(Moved {
+            id: MoveId::default(),
+            origin,
+            to: "work-2".into(),
+            at: AccountAt::Wall,
+            login: None,
+            process: kept.snapshot.clone().unwrap(),
+            answered: false,
+            untold: false,
+        });
+    }
+    read(&mut app);
+    let working = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
+    assert_eq!(
+        working.phase,
+        ProgressPhase::Verifying {
+            to: "work-2".into()
+        }
+    );
+    assert_eq!((working.eligible, working.next_at), (None, None));
+}
+
 fn ready(sid: &str) -> (Arc<Accts>, WorkerIdle) {
     let a = Accts::new();
     a.spawn(sid, ACCT_TALK_A, "main");

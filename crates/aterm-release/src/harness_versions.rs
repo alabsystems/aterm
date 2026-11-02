@@ -491,20 +491,50 @@ fn read() {}
     fn only_a_moved_harness_under_an_unchanged_version_owes() {
         let texts = |minor: u16| move |_: CliHarness| Ok::<_, Error>(one(minor));
         let before = |minor: u16| move |_: CliHarness| Ok::<_, Error>(Some(one(minor)));
-        let none = owed(&["README.md".into()], before(4), texts(4)).unwrap();
-        assert!(none.is_empty(), "no harness source moved");
-        let lane = owed(
-            &["crates/aterm-agent/src/harness/footer.rs".into()],
+        let none = owed(
+            &[
+                "README.md".into(),
+                "crates/aterm-agent/src/harness/footer.rs".into(),
+                "crates/aterm-agent/src/harness/codex_alab.rs".into(),
+            ],
             before(4),
             texts(4),
         )
         .unwrap();
-        assert_eq!(
-            lane.iter().map(|o| o.harness).collect::<Vec<_>>(),
-            CliHarness::ALL.to_vec(),
-            "the shared lane moves every harness"
+        assert!(
+            none.is_empty(),
+            "no CLI harness source moved; shared infrastructure does not lockstep-bump harnesses"
         );
-        assert!(lane.iter().all(|o| (o.at, o.to) == ((0, 4), (0, 5))));
+        for (harness, sample) in [
+            (
+                CliHarness::ClaudeCode,
+                "crates/aterm-agent/src/harness/cli_shared_claude.rs",
+            ),
+            (
+                CliHarness::Agy,
+                "crates/aterm-agent/src/harness/upgrade_agy.rs",
+            ),
+            (
+                CliHarness::Grok,
+                "crates/aterm-agent/src/harness/grok_signin.rs",
+            ),
+            (
+                CliHarness::Kimi,
+                "crates/aterm-agent/src/harness/cli_shared_kimi.rs",
+            ),
+            (
+                CliHarness::Muse,
+                "crates/aterm-agent/src/harness/upgrade_muse.rs",
+            ),
+        ] {
+            let single = owed(&[sample.into()], before(4), texts(4)).unwrap();
+            assert_eq!(
+                single.iter().map(|o| o.harness).collect::<Vec<_>>(),
+                vec![harness],
+                "{sample} moves only {harness:?}"
+            );
+            assert_eq!((single[0].at, single[0].to), ((0, 4), (0, 5)));
+        }
         let reader = owed(
             &["crates/aterm-phase/src/muse.rs".into()],
             before(4),
@@ -516,7 +546,10 @@ fn read() {}
         assert!(reader[0].line().contains("crates/aterm-phase/src/muse.rs"));
         assert!(reader[0].line().contains(&version_line((0, 5))));
         let bumped = owed(
-            &["crates/aterm-agent/src/harness/footer.rs".into()],
+            &[
+                "crates/aterm-phase/src/muse.rs".into(),
+                "crates/aterm-agent/src/harness/upgrade_muse.rs".into(),
+            ],
             before(4),
             texts(5),
         )
@@ -563,7 +596,8 @@ fn read() {}
         );
     }
 
-    /// A scratch history: a release tag, then a change to the shared lane.
+    /// A scratch history: a release tag, then changes to two harnesses (`claude` and `muse`) and a
+    /// non-harness file (`footer.rs`), leaving `agy`, `grok` and `kimi` untouched.
     fn history(dir: &Path, bump_too: bool) -> (String, String) {
         init(dir, &[("user.name", "t"), ("user.email", "t@example.com")]);
         let run = |args: &[&str]| {
@@ -588,9 +622,13 @@ fn read() {}
             )
             .unwrap();
         }
-        let lane = dir.join("crates/aterm-agent/src/harness/footer.rs");
-        std::fs::create_dir_all(lane.parent().unwrap()).unwrap();
-        std::fs::write(&lane, "fn a() {}\n").unwrap();
+        let footer = dir.join("crates/aterm-agent/src/harness/footer.rs");
+        let claude_src = dir.join("crates/aterm-agent/src/harness/cli_shared_claude.rs");
+        let muse_src = dir.join("crates/aterm-agent/src/harness/upgrade_muse.rs");
+        std::fs::create_dir_all(footer.parent().unwrap()).unwrap();
+        std::fs::write(&footer, "fn a() {}\n").unwrap();
+        std::fs::write(&claude_src, "fn c() {}\n").unwrap();
+        std::fs::write(&muse_src, "fn m() {}\n").unwrap();
         std::fs::write(
             dir.join("CHANGELOG.md"),
             "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - x\n",
@@ -599,9 +637,11 @@ fn read() {}
         run(&["add", "-A"]);
         run(&["commit", "-qm", "v0.1.0"]);
         let released = run(&["rev-parse", "HEAD"]);
-        std::fs::write(&lane, "fn a() { b() }\n").unwrap();
+        std::fs::write(&footer, "fn a() { b() }\n").unwrap();
+        std::fs::write(&claude_src, "fn c() { b() }\n").unwrap();
+        std::fs::write(&muse_src, "fn m() { b() }\n").unwrap();
         if bump_too {
-            for h in CliHarness::ALL {
+            for h in [CliHarness::ClaudeCode, CliHarness::Muse] {
                 std::fs::write(dir.join(h.version_file()), one(2)).unwrap();
             }
         }
@@ -618,8 +658,14 @@ fn read() {}
             .unwrap_err()
             .to_string();
         assert!(refused.contains("since v0.1.0"), "{refused}");
-        for h in CliHarness::ALL {
+        for h in [CliHarness::ClaudeCode, CliHarness::Muse] {
             assert!(refused.contains(h.version_file()), "{h:?}: {refused}");
+        }
+        for h in [CliHarness::Agy, CliHarness::Grok, CliHarness::Kimi] {
+            assert!(
+                !refused.contains(h.version_file()),
+                "{h:?} did not move: {refused}"
+            );
         }
         assert!(refused.contains(&version_line((0, 2))), "{refused}");
         let tmp = aterm_tempfile::TempDir::new().unwrap();
@@ -627,7 +673,11 @@ fn read() {}
         let git = Git::new(tmp.path());
         let passed = gate(&git, ("0.1.0", &released), &head).unwrap();
         assert!(
-            passed.contains("claude 0.2") && passed.contains("muse 0.2"),
+            passed.contains("claude 0.2")
+                && passed.contains("muse 0.2")
+                && passed.contains("agy 0.1")
+                && passed.contains("grok 0.1")
+                && passed.contains("kimi 0.1"),
             "{passed}"
         );
     }
@@ -638,14 +688,23 @@ fn read() {}
         let (released, _) = history(tmp.path(), false);
         let git = Git::new(tmp.path());
         let owed = bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
-        assert_eq!(owed.len(), CliHarness::ALL.len());
-        for h in CliHarness::ALL {
+        assert_eq!(
+            owed.iter().map(|o| o.harness).collect::<Vec<_>>(),
+            vec![CliHarness::ClaudeCode, CliHarness::Muse]
+        );
+        for h in [CliHarness::ClaudeCode, CliHarness::Muse] {
             let text = std::fs::read_to_string(tmp.path().join(h.version_file())).unwrap();
             assert_eq!(declared(&text), Some((0, 2)), "{h:?}");
             assert!(text.contains(&version_line((0, 2))), "{h:?}: one line");
         }
+        for h in [CliHarness::Agy, CliHarness::Grok, CliHarness::Kimi] {
+            let text = std::fs::read_to_string(tmp.path().join(h.version_file())).unwrap();
+            assert_eq!(declared(&text), Some((0, 1)), "{h:?} stays at 0.1");
+        }
         let log = std::fs::read_to_string(tmp.path().join("CHANGELOG.md")).unwrap();
         assert!(log.contains("`alab claude harness 0.2`"), "{log}");
+        assert!(log.contains("`alab muse harness 0.2`"), "{log}");
+        assert!(!log.contains("`alab agy harness"), "{log}");
         assert!(
             !log.contains("codex harness"),
             "Codex versions its own binary: {log}"

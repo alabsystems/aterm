@@ -263,18 +263,111 @@ pub fn html_text(html: &str) -> String {
             output.push(ch);
         }
     }
-    output
-        .replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&")
+    let mut decoded = String::with_capacity(output.len());
+    let mut rest = output.as_str();
+    while let Some(start) = rest.find('&') {
+        decoded.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let entity = rest.get(1..).and_then(|tail| {
+            tail.bytes()
+                .take(33)
+                .position(|byte| byte == b';')
+                .map(|end| &tail[..end])
+        });
+        if let Some((entity, ch)) =
+            entity.and_then(|entity| html_entity(entity).map(|ch| (entity, ch)))
+        {
+            decoded.push(ch);
+            rest = &rest[entity.len() + 2..];
+        } else {
+            decoded.push('&');
+            rest = &rest[1..];
+        }
+    }
+    decoded.push_str(rest);
+    let mut text = String::with_capacity(decoded.len());
+    for line in decoded.lines() {
+        let visible: String = line
+            .chars()
+            .filter(|ch| !matches!(ch, '\u{ad}' | '\u{34f}' | '\u{200b}' | '\u{feff}'))
+            .collect();
+        let line = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !line.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&line);
+        }
+    }
+    if decoded.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+fn html_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        "shy" => Some('\u{ad}'),
+        "ndash" => Some('–'),
+        "mdash" => Some('—'),
+        "lsquo" => Some('‘'),
+        "rsquo" => Some('’'),
+        "ldquo" => Some('“'),
+        "rdquo" => Some('”'),
+        "hellip" => Some('…'),
+        "copy" => Some('©'),
+        "reg" => Some('®'),
+        _ => {
+            let (digits, radix) = if let Some(digits) = entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+            {
+                (digits, 16)
+            } else {
+                (entity.strip_prefix('#')?, 10)
+            };
+            if digits.is_empty()
+                || !digits.bytes().all(|b| {
+                    if radix == 16 {
+                        b.is_ascii_hexdigit()
+                    } else {
+                        b.is_ascii_digit()
+                    }
+                })
+            {
+                return None;
+            }
+            u32::from_str_radix(digits, radix)
+                .ok()
+                .and_then(char::from_u32)
+                .filter(|ch| *ch != '\0')
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn html_numeric_entities_and_invisible_preview_padding_do_not_obscure_mail() {
+        assert_eq!(
+            html_text(
+                "<p>Hello &#x1f44b; &#8212; &amp; welcome</p>&#8199;&#847;&shy;&#8199;<p>Readable &ldquo;mail&rdquo;</p>"
+            ),
+            "Hello 👋 — & welcome\nReadable “mail”\n"
+        );
+        assert_eq!(
+            html_text("&amp;lt; &#x110000; &#0; &unknown;"),
+            "&lt; &#x110000; &#0; &unknown;"
+        );
+    }
+
     #[test]
     fn prefers_plain_part_and_decodes_headers_without_loading_html() {
         let raw = b"Subject: =?UTF-8?Q?Hello_=E2=9C=93?=\r\nContent-Type: multipart/alternative; boundary=x\r\n\r\n--x\r\nContent-Type: text/html\r\n\r\n<script>bad()</script><p>html</p>\r\n--x\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\ncGxhaW4=\r\n--x--\r\n";

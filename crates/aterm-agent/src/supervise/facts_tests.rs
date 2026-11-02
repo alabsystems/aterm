@@ -465,6 +465,7 @@ fn a_seed_holds_a_typed_wake_by_its_own_episode() {
             wall_ms: T0 + 60_000,
             told: &told,
             ranked: true,
+            nudge_wake: true,
         };
         let hold = HoldSeen {
             since_ms: 0,

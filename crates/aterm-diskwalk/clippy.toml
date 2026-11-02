@@ -28,6 +28,7 @@ disallowed-methods = [
   { path = "std::fs::File::sync_data", reason = "finish the write with aterm_durable::durable_data or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
   { path = "libc::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "libc::forkpty", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "libc::openpty", reason = "openpty leaves both ends inheritable and loses XNU's ptmx allocation race (EREDRIVEOPEN): use aterm_pty::open_pty_pair (clippy.toml: the confined shell)", allow-invalid = true },
   { path = "libc::execvp", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
   { path = "std::process::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
   { path = "libc::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },

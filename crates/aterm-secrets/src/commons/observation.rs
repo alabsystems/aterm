@@ -24,6 +24,20 @@ pub enum Unavailable {
 }
 
 impl Unavailable {
+    /// Preserve local contention when a required observation becomes an error.
+    #[cfg(unix)]
+    pub(crate) fn failure(self, context: &str) -> crate::Error {
+        let kind = if self == Self::Busy {
+            crate::ErrorKind::VaultBusy
+        } else {
+            crate::ErrorKind::Other
+        };
+        crate::Error::of_kind(
+            kind,
+            format!("{context} ({}): {}", self.code(), self.explanation()),
+        )
+    }
+
     pub const fn code(self) -> &'static str {
         match self {
             Self::Busy => "vault-busy",

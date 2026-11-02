@@ -766,6 +766,269 @@ fn a_member_that_reads_no_newer_records_lets_no_new_key_in() {
     drop(macs.root);
 }
 
+/// A brand-new Mac proves itself first and only then asks plainly, which is the only way a member
+/// forwards it for automatic admission. A member that refuses a Mac whatever it proves next says so
+/// before its possession challenge, so nothing was asked of `decide`, the Mac sent nothing a member
+/// could sign on (`Missed::signed_maybe` false) and no server is read: a stranger, and a seat whose
+/// Mac signed in the last day, which a person decides.
+///
+/// A refusal once possession has gone stays ambiguous, whatever its line says: nothing authenticates
+/// a `NO`, and a forged one after a real signature must not send the Mac to a second member, where
+/// two removals of one seat make a quorum `Remove`. So does the book's refusal of a seat members
+/// older than 0.148 would read as removed: it moves by itself, and no person is asked.
+///
+/// NEGATIVE CONTROLS: the `refuses` check removed from `desk::prove`: `decide` runs and
+/// `signed_maybe` is true for each refusal this expects early. `moved_seats_read` left as the book
+/// says in `refuses_before_possession_at_ms`: the dark seat is refused early. `joiner::prove`
+/// clearing `sent` on any `NO`: the seated Mac's `signed_maybe` is false. The `unclaimed` answer
+/// removed: the Mac with no claim reads the book's sentence. No `read_newest` in the dry run: the
+/// `unread` Mac goes on to possession. A missing signer read as `None`: `said` is `None`.
+#[test]
+fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguous() {
+    use crate::members::desk::{self, Desk, Local};
+    use crate::members::join::{self, Stream};
+    use crate::members::joiner::Joining;
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (macs.m22.clone(), macs.m7.clone());
+    let pair = node_pair(8);
+    publish_local_node_key(&m7, node(8), |network, actor| {
+        pair.sign(&node_proof_message(network, actor))
+            .as_ref()
+            .try_into()
+            .unwrap()
+    })
+    .expect("m7 publishes its node key")
+    .expect("a Node record");
+    post_records_to_servers(&m7).expect("m7 posts its records");
+    sync_records(&m22, None).expect("m22 pulls m7's Node record");
+    let fresh = Paths::for_home(&macs.root.path().join("new-mac"));
+    machine_identity(&fresh).expect("identity");
+    let device = crate::commons::bootstrap::Device::open(&fresh)
+        .expect("device")
+        .expect("an identity");
+    let prefix = format!("aterm-fleet/v3 record {}\0", desk::PROVE_RECORD);
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let decide = |_: &desk::Proving<'_>| -> crate::Result<crate::SecretBytes> {
+        asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(crate::Error::new("this member refused after possession"))
+    };
+    let tried = |node_key: [u8; 32], signer: &Ed25519KeyPair, fleet: Option<[u8; 32]>, at: u64| {
+        let joining = Joining {
+            device: &device,
+            node: node_key,
+            name: "new-mac".to_owned(),
+            model: "Mac17,6".to_owned(),
+        };
+        let sign_node = |message: &[u8]| -> [u8; 64] {
+            signer
+                .sign(&[prefix.as_bytes(), message].concat())
+                .as_ref()
+                .try_into()
+                .unwrap()
+        };
+        let hearing = std::sync::Mutex::new(Desk::new(
+            Local::of(&m22)
+                .expect("m22's desk")
+                .expect("m22 is a member"),
+        ));
+        std::thread::scope(|scope| {
+            let dial = |_: &str| -> crate::Result<Box<dyn Stream>> {
+                let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+                for end in [&ours, &theirs] {
+                    end.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
+                }
+                let (hearing, decide, member) = (&hearing, &decide, &m22);
+                scope.spawn(move || {
+                    let refuses = |proving: &desk::Proving<'_>| {
+                        refuses_before_possession_at_ms(member, proving, Book::default(), at)
+                    };
+                    let _ = desk::serve_with(
+                        hearing,
+                        &mut ours,
+                        std::net::IpAddr::from([192, 0, 2, 22]),
+                        &|_| Err(crate::Error::new("no phrase runs here")),
+                        Some(desk::Proof {
+                            decide,
+                            refuses: &refuses,
+                            fleet,
+                        }),
+                    );
+                });
+                Ok(Box::new(theirs))
+            };
+            match join::prove_first(&fresh, &dial, &joining, &sign_node, &["m22:7".to_owned()]) {
+                Ok(_) => panic!("this Mac was let in by its proof"),
+                Err(missed) => missed,
+            }
+        })
+    };
+    let count = || asked.load(std::sync::atomic::Ordering::SeqCst);
+
+    let now = aterm_time::unix_millis().unwrap();
+    let later = now + 2 * DARK_FOR_MS;
+    let stranger_pair = node_pair(9);
+
+    // The fleet's channel proved this one: its log may yet seat it, so the decision runs.
+    let over_fleet = tried(node(9), &stranger_pair, Some(node(9)), now);
+    assert_eq!(count(), 1, "{over_fleet:?}");
+    assert!(over_fleet.signed_maybe, "{over_fleet:?}");
+
+    // The seat's Mac signed just now: whatever this one proves a person decides, so it may ask.
+    let running = tried(node(8), &pair, None, now);
+    assert_eq!(count(), 1, "{running:?}");
+    assert!(!running.signed_maybe, "{running:?}");
+    assert!(
+        running.refused[0].1.contains("in the last day"),
+        "{running:?}"
+    );
+
+    // A dark seat the book would not let move, and any refusal past possession, stay ambiguous.
+    let seated = tried(node(8), &pair, None, later);
+    assert_eq!(count(), 2, "{seated:?}");
+    assert!(seated.signed_maybe, "{seated:?}");
+
+    // No server answers: a stranger's refusal does not wait on one, and a member that may not know
+    // of a removal says so before anything could be signed.
+    macs.server.stop();
+    let stranger = tried(node(9), &stranger_pair, None, now);
+    assert_eq!(count(), 2, "a stranger reached the decision: {stranger:?}");
+    assert!(!stranger.signed_maybe, "{stranger:?}");
+    assert!(
+        stranger.refused[0]
+            .1
+            .contains("no seat binds this node key"),
+        "{stranger:?}"
+    );
+    let unread = tried(node(8), &pair, None, later);
+    assert_eq!(count(), 2, "{unread:?}");
+    assert!(!unread.signed_maybe, "{unread:?}");
+    assert!(unread.refused[0].1.contains("newest records"), "{unread:?}");
+
+    // A Mac with no claim learns nothing else of the log, whatever `decide` would have said of it.
+    let request = Mac(33).request();
+    let proving = |node_key: [u8; 32]| desk::Proving {
+        request: &request,
+        node: node_key,
+        name: "new-mac",
+        fleet: false,
+    };
+    let seated_elsewhere = Book {
+        node_id_seated: true,
+        ..Book::default()
+    };
+    let said = refuses_before_possession_at_ms(&m22, &proving(node(9)), seated_elsewhere, now);
+    assert!(
+        said.as_deref()
+            .is_some_and(|why| why.contains("no seat binds")),
+        "{said:?}"
+    );
+
+    // A member with no signer cannot sign, so it says so while the Mac may still go elsewhere.
+    let device = m22.dir.join("commons").join("device.age");
+    std::fs::rename(&device, device.with_extension("gone")).unwrap();
+    let said = refuses_before_possession_at_ms(&m22, &proving(node(8)), Book::default(), later);
+    assert!(
+        said.as_deref()
+            .is_some_and(|why| why.contains("admits nobody")),
+        "{said:?}"
+    );
+    drop(macs.root);
+}
+
+/// A Commons member with no membership log can still hear a plain ask and hand over files.
+/// Its proof refusal must precede possession, so that the new Mac reaches that plain ask.
+///
+/// NEGATIVE CONTROL: let `refuses_before_possession_at_ms` return `None` for an absent log:
+/// the real proof exchange ends with `signed_maybe`, and no plain ask can follow it.
+#[test]
+fn a_member_without_a_log_refuses_before_possession_so_the_mac_can_ask() {
+    use crate::commons::bootstrap::Device;
+    use crate::members::desk::{self, Desk, Local};
+    use crate::members::join::{self, Stream};
+    use crate::members::joiner::{self, Joining};
+
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let vault = root.path().join("alab.vault");
+    let member = Paths::for_home(&root.path().join("member"));
+    test_create_unbound(&member, vault.to_str().unwrap(), None, Some("member"))
+        .expect("create vault");
+    admin_keys::legacy::publish_legacy(&member, &admin_open(&member).unwrap());
+    admin_commons_init(&member).expect("Commons init");
+    assert!(load_records(&member).unwrap().log().is_none(), "no genesis");
+    let local = Local::of(&member)
+        .unwrap()
+        .expect("a Commons member's desk");
+    assert!(local.can_allow(), "the pre-log Commons member can allow");
+    let desk = std::sync::Mutex::new(Desk::new(local));
+    let fresh = Paths::for_home(&root.path().join("fresh"));
+    machine_identity(&fresh).unwrap();
+    let device = Device::open(&fresh).unwrap().unwrap();
+    let joining = Joining {
+        device: &device,
+        node: node(9),
+        name: "fresh".to_owned(),
+        model: "Mac17,6".to_owned(),
+    };
+    let pair = node_pair(9);
+    let prefix = format!("aterm-fleet/v3 record {}\0", desk::PROVE_RECORD);
+    let sign_node = |message: &[u8]| -> [u8; 64] {
+        pair.sign(&[prefix.as_bytes(), message].concat())
+            .as_ref()
+            .try_into()
+            .unwrap()
+    };
+    std::thread::scope(|scope| {
+        let dial = |_: &str| -> crate::Result<Box<dyn Stream>> {
+            let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+            for end in [&ours, &theirs] {
+                end.set_read_timeout(Some(Duration::from_secs(60)))?;
+            }
+            let (desk, member) = (&desk, &member);
+            scope.spawn(move || {
+                let decide =
+                    |proving: &desk::Proving<'_>| prove_at_ms(member, proving, CURRENT, T0);
+                let refuses = |proving: &desk::Proving<'_>| {
+                    refuses_before_possession_at_ms(member, proving, CURRENT, T0)
+                };
+                let _ = desk::serve_with(
+                    desk,
+                    &mut ours,
+                    "192.168.1.19".parse().unwrap(),
+                    &|_| Err(crate::Error::new("no phrase runs here")),
+                    Some(desk::Proof {
+                        decide: &decide,
+                        refuses: &refuses,
+                        fleet: None,
+                    }),
+                );
+            });
+            Ok(Box::new(theirs))
+        };
+        let tried = join::prove_first(
+            &fresh,
+            &dial,
+            &joining,
+            &sign_node,
+            &["member:7".to_owned()],
+        );
+        let missed = match tried {
+            Ok(_) => panic!("a member without a log cannot admit by proof"),
+            Err(missed) => missed,
+        };
+        assert!(
+            !missed.signed_maybe,
+            "a plain ask must remain possible: {missed:?}"
+        );
+
+        let mut stream = dial("member:7").unwrap();
+        let greeting = joiner::greeting(&mut stream).unwrap();
+        joiner::ask(&mut stream, &greeting, &joining).expect("plain ask after proof refusal");
+    });
+    let rows = desk.lock().unwrap().rows(aterm_time::Instant::now());
+    assert_eq!(rows.len(), 1, "the member hears the new Mac's plain ask");
+    assert_eq!(rows[0].name, "fresh");
+}
+
 /// The whole path a Mac whose vault key changed takes, on two real vault folders: m22's desk
 /// serves `prove` with [`prove_at`] on its connection thread, and the fresh Mac's
 /// `members::join::prove_first` proves m7's node key over the desk's own wire (a Unix socket
@@ -837,6 +1100,7 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
                     &|_| Err(crate::Error::new("no phrase runs here")),
                     Some(desk::Proof {
                         decide,
+                        refuses: &|_| None,
                         fleet: None,
                     }),
                 );

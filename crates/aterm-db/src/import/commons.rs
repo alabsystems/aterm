@@ -241,7 +241,10 @@ fn validate(key: &str, value: &Value) -> Result<()> {
             column(&row["machine_column"])?;
         }
         if !row["machine_slot_hint"].is_null() {
-            crate::machines::Slot::parse(field(row, "machine_slot_hint")?)?;
+            // The grammar the writing builds checked, so 0.146/0.147 rows keep validating.
+            if !crate::machines::Slot::legacy(field(row, "machine_slot_hint")?) {
+                return Err(Error::new("account slot must be a positive number"));
+            }
             column(&row["machine_column"])?;
         }
         let providers = row["providers"]

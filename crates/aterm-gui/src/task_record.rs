@@ -64,6 +64,11 @@ pub(crate) const WHY_SIGNIN: &str = "signin";
 /// (`task_launch::refused_why`).
 pub(crate) const WHY_INSTALL: &str = "install";
 
+/// `why=` of a claim worker's record a restore other than a seamless update makes anew
+/// (`harness_host::credit_claim::note_restored_worker`): its worker started before the restore,
+/// so no startup or held deadline reads it as one just spawned.
+pub(crate) const WHY_RESTORED: &str = "restored";
+
 /// Closed `why=` vocabulary for task state transitions.
 pub(crate) const TASK_WHY: &[&str] = &[
     WHY_LANDED,
@@ -77,6 +82,7 @@ pub(crate) const TASK_WHY: &[&str] = &[
     "moved",
     WHY_SIGNIN,
     WHY_INSTALL,
+    WHY_RESTORED,
 ];
 
 /// A stalled task's words for a person, by its `why=` (the need's `what` and the menu bar's
@@ -155,6 +161,10 @@ pub(crate) struct TaskRecord {
     pub(crate) since_unix_ms: u64,
     /// Monotonic instant when the current state was entered.
     pub(crate) since: Instant,
+    /// Wall-clock timestamp (unix ms) when the task began, which no later state moves.
+    pub(crate) started_unix_ms: u64,
+    /// Monotonic instant when the task began.
+    pub(crate) started: Instant,
     /// Revision at which the current state was entered.
     pub(crate) entered: u64,
     /// Agent program started by `spawn agent=<word>`, if spawned as a worker.
@@ -229,10 +239,13 @@ impl TaskRecord {
     }
 
     /// Formats the record for seamless-update handoff
-    /// ([`crate::session_store::SessionRecord::task`]).
+    /// ([`crate::session_store::SessionRecord::task`]) at `now`: the wall-clock `since=` and
+    /// `started=` with how long each has stood on this process's monotonic clock (`age_ms=`,
+    /// `ran_ms=`), which a Mac asleep does not advance, so the successor's clocks go on from the
+    /// time this one measured ([`Self::from_carry_row`]).
     #[must_use]
     #[cfg(any(unix, test))]
-    pub(crate) fn carry_row(&self) -> String {
+    pub(crate) fn carry_row(&self, now: Instant) -> String {
         let mut out = format!(
             "rev={} state={} from={} since={} result_bytes={} attention={}",
             self.rev,
@@ -243,6 +256,20 @@ impl TaskRecord {
             u8::from(self.attention)
         );
         self.push_optional(&mut out);
+        let ms = |stood: std::time::Duration| u64::try_from(stood.as_millis()).unwrap_or(u64::MAX);
+        if self.started_unix_ms != self.since_unix_ms {
+            out.push_str(&format!(" started={}", self.started_unix_ms));
+        }
+        out.push_str(&format!(
+            " age_ms={}",
+            ms(now.saturating_duration_since(self.since))
+        ));
+        if self.started_unix_ms != self.since_unix_ms || self.started != self.since {
+            out.push_str(&format!(
+                " ran_ms={}",
+                ms(now.saturating_duration_since(self.started))
+            ));
+        }
         if let Some(agent) = self.agent {
             out.push_str(" agent=");
             out.push_str(agent.name());
@@ -261,7 +288,29 @@ impl TaskRecord {
         out
     }
 
+    /// The words of carry row `row` ([`Self::carry_row`]) that a seamless update's claims fence
+    /// compares between the park and the Commit ([`crate::session_store::CarriedClaims`]): all
+    /// but its ages (`age_ms=`, `ran_ms=`), which grow while the record stands still. A mark
+    /// still moves the face, by its `rev=` at least.
+    #[must_use]
+    #[cfg(unix)]
+    pub(crate) fn carry_face(row: &str) -> String {
+        row.split_whitespace()
+            .filter(|word| {
+                !word
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key == "age_ms" || key == "ran_ms")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Restores and validates a [`TaskRecord`] from a seamless-update carry row.
+    ///
+    /// Its `since` and `started` stand as long before `now` as the predecessor measured
+    /// (`age_ms=`, `ran_ms=`), never longer than the wall clock's gap since `since=` and
+    /// `started=` (which a row without them, from an older build, goes by), so time the Mac slept
+    /// before the update counts no more here than it did there.
     ///
     /// A `fact_rev=` absent or not a number reads 0; a `fact=` that is no [`FactWord`], or has no
     /// rev past 0, reads `None` and keeps the record. The successor's loop finds the carried word
@@ -286,7 +335,22 @@ impl TaskRecord {
         let parse_u64 = |s: &str| digits(s).then(|| s.parse::<u64>().ok()).flatten();
         let field = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
         let since_unix_ms = parse_u64(field("since")?)?;
-        let age = std::time::Duration::from_millis(now_unix_ms.saturating_sub(since_unix_ms));
+        let wall_age = std::time::Duration::from_millis(now_unix_ms.saturating_sub(since_unix_ms));
+        let age = match field("age_ms") {
+            Some(word) => std::time::Duration::from_millis(parse_u64(word)?).min(wall_age),
+            None => wall_age,
+        };
+        let started_unix_ms = match field("started") {
+            Some(word) => parse_u64(word)?,
+            None => since_unix_ms,
+        };
+        let wall_ran =
+            std::time::Duration::from_millis(now_unix_ms.saturating_sub(started_unix_ms));
+        let ran = match (field("ran_ms"), field("started")) {
+            (Some(word), _) => std::time::Duration::from_millis(parse_u64(word)?).min(wall_ran),
+            (None, None) => age,
+            (None, Some(_)) => wall_ran,
+        };
         let rev = parse_u64(field("rev")?).filter(|rev| *rev > 0)?;
         let fact_rev = field("fact_rev").and_then(parse_u64).unwrap_or(0);
         Some(Self {
@@ -317,6 +381,8 @@ impl TaskRecord {
             },
             since_unix_ms,
             since: now.checked_sub(age).unwrap_or(now),
+            started_unix_ms,
+            started: now.checked_sub(ran).unwrap_or(now),
             entered: rev,
             agent: field("agent").and_then(worker_agent),
             trusted_cwd: field("trusted_cwd").and_then(trusted_folder),
@@ -501,6 +567,8 @@ impl TaskMark {
                 attention,
                 since_unix_ms: now_unix_ms,
                 since: now,
+                started_unix_ms: now_unix_ms,
+                started: now,
                 entered: 1,
                 agent: None,
                 trusted_cwd: None,
@@ -610,7 +678,8 @@ pub(crate) fn supervisor_attention(meta: &crate::session_timeline::SessionMeta) 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MarkFenced;
 
-/// Applies `mark` to `ctx`'s task record, waking waiters and recording timeline events.
+/// [`mark_session_task_within`] with the session's own fence wait: the tests' unconditional mark.
+#[cfg(test)]
 pub(crate) fn mark_session_task(
     ctx: &SessionCtx,
     local_id: u64,
@@ -619,7 +688,8 @@ pub(crate) fn mark_session_task(
     mark_session_task_within(ctx, local_id, mark, ctx.fabric.fence_wait())
 }
 
-/// [`mark_session_task`] waiting at most `fence_wait` on a committing update's fence.
+/// Applies `mark` to `ctx`'s task record, waking waiters and recording timeline events, waiting
+/// at most `fence_wait` on a committing update's fence.
 pub(crate) fn mark_session_task_within(
     ctx: &SessionCtx,
     local_id: u64,

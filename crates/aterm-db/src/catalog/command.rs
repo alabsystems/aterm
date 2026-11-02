@@ -31,18 +31,26 @@ fn run_at(
         if !options.is_empty() {
             return Err(Error::new("unknown Commons inspection option"));
         }
+        let deadline = crate::admission::deadline();
         if command == "commons-custody" {
-            return custody_inspection(paths, config, table);
+            return custody_inspection(paths, config, table, deadline);
         }
-        return retained_inventory(&crate::generation::selected(paths)?, config, table, page);
+        return retained_inventory(
+            &crate::generation::observed_paths_until(paths, deadline)?,
+            config,
+            table,
+            page,
+            deadline,
+        );
     }
     if command == "commons-status" {
         if !options.is_empty() {
             return Err(Error::new("unknown Commons table option"));
         }
-        let recovery = crate::generation::status(paths)?;
-        let chosen = crate::generation::selected(paths);
-        let mut value = readiness(chosen.as_ref().unwrap_or(paths), config)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let recovery = crate::generation::status(paths, deadline)?;
+        let chosen = crate::generation::observed_paths_until(paths, deadline);
+        let mut value = readiness(chosen.as_ref().unwrap_or(paths), config, deadline)?;
         if !recovery.is_null() {
             let fields = value
                 .as_object_mut()
@@ -88,10 +96,10 @@ fn run_at(
     if command == "commons-authority" {
         return authority(paths);
     }
-    let selected = crate::generation::selected(paths)?;
-    let paths = &selected;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     if let Some((application, role, version, name)) = descriptor {
+        let selected = crate::generation::selected(paths)?;
+        let paths = &selected;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let (bootstrap, journal) = Bootstrap::required_with_journal_until(paths, deadline)
             .map_err(crate::table::failure)?;
         let session = Session::from_admitted_journal(&bootstrap, journal)?;
@@ -109,8 +117,11 @@ fn run_at(
             "application":application, "role":role, "version":version}),
         );
     }
-    let bootstrap = Bootstrap::required_until(paths, deadline).map_err(crate::table::failure)?;
-    let session = Session::observe(&bootstrap)?;
+    let deadline = crate::admission::deadline();
+    let selected = crate::generation::observed_paths_until(paths, deadline)?;
+    let paths = &selected;
+    let bootstrap = observed_bootstrap(paths, deadline)?;
+    let session = Session::observe_until(&bootstrap, deadline)?;
     let directory = Directory::new(paths, bootstrap.trust());
     let snapshot = directory.observe_with_config(&session, config)?;
     let rings = ring_tables(&session, &directory)?;
@@ -135,7 +146,12 @@ fn run_at(
     )
 }
 
-fn custody_inspection(paths: &Paths, config: &Path, table: Digest) -> Result<Value> {
+fn custody_inspection(
+    paths: &Paths,
+    config: &Path,
+    table: Digest,
+    deadline: std::time::Instant,
+) -> Result<Value> {
     let policy = Policy::read(config)?;
     if !policy.enabled || policy.excluded.contains(&table) {
         return Ok(json!({
@@ -146,9 +162,8 @@ fn custody_inspection(paths: &Paths, config: &Path, table: Digest) -> Result<Val
             "application_authenticated": false, "can_resume_writer": false,
         }));
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let bootstrap = Bootstrap::required_until(paths, deadline).map_err(crate::table::failure)?;
-    let session = Session::observe(&bootstrap)?;
+    let bootstrap = observed_bootstrap(paths, deadline)?;
+    let session = Session::observe_until(&bootstrap, deadline)?;
     Ok(crate::table::store::custody::inspect(&session, table)?.json())
 }
 
@@ -252,8 +267,9 @@ fn retained_inventory(
     config: &Path,
     table: Digest,
     page: Option<RecordPage>,
+    deadline: std::time::Instant,
 ) -> Result<Value> {
-    retained_inventory_admitted(paths, config, table, page, || {})
+    retained_inventory_admitted(paths, config, table, page, deadline, || {})
 }
 
 fn retained_inventory_admitted(
@@ -261,17 +277,17 @@ fn retained_inventory_admitted(
     config: &Path,
     table: Digest,
     page: Option<RecordPage>,
+    deadline: std::time::Instant,
     after_admission: impl FnOnce(),
 ) -> Result<Value> {
     use crate::replica::InventorySummary;
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     // Keep the current and ancestor vault sources stable for this one local
     // query, from session admission through both verified inventory summaries.
     // No source guard escapes this function or crosses network I/O.
     let _sources = crate::generation::local_source_reads_until(paths, deadline)?;
-    let bootstrap = Bootstrap::required_until(paths, deadline).map_err(crate::table::failure)?;
-    let session = Session::observe(&bootstrap)?;
+    let bootstrap = observed_bootstrap(paths, deadline)?;
+    let session = Session::observe_until(&bootstrap, deadline)?;
     after_admission();
     let directory = Directory::new(paths, bootstrap.trust());
     let catalog = directory.catalog_scope();
@@ -350,6 +366,24 @@ fn retained_inventory_admitted(
     Ok(value)
 }
 
+/// Preserve the vault's unavailable reason before requiring existing local custody.
+fn observed_bootstrap(paths: &Paths, deadline: std::time::Instant) -> Result<Bootstrap> {
+    if let aterm_secrets::commons::Observation::Unavailable(reason) =
+        aterm_secrets::commons::observe_until(paths, deadline).map_err(crate::table::failure)?
+    {
+        return Err(
+            if matches!(reason, aterm_secrets::commons::Unavailable::Busy) {
+                Error::busy()
+            } else {
+                Error::new(&format!("{}: {}", reason.code(), reason.explanation()))
+            },
+        );
+    }
+    Bootstrap::established_with_journal_until(paths, deadline)
+        .map(|(bootstrap, _)| bootstrap)
+        .map_err(crate::table::failure)
+}
+
 fn authority(paths: &Paths) -> Result<Value> {
     let admin = match aterm_secrets::client::admin_cached(paths) {
         Ok(admin) => admin,
@@ -383,33 +417,36 @@ fn authority(paths: &Paths) -> Result<Value> {
     }))
 }
 
-fn readiness(paths: &Paths, config: &Path) -> Result<Value> {
+fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Result<Value> {
     use aterm_secrets::commons::{
-        bootstrap::Availability,
+        Observation,
         constraints::{Fact, LEGACY_MAX_FACTS, MAX_FACTS},
         journal::State as ControlState,
         roster::Role,
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let sharing = Policy::read(config)?.enabled;
-    let Some(observation) = control_observation(Bootstrap::observe_until(paths, deadline))? else {
+    let Some(observation) =
+        control_observation(aterm_secrets::commons::observe_until(paths, deadline))?
+    else {
         return Ok(control_busy(sharing));
     };
-    let bootstrap = match observation {
-        Availability::Unavailable(reason) => {
+    let (bootstrap, journal) = match observation {
+        Observation::Unavailable(reason) => {
             return Ok(json!({
                 "state": reason.code(), "detail": reason.explanation(),
                     "ready": false, "sharing_enabled": sharing, "can_initialize_network": false,
             }));
         }
-        Availability::Available(bootstrap) => bootstrap,
+        Observation::Visible(_) => {
+            let Some(pair) =
+                control_observation(Bootstrap::established_with_journal_until(paths, deadline))?
+            else {
+                return Ok(control_busy(sharing));
+            };
+            pair
+        }
     };
     // The acknowledged prefix, read beside any writer: no lock to find busy.
-    let journal = aterm_secrets::commons::journal::Journal::read_existing(
-        bootstrap.journal_dir(),
-        bootstrap.trust(),
-    )
-    .map_err(crate::table::failure)?;
     bootstrap
         .revalidate_custody()
         .map_err(crate::table::failure)?;
@@ -553,15 +590,14 @@ fn readiness(paths: &Paths, config: &Path) -> Result<Value> {
 fn control_observation<T>(read: aterm_secrets::Result<T>) -> Result<Option<T>> {
     match read {
         Ok(value) => Ok(Some(value)),
-        Err(error)
-            if matches!(
-                error.kind(),
-                aterm_secrets::ErrorKind::JournalBusy | aterm_secrets::ErrorKind::CustodyBusy
-            ) =>
-        {
-            Ok(None)
+        Err(error) => {
+            let error = crate::table::failure(error);
+            if error.is_busy() {
+                Ok(None)
+            } else {
+                Err(error)
+            }
         }
-        Err(error) => Err(crate::table::failure(error)),
     }
 }
 
@@ -673,6 +709,116 @@ mod tests {
     }
 
     #[test]
+    fn inspections_preserve_missing_current_and_ancestor_custody() {
+        use aterm_secrets::commons::roster::Role;
+
+        fn read(command: &str, paths: &Paths, config: &Path, table: Digest) -> Result<Value> {
+            let table = aterm_codec::hex::encode_lower(&table);
+            let mut options = if matches!(command, "commons-inventory" | "commons-custody") {
+                BTreeMap::from([("--table", table.as_str())])
+            } else {
+                BTreeMap::new()
+            };
+            run_at(command, &mut options, paths, config)
+        }
+
+        let mut violations = Vec::new();
+        for recovered in [false, true] {
+            for command in [
+                "commons-inventory",
+                "commons-tables",
+                "commons-status",
+                "commons-custody",
+                "commons-authority",
+            ] {
+                for name in ["commons.lock", "commons.claim"] {
+                    let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Writer]);
+                    let paths = &lab.paths[0];
+                    let config = paths.home.join("config.toml");
+                    let table = {
+                        let bootstrap = lab.bootstrap(0);
+                        let session = Session::open(&bootstrap).unwrap();
+                        let directory = Directory::new(paths, bootstrap.trust());
+                        let descriptor =
+                            Descriptor::application(bootstrap.trust(), "inspection", "rows", 1)
+                                .unwrap();
+                        let scope = directory.publish(&session, &descriptor).unwrap();
+                        directory
+                            .open_store(&session, scope)
+                            .unwrap()
+                            .commit_catalog(&session, b"private inspection fixture")
+                            .unwrap();
+                        scope.digest()
+                    };
+                    if recovered {
+                        crate::generation::test_complete_successor(
+                            lab._home.path(),
+                            paths,
+                            &lab.paths[1],
+                            &config,
+                            std::time::Instant::now() + std::time::Duration::from_secs(60),
+                        )
+                        .unwrap();
+                    }
+                    read(command, paths, &config, table).unwrap();
+                    let path = paths.dir.join(name);
+                    std::fs::rename(&path, path.with_extension("preserved")).unwrap();
+                    let before = crate::tests::files(lab._home.path());
+                    let result = read(command, paths, &config, table);
+                    let changed = crate::tests::files(lab._home.path()) != before;
+                    let accepted = match command {
+                        "commons-authority" => false,
+                        "commons-status" => result
+                            .as_ref()
+                            .is_ok_and(|value| value["ready"].as_bool() == Some(true)),
+                        _ => result.is_ok(),
+                    };
+                    if changed || accepted {
+                        violations.push((recovered, command, name, changed, accepted));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "(successor, command, file, changed, accepted): {violations:?}"
+        );
+    }
+
+    #[test]
+    fn status_preserves_an_unconfigured_home() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&root.path().join("unconfigured"));
+        let value = run_at(
+            "commons-status",
+            &mut BTreeMap::new(),
+            &paths,
+            &paths.home.join("config.toml"),
+        )
+        .unwrap();
+        assert_eq!(value["ready"].as_bool(), Some(false));
+        assert_eq!(value["can_initialize_network"].as_bool(), Some(false));
+        assert!(!paths.home.exists());
+    }
+
+    #[test]
+    fn status_does_not_establish_visible_but_uninitialized_custody() {
+        let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
+        let paths = &lab.paths[0];
+        let before = crate::tests::files(lab._home.path());
+        assert!(
+            run_at(
+                "commons-status",
+                &mut BTreeMap::new(),
+                paths,
+                &paths.home.join("config")
+            )
+            .is_err()
+        );
+        assert!(crate::tests::files(lab._home.path()) == before);
+    }
+
+    #[test]
     fn inventory_keeps_current_and_ancestor_vault_sources_through_its_read() {
         use aterm_secrets::commons::roster::Role;
         use aterm_uds::private_file;
@@ -710,7 +856,7 @@ mod tests {
             .map(|paths| private_file::open_private(&paths.dir, ".lock").unwrap().0);
         let mut attempts = 0;
         let mut entered = Vec::new();
-        let read = retained_inventory_admitted(&selected, &config, scope.digest(), None, || {
+        let read = retained_inventory_admitted(&selected, &config, scope.digest(), None, crate::admission::deadline(), || {
             // A real vault writer tries to enter after session admission, at
             // the gap that previously let an inventory read fail mid-query.
             for writer in writers {
@@ -993,7 +1139,8 @@ mod tests {
             .unwrap();
         // No catalog exists. The independent claim can still bind the target.
         assert!(!directory.path(directory.catalog_scope()).unwrap().exists());
-        let read = custody_inspection(paths, &config, scope.digest()).unwrap();
+        let read = custody_inspection(paths, &config, scope.digest(), crate::admission::deadline())
+            .unwrap();
         assert_eq!(read["claim"], json!("ready"));
         assert_eq!(read["receipt_prefix"]["state"], json!("verified"));
         assert_eq!(read["can_resume_writer"], json!(false));
@@ -1012,12 +1159,16 @@ mod tests {
             b"damaged",
         )
         .unwrap();
-        let excluded = custody_inspection(paths, &config, scope.digest()).unwrap();
+        let excluded =
+            custody_inspection(paths, &config, scope.digest(), crate::admission::deadline())
+                .unwrap();
         assert_eq!(excluded["claim"], json!("not-inspected"));
         assert_eq!(excluded["reason"], json!("excluded"));
         assert_eq!(excluded["receipt_prefix"], Value::Null);
         std::fs::write(&config, "[commons]\nenabled = false\n").unwrap();
-        let disabled = custody_inspection(paths, &config, scope.digest()).unwrap();
+        let disabled =
+            custody_inspection(paths, &config, scope.digest(), crate::admission::deadline())
+                .unwrap();
         assert_eq!(disabled["reason"], json!("sharing-disabled"));
         assert_eq!(disabled["receipt_prefix"], Value::Null);
     }
@@ -1299,6 +1450,7 @@ mod tests {
         use aterm_secrets::commons::roster::Role;
         let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Reader]);
         for (index, role) in [(0, "writer"), (1, "reader")] {
+            lab.bootstrap(index);
             let ready = status(&lab.paths[index]);
             assert_eq!(ready["ready"].as_bool(), Some(true));
             assert_eq!(ready["role"].as_str(), Some(role));
@@ -1319,6 +1471,7 @@ mod tests {
             Some("membership-inactive")
         );
         let pending = crate::table::tests::Lab::with_enrolled(&[Role::Writer, Role::Writer], 1);
+        pending.bootstrap(1);
         assert_eq!(
             status(&pending.paths[1])["state"].as_str(),
             Some("enrollment-pending")
@@ -1426,6 +1579,7 @@ mod tests {
     fn commons_status_beside_a_custody_observation_held_past_its_wait_is_busy() {
         use aterm_secrets::commons::roster::Role;
         let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+        lab.bootstrap(0);
         let paths = &lab.paths[0];
         let custody = aterm_uds::private_file::PrivateLock::take(
             &paths.dir,
@@ -1573,6 +1727,8 @@ mod tests {
         save_records(&m3_a, &merged).unwrap();
         save_records(&m3_b, &merged).unwrap();
 
+        Bootstrap::required(&m3_a).unwrap();
+        Bootstrap::required(&m3_b).unwrap();
         let status_a = status(&m3_a);
         let status_b = status(&m3_b);
         let states = [

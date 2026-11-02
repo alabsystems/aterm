@@ -78,7 +78,7 @@ pub fn wait_phrase(word: &str) -> Option<&'static str> {
         "lock" => "a file lock (lock)",
         "timer" => "a timer (timer)",
         "read" => "a read (read)",
-        "event-loop" => "an event loop with nothing pending (event-loop)",
+        "event-loop" => "an event wait (event-loop)",
         "ipc" => "a Mach message (ipc)",
         "children" => "its children (children)",
         _ => return None,

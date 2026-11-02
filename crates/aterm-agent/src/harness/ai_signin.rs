@@ -68,7 +68,7 @@ pub struct AiSigninDoc {
 /// where the account's own `[[mailboxes]]` entry is sealed to it ([`sealed_route_for`]), that
 /// entry under `route`. A Mac built before `route` ignores the field whole, so it never files
 /// the entry's secrets as the address's own per-email ones.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SealedAccountBundle {
     #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<String>,
@@ -80,8 +80,15 @@ struct SealedAccountBundle {
     route: Option<SealedRoute>,
 }
 
+impl std::fmt::Debug for SealedAccountBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedAccountBundle")
+            .finish_non_exhaustive()
+    }
+}
+
 /// The account's own `[[mailboxes]]` entry, sealed whole: its login, URLs and secrets.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SealedRoute {
     login: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +103,12 @@ struct SealedRoute {
     mailbox_password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     totp_secret: Option<String>,
+}
+
+impl std::fmt::Debug for SealedRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedRoute").finish_non_exhaustive()
+    }
 }
 
 impl SealedAccountBundle {
@@ -831,10 +844,17 @@ impl MailCodeAudit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SealedMailCredential {
     kind: String,
     value: String,
+}
+
+impl std::fmt::Debug for SealedMailCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedMailCredential")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Seal a [`MailboxCredential`] to `recipient` and return a single-line base64 ciphertext.
@@ -1483,10 +1503,15 @@ pub fn select_steward_relay_peers<'a>(
             let paths = aterm_secrets::client::Paths::for_home(home);
             let roster = aterm_secrets::client::swarm_roster(&paths).ok().flatten();
             let denied = if roster.is_none() {
-                aterm_secrets::client::swarm_denied_nodes(&paths)
+                // Neither the roster nor the deny list read: no steward can be told from a
+                // revoked Mac, so the request goes to none until one is.
+                let Some(denied) = aterm_secrets::client::swarm_denied_nodes(&paths)
                     .ok()
                     .flatten()
-                    .unwrap_or_default()
+                else {
+                    return Vec::new();
+                };
+                denied
             } else {
                 Vec::new()
             };
@@ -1573,6 +1598,22 @@ pub fn fetch_relay_mail_credential(
     target_email: &str,
     within: Duration,
 ) -> Option<MailboxCredential> {
+    fetch_relay_mail_credential_by(cfg, target_email, within, None)
+}
+
+#[cfg(unix)]
+pub(super) fn fetch_relay_mail_credential_by(
+    cfg: &MailboxConfig,
+    target_email: &str,
+    within: Duration,
+    inherited: Option<super::auth_deadline::Deadline<'_>>,
+) -> Option<MailboxCredential> {
+    let clock = std::time::Instant::now;
+    let deadline = inherited.map_or_else(
+        || super::auth_deadline::Deadline::new(within, &clock),
+        |deadline| deadline.limited(within),
+    );
+    deadline.remaining().ok()?;
     use aterm_net::fleet_member::{
         Via, read_issuer_book, read_node_identity, read_peers, request_mail_code_from_bound_peer,
     };
@@ -1618,21 +1659,14 @@ pub fn fetch_relay_mail_credential(
 
     let standby_labels = read_standby_steward_labels(home);
     let ordered = select_steward_relay_peers(&peers, me.node(), &standby_labels, Some(home));
+    // No deny list read: the request, which names the mailbox, goes to no peer until one is.
     let denied_nodes = aterm_secrets::client::swarm_denied_nodes(&paths)
         .ok()
-        .flatten()
-        .unwrap_or_default();
+        .flatten()?;
     let log_keys = crate::fleet_log::LocalLog::of(&paths).keys();
 
-    let now = std::time::Instant::now();
-    let deadline = now
-        .checked_add(within)
-        .unwrap_or_else(|| now + std::time::Duration::from_secs(3600));
     for peer in ordered {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
+        let remaining = deadline.remaining().ok()?;
         match request_mail_code_from_bound_peer(
             peer,
             (&secret, Some(&me)),
@@ -1642,6 +1676,7 @@ pub fn fetch_relay_mail_credential(
         ) {
             Ok(Ok(sealed_b64)) => {
                 if let Ok(cred) = open_sealed_credential(&sealed_b64, &identity) {
+                    deadline.remaining().ok()?;
                     return Some(cred);
                 }
             }

@@ -16,12 +16,41 @@ pub(crate) struct Unit {
     pub opt_level: String,
     pub debug_assertions: bool,
     pub overflow_checks: bool,
+    /// The plan's word for the unit's LTO (`true` is fat, `false` is none).
+    pub lto: String,
+    /// The unit's codegen units, when the profile names them.
+    pub codegen_units: Option<u64>,
 }
 
 /// The measured path of one build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Audit {
     pub units: Vec<Unit>,
+}
+
+/// What an arm promises of every unit on its measured path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Promise {
+    /// The opt-level, when the arm promises one.
+    pub every_at: Option<&'static str>,
+    /// Whether debug assertions are on.
+    pub debug_assertions: bool,
+    /// The plan's word for the LTO, when the arm promises one.
+    pub lto: Option<&'static str>,
+    /// The codegen units, when the arm promises them.
+    pub codegen_units: Option<u64>,
+}
+
+impl Promise {
+    /// What `profile`'s arm promises.
+    pub(crate) const fn of(profile: super::Profile) -> Self {
+        Promise {
+            every_at: profile.every_crate_at(),
+            debug_assertions: profile.debug_assertions(),
+            lto: profile.lto(),
+            codegen_units: profile.codegen_units(),
+        }
+    }
 }
 
 fn on_the_path(unit: &Value) -> bool {
@@ -108,6 +137,14 @@ impl Audit {
                         .to_string(),
                     debug_assertions: flag("debug_assertions")?,
                     overflow_checks: flag("overflow_checks")?,
+                    lto: profile
+                        .and_then(|p| p.get("lto"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("unit {i} of the graph has no lto"))?
+                        .to_string(),
+                    codegen_units: profile
+                        .and_then(|p| p.get("codegen_units"))
+                        .and_then(Value::as_u64),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -148,8 +185,19 @@ impl Audit {
             n if n == self.units.len() => format!("{name} on"),
             n => format!("{name} on in {n} of {}", self.units.len()),
         };
+        let tally = |words: Vec<String>| {
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            for word in words {
+                *counts.entry(word).or_default() += 1;
+            }
+            counts
+                .into_iter()
+                .map(|(word, n)| format!("{word} ×{n}"))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
         format!(
-            "{} units on the measured path: {}; {}; {}",
+            "{} units on the measured path: {}; {}; {}; lto {}; codegen units {}",
             self.units.len(),
             levels.join(" · "),
             switch(
@@ -160,36 +208,77 @@ impl Audit {
                 "overflow checks",
                 self.units.iter().filter(|u| u.overflow_checks).count()
             ),
+            tally(self.units.iter().map(|u| u.lto.clone()).collect()),
+            tally(
+                self.units
+                    .iter()
+                    .map(|u| u
+                        .codegen_units
+                        .map_or_else(|| "default".to_string(), |n| n.to_string()))
+                    .collect()
+            ),
         )
     }
 
     /// Why this build is not the arm it is labelled, or `None`: a unit on the
-    /// path below the arm's opt-level (`every_at`, when the arm promises one),
-    /// or a unit without debug assertions, which compiles out the seams the
-    /// harness drives and would fail the run deep inside it. Pure
-    /// (unit-tested).
-    pub(crate) fn refusal(&self, every_at: Option<&str>) -> Option<String> {
-        let short = |pick: &dyn Fn(&Unit) -> bool| -> Vec<String> {
+    /// path whose code generation is not what the arm's [`Promise`] says. Debug
+    /// assertions off in an arm that promises them compiles out the seams the
+    /// harness drives and would fail the run deep inside it; on in the shipped
+    /// arm, the numbers are not the shipped code's. Pure (unit-tested).
+    pub(crate) fn refusal(&self, promise: Promise) -> Option<String> {
+        let short = |pick: &dyn Fn(&Unit) -> bool, of: &dyn Fn(&Unit) -> String| -> Vec<String> {
             let names: BTreeSet<String> = self
                 .units
                 .iter()
                 .filter(|u| pick(u))
-                .map(|u| format!("{} (opt-level {})", u.package, u.opt_level))
+                .map(|u| format!("{} ({})", u.package, of(u)))
                 .collect();
             names.into_iter().collect()
         };
         if self.units.is_empty() {
             return Some("the unit graph has nothing on the measured path".to_string());
         }
-        let no_seams = short(&|u| !u.debug_assertions);
-        if !no_seams.is_empty() {
-            return Some(format!(
-                "built without debug assertions, which the harness's test seams need: {}",
-                no_seams.join(", ")
-            ));
+        let level = |u: &Unit| format!("opt-level {}", u.opt_level);
+        let assertions = short(&|u| u.debug_assertions != promise.debug_assertions, &level);
+        if !assertions.is_empty() {
+            return Some(if promise.debug_assertions {
+                format!(
+                    "built without debug assertions, which the harness's test seams need: {}",
+                    assertions.join(", ")
+                )
+            } else {
+                format!(
+                    "built with debug assertions, which the shipped code has off: {}",
+                    assertions.join(", ")
+                )
+            });
         }
-        let want = every_at?;
-        let below = short(&|u| u.opt_level != want);
+        if let Some(want) = promise.lto {
+            let other = short(&|u| u.lto != want, &|u| format!("lto {}", u.lto));
+            if !other.is_empty() {
+                return Some(format!(
+                    "this arm promises lto {want} on every crate on the measured path, and cargo \
+                     plans {} of them otherwise: {}",
+                    other.len(),
+                    other.join(", ")
+                ));
+            }
+        }
+        if let Some(want) = promise.codegen_units {
+            let other = short(&|u| u.codegen_units != Some(want), &|u| {
+                format!("codegen units {:?}", u.codegen_units)
+            });
+            if !other.is_empty() {
+                return Some(format!(
+                    "this arm promises {want} codegen unit(s) on every crate on the measured \
+                     path, and cargo plans {} of them otherwise: {}",
+                    other.len(),
+                    other.join(", ")
+                ));
+            }
+        }
+        let want = promise.every_at?;
+        let below = short(&|u| u.opt_level != want, &level);
         (!below.is_empty()).then(|| {
             format!(
                 "this arm promises opt-level {want} on every crate on the measured path, and \
@@ -204,6 +293,7 @@ impl Audit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perf::bench_build::bench_profile::Profile;
 
     #[test]
     fn a_package_is_named_from_its_id() {
@@ -225,7 +315,8 @@ mod tests {
         format!(
             "{{\"pkg_id\":\"path+file:///w/crates/{package}#0.1.0\",\"mode\":\"{mode}\",\
              \"target\":{{\"kind\":[\"{kind}\"]}},\"profile\":{{\"opt_level\":\"{opt}\",\
-             \"debug_assertions\":true,\"overflow_checks\":false}},\"dependencies\":[{}]}}",
+             \"debug_assertions\":true,\"overflow_checks\":false,\"lto\":\"false\",\
+             \"codegen_units\":16}},\"dependencies\":[{}]}}",
             deps.join(",")
         )
     }
@@ -255,6 +346,16 @@ mod tests {
         )
     }
 
+    /// The fat-LTO, one-unit, assertions-off plan of the shipped arm, `edit` applied to its text:
+    /// a first occurrence is the root bench's, a unit on the path.
+    fn shipped_plan(edit: fn(String) -> String) -> String {
+        let all = plan("3")
+            .replace("\"debug_assertions\":true", "\"debug_assertions\":false")
+            .replace("\"lto\":\"false\"", "\"lto\":\"true\"")
+            .replace("\"codegen_units\":16", "\"codegen_units\":1");
+        edit(all)
+    }
+
     #[test]
     fn the_walk_keeps_what_runs_and_leaves_build_scripts_and_derives() {
         let audit = Audit::of(&plan("3")).expect("parses");
@@ -265,36 +366,84 @@ mod tests {
             3,
             "the bench, the binary and the library"
         );
-        assert_eq!(audit.refusal(Some("3")), None);
+        assert_eq!(audit.refusal(Promise::of(Profile::Opt)), None);
         assert_eq!(
             audit.summary(),
             "3 units on the measured path: opt-level 3 ×3; debug assertions on; overflow \
-             checks off"
+             checks off; lto false ×3; codegen units 16 ×3"
         );
     }
 
     #[test]
     fn a_crate_below_the_promise_is_named_and_the_dev_mix_is_reported() {
         let audit = Audit::of(&plan("2")).expect("parses");
-        let why = audit.refusal(Some("3")).expect("refused");
+        let why = audit.refusal(Promise::of(Profile::Opt)).expect("refused");
         assert!(why.contains("aterm-core (opt-level 2)"), "{why}");
         assert!(!why.contains("cc") && !why.contains("syn"), "{why}");
-        assert_eq!(audit.refusal(None), None);
+        assert_eq!(audit.refusal(Promise::of(Profile::Dev)), None);
         assert_eq!(
             audit.summary(),
             "3 units on the measured path: opt-level 2 ×1 (aterm-core) · opt-level 3 ×2; debug \
-             assertions on; overflow checks off"
+             assertions on; overflow checks off; lto false ×3; codegen units 16 ×3"
         );
     }
 
     #[test]
-    fn a_unit_without_debug_assertions_is_refused_in_every_arm() {
+    fn a_unit_without_debug_assertions_is_refused_where_the_arm_needs_them() {
         let text = plan("3").replacen("\"debug_assertions\":true", "\"debug_assertions\":false", 1);
         let audit = Audit::of(&text).expect("parses");
-        for every_at in [None, Some("3")] {
-            let why = audit.refusal(every_at).expect("refused");
-            assert!(why.contains("debug assertions"), "{why}");
+        for promise in [Promise::of(Profile::Dev), Promise::of(Profile::Opt)] {
+            let why = audit.refusal(promise).expect("refused");
+            assert!(why.contains("without debug assertions"), "{why}");
         }
+    }
+
+    #[test]
+    fn the_shipped_arm_holds_its_lto_codegen_units_and_assertions_to_the_plan() {
+        let promise = Promise::of(Profile::Shipped);
+        let audit = Audit::of(&shipped_plan(|all| all)).expect("parses");
+        assert_eq!(audit.refusal(promise), None);
+        assert_eq!(
+            audit.summary(),
+            "3 units on the measured path: opt-level 3 ×3; debug assertions off; overflow \
+             checks off; lto true ×3; codegen units 1 ×3"
+        );
+        for (edit, says) in [
+            (
+                (|all: String| all.replacen("\"lto\":\"true\"", "\"lto\":\"thin\"", 1))
+                    as fn(String) -> String,
+                "lto true",
+            ),
+            (
+                |all: String| all.replacen("\"codegen_units\":1", "\"codegen_units\":16", 1),
+                "1 codegen unit",
+            ),
+            (
+                |all: String| all.replacen("\"codegen_units\":1", "\"codegen_units\":null", 1),
+                "1 codegen unit",
+            ),
+            (
+                |all: String| {
+                    all.replacen("\"debug_assertions\":false", "\"debug_assertions\":true", 1)
+                },
+                "with debug assertions",
+            ),
+        ] {
+            let why = Audit::of(&shipped_plan(edit))
+                .expect("parses")
+                .refusal(promise)
+                .expect("refused");
+            assert!(why.contains(says), "{says}: {why}");
+        }
+        let plain_release =
+            plan("3").replace("\"debug_assertions\":true", "\"debug_assertions\":false");
+        assert!(
+            Audit::of(&plain_release)
+                .expect("parses")
+                .refusal(promise)
+                .is_some(),
+            "16 units and no LTO are not the shipped code"
+        );
     }
 
     #[test]
@@ -309,7 +458,7 @@ mod tests {
         }
         let empty = Audit::of("{\"version\":1,\"units\":[],\"roots\":[]}").expect("parses");
         assert!(
-            empty.refusal(None).is_some(),
+            empty.refusal(Promise::of(Profile::Dev)).is_some(),
             "nothing on the path is no build"
         );
     }

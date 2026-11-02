@@ -24,7 +24,7 @@ impl Policy {
     /// read ([`aterm_secrets::swarm::enabled_at`]).
     pub fn read(path: &Path) -> Result<Self> {
         let bytes = aterm_secrets::fsx::read_aterm_config(path, 1024 * 1024).map_err(|why| {
-            Error(format!(
+            Error::new(&format!(
                 "Commons configuration is not a file of this user's or root's that others cannot \
                  write: {why}"
             ))
@@ -36,8 +36,8 @@ impl Policy {
             std::str::from_utf8(&bytes).map_err(|_| Error::new("invalid Commons configuration"))?;
         let value: aterm_toml::Value =
             aterm_toml::from_str(text).map_err(|_| Error::new("invalid Commons configuration"))?;
-        let swarm =
-            aterm_secrets::swarm::enabled_in_value(&value).map_err(|why| Error(why.to_string()))?;
+        let swarm = aterm_secrets::swarm::enabled_in_value(&value)
+            .map_err(|why| Error::new(&why.to_string()))?;
         let Some(commons) = value.get("commons") else {
             return Ok(Self {
                 enabled: swarm,

@@ -543,6 +543,7 @@ mod probe {
             let round = RepairRound {
                 target: None,
                 actor: Some(actor),
+                connection: None,
                 exchange_started: true,
                 cancelled: false,
                 phase: Some(control::Phase::Complete),

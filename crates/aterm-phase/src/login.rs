@@ -98,10 +98,6 @@ pub enum LoginScreen {
     Failed,
 }
 
-fn rule(row: &str) -> bool {
-    frame_rule(row) == Some(PanelRenderer::Inline)
-}
-
 /// The renderer whose dialog frame `row` is the full-width rule of: the inline renderer's `─`
 /// rule, or the fullscreen renderer's `▔` rule, the top of its bottom panel, which carries
 /// Claude Code's right-aligned hint between its ends while one shows (`◐ medium · /effort`, as
@@ -196,8 +192,21 @@ pub fn login_screen(rows: &[String]) -> Option<LoginScreen> {
     Some(LoginScreen::Failed)
 }
 
+/// Where the live rows of a screen whose composer a `/login` dialog replaced begin: the last row
+/// said above the dialog's top rule (the status row's place, as above the composer's), or the
+/// rule itself. The rows above it are the transcript the dialog opened under, its spinner and
+/// waiting rows ended turns ([`crate::phase::busy_signal`]; 2.1.302's `✻ Waiting for 4 dynamic
+/// workflows to finish` above a person's own hand-off, measured).
+pub(crate) fn dialog_live_from(rows: &[String]) -> Option<usize> {
+    login_screen(rows)?;
+    let (rule, _) = last_frame(rows)?;
+    Some(said_above(rows, rule).unwrap_or(rule))
+}
+
 /// Whether the last thing said is `⎿  Login interrupted` under `❯ /login`, above the composer
 /// and any right-aligned hint drawn over its top rule (the fullscreen renderer's `/effort` hint).
+/// That top rule is the composer frame's ([`crate::phase::is_rule`]): plain, or carrying the word
+/// Claude Code draws into it near its right end (2.1.302's effort word, measured).
 #[must_use]
 pub fn login_interrupted(rows: &[String]) -> bool {
     let said: Vec<&str> = rows
@@ -209,7 +218,7 @@ pub fn login_interrupted(rows: &[String]) -> bool {
         .iter()
         .rposition(|r| r.starts_with('❯') && !r.starts_with("❯ /login"))
         .and_then(|composer| composer.checked_sub(1))
-        .filter(|&top| rule(said[top]))
+        .filter(|&top| crate::phase::is_rule(said[top]))
         .map_or(said.len(), |top| {
             let hints = said[..top]
                 .iter()
@@ -247,15 +256,14 @@ pub struct LoginAtWall {
     pub left_before: bool,
 }
 
-/// Returns the lost-login wall above a standing or interrupted `/login`, if any. The inline
-/// renderer draws the typed `❯ /login` above its dialog; the fullscreen renderer echoes it only
-/// once the dialog closes, so its panel stands right under what was said before it.
-#[must_use]
-pub fn login_at_wall(rows: &[String]) -> Option<LoginAtWall> {
+fn wall_above_login(
+    rows: &[String],
+    include_interrupted: bool,
+) -> Option<(crate::wall::Wall, bool)> {
     let (from, echoed) = if login_screen(rows).is_some() {
         let (at, renderer) = last_frame(rows)?;
         (at, renderer == PanelRenderer::Inline)
-    } else if login_interrupted(rows) {
+    } else if include_interrupted && login_interrupted(rows) {
         (rows.iter().rposition(|r| interrupted_row(r))?, true)
     } else {
         return None;
@@ -281,11 +289,29 @@ pub fn login_at_wall(rows: &[String]) -> Option<LoginAtWall> {
     let bar = "─".repeat(width);
     let mut then: Vec<String> = rows[..at].to_vec();
     then.extend([bar.clone(), "❯ ".to_string(), bar]);
-    let wall = crate::wall::wall(&then)?;
+    Some((crate::wall::wall(&then)?, left_before))
+}
+
+/// Returns the lost-login wall above a standing or interrupted `/login`, if any. The inline
+/// renderer draws the typed `❯ /login` above its dialog; the fullscreen renderer echoes it only
+/// once the dialog closes, so its panel stands right under what was said before it.
+#[must_use]
+pub fn login_at_wall(rows: &[String]) -> Option<LoginAtWall> {
+    let (wall, left_before) = wall_above_login(rows, true)?;
     (wall.kind == crate::wall::WallKind::Auth).then_some(LoginAtWall {
         message: wall.message,
         left_before,
     })
+}
+
+/// Returns the usage or model limit wall above a standing `/login` dialog, if any. Both the
+/// inline dialog (above its `❯ /login` echo) and the fullscreen renderer's bottom panel (which
+/// echoes `❯ /login` only once closed) are read, and earlier interrupted `/login` attempts at
+/// the same wall are stepped past.
+#[must_use]
+pub fn login_over_limit(rows: &[String]) -> Option<crate::wall::Wall> {
+    let (wall, _) = wall_above_login(rows, false)?;
+    wall.kind.reads_limited().then_some(wall)
 }
 
 #[cfg(test)]

@@ -634,6 +634,7 @@ pub(crate) enum Msg {
     Facts(Box<Request>),
     Pull,
     CpuPolicy(aterm_vitals::sys::json::Jv),
+    Name(Box<crate::sys_naming::Request>),
 }
 
 /// The loop's side of the probe thread.
@@ -1093,6 +1094,27 @@ trait Source {
     fn jobs_armed(&self) -> bool {
         false
     }
+    fn capture_name(
+        &self,
+        _session: u64,
+        _target: &aterm_vitals::sys::query::NameTarget,
+    ) -> Result<aterm_vitals::jobs::NamingTicket, aterm_vitals::jobs::NamingError> {
+        Err(aterm_vitals::jobs::NamingError::Unread)
+    }
+    fn apply_name(
+        &mut self,
+        _ticket: &aterm_vitals::jobs::NamingTicket,
+        _word: aterm_vitals::jobs::TierB,
+    ) -> Result<(), aterm_vitals::jobs::NamingError> {
+        Err(aterm_vitals::jobs::NamingError::Unread)
+    }
+    fn name_is_shown(
+        &self,
+        _ticket: &aterm_vitals::jobs::NamingTicket,
+        _word: aterm_vitals::jobs::TierB,
+    ) -> bool {
+        false
+    }
 }
 
 impl Source for Reader {
@@ -1120,6 +1142,30 @@ impl Source for Reader {
     fn jobs_armed(&self) -> bool {
         self.jobs_armed.armed()
     }
+
+    fn capture_name(
+        &self,
+        session: u64,
+        target: &aterm_vitals::sys::query::NameTarget,
+    ) -> Result<aterm_vitals::jobs::NamingTicket, aterm_vitals::jobs::NamingError> {
+        self.jobs.capture_name(session, target)
+    }
+
+    fn apply_name(
+        &mut self,
+        ticket: &aterm_vitals::jobs::NamingTicket,
+        word: aterm_vitals::jobs::TierB,
+    ) -> Result<(), aterm_vitals::jobs::NamingError> {
+        self.jobs.apply_name(ticket, word)
+    }
+
+    fn name_is_shown(
+        &self,
+        ticket: &aterm_vitals::jobs::NamingTicket,
+        word: aterm_vitals::jobs::TierB,
+    ) -> bool {
+        self.jobs.name_is_shown(ticket, word)
+    }
 }
 
 #[derive(Default)]
@@ -1130,6 +1176,7 @@ struct Asked {
     pull: bool,
     facts: bool,
     cpu_policy: Option<aterm_vitals::sys::json::Jv>,
+    names: Vec<crate::sys_naming::Request>,
 }
 
 impl Asked {
@@ -1173,7 +1220,65 @@ impl Asked {
                 self.cpu_policy = Some(report);
                 self.read = true;
             }
+            Msg::Name(request) => {
+                self.names.push(*request);
+                self.pull = true;
+            }
         }
+    }
+}
+
+type NameReply = (
+    crate::sys_naming::Request,
+    Result<crate::sys_naming::Answer, crate::sys_naming::Error>,
+);
+
+/// Engine calls and the nonblocking peer check stay under the active lease; process readings
+/// never do.
+fn prepare_names(
+    source: &mut impl Source,
+    names: Vec<crate::sys_naming::Request>,
+) -> Vec<NameReply> {
+    use crate::sys_naming::{Answer, Operation};
+    names
+        .into_iter()
+        .map(|request| {
+            let answer = request.run_active(|| match &request.operation {
+                Operation::Capture { session, target } => {
+                    source.capture_name(*session, target).map(Answer::Captured)
+                }
+                Operation::Apply { ticket, word } => {
+                    source.apply_name(ticket, *word)?;
+                    Ok(Answer::Applied {
+                        job: ticket.job().to_owned(),
+                        word: *word,
+                    })
+                }
+            });
+            (request, answer)
+        })
+        .collect()
+}
+
+/// Replies follow publication of the final reading, and an accepted name must still be visible.
+fn finish_names(source: &impl Source, replies: Vec<NameReply>) {
+    use crate::sys_naming::Operation;
+    for (request, mut answer) in replies {
+        if answer.is_ok()
+            && let Operation::Apply { ticket, word } = &request.operation
+        {
+            answer = request.run_active(|| {
+                if source.name_is_shown(ticket, *word) {
+                    Ok(crate::sys_naming::Answer::Applied {
+                        job: ticket.job().to_owned(),
+                        word: *word,
+                    })
+                } else {
+                    Err(aterm_vitals::jobs::NamingError::Stale)
+                }
+            });
+        }
+        request.respond(answer);
     }
 }
 
@@ -1238,13 +1343,22 @@ fn run(
         }
         let began = Instant::now();
         crate::metrics::note_reading(crate::metrics::ReadingStep::Began);
-        let snap = if asked.pull {
-            pull(&mut source, &mut req, last_whole)
+        let mut snap = if asked.pull {
+            pull(&mut source, &mut req, last_whole, !asked.names.is_empty())
         } else {
             source.reading(&req)
         };
         req.note_gaps.clear();
         req.note_events.clear();
+        let replies = prepare_names(&mut source, asked.names);
+        if replies
+            .iter()
+            .any(|(_, answer)| matches!(answer, Ok(crate::sys_naming::Answer::Applied { .. })))
+        {
+            let previous = snap;
+            snap = pull(&mut source, &mut req, Some(Instant::now()), true);
+            keep_warm_events(previous, &mut snap);
+        }
         if let Some(record) = cpu_report_record(&snap) {
             current_report = Some(record);
         }
@@ -1258,7 +1372,10 @@ fn run(
         if let Some(sys) = sys {
             sys.publish(snap, source.machine().unwrap_or(&no_machine));
         }
-        if (asked.read || jobs_moved) && !post() {
+        if (asked.read || jobs_moved || !replies.is_empty()) && !post() {
+            for (request, _) in replies {
+                request.respond(Err(crate::sys_naming::Error::Canceled));
+            }
             // The event loop is gone, at a quit or as a main thread's panic unwinds out of it. The
             // thread takes no more readings (a cold one begun now could outlast `stop_at_exit`'s
             // bound), takes the workers' sender back so they answer from what they hold, and waits
@@ -1270,6 +1387,7 @@ fn run(
             while rx.recv().is_ok() {}
             break;
         }
+        finish_names(&source, replies);
         let kept_at = Instant::now();
         if current_report.is_some() {
             report.keep(&current_report, kept_at, policy_changed);
@@ -1308,7 +1426,12 @@ fn run(
 /// last reading read with, which the view is handed back with. The pull keeps the engine's
 /// cadence, whatever that request asked of it, but for its last reading while a `sys jobs`
 /// arms the engine ([`Source::jobs_armed`]): one look, never the warm one's too.
-fn pull(source: &mut impl Source, req: &mut Request, last_whole: Option<Instant>) -> Snapshot {
+fn pull(
+    source: &mut impl Source,
+    req: &mut Request,
+    last_whole: Option<Instant>,
+    force_jobs: bool,
+) -> Snapshot {
     if let Some(t) = last_whole {
         std::thread::sleep(MIN_WINDOW.saturating_sub(t.elapsed()));
     }
@@ -1327,7 +1450,7 @@ fn pull(source: &mut impl Source, req: &mut Request, last_whole: Option<Instant>
         warm
     });
     pull.reread_words();
-    pull.jobs_now = source.jobs_armed();
+    pull.jobs_now = force_jobs || source.jobs_armed();
     let mut snap = source.reading(&pull);
     if let Some(warm) = warm {
         keep_warm_events(warm, &mut snap);
@@ -2478,6 +2601,7 @@ impl Reader {
             self.split.lane = CoalLane::Off;
         }
         let slots = self.set_occupancy_facts(&mut snap);
+        snap.place = crate::net_place::sys_view();
         snap.slot_tabs = crate::occupancy_host::slot_tabs(
             &slots,
             sample.procs.as_deref(),
@@ -2538,6 +2662,7 @@ impl Reader {
             .map(|fixture| fixture.reading(&sample, false));
         let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
         self.set_occupancy_facts(&mut snap);
+        snap.place = crate::net_place::sys_view();
         let events_before = snap.strip_events.len();
         let jobs = self.jobs.tick(
             sample.at_ns / 1_000_000,

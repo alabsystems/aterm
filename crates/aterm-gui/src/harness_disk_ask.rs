@@ -209,9 +209,8 @@ impl crate::App {
     }
 
     /// Session `sid`'s Autopilot turned Off, written by aterm, where `sid` is a live session of
-    /// this process: whether it was. A worker of aterm's that ran out of its time stops so (the
-    /// disk worker's, [`Self::disk_worker_expired`]; a credit claim worker's,
-    /// [`Self::credit_claim_expired`]).
+    /// this process: whether it was. The disk worker stops so when it runs out of its time
+    /// ([`Self::disk_worker_expired`]).
     pub(crate) fn worker_autopilot_off(&mut self, sid: &str) -> bool {
         let local = {
             let store = self.store.read().unwrap_or_else(PoisonError::into_inner);

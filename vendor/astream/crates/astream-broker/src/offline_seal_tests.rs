@@ -783,9 +783,7 @@ fn a_sealed_log_whose_seal_is_gone_keeps_its_held_through_every_keyless_way_in()
     );
     untouched(
         "a seal",
-        BrokerLog::seal_plaintext(&fx.path, KEY)
-            .err()
-            .expect("it seals"),
+        BrokerLog::seal_plaintext(&fx.path, KEY).expect_err("it seals"),
     );
     std::fs::write(fx.file(".seal"), seal).unwrap();
     let log = fx.sealed().unwrap();

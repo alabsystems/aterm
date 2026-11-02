@@ -182,3 +182,62 @@ fn both_backends_render_the_fire_contrast_halo() {
         "CPU and GPU weak-strength halos must stay visually close (max delta {lick_delta})"
     );
 }
+
+#[test]
+fn fire_contrast_halo_clips_at_its_own_row_floor() {
+    let theme = Theme::default();
+    let (mut cpu, mut gpu) = backends(18.0, theme);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (rows, cols) = (4usize, 12usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b[?25l\x1b[2;5H\xe2\x96\x88gp");
+    let (cw, ch) = cpu.cell_size();
+    let base = term.cell_frame(rows, cols);
+    let frame = cpu.render_input(&base);
+    let (width, height) = (frame.width, frame.height);
+    let grid_top = (height - rows * ch) / 2;
+    let row2_y0 = grid_top + 2 * ch;
+
+    let sheet_row = |row: u16| FirePatch {
+        row,
+        x: cw as u16,
+        y: (grid_top + row as usize * ch) as u16,
+        w: (8 * cw) as u16,
+        h: ch as u16,
+        base_y: (grid_top + 3 * ch) as u16,
+        peak_h: (3 * ch) as u16,
+        phase: 4096,
+        temp: 240,
+        strength: 255,
+        lean: 0,
+        cov_cap: 255,
+        cell_h: ch as u16,
+        mode: FireMode::Add,
+    };
+
+    let mut fire_only = term.cell_frame(rows, cols);
+    fire_only.fire_patch = vec![sheet_row(1), sheet_row(2)];
+    let cpu_fo = cpu.render_input(&fire_only).pixels.clone();
+    let gpu_fo = gpu.render_input(&mut win, &fire_only, None).pixels;
+
+    let mut haloed = fire_only.clone();
+    haloed.fire_halo = vec![halo(1, 4, 255), halo(1, 5, 255), halo(1, 6, 255)];
+    let cpu_h = cpu.render_input(&haloed).pixels.clone();
+    let gpu_h = gpu.render_input(&mut win, &haloed, None).pixels;
+
+    assert_eq!(
+        &cpu_h[row2_y0 * width..],
+        &cpu_fo[row2_y0 * width..],
+        "CPU clips row 1's fire halo at row 2's top edge"
+    );
+    assert_eq!(
+        &gpu_h[row2_y0 * width..],
+        &gpu_fo[row2_y0 * width..],
+        "GPU must also clip row 1's fire halo at row 2's top edge instead of bleeding dy=+1,+2 into row 2's fire"
+    );
+    let delta = max_channel_delta(&cpu_h, &gpu_h);
+    assert!(
+        delta <= 24,
+        "multi-row fire halo CPU-vs-GPU max per-channel delta must stay <= 24 (got {delta})"
+    );
+}

@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 use super::fixtures::{
-    REPLY_QUOTES_LOGIN_ENDED, REPLY_QUOTES_RATE_LIMIT, REPLY_QUOTES_UPSELL, SIGNED_OUT,
+    BOX_SHELL, BUSY_DRAFT, DRAFT_MULTILINE_TYPED, IDLE_DRAFT, IDLE_EMPTY, PLAN_APPROVAL,
+    REPLY_QUOTES_LOGIN_ENDED, REPLY_QUOTES_RATE_LIMIT, REPLY_QUOTES_UPSELL, RETRY_429_1_0_70,
+    SIGNED_OUT, TURN_ENDED_EMPTY, UPSELL_FREE_1_0_70, UPSELL_WEEKLY_1_0_70, WALL_401_1_0_70,
     WALL_AUTH_TOKEN_INVALID, WALL_CREDIT_LIMIT, WALL_PLAN_RATE_LIMIT, WALL_WEEKLY_LIMIT,
 };
 use super::*;
@@ -466,4 +468,202 @@ fn a_reply_row_opening_with_a_short_login_texts_words_is_no_wall_and_the_whole_t
             "CONTROL: {ended:?}"
         );
     }
+}
+
+#[test]
+fn the_composers_box_is_found_on_the_measured_frames_and_nowhere_else() {
+    for (what, text) in [
+        ("idle empty", IDLE_EMPTY),
+        ("idle draft", IDLE_DRAFT),
+        ("multiline draft", DRAFT_MULTILINE_TYPED),
+        ("busy draft", BUSY_DRAFT),
+        ("turn ended", TURN_ENDED_EMPTY),
+        ("plan approval", PLAN_APPROVAL),
+    ] {
+        let rows = screen(text);
+        let (top, caret, bottom) = composer_rows(&rows).expect(what);
+        assert!(
+            crate::text::trim_start(&rows[top]).starts_with('╭'),
+            "{what}"
+        );
+        assert!(caret_row(&rows[caret]), "{what}");
+        assert!(
+            crate::text::trim_start(&rows[bottom]).starts_with('╰'),
+            "{what}"
+        );
+        // The composer's box is the screen's last: no caret row stands under its bottom edge.
+        assert!(!rows[bottom + 1..].iter().any(|r| caret_row(r)), "{what}");
+    }
+    // The multiline draft grew the box upward: one continuation row between caret and bottom.
+    let rows = screen(DRAFT_MULTILINE_TYPED);
+    let (_, caret, bottom) = composer_rows(&rows).expect("multiline");
+    assert_eq!(bottom - caret, 2, "one continuation row");
+    // NEGATIVE CONTROLS: an approval box standing with no composer drawn, and the sign-in
+    // screen, hold no composer; the welcome card's own box (no caret row in it) is not the
+    // composer under it, and a sent message's `❯` rows in the multiline frame's transcript
+    // (no `│` before them) never make one.
+    assert_eq!(composer_rows(&screen(BOX_SHELL)), None);
+    assert_eq!(composer_rows(&screen(SIGNED_OUT)), None);
+    let welcome = screen(IDLE_EMPTY);
+    let (top, ..) = composer_rows(&welcome).expect("the composer under the card");
+    assert!(
+        welcome[..top]
+            .iter()
+            .any(|r| r.contains("Grok Build  1.0.70")),
+        "the welcome card stands above the composer's top"
+    );
+}
+
+/// ITS COMPOSER BOX CLAIMS NO OTHER PROGRAM'S SCREEN: over the whole measured fixture corpus,
+/// no fixture of another program is read as a Grok Build screen (`is_grok_screen`), and every
+/// Grok Build frame that draws the box identifies as Grok Build by screen alone, the signed-in
+/// frames that drew nothing to tell them by before. So does each frame whose composer a
+/// question card replaces (the two upsells, a question, three approvals), told by a radio
+/// option on its heavy bar. NEGATIVE CONTROL: a Grok Build frame with no box, card or sign-in
+/// screen (a hand-built wall, a quit) is claimed by nothing, an agy notice card on the same
+/// bar is no question card, and the corpus holds such frames and over a thousand of the other
+/// programs'.
+#[test]
+fn its_composer_box_claims_no_other_programs_screen() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the fixtures")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".txt"))
+        .collect();
+    names.sort();
+    assert!(names.len() > 1000, "{} fixtures", names.len());
+    let (mut claimed, mut panel_only, mut unclaimed, mut others) = (0usize, 0usize, 0usize, 0usize);
+    for name in &names {
+        let rows = screen(&std::fs::read_to_string(dir.join(name)).expect("a fixture"));
+        if name.starts_with("grok-") {
+            if composer_rows(&rows).is_some() {
+                claimed += 1;
+                assert_eq!(
+                    identify(None, &rows).program(),
+                    Program::Grok,
+                    "{name}: its box names it"
+                );
+            } else if panel_standing(&rows) {
+                panel_only += 1;
+                assert_eq!(
+                    identify(None, &rows).program(),
+                    Program::Grok,
+                    "{name}: its question card names it"
+                );
+            } else if identify(None, &rows).program() != Program::Grok {
+                unclaimed += 1;
+            }
+        } else {
+            others += 1;
+            assert!(!is_grok_screen(&rows), "{name}: no other program's screen");
+        }
+    }
+    assert!(claimed > 30, "{claimed} box frames identify by screen");
+    assert_eq!(
+        panel_only, 6,
+        "the upsell, question and approval cards with no composer"
+    );
+    assert!(unclaimed > 0, "frames with nothing to tell them by stand");
+    assert!(others > 1000, "{others} other programs' frames");
+    // A card named by screen alone reads its wall through the unnamed read too, where the
+    // same frames read as a generic program's before (no composer to tell them by).
+    assert_eq!(
+        read(None, &screen(UPSELL_WEEKLY_1_0_70), None)
+            .wall
+            .map(|w| w.kind),
+        Some(WallKind::UsageWeekly)
+    );
+}
+
+#[test]
+fn the_headers_token_counts_read_as_the_context_left() {
+    for (what, text, left) in [
+        ("idle draft", IDLE_DRAFT, 99),
+        ("multiline draft", DRAFT_MULTILINE_TYPED, 95),
+        ("busy draft", BUSY_DRAFT, 95),
+        ("turn ended", TURN_ENDED_EMPTY, 95),
+    ] {
+        let rows = screen(text);
+        assert_eq!(context_left(&rows), Some(left), "{what}");
+        let r = read(Some("grok"), &rows, None);
+        assert_eq!(r.context_left, Some(left), "{what}: the reading");
+        // The watch does not take it: the header names no compaction.
+        assert_eq!(Program::Grok.reader().context(&rows), None, "{what}");
+    }
+    // NEGATIVE CONTROLS: no header counts stand on the welcome card, the sign-in screen or a
+    // hand-built wall, and the counts quoted deep in a transcript (the header row moved to
+    // the foot of the screen) are no header.
+    for (what, text) in [
+        ("welcome card", IDLE_EMPTY),
+        ("signed out", SIGNED_OUT),
+        ("hand-built wall", WALL_PLAN_RATE_LIMIT),
+    ] {
+        assert_eq!(context_left(&screen(text)), None, "{what}");
+    }
+    let mut quoted = screen(IDLE_DRAFT);
+    let header = quoted
+        .iter()
+        .position(|r| header_counts(r).is_some())
+        .expect("the header row");
+    let row = quoted.remove(header);
+    quoted.push(row);
+    assert_eq!(context_left(&quoted), None, "quoted counts are no header");
+}
+
+/// THE MEASURED WALLS ARE READ: a 401's drawn failure under the prompt at the screen's top
+/// (a short transcript over a blank screen and its full-height scrollbar gutter, where a row
+/// count from the foot never reached it) is an ended-login wall, and the upsells drawn in the
+/// composer's place are their windows' walls. NEGATIVE CONTROLS: a 429's server text, which
+/// no opener of the program's carries, is no wall; replies that quote the login-ended and
+/// limit texts are none either; and a notice with a whole reply of worded rows under it has
+/// been superseded.
+#[test]
+fn the_measured_walls_are_read_where_they_stand() {
+    let rows = screen(WALL_401_1_0_70);
+    let w = wall(&rows).expect("the 401 is a wall");
+    assert_eq!(w.kind, WallKind::Auth);
+    assert!(
+        rows[w.row].contains("Authentication required:"),
+        "{}",
+        rows[w.row]
+    );
+    assert_eq!(
+        read(Some("grok"), &rows, None).wall.map(|w| w.kind),
+        Some(WallKind::Auth)
+    );
+    for (what, text, kind) in [
+        (
+            "free-usage upsell",
+            UPSELL_FREE_1_0_70,
+            WallKind::UsageSession,
+        ),
+        ("weekly upsell", UPSELL_WEEKLY_1_0_70, WallKind::UsageWeekly),
+    ] {
+        assert_eq!(wall(&screen(text)).map(|w| w.kind), Some(kind), "{what}");
+    }
+    // CONTROLS: the server's words after `Retry failed:` are no opener of the program's, and
+    // prose quoting the wall texts opens no row in the zone.
+    assert_eq!(wall(&screen(RETRY_429_1_0_70)), None, "CONTROL: the 429");
+    assert_eq!(
+        wall(&screen(REPLY_QUOTES_LOGIN_ENDED)),
+        None,
+        "CONTROL: quoted login-ended texts"
+    );
+    assert_eq!(
+        wall(&screen(REPLY_QUOTES_RATE_LIMIT)),
+        None,
+        "CONTROL: quoted limit texts"
+    );
+    // CONTROL: the same failure with a reply of worded rows drawn under it is superseded.
+    let mut superseded = screen(WALL_401_1_0_70);
+    let at = superseded
+        .iter()
+        .position(|r| r.contains("Authentication required:"))
+        .expect("the failure");
+    for n in 0..LIVE_ROWS {
+        superseded.insert(at + 2 + n, format!("the reply went on, line {n} of it"));
+    }
+    assert_eq!(wall(&superseded), None, "CONTROL: superseded");
 }

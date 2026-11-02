@@ -814,6 +814,20 @@ pub trait Ports: Sync {
     /// no mug at login, so the subscriber's pass, which runs at login with no window, leaves it
     /// to a window.
     fn awake_startup_off(&self) -> bool;
+    /// Old `aterm caffeine` login jobs no aterm will run again (their `aterm` is gone, is this
+    /// build, or answers no to `aterm help caffeine`, as 0.145.0 does): `sync.awake` retires
+    /// them even when a mug already runs or the person turned keep-awake or Enable at Startup off.
+    fn awake_retired_jobs(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Retire the old `aterm caffeine` login jobs [`Ports::awake_retired_jobs`] found, starting
+    /// no mug and touching no Enable at Startup.
+    ///
+    /// # Errors
+    /// A retired job's plist could not be removed.
+    fn retire_awake_old_jobs(&self) -> Result<String, String> {
+        Ok(String::new())
+    }
     /// `sync.fabric`'s apply where the fabric is [`FabricRead::Unset`]: `aterm fabric on`'s steps,
     /// which ask nothing.
     ///
@@ -901,6 +915,10 @@ struct Synced<'a> {
     said: Mutex<Option<String>>,
     /// Why the last apply stood aside.
     aside: Mutex<Option<StoodAside>>,
+    /// Whether this pass's `sync.awake` apply retired old `aterm caffeine` login jobs without
+    /// starting a mug, so its read-back verifies their removal even when keep-awake itself is off
+    /// or deferred.
+    retired_awake: std::sync::atomic::AtomicBool,
 }
 
 impl<'a> Synced<'a> {
@@ -913,6 +931,7 @@ impl<'a> Synced<'a> {
             held: std::sync::OnceLock::new(),
             said: Mutex::new(None),
             aside: Mutex::new(None),
+            retired_awake: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -973,6 +992,26 @@ impl<'a> Synced<'a> {
 
 fn not_applicable(why: impl Into<String>) -> Probe {
     Probe::NotApplicable { why: why.into() }
+}
+
+const AWAKE_STARTUP_OFF_WHY: &str = "aCaffiene's Enable at Startup is off by your choice, so an \
+     aterm window starts the mug, not this pass";
+
+fn old_awake_jobs_due(retired: &[String], context: &str) -> Probe {
+    let noun = if retired.len() == 1 { "item" } else { "items" };
+    Probe::Change {
+        from: format!(
+            "{context}; old `aterm caffeine` login {noun} ({}) still in LaunchAgents",
+            retired.join(", ")
+        ),
+        to: format!("the old `aterm caffeine` login {noun} retired"),
+    }
+}
+
+fn retired_awake_now(context: &str) -> Probe {
+    Probe::Ok {
+        now: format!("retired the old `aterm caffeine` login item(s) ({context})"),
+    }
 }
 
 fn read<T>(read: Result<T, String>, probe: impl FnOnce(T) -> Probe) -> Probe {
@@ -1307,24 +1346,49 @@ impl Item for Synced<'_> {
             Kind::Awake if self.trigger.in_window() => not_applicable(
                 "the aterm window keeps this Mac awake at launch and every five minutes",
             ),
-            // A person's Enable at Startup off is no mug at login; a window still starts one.
+            // A person's Enable at Startup off is no mug at login; a window still starts one,
+            // while dead or 0.145.0 `aterm caffeine` login jobs are still retired.
             Kind::Awake
                 if self.trigger == Trigger::Subscriber && self.ports.awake_startup_off() =>
             {
-                not_applicable(
-                    "aCaffiene's Enable at Startup is off by your choice, so an aterm window \
-                     starts the mug, not this pass",
-                )
+                let retired = self.ports.awake_retired_jobs();
+                if !retired.is_empty() {
+                    old_awake_jobs_due(&retired, AWAKE_STARTUP_OFF_WHY)
+                } else if self
+                    .retired_awake
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    retired_awake_now(AWAKE_STARTUP_OFF_WHY)
+                } else {
+                    not_applicable(AWAKE_STARTUP_OFF_WHY)
+                }
             }
-            Kind::Awake => read(self.ports.awake(), |awake| match awake {
-                AwakeRead::NotApplicable(why) => not_applicable(why),
-                AwakeRead::Current(now) => Probe::Ok { now },
-                AwakeRead::Asking(why) => Probe::Deferred { why },
-                AwakeRead::Due(from) => Probe::Change {
-                    from,
-                    to: "the installed app's mug keeps this Mac awake".to_owned(),
-                },
-            }),
+            Kind::Awake => {
+                let retired = self.ports.awake_retired_jobs();
+                let retired_here = self
+                    .retired_awake
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                read(self.ports.awake(), |awake| match awake {
+                    AwakeRead::Due(from) => Probe::Change {
+                        from,
+                        to: "the installed app's mug keeps this Mac awake".to_owned(),
+                    },
+                    AwakeRead::Current(now) if !retired.is_empty() => {
+                        old_awake_jobs_due(&retired, &now)
+                    }
+                    AwakeRead::Current(now) => Probe::Ok { now },
+                    AwakeRead::NotApplicable(why) if !retired.is_empty() => {
+                        old_awake_jobs_due(&retired, &why)
+                    }
+                    AwakeRead::NotApplicable(why) if retired_here => retired_awake_now(&why),
+                    AwakeRead::NotApplicable(why) => not_applicable(why),
+                    AwakeRead::Asking(why) if !retired.is_empty() => {
+                        old_awake_jobs_due(&retired, &why)
+                    }
+                    AwakeRead::Asking(why) if retired_here => retired_awake_now(&why),
+                    AwakeRead::Asking(why) => Probe::Deferred { why },
+                })
+            }
         }
     }
 
@@ -1406,7 +1470,18 @@ impl Item for Synced<'_> {
                     return Ok(());
                 }
             },
-            Kind::Awake => self.ports.keep_awake()?,
+            Kind::Awake => {
+                let start_mug = !(self.trigger == Trigger::Subscriber
+                    && self.ports.awake_startup_off())
+                    && matches!(self.ports.awake()?, AwakeRead::Due(_));
+                if start_mug {
+                    self.ports.keep_awake()?
+                } else {
+                    self.retired_awake
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.ports.retire_awake_old_jobs()?
+                }
+            }
             // Report only: its probe never plans a change.
             Kind::Vault => return Ok(()),
         };

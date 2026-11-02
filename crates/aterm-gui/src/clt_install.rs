@@ -688,6 +688,7 @@ impl App {
         status: &crate::SetupStatus,
     ) -> Option<ToolsInstall> {
         self.read_developer_tools_exit();
+        self.settle_missing_tools_exception(status);
         let reading = self.developer_tools_reading();
         let activity = activity(reading);
         let setup = &mut self.workstation_setup;
@@ -741,6 +742,20 @@ impl App {
 
     /// What this Mac shows of an installer now ([`Reading`]): the same local evidence drives the
     /// displayed wait and each dispatch boundary.
+    /// A repositories reading that no longer waits on the tools ends the digest's "missing" entry,
+    /// however they arrived: an install in a tab this window did not open runs no package pass,
+    /// whose `c-toolchain: ready` was the only other thing that ended it.
+    fn settle_missing_tools_exception(&mut self, status: &crate::SetupStatus) {
+        use crate::toolchain_words::{CToolchain, c_toolchain_entry};
+        if status.repositories_reading().is_none() || status.repositories_tools_wait().is_some() {
+            return;
+        }
+        let missing = c_toolchain_entry(CToolchain::Missing).key();
+        if self.owes_exception(&missing) {
+            self.except_clear(&missing);
+        }
+    }
+
     fn developer_tools_reading(&self) -> Reading {
         self.workstation_setup
             .developer_tools_probe

@@ -32,6 +32,32 @@ pub fn parse_tap_name(s: &str) -> Option<(String, String)> {
         .then(|| (user.to_owned(), repo.to_owned()))
 }
 
+/// The tap `old_tap`'s `tap_migrations.json` says `oldname`
+/// moved to, when that tap is installed locally (brew's
+/// `old_tap.tap_migrations`). Returns the target tap as
+/// `user/repo`.
+pub(super) fn migration_target_tap(
+    prefix: &Prefix,
+    old_tap: &str,
+    oldname: &str,
+) -> Option<String> {
+    let (user, repo) = parse_tap_name(old_tap)?;
+    let dir = tap_path(prefix, &user, &repo).ok()?;
+    let bytes =
+        crate::metadata_io::read_bounded_regular(&dir.join("tap_migrations.json"), 1024 * 1024)
+            .ok()?;
+    let value: aterm_json::Value = aterm_json::from_slice(&bytes).ok()?;
+    let target = value.get(oldname)?.as_str()?;
+    // `Utils.tap_from_full_name`: a full name's first two parts,
+    // else a two-part tap as written.
+    let parts: Vec<&str> = target.split('/').collect();
+    match parts.len() {
+        2 => Some(target.to_string()),
+        3.. => Some(format!("{}/{}", parts[0], parts[1])),
+        _ => None,
+    }
+}
+
 fn tap_path(prefix: &Prefix, user: &str, repo: &str) -> Result<PathBuf, String> {
     if !super::valid_component(user) || !super::valid_component(repo) {
         return Err("abrew: invalid tap path component".to_owned());
@@ -145,36 +171,138 @@ fn git_protocol_args(local: bool) -> Vec<&'static str> {
     args
 }
 
+const DEPRECATED_OFFICIAL_TAPS: &[&str] = &[
+    "aliases",
+    "apache",
+    "binary",
+    "bundle",
+    "cask-drivers",
+    "cask-eid",
+    "cask-fonts",
+    "cask-versions",
+    "command-not-found",
+    "completions",
+    "devel-only",
+    "dupes",
+    "emacs",
+    "formula-analytics",
+    "fuse",
+    "games",
+    "gui",
+    "head-only",
+    "linux-fonts",
+    "livecheck",
+    "nginx",
+    "php",
+    "portable-ruby",
+    "python",
+    "science",
+    "services",
+    "test-bot",
+    "tex",
+    "versions",
+    "x11",
+];
+
+fn redirect_refusal(name: &str) -> String {
+    format!(
+        "abrew: tap {name} was redirected by its remote; following a redirected tap is not native (run real brew)"
+    )
+}
+
+fn is_shallow(path: &std::path::Path) -> bool {
+    git_out(path, &["rev-parse", "--is-shallow-repository"]).is_ok_and(|out| out == "true")
+}
+
 /// Clone or verify an installed tap, returning `(tap, newly_tapped)`.
-pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<(Tap, bool), String> {
+/// Mirrors brew's `Tap#install` decision matrix.
+pub fn add(
+    prefix: &Prefix,
+    name: &str,
+    url: Option<&str>,
+    custom_remote: bool,
+    force: bool,
+) -> Result<(Tap, bool), String> {
     let (user, repo) = parse_tap_name(name)
         .ok_or_else(|| format!("abrew: tap name must be user/repo, got {name}"))?;
+    let shown = format!("{user}/{repo}");
+    let user_l = user.to_ascii_lowercase();
+    let repo_l = repo.to_ascii_lowercase();
+    if user_l == "homebrew" && DEPRECATED_OFFICIAL_TAPS.contains(&repo_l.as_str()) {
+        return Err(format!(
+            "Error: {shown} was deprecated. This tap is now empty and all its contents were either deleted or migrated."
+        ));
+    }
+    if user_l == "caskroom" || (user_l == "phinze" && repo_l == "cask") {
+        let new_repo = if repo_l == "cask" {
+            "cask".to_string()
+        } else {
+            format!("cask-{repo}")
+        };
+        return Err(format!(
+            "Error: {shown} was moved. Tap homebrew/{new_repo} instead."
+        ));
+    }
+    if custom_remote && url.is_none() {
+        return Err(format!(
+            "Error: Tap {shown} with option `--custom-remote` but without a remote URL."
+        ));
+    }
     let (path, update) = mutation_path(prefix, &user, &repo, true)?;
     if update {
-        if let Some(url) = url {
-            let origin = fetch::run_capture(
-                aterm_uds::os_path!("git"),
-                &["-C", &path.to_string_lossy(), "remote", "get-url", "origin"],
-            )
+        let tap = Tap {
+            user: user.clone(),
+            repo: repo.clone(),
+            path: path.clone(),
+        };
+        let existing = git_out(&path, &["remote", "get-url", "origin"])
             .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
-            match origin.as_deref() {
-                Some(existing) if existing == url => {}
-                Some(existing) => {
-                    return Err(format!(
-                        "abrew: tap {user}/{repo} is already tapped from {existing}"
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "abrew: cannot read the existing remote of tap {user}/{repo}"
-                    ));
-                }
+            .filter(|s| !s.is_empty());
+        if !custom_remote
+            && let Some(want) = url
+            && existing.as_deref() != Some(want)
+        {
+            return Err(format!(
+                "Error: Tap {shown} remote mismatch.\n{} != {want}",
+                existing.as_deref().unwrap_or_default()
+            ));
+        }
+        if custom_remote
+            && let Some(want) = url
+            && existing.as_deref() != Some(want)
+        {
+            fix_remote_configuration(&tap, Some(want))?;
+        }
+        let _ = git_out(&path, &["config", "--unset", "homebrew.forceautoupdate"]);
+        if is_shallow(&path) {
+            eprintln!("{}", super::tty::ohai_err(&format!("Unshallowing {shown}")));
+            let local = existing.as_deref().or(url).is_some_and(is_local_remote);
+            let path_s = path.to_string_lossy();
+            let mut args = git_protocol_args(local);
+            args.extend(["-C", &path_s, "fetch", "--unshallow"]);
+            let fetched = fetch::run_capture(aterm_uds::os_path!("git"), &args)
+                .map_err(|e| format!("abrew: git fetch failed for tap {shown}: {e}"))?;
+            if !fetched.status.success() {
+                return Err(format!("abrew: git fetch failed for tap {shown}"));
+            }
+            if String::from_utf8_lossy(&fetched.stderr)
+                .to_lowercase()
+                .contains("redirecting to ")
+            {
+                return Err(redirect_refusal(&shown));
             }
         }
-        return Ok((Tap { user, repo, path }, false));
-    } else {
+        return Ok((tap, false));
+    }
+    let core = (user_l == "homebrew" || user_l == "linuxbrew")
+        && (repo_l == "core" || repo_l == "homebrew");
+    let core_cask = user_l == "homebrew" && repo_l == "cask";
+    if (core || core_cask) && !force {
+        return Err(format!(
+            "Error: Tapping {shown} is no longer typically necessary.\nAdd --force if you are sure you need it for contributing to Homebrew."
+        ));
+    }
+    {
         let remote = url.map_or_else(
             || format!("https://github.com/{user}/homebrew-{repo}.git"),
             str::to_owned,
@@ -200,6 +328,14 @@ pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<(Tap, bool)
         }
         super::prefix::publish_directory(&staged, &path, false)
             .map_err(|e| format!("abrew: cannot publish tap {user}/{repo}: {e}"))?;
+        link_completions_and_manpages(
+            prefix,
+            &Tap {
+                user: user.clone(),
+                repo: repo.clone(),
+                path: path.clone(),
+            },
+        );
     }
     Ok((Tap { user, repo, path }, true))
 }
@@ -234,6 +370,144 @@ fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
         return Err(format!(
             "abrew: git pull failed for tap {user}/{repo} ({code})"
         ));
+    }
+    Ok(())
+}
+
+fn git_out(path: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let path_s = path.to_string_lossy();
+    let mut full: Vec<&str> = vec!["-C", &path_s];
+    full.extend(args);
+    let out = fetch::run_capture(aterm_uds::os_path!("git"), &full).map_err(|e| {
+        format!(
+            "abrew: git {} failed: {e}",
+            args.first().copied().unwrap_or("")
+        )
+    })?;
+    if !out.status.success() {
+        return Err(format!(
+            "abrew: git {} failed in {}",
+            args.first().copied().unwrap_or(""),
+            path.display()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn origin_branch_name(path: &std::path::Path) -> Option<String> {
+    let refname = git_out(path, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]).ok()?;
+    refname
+        .strip_prefix("refs/remotes/origin/")
+        .map(str::to_owned)
+        .filter(|name| !name.is_empty())
+}
+
+/// brew's `Tap#fix_remote_configuration`: point the tap at a
+/// requested remote when given, and follow an upstream
+/// default-branch rename. A repository redirect (brew renames
+/// the tap through its trust machinery) is refused before any
+/// rename.
+fn fix_remote_configuration(tap: &Tap, requested_remote: Option<&str>) -> Result<(), String> {
+    let path = &tap.path;
+    if let Some(want) = requested_remote {
+        let previous = git_out(path, &["remote", "get-url", "origin"]).unwrap_or_default();
+        git_out(
+            path,
+            &["remote", "set-url", "origin", "--end-of-options", want],
+        )?;
+        git_out(
+            path,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        )?;
+        eprintln!(
+            "{}",
+            super::tty::ohai_err(&format!(
+                "{}: changed remote from {previous} to {want}",
+                tap.name()
+            ))
+        );
+    }
+    let Ok(remote) = git_out(path, &["remote", "get-url", "origin"]) else {
+        return Ok(());
+    };
+    if remote.is_empty() {
+        return Ok(());
+    }
+    let local = is_local_remote(&remote);
+    let path_s = path.to_string_lossy();
+    let current = origin_branch_name(path);
+    if requested_remote.is_none()
+        && let Some(branch) = &current
+    {
+        let mut args = git_protocol_args(local);
+        args.extend(["-C", &path_s, "ls-remote", "--heads", "origin", branch]);
+        let listed = fetch::run_capture(aterm_uds::os_path!("git"), &args)
+            .map_err(|e| format!("abrew: git ls-remote failed for tap {}: {e}", tap.name()))?;
+        if listed.status.success() && !listed.stdout.is_empty() {
+            return Ok(());
+        }
+    }
+    let mut args = git_protocol_args(local);
+    args.extend([
+        "-C",
+        &path_s,
+        "fetch",
+        "origin",
+        "+refs/heads/*:refs/remotes/origin/*",
+    ]);
+    let fetched = fetch::run_capture(aterm_uds::os_path!("git"), &args)
+        .map_err(|e| format!("abrew: git fetch failed for tap {}: {e}", tap.name()))?;
+    if !fetched.status.success() {
+        return Err(format!("abrew: git fetch failed for tap {}", tap.name()));
+    }
+    let stderr = String::from_utf8_lossy(&fetched.stderr).to_lowercase();
+    if stderr.contains("redirecting to ") {
+        return Err(redirect_refusal(&tap.name()));
+    }
+    git_out(path, &["remote", "set-head", "origin", "--auto"])?;
+    let Some(new_branch) = origin_branch_name(path) else {
+        return Err(format!(
+            "Error: Could not determine the default branch of {}",
+            tap.name()
+        ));
+    };
+    let current = current.unwrap_or_else(|| new_branch.clone());
+    if new_branch == current {
+        return Ok(());
+    }
+    git_out(
+        path,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    )?;
+    git_out(path, &["branch", "-m", &current, &new_branch])?;
+    git_out(
+        path,
+        &["branch", "-u", &format!("origin/{new_branch}"), &new_branch],
+    )?;
+    eprintln!(
+        "{}",
+        super::tty::ohai_err(&format!(
+            "{}: changed default branch name from {current} to {new_branch}!",
+            tap.name()
+        ))
+    );
+    Ok(())
+}
+
+/// `brew tap --repair`: relink every tap's manpages and
+/// completions, then repair its remote configuration.
+pub(super) fn repair(prefix: &Prefix) -> Result<(), String> {
+    for tap in list(prefix) {
+        link_completions_and_manpages(prefix, &tap);
+        fix_remote_configuration(&tap, None)?;
     }
     Ok(())
 }
@@ -296,6 +570,13 @@ pub fn remove(prefix: &Prefix, name: &str) -> Result<(), String> {
         }
     }
     let (path, _) = mutation_path(prefix, &user, &repo, false)?;
+    let tap = Tap {
+        user: user.clone(),
+        repo: repo.clone(),
+        path: path.clone(),
+    };
+    unlink_tap_manpages(prefix, &tap);
+    unlink_tap_completions(prefix, &tap);
     std::fs::remove_dir_all(&path).map_err(|e| format!("abrew: {e}"))
 }
 
@@ -329,6 +610,261 @@ pub fn list(prefix: &Prefix) -> Vec<Tap> {
     }
     out.sort_by_key(|a| a.name());
     out
+}
+
+/// Brew's completions setting, kept in the prefix's own state
+/// (`var/homebrew/linkcompletions`): brew keeps it in its git
+/// config, which an abrew prefix is not.
+/// One brew Settings-style boolean kept in the prefix's own
+/// state (`var/homebrew/<name>`).
+pub(super) fn setting_bool(prefix: &Prefix, name: &str) -> bool {
+    std::fs::read_to_string(prefix.root.join("var/homebrew").join(name))
+        .is_ok_and(|v| v.trim() == "true")
+}
+
+pub(super) fn set_setting_bool(prefix: &Prefix, name: &str, value: bool) -> Result<(), String> {
+    let path = prefix.root.join("var/homebrew").join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("abrew: {e}"))?;
+    }
+    std::fs::write(&path, if value { "true" } else { "false" }).map_err(|e| format!("abrew: {e}"))
+}
+
+pub(super) fn completions_linked(prefix: &Prefix) -> bool {
+    setting_bool(prefix, "linkcompletions")
+}
+
+pub(super) fn set_completions_linked(prefix: &Prefix, linked: bool) -> Result<(), String> {
+    set_setting_bool(prefix, "linkcompletions", linked)
+}
+
+/// The symlink target for `to` as seen from `from_dir`
+/// (brew's `make_relative_symlink`).
+fn relative_link_target(from_dir: &std::path::Path, to: &std::path::Path) -> std::path::PathBuf {
+    let from: Vec<std::ffi::OsString> = from_dir
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let dest: Vec<std::ffi::OsString> = to
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let mut common = 0;
+    while common < from.len() && common < dest.len() && from[common] == dest[common] {
+        common += 1;
+    }
+    let mut out = std::path::PathBuf::new();
+    for _ in common..from.len() {
+        out.push("..");
+    }
+    for part in &dest[common..] {
+        out.push(part);
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// Files under `dir`, recursively (brew's `Pathname#find`
+/// without directories).
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            collect_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// One shell's link pass for one tap (`Utils::Link`):
+/// returns destinations that conflicted.
+pub(super) fn link_src_dst(
+    src_dir: &std::path::Path,
+    dst_dir: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let mut conflicts = Vec::new();
+    if !src_dir.is_dir() {
+        return conflicts;
+    }
+    let mut files = Vec::new();
+    collect_files(src_dir, &mut files);
+    files.sort();
+    for src in files {
+        let Ok(rel) = src.strip_prefix(src_dir) else {
+            continue;
+        };
+        let dst = dst_dir.join(rel);
+        if dst
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            if std::fs::canonicalize(&dst).ok() == std::fs::canonicalize(&src).ok() {
+                continue;
+            }
+            let _ = std::fs::remove_file(&dst);
+        }
+        if dst.exists() {
+            conflicts.push(dst);
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+            let target = relative_link_target(parent, &src);
+            let _ = symlink_entry(&target, &dst);
+        }
+    }
+    conflicts
+}
+
+pub(super) fn unlink_src_dst(src_dir: &std::path::Path, dst_dir: &std::path::Path) {
+    if !src_dir.is_dir() {
+        return;
+    }
+    let mut files = Vec::new();
+    collect_files(src_dir, &mut files);
+    for src in files {
+        let Ok(rel) = src.strip_prefix(src_dir) else {
+            continue;
+        };
+        let dst = dst_dir.join(rel);
+        if dst
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::canonicalize(&dst).ok() == std::fs::canonicalize(&src).ok()
+        {
+            let _ = std::fs::remove_file(&dst);
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+}
+
+/// `brew completions [state|link|unlink]`: whether tap shell
+/// completion files are linked into the prefix's completion
+/// directories (brew's destinations).
+fn symlink_entry(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, link);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlinks are not supported",
+        ))
+    }
+}
+
+/// The conflict report brew's `Utils::Link` prints.
+fn report_link_conflicts(conflicts: &[PathBuf], command: &str) {
+    if conflicts.is_empty() {
+        return;
+    }
+    eprintln!(
+        "Error: Could not link:\n{}\n\nPlease delete these paths and run:\n  {command}",
+        conflicts
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Whether the one-time completions hint has been shown
+/// (brew's `completionsmessageshown` setting, same store).
+fn completions_message_shown(prefix: &Prefix) -> bool {
+    std::fs::read_to_string(prefix.root.join("var/homebrew/completionsmessageshown"))
+        .is_ok_and(|v| v.trim() == "true")
+}
+
+fn mark_completions_message_shown(prefix: &Prefix) {
+    let path = prefix.root.join("var/homebrew/completionsmessageshown");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, "true");
+}
+
+/// Destination dirs for linked tap files, brew's layout.
+pub(super) fn completion_dirs(prefix: &Prefix) -> [(&'static str, PathBuf); 3] {
+    [
+        ("bash", prefix.root.join("etc/bash_completion.d")),
+        ("zsh", prefix.root.join("share/zsh/site-functions")),
+        ("fish", prefix.root.join("share/fish/vendor_completions.d")),
+    ]
+}
+
+/// Link or unlink one tap's completions per the setting,
+/// with manpages always linked (brew's tap-install hook).
+pub(super) fn link_completions_and_manpages(prefix: &Prefix, tap: &Tap) {
+    let man_conflicts = link_src_dst(
+        &tap.path.join("manpages"),
+        &prefix.root.join("share/man/man1"),
+    );
+    report_link_conflicts(&man_conflicts, "brew tap --repair");
+    show_completions_message_if_needed(prefix);
+    if tap.user == "homebrew" || completions_linked(prefix) {
+        let mut conflicts = Vec::new();
+        for (shell, dst) in completion_dirs(prefix) {
+            conflicts.extend(link_src_dst(
+                &tap.path.join("completions").join(shell),
+                &dst,
+            ));
+        }
+        report_link_conflicts(&conflicts, "brew tap --repair");
+    } else {
+        unlink_tap_completions(prefix, tap);
+    }
+}
+
+/// Remove one tap's linked completion files.
+pub(super) fn unlink_tap_completions(prefix: &Prefix, tap: &Tap) {
+    for (shell, dst) in completion_dirs(prefix) {
+        unlink_src_dst(&tap.path.join("completions").join(shell), &dst);
+    }
+}
+
+/// Remove one tap's linked manpages.
+pub(super) fn unlink_tap_manpages(prefix: &Prefix, tap: &Tap) {
+    unlink_src_dst(
+        &tap.path.join("manpages"),
+        &prefix.root.join("share/man/man1"),
+    );
+}
+
+fn show_completions_message_if_needed(prefix: &Prefix) {
+    if completions_message_shown(prefix) {
+        return;
+    }
+    let to_link = list(prefix).iter().any(|tap| {
+        tap.user != "homebrew"
+            && ["bash", "zsh", "fish"]
+                .iter()
+                .any(|shell| tap.path.join("completions").join(shell).is_dir())
+    });
+    if !to_link {
+        return;
+    }
+    println!(
+        "{}",
+        super::tty::ohai("Homebrew completions for external commands are unlinked by default!")
+    );
+    println!(
+        "To opt-in to automatically linking external tap shell completion files, run:\n  brew completions link\nThen, follow the directions at https://docs.brew.sh/Shell-Completion"
+    );
+    mark_completions_message_shown(prefix);
 }
 
 /// Locate a formula `.rb` file inside `tap`.
@@ -442,6 +978,125 @@ pub fn lookup(prefix: &Prefix, full: &str) -> Option<Formula> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git_ok(args: &[&str]) {
+        let out = fetch::run_capture(aterm_uds::os_path!("git"), args).unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn tap_add_refusals_match_brew() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        let err = |name: &str, url: Option<&str>, custom: bool, force: bool| {
+            add(&prefix, name, url, custom, force).unwrap_err()
+        };
+        assert!(err("homebrew/services", None, false, false).contains("was deprecated"));
+        assert!(err("homebrew/bundle", None, false, false).contains("was deprecated"));
+        assert_eq!(
+            err("caskroom/fonts", None, false, false),
+            "Error: caskroom/fonts was moved. Tap homebrew/cask-fonts instead."
+        );
+        assert_eq!(
+            err("someone/tap", None, true, false),
+            "Error: Tap someone/tap with option `--custom-remote` but without a remote URL."
+        );
+        assert!(err("homebrew/core", None, false, false).contains("--force"));
+        assert!(err("homebrew/cask", None, false, false).contains("--force"));
+        assert!(err("linuxbrew/core", None, false, false).contains("--force"));
+    }
+
+    #[test]
+    fn tap_add_mismatch_and_custom_remote() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        let origin_s = origin.to_string_lossy().into_owned();
+        git_ok(&["-C", &origin_s, "init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("f.rb"), b"# tap").unwrap();
+        git_ok(&["-C", &origin_s, "add", "f.rb"]);
+        git_ok(&[
+            "-C",
+            &origin_s,
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "one",
+        ]);
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        let (tap, newly) = add(&prefix, "someone/tap", Some(&origin_s), false, false).unwrap();
+        assert!(newly);
+        // Re-tap with a different URL refuses with brew's mismatch text.
+        let error = add(&prefix, "someone/tap", Some("/elsewhere"), false, false).unwrap_err();
+        assert_eq!(
+            error,
+            format!("Error: Tap someone/tap remote mismatch.\n{origin_s} != /elsewhere")
+        );
+        // --custom-remote repoints the tap at the new remote.
+        let mirror = tmp.path().join("mirror");
+        let mirror_s = mirror.to_string_lossy().into_owned();
+        git_ok(&["clone", "-q", &origin_s, &mirror_s]);
+        add(&prefix, "someone/tap", Some(&mirror_s), true, false).unwrap();
+        let remote = git_out(&tap.path, &["remote", "get-url", "origin"]).unwrap();
+        assert_eq!(remote, mirror_s);
+    }
+
+    #[test]
+    fn repair_follows_an_upstream_default_branch_rename() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        let origin_s = origin.to_string_lossy().into_owned();
+        git_ok(&["-C", &origin_s, "init", "-q", "-b", "trunk"]);
+        std::fs::write(origin.join("f.rb"), b"# tap").unwrap();
+        git_ok(&["-C", &origin_s, "add", "f.rb"]);
+        git_ok(&[
+            "-C",
+            &origin_s,
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "one",
+        ]);
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        let tap_dir = prefix.taps_dir().join("someone/homebrew-tap");
+        std::fs::create_dir_all(tap_dir.parent().unwrap()).unwrap();
+        let tap_s = tap_dir.to_string_lossy().into_owned();
+        git_ok(&["clone", "-q", &origin_s, &tap_s]);
+        // Stale state: local branch and origin/HEAD still say master.
+        git_ok(&["-C", &tap_s, "branch", "-m", "trunk", "master"]);
+        git_ok(&[
+            "-C",
+            &tap_s,
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/master",
+        ]);
+        repair(&prefix).unwrap();
+        let branches = git_out(&tap_dir, &["branch", "--format=%(refname:short)"]).unwrap();
+        assert_eq!(branches, "trunk");
+        assert_eq!(origin_branch_name(&tap_dir).as_deref(), Some("trunk"));
+        // A second repair is a quiet no-op.
+        repair(&prefix).unwrap();
+        // No taps at all is fine too.
+        let empty = Prefix::at(&tmp.path().join("empty"));
+        empty.ensure().unwrap();
+        repair(&empty).unwrap();
+    }
 
     #[test]
     fn untap_refuses_while_tap_packages_are_installed() {
@@ -710,5 +1365,62 @@ mod tests {
             assert_eq!(std::fs::read(external.join("marker")).unwrap(), b"keep");
         }
         assert_eq!(std::fs::read(outside.join("marker")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn migration_target_reads_local_tap_migrations() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        assert_eq!(migration_target_tap(&p, "example/tap", "aztfy"), None);
+        let dir = p.taps_dir().join("example/homebrew-tap");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tap_migrations.json"),
+            br#"{"aztfy": "homebrew/core", "old": "other/tap/renamed"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            migration_target_tap(&p, "example/tap", "aztfy").as_deref(),
+            Some("homebrew/core")
+        );
+        assert_eq!(
+            migration_target_tap(&p, "example/homebrew-tap", "old").as_deref(),
+            Some("other/tap")
+        );
+        assert_eq!(migration_target_tap(&p, "example/tap", "missing"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tap_link_hook_links_manpages_and_setting_gated_completions() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let root = p.taps_dir().join("someone/homebrew-tools");
+        for dir in ["manpages", "completions/zsh", ".git"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("manpages/tool.1"), b"man").unwrap();
+        std::fs::write(root.join("completions/zsh/_tool"), b"#compdef tool").unwrap();
+        let tap = Tap {
+            user: "someone".to_string(),
+            repo: "tools".to_string(),
+            path: root.clone(),
+        };
+        // Unlinked setting: manpages link, completions do not.
+        link_completions_and_manpages(&p, &tap);
+        assert!(p.root.join("share/man/man1/tool.1").exists());
+        assert!(!p.root.join("share/zsh/site-functions/_tool").exists());
+        assert!(completions_message_shown(&p));
+        // Linked setting: completions follow.
+        set_completions_linked(&p, true).unwrap();
+        link_completions_and_manpages(&p, &tap);
+        assert!(p.root.join("share/zsh/site-functions/_tool").exists());
+        // Untap removes both link sets.
+        remove(&p, "someone/tools").unwrap();
+        assert!(!p.root.join("share/man/man1/tool.1").exists());
+        assert!(!p.root.join("share/zsh/site-functions/_tool").exists());
+        assert!(!root.exists());
     }
 }

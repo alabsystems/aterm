@@ -43,6 +43,8 @@ pub struct Formula {
     pub optional_dependencies: Vec<String>,
     /// `version_scheme` (keg ordering sorts by it before version).
     pub version_scheme: u64,
+    /// `compatibility_version` when the formula declares one.
+    pub compatibility_version: Option<u64>,
     pub keg_only: bool,
     /// `keg_only_reason` as (reason, explanation): the reason is a
     /// `:symbol` (inspect form) or free text.
@@ -464,6 +466,7 @@ impl Formula {
             recommended_dependencies: str_list(v.get("recommended_dependencies")),
             optional_dependencies: str_list(v.get("optional_dependencies")),
             version_scheme: v.get("version_scheme").and_then(Value::as_u64).unwrap_or(0),
+            compatibility_version: v.get("compatibility_version").and_then(Value::as_u64),
             keg_only: v.get("keg_only").and_then(Value::as_bool).unwrap_or(false),
             keg_only_reason: v.get("keg_only_reason").and_then(|r| {
                 let reason = r.get("reason").and_then(Value::as_str)?;
@@ -1420,7 +1423,9 @@ pub fn version_cmp(a: &str, b: &str) -> Ordering {
     a_rev.cmp(&b_rev)
 }
 
-fn split_revision(v: &str) -> (String, u64) {
+/// A `pkg_version` split into its version and revision parts
+/// (`1.2.3_1` -> (`1.2.3`, 1); no numeric `_N` suffix -> 0).
+pub(super) fn split_revision(v: &str) -> (String, u64) {
     if let Some((head, tail)) = v.rsplit_once('_')
         && let Ok(n) = tail.parse::<u64>()
         && tail.chars().all(|c| c.is_ascii_digit())

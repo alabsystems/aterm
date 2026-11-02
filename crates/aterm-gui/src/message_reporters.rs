@@ -5115,7 +5115,11 @@ pub(crate) fn credit_claim_started_entry(
             )),
             reason: Reason::new("Claude Code's cached offer says this account can claim it"),
         },
-        Then::step(format!("Read tab @{sid} for the worker's last reply")),
+        Then::step(format!(
+            "Read tab @{sid} for the worker's last reply: it ends by itself about 30 minutes \
+             after it started or you last typed in it, and its tab closes about 30 minutes after \
+             that unless it is its window's last tab"
+        )),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)

@@ -172,6 +172,13 @@ pub enum ErrorKind {
     /// Another local Commons custody observation held its lock past a bounded
     /// wait. Nothing was observed; retry after it finishes.
     CustodyBusy,
+    /// A local vault writer prevented a fresh Commons source observation.
+    /// Retry from a new observation after the writer releases its lock.
+    VaultBusy,
+    /// A valid local vault observation differs from the source or applied
+    /// version captured earlier. The old observation grants no access; a
+    /// retry must obtain and authorize the current source again.
+    VaultChanged,
     /// A connect to a private or link-local address (a vault on this LAN) found no route:
     /// what macOS answers while aterm may not yet reach the local network (its Local Network
     /// question is open, or was answered Don't Allow), and also what a LAN host that is down
@@ -195,6 +202,9 @@ pub enum ErrorKind {
     /// and it is not a race with a publish of the same bytes: asked again, it gets the same
     /// answer until someone changes the server or the path.
     Refused,
+    /// A member's desk answered that a vault pass on it holds its state: its join run touched no
+    /// phrase, so the same words go to it again once the pass ends.
+    MemberBusy,
 }
 
 impl Error {

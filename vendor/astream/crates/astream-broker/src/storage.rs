@@ -254,6 +254,28 @@ impl Backing {
         }
     }
 
+    /// Exactly `len` bytes from byte `start`, by a POSITIONAL read (`pread`): the file
+    /// offset the appends use is never moved, so a reader holding only `&self` (a cold
+    /// record read under the log's shared borrow) cannot disturb the next write.
+    pub(crate) fn read_at(&self, start: u64, len: usize) -> io::Result<Vec<u8>> {
+        match self {
+            Backing::Os(f) => {
+                let mut buf = vec![0u8; len];
+                read_exact_at(f, &mut buf, start)?;
+                Ok(buf)
+            }
+            #[cfg(test)]
+            Backing::Sim(s) => {
+                let mut all = Vec::new();
+                s.read_log(&mut all);
+                let start = usize::try_from(start).unwrap_or(usize::MAX);
+                all.get(start..start.saturating_add(len))
+                    .map(<[u8]>::to_vec)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
+            }
+        }
+    }
+
     /// Every byte of the file as stored (empty when it cannot be read): the
     /// inspection path, never the hot one.
     pub(crate) fn stored(&self, path: &Path) -> Vec<u8> {
@@ -286,6 +308,29 @@ impl Backing {
             )),
         }
     }
+}
+
+/// `pread` the whole of `buf` from byte `start` of `file`.
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], start: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, start)
+}
+
+/// `pread` the whole of `buf` from byte `start` of `file`.
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut start: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = file.seek_read(buf, start)?;
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        let rest = std::mem::take(&mut buf);
+        buf = rest.get_mut(n..).unwrap_or(&mut []);
+        start = start.saturating_add(n as u64);
+    }
+    Ok(())
 }
 
 /// A FULL flush of the log taken OUTSIDE its lock: what the writer issues for an

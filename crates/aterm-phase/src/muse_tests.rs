@@ -3927,3 +3927,57 @@ fn the_banner_over_one_message_is_the_opening_exchange() {
         "an earlier session above the banner: {relaunched:#?}"
     );
 }
+
+#[test]
+fn saved_login_and_model_failed_auth_notices_are_sign_in_walls() {
+    let rows = screen(KEY_REJECTED);
+    for (id, fix) in [
+        (
+            "muse.wall.saved_login",
+            "log in again or use a different account",
+        ),
+        ("muse.wall.still_unauthorized", "run `muse login` again"),
+        ("muse.wall.not_logged_in_cli", "run `muse login` first"),
+        (
+            "muse.wall.not_logged_in_key",
+            "run /login to add an API key",
+        ),
+    ] {
+        let bare = crate::anchor(id);
+        for notice_row in [
+            format!("◆ {bare}"),
+            format!("◆ model failed: {bare}"),
+            format!("◆ model failed after 1 attempt: {bare}"),
+            format!("◆ model failed after 3 attempts: {bare}"),
+        ] {
+            let walled = edited(&rows, "◆ your API key", &notice_row);
+            let w =
+                wall(&walled).unwrap_or_else(|| panic!("expected auth wall for {notice_row:?}"));
+            assert_eq!(w.kind, WallKind::Auth, "{notice_row}");
+            assert_eq!(remedy(&w.message).as_deref(), Some(fix), "{notice_row}");
+        }
+        let quoted = edited(&rows, "◆ your API key", &format!("◆ The page said: {bare}"));
+        assert_eq!(wall(&quoted), None, "the control: {id}");
+    }
+
+    // Singular `1 attempt:` on a transport failure reads as unreachable, while mismatched `1 attempts:` is plain prose.
+    let one_try = edited(
+        &rows,
+        "◆ your API key",
+        "◆ model failed after 1 attempt: transport error: connection reset",
+    );
+    assert_eq!(
+        wall(&one_try).map(|w| w.kind),
+        Some(WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Unreachable,
+        })
+    );
+    let mismatched = edited(
+        &rows,
+        "◆ your API key",
+        "◆ model failed after 1 attempts: transport error: connection reset",
+    );
+    assert_eq!(wall(&mismatched), None, "singular count requires attempt:");
+}

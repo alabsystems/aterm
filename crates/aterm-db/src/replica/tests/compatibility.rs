@@ -454,6 +454,18 @@ fn a_round_that_moves_nothing_reports_its_cpu() {
     }
     let spent = process_cpu() - start;
     eprintln!(
+        "COMMONS-QUIET {}",
+        aterm_json::json!({
+            "schema": 1,
+            "warmup_rounds": WARM,
+            "rounds": MEASURED,
+            "process_cpu_ns": u64::try_from(spent.as_nanos()).unwrap(),
+            "per_round_cpu_ns": u64::try_from((spent / MEASURED).as_nanos()).unwrap(),
+            "clock_read_cpu_ns": u64::try_from(reading.as_nanos()).unwrap(),
+            "moved_records": 0,
+        })
+    );
+    eprintln!(
         "COMMONS-NOOP-ROUND process CPU, both sides, per round over {MEASURED} rounds: {:?} \
          (one CPU reading costs {reading:?})",
         spent / MEASURED,

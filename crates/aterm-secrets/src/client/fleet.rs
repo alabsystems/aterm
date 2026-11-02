@@ -190,9 +190,14 @@ pub fn parse_denied_nodes_toml(text: &str) -> crate::Result<Vec<String>> {
 /// - `Ok(None)` when the local vault state is mid-apply, locked, partial, or revoked, so a
 ///   listener retains its last authoritative deny-list rather than clearing it transiently.
 ///
+/// A state lock an older build left wider than `0600` is narrowed first, where it is this user's
+/// to narrow (`StateLock::narrow_owned`), so an upgrade does not leave the list unread until the
+/// next vault sync.
+///
 /// # Errors
 /// Local vault files cannot be read, or `aterm-swarm-roster` is malformed UTF-8 / TOML.
 pub fn swarm_denied_nodes(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
+    StateLock::narrow_owned(paths)?;
     let Some(expected) = config(paths)? else {
         return Ok(Some(Vec::new()));
     };
@@ -428,6 +433,145 @@ mod tests {
         );
         assert!(parse_denied_nodes_toml("deny_nodes = 7\n").is_err());
         assert!(parse_denied_nodes_toml("deny_nodes = [7]\n").is_err());
+    }
+
+    /// A state lock an older build left at `0644`, this user's own, is narrowed to `0600` through
+    /// its descriptor by the deny list's read, which then answers, directly and through the
+    /// listener's memo, as the roster's memo does. The same lock seen as another user's, or one
+    /// reached through a symlink, is left exactly as it is and refused as before.
+    ///
+    /// The roster's read narrows it as well, the lock narrowed is the inode the checks judged
+    /// (a file renamed to its name in between is left), and one in a directory other users may
+    /// write is left.
+    ///
+    /// NEGATIVE CONTROLS (2026-11-01): with `swarm_denied_nodes`, `swarm_roster` and the memo
+    /// not calling `StateLock::narrow_owned`, the first read fails on the wide lock (`read past a
+    /// wide lock: ... mode 644 lets other users read it; run chmod 600 on it`); with only
+    /// `swarm_roster` not calling it, the lock stays wide (`the roster's read narrows the lock`);
+    /// with `narrow_owned` setting the mode by the lock's name (`std::fs::set_permissions`) in
+    /// place of its descriptor, the file renamed to that name is narrowed (`the checked lock is
+    /// narrowed`); with its directory mode check dropped, the lock in a group-writable directory
+    /// is narrowed (`a lock in a group-writable directory is left`); with
+    /// `narrow_owned` opening the lock `O_NOFOLLOW` but with no owner check (in place of
+    /// `open_existing`) and its directory owner check dropped, another user's lock is narrowed
+    /// (`another user's lock is left`); with it opening the lock by its name
+    /// (`std::fs::File::open`, which follows a symlink) and checking only the opened file's
+    /// owner, kind and links, the symlink's target is narrowed (`assertion failed:
+    /// !StateLock::narrow_owned(&admin_paths)...`).
+    #[test]
+    fn an_own_wide_lock_is_narrowed_by_the_deny_list_read_and_a_foreign_or_linked_one_is_not() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let vault_path = root.path().join("swarm.vault");
+        let admin_paths = Paths::for_home(&root.path().join("admin"));
+        create(&admin_paths, vault_path.to_str().unwrap(), None, Some("m1")).expect("create");
+        let opened = admin_open(&admin_paths).expect("admin open");
+        let mut doc = opened.doc.clone();
+        doc.set_entry(
+            &Audience::Everyone,
+            SWARM_ROSTER_ENTRY,
+            b"deny_nodes = [\"ff00\"]\n",
+        )
+        .expect("set roster");
+        admin_publish(&admin_paths, &opened, &doc).expect("publish");
+        sync(&admin_paths, None).expect("sync");
+        let denied = Some(vec!["ff00".to_owned()]);
+        let lock = admin_paths.lock_file();
+        let mode = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .expect("lock metadata")
+                .mode()
+                & 0o7777
+        };
+        let widen = |path: &std::path::Path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("widen");
+        };
+        assert_eq!(mode(&lock), 0o600, "a sync leaves the lock private");
+
+        widen(&lock);
+        let inode = std::fs::metadata(&lock).expect("lock").ino();
+        assert_eq!(
+            swarm_denied_nodes(&admin_paths).expect("read past a wide lock"),
+            denied
+        );
+        assert_eq!(mode(&lock), 0o600);
+        assert_eq!(
+            std::fs::metadata(&lock).expect("lock").ino(),
+            inode,
+            "narrowed in place"
+        );
+
+        widen(&lock);
+        assert_eq!(
+            super::super::swarm_denied_nodes_now(&admin_paths).expect("memo read"),
+            denied
+        );
+        assert_eq!(mode(&lock), 0o600);
+        widen(&lock);
+        assert!(super::super::swarm_roster_now(&admin_paths).is_ok());
+        assert_eq!(mode(&lock), 0o600);
+        // The roster's own read narrows it too, past its memo.
+        widen(&lock);
+        assert!(swarm_roster(&admin_paths).is_ok());
+        assert_eq!(mode(&lock), 0o600, "the roster's read narrows the lock");
+
+        // Narrowed through the descriptor: a file renamed to the lock's name after the checks
+        // keeps its mode, and the lock that was checked is the one narrowed.
+        widen(&lock);
+        let checked = admin_paths.dir.join("checked-lock");
+        let narrowed = StateLock::narrow_owned_then(&admin_paths, || {
+            std::fs::rename(&lock, &checked).expect("move the checked lock");
+            std::fs::write(&lock, b"").expect("another file at the lock's name");
+            widen(&lock);
+        });
+        assert!(narrowed.expect("narrowed"));
+        assert_eq!(mode(&checked), 0o600, "the checked lock is narrowed");
+        assert_eq!(mode(&lock), 0o644, "the file now at its name is left");
+        std::fs::rename(&checked, &lock).expect("put the lock back");
+
+        // In a directory other users may write, someone else could have renamed one of this
+        // user's files to the lock's name: it is left, and refused.
+        widen(&lock);
+        std::fs::set_permissions(&admin_paths.dir, std::fs::Permissions::from_mode(0o770))
+            .expect("open the directory to the group");
+        let narrowed = StateLock::narrow_owned(&admin_paths);
+        std::fs::set_permissions(&admin_paths.dir, std::fs::Permissions::from_mode(0o700))
+            .expect("close the directory");
+        assert!(
+            !narrowed.expect("nothing to fail"),
+            "a lock in a group-writable directory is left"
+        );
+        assert_eq!(mode(&lock), 0o644);
+        assert_eq!(
+            swarm_denied_nodes(&admin_paths).expect("narrowed in a private directory"),
+            denied
+        );
+
+        // Another user's lock is not this user's to narrow.
+        widen(&lock);
+        let (narrowed, read) = fsx::as_another_user(|| {
+            (
+                StateLock::narrow_owned(&admin_paths),
+                swarm_denied_nodes(&admin_paths),
+            )
+        });
+        assert!(
+            !narrowed.expect("nothing to fail"),
+            "another user's lock is left"
+        );
+        assert!(read.is_err(), "another user's lock is refused: {read:?}");
+        assert_eq!(mode(&lock), 0o644);
+
+        // A lock that is a symlink, here to this user's own wide file, is never followed.
+        let target = admin_paths.dir.join("linked-lock");
+        std::fs::rename(&lock, &target).expect("move the lock aside");
+        std::os::unix::fs::symlink(&target, &lock).expect("link the lock");
+        assert!(!StateLock::narrow_owned(&admin_paths).expect("nothing to fail"));
+        assert!(
+            swarm_denied_nodes(&admin_paths).is_err(),
+            "a linked lock is refused"
+        );
+        assert_eq!(mode(&target), 0o644, "the link's target is left as it is");
     }
 
     #[test]

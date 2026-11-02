@@ -195,9 +195,20 @@ impl<T: Clone> Memo<T> {
         if let Some(answer) = self.kept(paths, &stamps) {
             return Ok(answer);
         }
+        // A lock an older build left wide is narrowed before it is observed, as the read itself
+        // narrows it, so the first read after an upgrade can settle. The narrowing moved the
+        // lock's change time, so its stamps are taken again, still before the read.
+        let narrowed = StateLock::narrow_owned(paths);
+        let stamps = match narrowed {
+            Ok(true) => match stamp_inputs(paths) {
+                Some(stamps) => stamps,
+                None => return read(paths),
+            },
+            Ok(false) | Err(_) => stamps,
+        };
         // Held across the read: no writer can start while it is, so a writer that held the lock
         // first is the only way to a mid-apply answer.
-        let observation = StateLock::observe_classified(paths);
+        let observation = narrowed.and_then(|_| StateLock::observe_classified(paths));
         let settled = matches!(
             observation,
             Ok(StateObservation::Held(_) | StateObservation::Absent)
@@ -427,6 +438,38 @@ mod tests {
     ///
     /// NEGATIVE CONTROL (2026-11-01): with only `Ok(Some(_))` kept (the shape before), every call
     /// on that Mac reads again (`left: 2, right: 1`).
+    /// A lock an older build left wide is narrowed by the memo before it observes it, so the
+    /// first read after an upgrade settles and is kept: a reader that does not narrow it itself
+    /// reads once.
+    ///
+    /// NEGATIVE CONTROL (2026-11-01): with the memo's `StateLock::narrow_owned` call removed (the
+    /// observation alone, as before), the wide lock fails the observation, no answer settles and
+    /// every call reads again (`left: 2, right: 1`, `a read past a wide lock is kept`).
+    #[test]
+    fn a_read_past_a_wide_lock_narrows_it_and_is_kept() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = vault(home.path());
+        drop(StateLock::take(&paths).unwrap());
+        std::fs::set_permissions(paths.lock_file(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let memo = Memo::<Vec<String>>::new();
+        let reads = AtomicUsize::new(0);
+        let now = || memo.read(&paths, |p| lines(p, &reads)).unwrap();
+
+        assert_eq!(now(), Some(vec!["m60".to_owned()]));
+        assert_eq!(now(), Some(vec!["m60".to_owned()]));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "a read past a wide lock is kept"
+        );
+        assert_eq!(
+            std::fs::metadata(paths.lock_file()).unwrap().mode() & 0o7777,
+            0o600
+        );
+    }
+
     #[test]
     fn a_settled_answer_that_is_not_a_list_is_kept_until_the_inputs_change() {
         let home = aterm_tempfile::tempdir().unwrap();

@@ -62,6 +62,7 @@ struct World {
     /// cut then fails before it journals anything.
     claim_lands_unjournaled: bool,
     machine_refusals: Vec<Refusal>,
+    validation_tools: Result<String, Refusal>,
     /// The preflight's own blocks: R's commit-only gates and the engine's readiness.
     blocks: Vec<Refusal>,
     audits: VecDeque<Vec<Finding>>,
@@ -139,7 +140,7 @@ struct World {
     ls_remote_down: bool,
     /// A peer's `pub stage aterm` moved the staging tier's main since R was attested; a
     /// stage of R attests it as it is again.
-    peer_staged: bool,
+    candidate_missing: bool,
 }
 
 impl World {
@@ -178,6 +179,7 @@ impl World {
             overtaken_at_cut: false,
             claim_lands_unjournaled: false,
             machine_refusals: Vec::new(),
+            validation_tools: Ok("pinned tools ready".into()),
             blocks: Vec::new(),
             audits: VecDeque::new(),
             audited_dry: Vec::new(),
@@ -220,7 +222,7 @@ impl World {
             claim_at_interrupted: None,
             child_note_at_stage: false,
             ls_remote_down: false,
-            peer_staged: false,
+            candidate_missing: false,
         }
     }
 
@@ -437,11 +439,11 @@ impl Backend for World {
         };
         Ok(now)
     }
-    fn staging_moved(&mut self) -> Result<Option<String>, String> {
-        self.calls.push("staging-now".into());
-        let why = "the staging tier's main moved since R was attested (555555555..666666666: a \
-                   peer's pub stage), and pub promote refuses that attestation";
-        Ok(self.peer_staged.then(|| why.to_string()))
+    fn candidate_missing(&mut self) -> Result<Option<String>, String> {
+        self.calls.push("candidate-now".into());
+        Ok(self
+            .candidate_missing
+            .then(|| "the qualified candidate was lost".into()))
     }
     fn cut_journal(&mut self) -> Option<CutState> {
         self.cut.clone()
@@ -464,6 +466,11 @@ impl Backend for World {
         self.versions.insert(made.into(), to.into());
         Ok(made.into())
     }
+    fn validation_tools(&mut self) -> Result<String, Refusal> {
+        self.calls.push("validation-tools".into());
+        self.validation_tools.clone()
+    }
+
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal> {
         self.calls.push(format!("move {}", &commit[..4]));
         self.head = commit.to_string();
@@ -703,7 +710,7 @@ impl Backend for World {
         if self.stage_stages {
             self.attested = Some(c.commit.clone());
             self.staged_by = Some(self.engine.clone());
-            self.peer_staged = false;
+            self.candidate_missing = false;
             if self.child_note_at_stage {
                 std::fs::write(
                     World::release_dir(self).join(RUNNING_CHILD_FILE),
@@ -793,7 +800,6 @@ impl Backend for World {
         let site = crate::release_steps::site_outcome(&self.site, vec!["== site".into()])?;
         Ok(AfterCut {
             note: format!("{shape}; {}", site.note),
-            ..site
         })
     }
     fn latest(&mut self) -> Result<String, String> {
@@ -861,6 +867,7 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             "sync",
             "bump",
             "move cccc",
+            "validation-tools",
             "commit-gates",
             "stage",
             "reserve",
@@ -869,7 +876,7 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             "verify",
             "sync",
             "engine-now",
-            "staging-now",
+            "candidate-now",
             "publish",
             "source-publication",
             "sync",
@@ -1960,36 +1967,37 @@ fn a_claim_forgotten_and_resumed_is_never_built_again() {
 }
 
 #[test]
-fn a_site_this_machine_cannot_sync_is_a_recorded_hand_step_and_the_release_ends() {
-    let mut w = World::new();
-    w.site = Ok(crate::site::Outcome::NoCheckout(
-        "site checkout not found — set SITE_DIR or skip with --skip-site (looked in /s)".into(),
-    ));
-    let (code, last) = w.run(bump());
-    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
-    assert!(
-        last.starts_with("RELEASED aterm 0.6.0 (build 1791600000)")
-            && last.contains(crate::release::SITE_BY_HAND),
-        "{last}"
-    );
-    let j = w.journal().unwrap();
-    assert!(
-        j.finished() && j.has("after-cut") && j.has("site-deferred"),
-        "{j:?}"
-    );
-    w.calls.clear();
-    let (code, last) = w.run(mac());
-    assert_eq!(code, 0, "{last}");
-    assert!(last.contains(crate::release::SITE_BY_HAND), "{last}");
-    assert_eq!(w.count("after-cut 0.6.0"), 0, "{:?}", w.calls);
-    let undeployed =
-        crate::release_steps::site_outcome(&Ok(crate::site::Outcome::NoDeploy), Vec::new())
-            .unwrap();
-    assert!(
-        undeployed.note.contains("NOT deployed") && !undeployed.note.contains("already"),
-        "{undeployed:?}"
-    );
-    assert!(!undeployed.site_deferred);
+fn the_release_waits_for_a_deployed_and_verified_website_without_rebuilding() {
+    use crate::site::Outcome;
+    for outcome in [
+        Outcome::NoCheckout("no checkout".into()),
+        Outcome::NoDeploy,
+        Outcome::NotDeployed,
+        Outcome::Skipped,
+        Outcome::Deferred,
+        Outcome::Planned {
+            files: vec![],
+            engine: false,
+        },
+        Outcome::LiveUnchecked { deployed: true },
+        Outcome::LiveUnchecked { deployed: false },
+    ] {
+        let mut w = World::new();
+        w.site = Ok(outcome);
+        let (code, last) = w.run(bump());
+        assert_ne!(code, 0, "{last}");
+        assert!(last.starts_with("REFUSED at 10/11 after-cut"), "{last}");
+        assert!(!w.journal().unwrap().finished());
+        assert!(!w.journal().unwrap().has("after-cut"));
+        w.site = Ok(Outcome::Synced { deployed: true });
+        w.calls.clear();
+        assert_eq!(w.run(mac()).0, 0);
+        assert_eq!(w.count("after-cut 0.6.0"), 1);
+        for work in ["reserve", "build", "verify", "publish", "cut"] {
+            assert_eq!(w.count(work), 0, "{work}: {:?}", w.calls);
+        }
+        assert!(w.journal().unwrap().finished());
+    }
     let failed = crate::release_steps::site_outcome(
         &Err(crate::site::Failure::Child {
             child: "git push",
@@ -2012,6 +2020,25 @@ fn a_site_this_machine_cannot_sync_is_a_recorded_hand_step_and_the_release_ends(
     let (code, last) = w.run(bump());
     assert_eq!(code, 1);
     assert!(last.starts_with("REFUSED at 10/11 after-cut"), "{last}");
+}
+
+#[test]
+fn an_old_deferred_website_is_repaired_before_the_release_is_complete() {
+    let mut w = World::new();
+    assert_eq!(w.run(bump()).0, 0);
+    let mut journal = w.journal().unwrap();
+    journal.done.push("site-deferred".into());
+    assert!(!journal.finished());
+    journal.save(&w.release_dir().join(JOURNAL_FILE)).unwrap();
+    w.calls.clear();
+    assert_eq!(w.run(mac()).0, 0);
+    assert_eq!(w.count("after-cut 0.6.0"), 1);
+    for work in ["reserve", "build", "verify", "publish", "cut"] {
+        assert_eq!(w.count(work), 0, "{work}: {:?}", w.calls);
+    }
+    let journal = w.journal().unwrap();
+    assert!(journal.finished());
+    assert!(!journal.has("site-deferred"));
 }
 
 #[test]
@@ -2256,8 +2283,8 @@ fn what_moved_while_the_long_steps_ran_stages_again_before_the_publish() {
             "f3f3f3f3f3",
         ),
         (
-            "the staging tier moved",
-            |w| w.peer_staged = true,
+            "the retained candidate was lost",
+            |w| w.candidate_missing = true,
             "e7e7e7e7e7",
         ),
     ];
@@ -2510,4 +2537,40 @@ fn a_spent_reservation_is_built_again_never_renumbered() {
         );
         assert_eq!(w.cut.as_ref().unwrap().build, fresh.build, "{case}");
     }
+}
+
+#[test]
+fn missing_validation_tools_stop_before_staging_or_product_compilation() {
+    let mut world = World::new();
+    world.validation_tools =
+        Err(Refusal::new("missing pinned browser", "provision it").could_not_run());
+    let (code, last) = world.run(bump());
+    assert_ne!(code, 0);
+    assert!(last.contains("missing pinned browser"), "{last}");
+    assert_eq!(world.count("validation-tools"), 1);
+    for expensive in ["stage", "build", "verify", "publish"] {
+        assert_eq!(world.count(expensive), 0, "{expensive}: {:?}", world.calls);
+    }
+}
+
+#[test]
+fn structured_stage_events_include_source_log_and_separate_waiting_from_execution() {
+    let mut world = World::new();
+    assert_eq!(world.run(bump()).0, 0);
+    let events: Vec<aterm_json::Value> = world
+        .out
+        .iter()
+        .filter_map(|line| line.strip_prefix("release-event: "))
+        .map(|json| aterm_json::from_str(json).unwrap())
+        .collect();
+    let build = events
+        .iter()
+        .find(|event| {
+            event["stage"].as_str() == Some("build") && event["outcome"].as_str() == Some("ok")
+        })
+        .expect("build completion");
+    assert_eq!(build["source"].as_str(), Some(BUMP));
+    assert!(build["log"].as_str().is_some());
+    assert!(build["waiting_s"].as_u64().is_some());
+    assert!(build["execution_s"].as_u64().is_some());
 }

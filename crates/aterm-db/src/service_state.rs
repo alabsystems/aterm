@@ -337,8 +337,13 @@ fn accounts_until(
     now_ms: u64,
     deadline: std::time::Instant,
 ) -> ServiceState {
-    let selected = match crate::generation::selected(paths) {
+    let expired = || Instant::now() >= deadline;
+    if expired() {
+        return control_busy(now_ms);
+    }
+    let selected = match crate::generation::observed_paths_until(paths, deadline) {
         Ok(paths) => paths,
+        Err(error) if error.is_busy() || expired() => return control_busy(now_ms),
         Err(_) => return failed_observation(now_ms, "Commons writer recovery is pending"),
     };
     let paths = &selected;
@@ -370,27 +375,18 @@ fn accounts_until(
         }
         Ok(true) => {}
     }
-    let bootstrap = match commons::bootstrap::Bootstrap::cached_until(paths, deadline) {
-        Ok(Some(bootstrap)) => bootstrap,
-        Ok(None) => {
-            return state(
-                ServiceAvailability::Unknown,
-                now_ms,
-                "Commons custody could not be verified",
-            );
-        }
-        Err(error)
-            if matches!(
-                error.kind(),
-                aterm_secrets::ErrorKind::JournalBusy | aterm_secrets::ErrorKind::CustodyBusy
-            ) =>
-        {
-            return control_busy(now_ms);
-        }
-        Err(_) => {
-            return failed_observation(now_ms, "Commons custody could not be verified");
-        }
-    };
+    // Observation must not establish missing current or predecessor custody.
+    let bootstrap =
+        match commons::bootstrap::Bootstrap::established_with_journal_until(paths, deadline) {
+            Ok((bootstrap, _)) => bootstrap,
+            Err(error) => {
+                return if crate::table::failure(error).is_busy() || expired() {
+                    control_busy(now_ms)
+                } else {
+                    failed_observation(now_ms, "Commons custody could not be verified")
+                };
+            }
+        };
     let directory = crate::catalog::Directory::new(paths, bootstrap.trust());
     let descriptor = match crate::catalog::Descriptor::application(
         bootstrap.trust(),
@@ -403,8 +399,11 @@ fn accounts_until(
             return failed_observation(now_ms, "Account catalog identity is unavailable");
         }
     };
-    let session = match crate::table::Session::observe(&bootstrap) {
+    #[cfg(test)]
+    tests::bootstrapped();
+    let session = match crate::table::Session::observe_until(&bootstrap, deadline) {
         Ok(session) => session,
+        Err(error) if error.is_busy() || expired() => return control_busy(now_ms),
         Err(_) => {
             return failed_observation(now_ms, "Account access could not be verified");
         }
@@ -413,12 +412,17 @@ fn accounts_until(
     tests::observed();
     // The session and table snapshots read beside writers. A newer control
     // history or table witness makes this observation stale; read it afresh.
-    // Every changed claim still refuses, and damaged custody remains a failure.
+    // Within the budget, changed claims refuse and damaged custody remains a failure.
     let moved = || {
-        crate::table::Session::observe(&bootstrap)
-            .and_then(|now| now.observation())
-            .ok()
-            != session.observation().ok()
+        expired()
+            || match crate::table::Session::observe_until(&bootstrap, deadline)
+                .and_then(|now| now.observation())
+            {
+                Ok(current) => session
+                    .observation()
+                    .is_ok_and(|previous| current != previous),
+                Err(error) => error.is_busy(),
+            }
     };
     // A retained enrollment claim can outlive its data directory.
     let catalog = match directory.observe_with_config(&session, config) {
@@ -471,6 +475,9 @@ fn accounts_until(
                 return failed_observation(now_ms, "Retained account records could not be read");
             }
         };
+    if expired() {
+        return control_busy(now_ms);
+    }
     let counts = account_counts(&snapshot.cells);
     let mut result = state(
         ServiceAvailability::Cached,
@@ -1445,6 +1452,51 @@ mod tests {
     }
 
     #[test]
+    fn expired_account_observation_does_not_report_unread_state_as_unavailable() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&root.path().join("not-observed"));
+        let state = accounts_until(
+            &paths,
+            &paths.home.join("config.toml"),
+            1000,
+            Instant::now(),
+        );
+        assert_eq!(state.availability, ServiceAvailability::Unknown);
+        assert!(!state.refresh_failed);
+        assert_eq!(state.last_success_ms, None);
+        assert!(!paths.home.exists());
+    }
+
+    #[test]
+    fn account_observation_never_repairs_missing_current_custody() {
+        use crate::accounts::proposals::Proposals;
+        use aterm_secrets::commons::roster::Role;
+
+        for name in ["commons.lock", "commons.claim"] {
+            let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+            let paths = &lab.paths[0];
+            let config = paths.home.join("config.toml");
+            Proposals::at(paths.clone()).initialize().unwrap();
+            assert_eq!(
+                accounts(paths, &config, 1000).availability,
+                ServiceAvailability::Cached
+            );
+            let path = paths.dir.join(name);
+            std::fs::rename(&path, path.with_extension("preserved")).unwrap();
+            let before = crate::tests::files(lab._home.path());
+
+            let observed = accounts(paths, &config, 2000);
+            assert!(
+                crate::tests::files(lab._home.path()) == before,
+                "observing missing {name} changed retained state"
+            );
+            assert_eq!(observed.availability, ServiceAvailability::Unknown);
+            assert!(observed.refresh_failed);
+            assert_eq!(observed.last_success_ms, None);
+        }
+    }
+
+    #[test]
     fn account_observation_reads_existing_records_without_activating_or_exposing_them() {
         use crate::{accounts::proposals::Proposals, database::Change};
         use aterm_secrets::commons::roster::Role;
@@ -1542,12 +1594,21 @@ mod tests {
     }
 
     thread_local! {
+        /// Run after custody admission, before the table session revalidates it.
+        static BOOTSTRAPPED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
         /// Run once [`accounts`] has observed its session.
         static OBSERVED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
             const { std::cell::RefCell::new(None) };
         /// Run once the account table's witnessed snapshot has opened.
         static STORE_OBSERVED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
             const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn bootstrapped() {
+        let hook = BOOTSTRAPPED.with(|hook| hook.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
     }
     pub(super) fn observed() {
         let hook = OBSERVED.with(|hook| hook.borrow_mut().take());
@@ -1567,6 +1628,43 @@ mod tests {
             key: key.into(),
             value: Some(aterm_json::json!({"provider":"claude", "method":"oauth"})),
         }
+    }
+
+    #[test]
+    fn a_vault_writer_during_account_admission_is_busy_then_readable() {
+        use crate::accounts::proposals::Proposals;
+        use aterm_secrets::commons::roster::Role;
+        use std::{cell::RefCell, rc::Rc};
+        let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+        let paths = lab.paths[0].clone();
+        let config = paths.home.join("config.toml");
+        Proposals::at(paths.clone()).initialize().unwrap();
+        let held = Rc::new(RefCell::new(None));
+        let writer = held.clone();
+        let locked = paths.clone();
+        BOOTSTRAPPED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                *writer.borrow_mut() = Some(
+                    aterm_uds::private_file::PrivateLock::take(
+                        &locked.dir,
+                        ".lock",
+                        Duration::ZERO,
+                        "held",
+                    )
+                    .unwrap(),
+                );
+            }));
+        });
+        let busy = accounts(&paths, &config, 1000);
+        assert!(BOOTSTRAPPED.with(|hook| hook.borrow().is_none()));
+        assert_eq!(busy.availability, ServiceAvailability::Unknown, "{busy:?}");
+        assert!(!busy.refresh_failed, "{busy:?}");
+        assert_eq!(busy.last_success_ms, None);
+        drop(held.borrow_mut().take());
+        assert_eq!(
+            accounts(&paths, &config, 2000).availability,
+            ServiceAvailability::Cached
+        );
     }
 
     #[test]
@@ -1716,6 +1814,39 @@ mod tests {
             "{raced:?}"
         );
         assert!(!raced.refresh_failed, "{raced:?}");
+        assert_eq!(
+            accounts(&paths, &config, 2000).availability,
+            ServiceAvailability::Cached
+        );
+    }
+
+    #[test]
+    fn damaged_custody_during_account_observation_remains_a_failure() {
+        use crate::accounts::proposals::Proposals;
+        use aterm_secrets::commons::roster::Role;
+        let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+        let paths = lab.paths[0].clone();
+        let config = paths.home.join("config.toml");
+        Proposals::at(paths.clone()).initialize().unwrap();
+        let pin = paths.dir.join("commons/default.pin");
+        let before = std::fs::read(&pin).unwrap();
+        let mut corrupted = before.clone();
+        corrupted[0] ^= 1;
+        let damaged = pin.clone();
+        OBSERVED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&damaged, &corrupted).unwrap();
+            }));
+        });
+        let failed = accounts(&paths, &config, 1000);
+        std::fs::write(&pin, &before).unwrap();
+        assert!(OBSERVED.with(|hook| hook.borrow().is_none()));
+        assert_eq!(failed.availability, ServiceAvailability::Unknown);
+        assert!(
+            failed.refresh_failed,
+            "custody damage is not contention: {failed:?}"
+        );
+        assert_eq!(failed.last_success_ms, None);
         assert_eq!(
             accounts(&paths, &config, 2000).availability,
             ServiceAvailability::Cached

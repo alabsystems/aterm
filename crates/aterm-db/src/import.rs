@@ -9,6 +9,7 @@ use crate::{
     Error, Result, crypto,
     database::{Change, Command},
     local::Database,
+    typed::keys,
 };
 use aterm_codec::hex;
 use aterm_digest::Sha256;
@@ -19,14 +20,22 @@ const MAX_CSV: usize = 1024 * 1024;
 const MAX_ROWS: usize = 4096;
 const MAX_COLUMNS: usize = 64;
 const MAX_CELL: usize = 8192;
+/// The sheet's provider columns and the one provider word each names, shared with the typed
+/// lab model (`typed::keys::PROVIDERS`).
 const PROVIDERS: &[(&str, &str)] = &[
-    ("claude", "anthropic"),
-    ("open ai", "openai"),
-    ("google", "google"),
-    ("meta", "meta"),
-    ("kimi", "kimi"),
-    ("x", "xai"),
+    ("claude", keys::ANTHROPIC),
+    ("open ai", keys::OPENAI),
+    ("google", keys::GOOGLE),
+    ("meta", keys::META),
+    ("kimi", keys::KIMI),
+    ("x", keys::XAI),
 ];
+
+/// The provider words the sheet's columns name.
+#[cfg(test)]
+pub(crate) fn provider_words() -> impl Iterator<Item = &'static str> {
+    PROVIDERS.iter().map(|(_, word)| *word)
+}
 
 pub mod commons;
 
@@ -57,7 +66,12 @@ const O_NONBLOCK: i32 = 0o4000;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 const O_NONBLOCK: i32 = 0x0004;
 
-fn load(path: &Path) -> Result<Csv> {
+/// Read a CSV file's bytes within the import's capacity: a regular file only, opened without
+/// blocking on a FIFO, at most 1 MiB.
+///
+/// # Errors
+/// It cannot be opened, is not a regular file, or is larger than the import reads.
+pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = OpenOptions::new()
         .read(true)
@@ -71,6 +85,11 @@ fn load(path: &Path) -> Result<Csv> {
     if bytes.len() > MAX_CSV {
         return Err(Error::new("CSV exceeds import capacity"));
     }
+    Ok(bytes)
+}
+
+fn load(path: &Path) -> Result<Csv> {
+    let bytes = read_bounded(path)?;
     let digest = Sha256::digest(&bytes);
     let mut records = parse(&bytes)?;
     if records.is_empty() {
@@ -86,7 +105,12 @@ fn load(path: &Path) -> Result<Csv> {
         digest,
     })
 }
-fn parse(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
+/// Read CSV records within the import's row, column and cell caps; quotes, CRLF and a BOM
+/// are handled as the sheets write them.
+///
+/// # Errors
+/// Malformed quoting, non-UTF-8 text, or a cap passed.
+pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     let mut records = Vec::new();
     let mut row = Vec::new();
@@ -153,7 +177,8 @@ fn finish_cell(row: &mut Vec<String>, cell: &mut Vec<u8>) -> Result<()> {
     row.push(String::from_utf8(std::mem::take(cell)).map_err(|_| Error::new("CSV is not UTF-8"))?);
     Ok(())
 }
-fn provider(header: &str) -> Option<&'static str> {
+/// The provider word a sheet header names (`claude`, `Open AI`, `google`, `meta`, `kimi`, `x`).
+pub(crate) fn provider(header: &str) -> Option<&'static str> {
     let header = header.trim().to_ascii_lowercase();
     PROVIDERS
         .iter()

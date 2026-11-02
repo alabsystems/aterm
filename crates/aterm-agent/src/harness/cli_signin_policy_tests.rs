@@ -316,6 +316,9 @@ fn vendor_login_and_renewal_policy_conform_with_independent_edits_allowed() {
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
+                if action.name == "Publish" && !signs_in_here(provider(state["provider"])) {
+                    continue;
+                }
                 let next = policy_transition(&state, action.name);
                 assert!(
                     model.successors(action.name, &state).contains(&next),
@@ -484,6 +487,9 @@ fn run_observation(world: &World, host: &ObservationHost<'_>) -> bool {
 #[test]
 fn failed_login_observations_never_publish_without_their_history() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        if !signs_in_here(cli) {
+            continue;
+        }
         for operation in 1..=3 {
             let world = World::new(cli);
             let before = world.records();
@@ -619,6 +625,12 @@ fn signin_observations_conform_to_durable_publication() {
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
+                if action.name == "Observe"
+                    && state["operation"] != 4
+                    && !signs_in_here(provider(state["provider"]))
+                {
+                    continue;
+                }
                 let next = observation_commit_transition(&state, action.name);
                 assert!(
                     model.successors(action.name, &state).contains(&next),

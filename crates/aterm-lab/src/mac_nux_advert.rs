@@ -225,10 +225,10 @@ pub fn split(
     dns_sd: &mut DnsSd<'_>,
 ) -> Result<Split, Fail> {
     let mut out = Split::default();
-    for advert in heard {
+    for (advert, placed) in place(heard, service, own, dns_sd)? {
         let over =
             name_of(advert.interface).unwrap_or_else(|| format!("interface {}", advert.interface));
-        match whose(&resolve(advert, service, dns_sd)?, own) {
+        match placed {
             Whose::ThisMac => out
                 .this_macs
                 .push(format!("{} heard over {over}", advert.instance)),
@@ -238,6 +238,29 @@ pub fn split(
         }
     }
     Ok(out)
+}
+
+/// Each advert in `heard` of `service` with whose it is ([`resolve`] through `dns_sd`, then
+/// [`whose`] against `own`), in the order heard. With `own` a guest's addresses (`vault-phrase`'s
+/// browse of its lab members service), [`Whose::ThisMac`] reads "the guest's own".
+///
+/// # Errors
+/// A `dns-sd` run could not be made, or the run was stopped.
+pub fn place(
+    heard: &[Heard],
+    service: &str,
+    own: &[IpAddr],
+    dns_sd: &mut DnsSd<'_>,
+) -> Result<Vec<(Heard, Whose)>, Fail> {
+    heard
+        .iter()
+        .map(|advert| {
+            Ok((
+                advert.clone(),
+                whose(&resolve(advert, service, dns_sd)?, own),
+            ))
+        })
+        .collect()
 }
 
 /// This Mac's own addresses now, every interface's (its end of tart's bridge included while a

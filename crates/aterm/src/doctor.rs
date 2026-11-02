@@ -832,7 +832,8 @@ fn unmeasured(id: &str, family: &str, layer: Option<Layer>, why: String) -> Item
 
 /// The base items `aterm init` runs before its workstation items (design §4.2, S5): the
 /// same repair items, the doctor's pass (an opted-out rc stays as the person left it),
-/// `base.ai.accounts`, on a Mac `base.clt` over atpkg's C toolchain probe (S6), and
+/// `base.ai.accounts`, `base.agents.primer` ([`AgentPrimerItem`]), on a Mac `base.clt` over
+/// atpkg's C toolchain probe (S6), and
 /// `base.pkg.toolset` ([`toolset`]), which installs the toolset once the lock is let go.
 #[cfg(unix)]
 pub(crate) fn init_base(lock: aterm_machines::init::BaseLock) -> aterm_machines::init::Base {
@@ -846,6 +847,7 @@ pub(crate) fn init_base(lock: aterm_machines::init::BaseLock) -> aterm_machines:
         None => aterm_machines::init::Base::none(),
     };
     base.items.push(Box::new(AiAccountsItem));
+    base.items.push(Box::new(AgentPrimerItem::live()));
     // Apple's Command Line Tools exist on a Mac alone.
     #[cfg(target_os = "macos")]
     let clt = command_line_tools();
@@ -1092,6 +1094,163 @@ impl Item for AiAccountsItem {
             why,
             remedy: Remedy::Init {
                 only: "base.ai.accounts".to_owned(),
+            },
+        }
+    }
+}
+
+/// `base.agents.primer`: the aterm primer and bundled skills of every coding agent detected under
+/// the account's home, for a Mac set up from a terminal (SSH, CLI-only) that no window has primed
+/// yet. It runs the window's automatic pass over the shell's roots, as `aterm agents` typed there
+/// reads them ([`aterm_primer::shell_prime`]): no undetected agent's folder is made, and a block a
+/// newer aterm wrote or a skill the person wrote is left. It lays nothing while
+/// `agents_auto_prime = false`, or from an app bundle that is not the installed aterm.app, as the
+/// window's pass and init's shell hooks do not (`aterm agents install` primes from anywhere).
+#[cfg(unix)]
+struct AgentPrimerItem {
+    /// The account's home ([`aterm_primer::home_dir`]).
+    home: Option<std::path::PathBuf>,
+    /// `agents_auto_prime` in aterm.toml ([`atpkg::config::load_agents_auto_prime`]).
+    enabled: bool,
+    /// This aterm runs from an app bundle that is not the installed aterm.app
+    /// ([`atpkg::hooks::runs_from_non_release_bundle`]).
+    other_bundle: bool,
+    /// What the pass would write ([`aterm_primer::shell_prime_pending`]).
+    pending: fn(&Path) -> aterm_primer::PrimePending,
+    /// The pass ([`aterm_primer::shell_prime`]).
+    prime: fn(&Path) -> aterm_primer::AutoPrime,
+}
+
+#[cfg(unix)]
+const AGENT_PRIMER: &str = "base.agents.primer";
+
+#[cfg(unix)]
+impl AgentPrimerItem {
+    fn live() -> Self {
+        Self {
+            home: aterm_primer::home_dir(),
+            enabled: atpkg::config::load_agents_auto_prime(),
+            other_bundle: atpkg::hooks::runs_from_non_release_bundle(),
+            pending: aterm_primer::shell_prime_pending,
+            prime: aterm_primer::shell_prime,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Item for AgentPrimerItem {
+    fn id(&self) -> String {
+        AGENT_PRIMER.to_owned()
+    }
+
+    fn family(&self) -> &'static str {
+        "agents"
+    }
+
+    fn layer(&self) -> Layer {
+        Layer::Base
+    }
+
+    fn class(&self) -> aterm_converge::Class {
+        aterm_converge::Class::Relay
+    }
+
+    fn title(&self) -> String {
+        "coding agents' aterm primer and skills".to_owned()
+    }
+
+    fn probe(&self) -> aterm_converge::Probe {
+        use aterm_converge::Probe;
+        if !self.enabled {
+            return Probe::NotApplicable {
+                why: "agents_auto_prime = false in aterm.toml, so aterm primes no agent by \
+                      itself (`aterm agents install` does)"
+                    .to_owned(),
+            };
+        }
+        if self.other_bundle {
+            return Probe::Ok {
+                now: "left as they are: this aterm runs from an app bundle that is not the \
+                      installed aterm.app, so it primes no agent (`aterm agents install` does, \
+                      from anywhere)"
+                    .to_owned(),
+            };
+        }
+        let Some(home) = self.home.as_deref() else {
+            return Probe::Blocked {
+                why: "$HOME is unknown, so no coding agent's folder can be found".to_owned(),
+            };
+        };
+        let pending = (self.pending)(home);
+        if pending.detected.is_empty() {
+            return Probe::NotApplicable {
+                why: format!(
+                    "no coding agent detected (looked for {})",
+                    pending.looked.join(", ")
+                ),
+            };
+        }
+        let agents = pending.detected.join(", ");
+        // A file the pass cannot write stops none of the others, as in the window's pass: the
+        // pass runs while anything is due, and its error fails the row, naming the file.
+        match (pending.due.is_empty(), pending.errors.is_empty()) {
+            (true, true) => Probe::Ok {
+                now: format!("current for {agents}"),
+            },
+            (true, false) => Probe::Blocked {
+                why: pending.errors.join("; "),
+            },
+            (false, _) => Probe::Change {
+                from: pending
+                    .due
+                    .iter()
+                    .chain(&pending.errors)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                to: format!("this aterm's primer and skills for {agents}"),
+            },
+        }
+    }
+
+    fn apply(&self) -> Result<(), String> {
+        let home = self
+            .home
+            .as_deref()
+            .ok_or_else(|| "$HOME is unknown".to_owned())?;
+        let pass = (self.prime)(home);
+        let failed: Vec<String> = pass
+            .errors()
+            .map(|(agent, why)| format!("{agent}: {why}"))
+            .collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
+    }
+
+    fn explain(&self, probe: &aterm_converge::Probe) -> aterm_converge::Explain {
+        use aterm_converge::{Explain, Probe};
+        match probe {
+            Probe::Ok { now } => Explain {
+                why: now.clone(),
+                remedy: Remedy::None,
+            },
+            Probe::NotApplicable { why } => Explain {
+                why: why.clone(),
+                remedy: Remedy::None,
+            },
+            Probe::Blocked { why } => Explain {
+                why: why.clone(),
+                remedy: Remedy::Command("aterm agents status".to_owned()),
+            },
+            _ => Explain {
+                why: "a detected coding agent's aterm primer or skill is absent or stale"
+                    .to_owned(),
+                remedy: Remedy::Init {
+                    only: AGENT_PRIMER.to_owned(),
+                },
             },
         }
     }

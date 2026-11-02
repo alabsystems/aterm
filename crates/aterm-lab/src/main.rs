@@ -74,6 +74,8 @@ mod commons_lan;
 #[cfg(target_os = "macos")]
 mod commons_startup;
 #[cfg(target_os = "macos")]
+mod composer_turn;
+#[cfg(target_os = "macos")]
 mod crash;
 #[cfg(target_os = "macos")]
 mod deck_motion;
@@ -107,6 +109,10 @@ mod git_starts;
 mod grok;
 #[cfg(target_os = "macos")]
 mod halfdraw;
+#[cfg(target_os = "macos")]
+mod harness_proof;
+#[cfg(target_os = "macos")]
+mod harness_proof_judge;
 #[cfg(target_os = "macos")]
 mod idlepoints;
 #[cfg(target_os = "macos")]
@@ -175,6 +181,10 @@ mod muse_proof;
 mod nudge;
 #[cfg(target_os = "macos")]
 mod occupancy_break;
+#[cfg(target_os = "macos")]
+mod occupancy_standin;
+#[cfg(target_os = "macos")]
+mod occupancy_wake;
 #[cfg(target_os = "macos")]
 mod outlook_captures;
 #[cfg(target_os = "macos")]
@@ -408,8 +418,8 @@ usage: targo --unverified lab <command> [tag] [args]
                                  agy typing take (--baseline ATERM, alone without --harness; --typing codex-alab: on
                                  codex-alab, each arm then idle 20 s) (~40 min a look and scale; runs side by side
                                  share one folder)
-  turn|send|enter|key [tag] ...  type prompt+Enter | text | Enter | named key (0, escape, ctrl+c, ...); turn exits 1
-                                 unless the composer accepted the prompt
+  turn|send|enter|key [tag] ...  type prompt+Enter | text | Enter | named key (0, escape, ctrl+c, ...); turn types
+                                 only into an empty composer, and exits 1 unless the composer accepted the prompt
   mode [tag] [name ['<spec>']]   show or set the stub mode: ok long numbered overloaded too-long compact-fails slow
                                  rate-limit 401 500 bad-key bg[:SLEEP[:SLOW]] tool limit:CLAIM:RESET[:PLAN],
                                  limit-after:N:CLAIM:AHEAD_MS[:MODE] (global only), or a
@@ -616,13 +626,14 @@ Outside any lab (no jail, no stub):
                                  ordinary executable startup, exact generic table readback, no installed state changes
                                  auto-join instead tests the live default ALab policy from a new identity, with no service install
                                  retain that profile: a successful admission belongs to the live vault
-  commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS | --peer-cycle [--peer-details]]
+  commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS | --peer-cycle [--peer-details] | --local-follower]
                                  start an ordinary window and node host on private custody and loopback Commons;
                                  require enrollment, fresh signed table data in both directions and concurrent offline values after restart
                                  (--suppressed: negative control, whose private socket prevents window runtime startup;
                                  --observe: keep the successful window running 1-60 s, then save its frame and live state;
                                  --peer-cycle: stop the source, restart the observer with that peer absent, then reconnect; saves retained-history/account, reachability and Overview evidence;
-                                 --peer-details: requires --peer-cycle and a bundled app; adds selected-peer images after one owned-bundle reopen with identity/focus checks)
+                                 --peer-details: requires --peer-cycle and a bundled app; adds selected-peer images after one owned-bundle reopen with identity/focus checks;
+                                 --local-follower: adds a fresh window on the source vault with a separate configuration; checks its live owner, exact table inventory and native Network State)
   fleet-menu <aterm> <new-output-directory>
                                  run an isolated reader window and a peer with a sibling on loopback; retain the
                                  peer's two-instance survey, the reader's menu dump and frame (all private worlds kept)
@@ -756,6 +767,14 @@ Outside any lab (no jail, no stub):
                                  CODEX_MEASURED_BUILDS says of the package's build; one proof at a time on this Mac (it
                                  waits up to 20 min for another to end, then is NOT RUN); an --aterm older than the
                                  lifeline every lab launch is armed with (its broker refuses --lifeline-fd) is NOT RUN
+  harness-proof <id> --repo DIR [--aterm PATH] [--target-dir DIR.noindex]
+                                 the harness proof (design harness-repos §9 step 2) of a rostered harness built from its
+                                 checkout (muse-alab; the others are NOT RUN until the stand-in plays their vendor) in a
+                                 private headless jailed aterm against the stand-in vendor laid into a scratch atpkg store
+                                 as two builds: the proven scoped claim, a crash relaunch, no move while a draft or a
+                                 person's typing is present then the move at a safe point, its own re-exec, signal and
+                                 exit propagation; then the negative control (an aterm serving no contract=3: it passes
+                                 through, the built-in lanes take the session); its worlds are always kept
   codex-measure [--package DIR] [--keep]
                                  measure a codex-alab build for the rollout tap, in a clean checkout (~25 min): the proof
                                  in process expecting it partial, its six legs' rollouts reduced to a fixed point the
@@ -1043,6 +1062,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "meta-keys" => meta_keys::cmd_meta_keys(args),
         "predict-live" => predict_live::cmd_predict_live(args),
         "codex-alab-proof" => codex_alab_proof::cmd_codex_alab_proof(args),
+        "harness-proof" => harness_proof::cmd_harness_proof(args),
         "codex-measure" => codex_measure::cmd_codex_measure(args),
         "claude-measure" => claude_measure::cmd_claude_measure(args),
         "seamless" => seamless::cmd_seamless(args),
@@ -1130,6 +1150,8 @@ fn main() -> std::process::ExitCode {
         Some("claude") => {
             if swarm::standin_configured() {
                 swarm::claude_main(&args)
+            } else if occupancy_standin::configured(&argv0) {
+                occupancy_standin::claude_main(&args)
             } else {
                 fleet_fixture::claude(&args)
             }

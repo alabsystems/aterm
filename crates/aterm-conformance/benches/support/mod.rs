@@ -48,14 +48,72 @@ impl Counts {
     }
 }
 
-pub fn run<R>(target: &str, rows: &[(&str, R)], take: impl FnMut(&R) -> Outcome) -> ExitCode {
-    match run_into(target, rows, take, &mut io::stdout().lock()) {
+pub fn run<R>(target: &str, rows: &[(&str, R)], mut take: impl FnMut(&R) -> Outcome) -> ExitCode {
+    let options = match selection(std::env::args().skip(1)) {
+        Ok(options) => options,
+        Err(why) => {
+            eprintln!("measure {target}: {why}");
+            return ExitCode::from(2);
+        }
+    };
+    let selected: Vec<_> = rows
+        .iter()
+        .filter(|(name, _)| {
+            options
+                .0
+                .as_ref()
+                .is_none_or(|filter| name.contains(filter))
+        })
+        .map(|(name, row)| (*name, row))
+        .collect();
+    if options.1 {
+        for (name, _) in &selected {
+            println!("{target}::{name}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    match run_into(
+        target,
+        &selected,
+        |row| take(*row),
+        &mut io::stdout().lock(),
+    ) {
         Ok(counts) => ExitCode::from(counts.exit_code()),
         Err(why) => {
             eprintln!("measure {target}: cannot write the measurement report: {why}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn selection(args: impl Iterator<Item = String>) -> Result<(Option<String>, bool), String> {
+    let mut args = args;
+    let (mut filter, mut list) = (None, false);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--bench" => {}
+            "--admit" => {
+                args.next().ok_or("--admit needs now or wait")?;
+            }
+            "--list" => list = true,
+            "--filter" => {
+                if filter.is_some() {
+                    return Err("--filter given twice".into());
+                }
+                filter = Some(
+                    args.next()
+                        .filter(|word| !word.is_empty() && !word.starts_with('-'))
+                        .ok_or("--filter needs a row-name substring")?,
+                );
+            }
+            _ => {
+                return Err(format!(
+                    "unknown argument {arg}; use --filter ROW or --list"
+                ));
+            }
+        }
+    }
+    Ok((filter, list))
 }
 
 fn run_into<R>(
@@ -196,5 +254,25 @@ mod tests {
         .unwrap();
         assert_eq!(unanswered.unanswered, rows.len());
         assert_eq!(unanswered.exit_code(), 3);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    #[test]
+    fn selecting_rows_is_explicit_and_rejects_misspelled_options() {
+        let args = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| (*word).into())
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        assert_eq!(
+            super::selection(args(&["--bench", "--filter", "pet", "--list"])).unwrap(),
+            (Some("pet".into()), true)
+        );
+        assert!(super::selection(args(&["--filter"])).is_err());
+        assert!(super::selection(args(&["--fliter", "pet"])).is_err());
     }
 }

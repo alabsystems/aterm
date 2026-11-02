@@ -101,6 +101,8 @@ impl Running {
         let mut command = aterm_uds::spawnfd::command(&prepared.program);
         command
             .args(&prepared.args)
+            .env(atpkg::build_admit::LEDGER_ENV, home.join("capacity"))
+            .env(atpkg::build_admit::ADMIT_ENV, "now")
             .stdin(Stdio::null())
             .stdout(Stdio::piped());
         command.stderr(
@@ -209,9 +211,7 @@ impl Running {
         );
         let owner =
             Identity::parse(&self.owner().expect("recorded owner")).expect("owner identity");
-        let ledger = atpkg::build_admit::Seat::live()
-            .ledger
-            .expect("same user capacity ledger");
+        let ledger = aterm_capacity::Ledger::at(self.home.join("capacity"));
         let remaining = ledger
             .of_pid(owner.pid as u32)
             .expect("remaining owner claims");

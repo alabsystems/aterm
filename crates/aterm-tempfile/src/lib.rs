@@ -735,6 +735,15 @@ const fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_slots_hash_is_aterm_hashs_fold() {
+        let inputs: [&[u8]; 4] = [b"", b"a", b"foobar", &[0, 0xff, 0x80, 0x7f]];
+        for bytes in inputs {
+            assert_eq!(fnv1a(bytes), aterm_hash::fnv1a_64(bytes), "{bytes:02x?}");
+        }
+    }
+
     #[test]
     fn tempdir_creates_and_cleans_up() {
         let path;

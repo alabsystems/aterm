@@ -143,6 +143,8 @@ const HIGH_5H: &str = "0.95";
 const UUID_A: &str = "00000000-0000-4000-8000-00000000aa01";
 /// [`LABEL_B`]'s.
 const UUID_B: &str = "00000000-0000-4000-8000-00000000bb02";
+/// [`LABEL_C`]'s, as its login directory's profile names it once R2 makes that login.
+const UUID_C: &str = "00000000-0000-4000-8000-00000000cc03";
 
 // ---------------------------------------------------------------------------------------------
 // The evidence, read from text.
@@ -1823,6 +1825,26 @@ fn put_login(dir: &Path, label: &str) -> Result<(), Fail> {
     .map_err(|e| die(&creds.display().to_string(), e))
 }
 
+/// A roster row's login in its own login directory `dir`, as a sign-in under that directory
+/// leaves it: `label`'s live login ([`put_login`]) and the directory's own profile
+/// (`dir/.claude.json`) naming `email`'s account (`uuid`). The sync gives a row a directory that
+/// holds a login only where that profile names the row's account, so a login with no profile
+/// would send the row to a new, empty directory beside it.
+fn put_row_login(dir: &Path, label: &str, email: &str, uuid: &str) -> Result<(), Fail> {
+    put_login(dir, label)?;
+    let mut account = crate::stub::account::composed_oauth_account(now_ms());
+    account.set("emailAddress", J::s(email));
+    account.set("accountUuid", J::s(uuid));
+    let profile = dir.join(".claude.json");
+    atomic_write(
+        &profile,
+        J::obj([("oauthAccount", account)])
+            .dump(crate::pyjson::COMPACT)
+            .as_bytes(),
+    )
+    .map_err(|e| die(&profile.display().to_string(), e))
+}
+
 /// The default login's profile (`home/.claude.json`, as it stands) naming `email`'s account
 /// (`uuid`), as Claude Code writes it once a sign-in read the account's profile.
 fn put_profile(world: &World, email: &str, uuid: &str) -> Result<(), Fail> {
@@ -1948,7 +1970,7 @@ fn lay_world(run: &Run, world: &World) -> Result<(), Fail> {
     )
     .map_err(|e| die(&world.profile.display().to_string(), e))?;
     sign_in_default(world, LABEL_A, EMAIL_A, UUID_A)?;
-    put_login(&world.login_b, LABEL_B)?;
+    put_row_login(&world.login_b, LABEL_B, EMAIL_B, UUID_B)?;
     if let Some(logins) = world.login_b.parent() {
         // The store's own logins folder is owner-only, as the store makes it.
         let _ = fs::set_permissions(logins, fs::Permissions::from_mode(0o700));
@@ -2560,7 +2582,7 @@ fn scenarios(d: &mut Drive<'_>, m: &mut Marks) -> Result<(), Fail> {
     }
 
     // R2: lab-a high, lab-c's login made.
-    put_login(&world.login_c, LABEL_C)?;
+    put_row_login(&world.login_c, LABEL_C, EMAIL_C, UUID_C)?;
     crate::verbs::write_headers_for(&run.w, AUTH_A, usage_blocks(HIGH_5H))?;
     m.r2.from = now_ms();
     m.r5b.to = m.r2.from;

@@ -1,30 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `member HOME LISTEN OUT [--allow NAME]`: the Allowing member of `lab mac nux`'s
-//! `vault-phrase` row (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10), the ALab member that lets
-//! the guest's joiner in by Allow and a phrase.
+//! `member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE]`: the Allowing member of `lab mac
+//! nux`'s `vault-phrase` row (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10), the ALab member that
+//! lets the guest's joiner in by Allow and a phrase.
 //!
 //! It runs F10's members desk (`aterm_secrets::members::desk`), the code the window's `ask`
 //! handler runs, on the custody under HOME (in the row, the scratch home of a member that is no
-//! admin, enrolled in the vault's Commons): an `ask`-only listener at LISTEN, which must be a
-//! loopback address, hands each asking Mac's stream to the desk, and a run that lets a Mac in
-//! posts the records its Allow signed (where the vault has a membership log, F15) and that
-//! Mac's request with its `Allowed` to HOME's vault server, as the window does. It offers no
-//! fleet op (its fleet secret is fresh and held by no one) and registers no Bonjour service.
-//! The first Mac that asks (the one named NAME, with `--allow`) gets one Allow, pressed as
-//! soon as its request is heard, and the phrase the window would show in its sheet is written
-//! to OUT: the shipped member shows a
-//! phrase on its own screen alone (§3.3.5), and the lane reads no window, so this lab member
-//! hands the phrase to the lane, as `lab swarm partition` presses Allow in its own process.
+//! admin, enrolled in the vault's Commons): an `ask`-only listener at LISTEN hands each asking
+//! Mac's stream to the desk, and a run that lets a Mac in posts the records its Allow signed
+//! (where the vault has a membership log, F15) and that Mac's request with its `Allowed` to
+//! HOME's vault server, as the window does. It offers no fleet op (its fleet secret is fresh and
+//! held by no one). The first Mac that asks (the one named NAME, with `--allow`) gets one Allow,
+//! pressed as soon as its request is heard, and the phrase the window would show in its sheet is
+//! written to OUT: the shipped member shows a phrase on its own screen alone (§3.3.5), and the
+//! lane reads no window, so this lab member hands the phrase to the lane, as `lab swarm
+//! partition` presses Allow in its own process.
+//!
+//! Without `--advertise`, LISTEN must be a loopback address and the member registers no Bonjour
+//! service. With `--advertise SERVICE`, SERVICE must be a lab's members service
+//! (`aterm_secrets::discover::lab_service`: `_alab-lab-<nonce>._tcp`, never `_alab._tcp`, so no
+//! live ALab Mac browses it) and LISTEN may be the guest's own address on its network (never a
+//! wildcard): the member registers its ask port under SERVICE as the node job registers a
+//! member's fleet port ([`advert_args`]: `dns-sd -R <alab-8 hex> SERVICE local <port> v=1
+//! role=member fleet=<port> window=1`), so a joiner whose `ATERM_LAB_MEMBER_SERVICE` names
+//! SERVICE finds it by `discover::browse_members` and dials it at the address that browse
+//! resolves.
 //!
 //! OUT's lines (each `<kind> <epoch ms> …`, read by `mac_nux::phrase::read_desk`):
 //! `member listen=<addr> name=<name>` once it serves, `refused <why>` when it cannot (no
 //! Commons control, or one that may not allow), `heard id=<id> name=<name> code=<code>
 //! from=<ip>` for each request, `phrase id=<id> name=<name> <word> <word> <word>` for its Allow,
-//! `allow-failed <why>`, `let-in name=<name>` once a run sent its bundle, `posted ok` or
-//! `posted failed <why>` for the request it posted, `asked from=<ip>` for an exchange that let
-//! no Mac in, and `ask-ended from=<ip> <why>` for one that ended in an error.
+//! `allow-failed <why>`, `let-in name=<name>` once a run's bundle reached the new Mac (it
+//! acknowledged it, or asked for no acknowledgement), `sent-unacknowledged name=<name> <why>`
+//! for one it never acknowledged (the window logs it sent, not let in), `posted ok` or `posted
+//! failed <why>` for the request it posted, `asked from=<ip>` for an exchange that let no Mac
+//! in, and `ask-ended from=<ip> <why>` for one that ended in an error.
+//! `advertised instance=<name> service=<service> port=<port>` records a running registration;
+//! a registration that cannot start is recorded as `refused`.
 
 use std::collections::BTreeSet;
 use std::net::{SocketAddr, TcpListener};
@@ -35,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use aterm_net::fleet::{AskHandler, Duplex, FleetOp, FleetScope, FleetSecret, Listening};
 use aterm_secrets::client::{self, Paths};
-use aterm_secrets::members::desk::{self, Desk, Local, RowState};
+use aterm_secrets::members::desk::{self, Delivered, Desk, Local, RowState};
 use aterm_types::MutexExt as _;
 
 use super::Out;
@@ -56,28 +69,42 @@ const SLOTS: usize = 4;
 pub(crate) struct Ask {
     /// The member's home, whose vault custody the desk signs with.
     pub(crate) home: PathBuf,
-    /// The listener's address: loopback alone.
+    /// The listener's address: loopback, or with [`Self::advertise`] the guest's own address.
     pub(crate) listen: SocketAddr,
     /// The record.
     pub(crate) out: String,
     /// The one machine name whose request gets the Allow (`None`: the first one heard).
     pub(crate) allow: Option<String>,
+    /// The lab members service the ask port is registered under (`None`: none).
+    pub(crate) advertise: Option<String>,
 }
 
 impl Ask {
-    /// `HOME LISTEN OUT [--allow NAME]` (the words after `member`).
+    /// `HOME LISTEN OUT [--allow NAME] [--advertise SERVICE]` (the words after `member`).
     ///
     /// # Errors
-    /// A missing or stray word, or a LISTEN that is no loopback `address:port`: the member never
-    /// listens where the guest's network reaches it.
+    /// A missing or stray word; a SERVICE that is no lab members service; or a LISTEN that is no
+    /// `address:port`, that is no loopback one without `--advertise`, or that is a wildcard or
+    /// multicast one with it: the member never listens where nothing names it.
     pub(crate) fn parse(args: &[String]) -> Result<Ask, String> {
-        let usage = "member HOME LISTEN OUT [--allow NAME]";
+        let usage = "member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE]";
         let mut words = Vec::new();
         let mut allow = None;
+        let mut advertise = None;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             if arg == "--allow" {
                 allow = Some(args.next().ok_or("--allow takes a machine name")?.clone());
+            } else if arg == "--advertise" {
+                let service = args.next().ok_or("--advertise takes a service")?;
+                if !aterm_secrets::discover::lab_service(service) {
+                    return Err(format!(
+                        "member: {service} is no lab members service (_alab-lab-<1 to 6 \
+                         lowercase letters or digits>._tcp): the lab's member never advertises \
+                         a service the live fleet browses"
+                    ));
+                }
+                advertise = Some(service.clone());
             } else if arg.starts_with("--") {
                 return Err(format!("member: unknown option {arg} ({usage})"));
             } else {
@@ -88,10 +115,17 @@ impl Ask {
         let listen: SocketAddr = listen
             .parse()
             .map_err(|_| format!("member: {listen} is no address:port"))?;
-        if !listen.ip().is_loopback() {
+        let ip = listen.ip();
+        if advertise.is_none() && !ip.is_loopback() {
             return Err(format!(
-                "member: {listen} is not loopback: the member listens where nothing beyond the \
-                 guest reaches it"
+                "member: {listen} is not loopback: without --advertise the member listens where \
+                 nothing beyond the guest reaches it"
+            ));
+        }
+        if ip.is_unspecified() || ip.is_multicast() {
+            return Err(format!(
+                "member: {listen} is no one address: the member listens at the address its \
+                 advert resolves to alone"
             ));
         }
         Ok(Ask {
@@ -99,8 +133,59 @@ impl Ask {
             listen,
             out,
             allow,
+            advertise,
         })
     }
+}
+
+/// The `dns-sd` arguments that register the member's ask port `port` under the lab members
+/// service `service` as `instance`: the node job's `_alab._tcp` registration
+/// (`aterm_agent::node_service::alab_tcp_dns_sd_args`, its instance, port and TXT as a window's
+/// member advertises them) with `service` in `_alab._tcp`'s place.
+pub(crate) fn advert_args(service: &str, instance: &str, port: u16) -> Vec<String> {
+    use aterm_agent::node_service::{ALAB_TCP_SERVICE, AlabTcpTxt, NodeRole};
+    let txt = AlabTcpTxt {
+        role: NodeRole::Member,
+        fleet_port: port,
+        window: true,
+    };
+    aterm_agent::node_service::alab_tcp_dns_sd_args(instance, txt)
+        .into_iter()
+        .map(|word| {
+            if word == ALAB_TCP_SERVICE {
+                service.to_owned()
+            } else {
+                word
+            }
+        })
+        .collect()
+}
+
+/// Register the ask port `port` under `service` ([`advert_args`], a fresh `alab-<8 hex>`
+/// instance): the running `dns-sd`, which holds the registration while it lives (its output in
+/// `home/member.advert`), and the instance.
+///
+/// # Errors
+/// The output file could not be made, or `dns-sd` could not start.
+fn register(
+    home: &std::path::Path,
+    service: &str,
+    port: u16,
+) -> Result<(aterm_uds::spawnfd::Child, String), String> {
+    let instance = aterm_agent::node_service::random_alab_instance_name();
+    let log = home.join("member.advert");
+    let file = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let err = file
+        .try_clone()
+        .map_err(|e| format!("{}: {e}", log.display()))?;
+    let child = aterm_uds::spawnfd::command(aterm_agent::node_service::DNS_SD)
+        .args(advert_args(service, &instance, port))
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::from(file))
+        .stderr(aterm_uds::spawnfd::Stdio::from(err))
+        .spawn()
+        .map_err(|e| format!("dns-sd -R {instance} {service}: {e}"))?;
+    Ok((child, instance))
 }
 
 /// Serve as the Allowing member until killed ([`Ask`], the module docs).
@@ -123,6 +208,22 @@ pub(crate) fn member(ask: &Ask) -> Result<(), String> {
     let bound = listener
         .local_addr()
         .map_err(|e| refuse(format!("{}: {e}", ask.listen)))?;
+    // Held while the member serves, which it does until it is killed: the registration lives as
+    // long as its `dns-sd`.
+    let _advert = match &ask.advertise {
+        Some(service) => {
+            let (child, instance) = register(&ask.home, service, bound.port()).map_err(refuse)?;
+            out.line(
+                "advertised",
+                &format!(
+                    "instance={instance} service={service} port={}",
+                    bound.port()
+                ),
+            );
+            Some(child)
+        }
+        None => None,
+    };
     let listening = Listening {
         secret: fresh_secret().map_err(refuse)?,
         scope: FleetScope::Facts,
@@ -198,7 +299,8 @@ fn ask_handler(desk: Arc<Mutex<Desk>>, paths: Paths, out: Arc<Out>) -> AskHandle
             let bundle = |handing: &desk::Handing<'_>| client::hand_over(&paths, handing);
             match desk::serve(&desk, stream, peer.ip(), &bundle) {
                 Ok(Some(let_in)) => {
-                    out.line("let-in", &format!("name={}", let_in.allowed.name()));
+                    let (kind, rest) = ran(let_in.allowed.name(), &let_in.delivered);
+                    out.line(kind, &rest);
                     let (paths, out) = (paths.clone(), Arc::clone(&out));
                     std::thread::spawn(move || {
                         if let_in.logged
@@ -223,6 +325,19 @@ fn ask_handler(desk: Arc<Mutex<Desk>>, paths: Paths, out: Arc<Out>) -> AskHandle
             Ok(())
         },
     )
+}
+
+/// The record line for a run that sent Mac `name` its bundle, by how it was `delivered`: `let-in`
+/// once the bundle reached it, `sent-unacknowledged` (with why) for one it never acknowledged,
+/// which the window logs as sent, not let in. Either way the records and the `Allowed` are
+/// posted, as the window posts them.
+fn ran(name: &str, delivered: &Delivered) -> (&'static str, String) {
+    match delivered {
+        Delivered::Acknowledged | Delivered::Written => ("let-in", format!("name={name}")),
+        Delivered::Unacknowledged(why) => {
+            ("sent-unacknowledged", format!("name={name} {}", flat(why)))
+        }
+    }
 }
 
 /// Look at the desk every [`LOOK_EVERY`]: write each request heard, and press Allow once, for
@@ -275,9 +390,9 @@ mod tests {
         words.iter().map(|w| (*w).to_owned()).collect()
     }
 
-    /// The member listens on loopback alone: an address the guest's network reaches (any
-    /// interface, the guest's own address on tart's network, IPv6's any) is refused before
-    /// anything binds.
+    /// Without `--advertise` the member listens on loopback alone: an address the guest's
+    /// network reaches (any interface, the guest's own address on tart's network, IPv6's any) is
+    /// refused before anything binds.
     #[test]
     fn the_member_listens_on_loopback_alone() {
         let ask = Ask::parse(&args(&["/s", "127.0.0.1:7486", "/o", "--allow", "mb"])).unwrap();
@@ -288,6 +403,7 @@ mod tests {
                 listen: "127.0.0.1:7486".parse().unwrap(),
                 out: "/o".into(),
                 allow: Some("mb".into()),
+                advertise: None,
             }
         );
         assert!(Ask::parse(&args(&["/s", "[::1]:7486", "/o"])).is_ok());
@@ -300,5 +416,112 @@ mod tests {
         assert!(Ask::parse(&args(&["/s", "127.0.0.1:7486", "/o", "x"])).is_err());
         assert!(Ask::parse(&args(&["/s", "127.0.0.1:7486", "/o", "--allow"])).is_err());
         assert!(Ask::parse(&args(&["/s", "127.0.0.1:7486", "/o", "--loud"])).is_err());
+    }
+
+    /// A run whose bundle the new Mac never acknowledged is written as sent, not as a Mac let in,
+    /// so `lab mac nux` counts no join the new Mac never took; one it acknowledged, or one from a
+    /// joiner that asked for no acknowledgement, is a Mac let in.
+    ///
+    /// NEGATIVE CONTROL: write `let-in` for every run (`ran` ignoring `delivered`):
+    /// `left: ("let-in", "name=mb")`, `right: ("sent-unacknowledged", "name=mb the other Mac
+    /// closed the join exchange")`.
+    #[test]
+    fn a_bundle_the_new_mac_never_acknowledged_is_no_mac_let_in() {
+        assert_eq!(
+            ran(
+                "mb",
+                &Delivered::Unacknowledged("the other Mac  closed\nthe join exchange".into())
+            ),
+            (
+                "sent-unacknowledged",
+                "name=mb the other Mac closed the join exchange".to_owned()
+            )
+        );
+        for delivered in [Delivered::Acknowledged, Delivered::Written] {
+            assert_eq!(
+                ran("mb", &delivered),
+                ("let-in", "name=mb".to_owned()),
+                "{delivered:?}"
+            );
+        }
+    }
+
+    /// With `--advertise` the member listens at the guest's own address and registers there
+    /// under a lab members service alone: `_alab._tcp`, the vault's service or any name that is
+    /// no lab one is refused, and so is a wildcard or multicast address, before anything binds or
+    /// registers. Its registration is the node job's, with the lab service in `_alab._tcp`'s
+    /// place.
+    ///
+    /// NEGATIVE CONTROL (2026-10-29): `Ask::parse` taking any `--advertise` word (its
+    /// `lab_service` check removed) fails here: `_alab._tcp was taken`.
+    #[test]
+    fn an_advertising_member_registers_a_lab_service_alone_at_one_address() {
+        let lab = "_alab-lab-k3x9q2._tcp";
+        let ask = Ask::parse(&args(&[
+            "/s",
+            "192.168.64.5:7486",
+            "/o",
+            "--advertise",
+            lab,
+        ]))
+        .unwrap();
+        assert_eq!(ask.listen, "192.168.64.5:7486".parse().unwrap());
+        assert_eq!(ask.advertise.as_deref(), Some(lab));
+        assert!(Ask::parse(&args(&["/s", "127.0.0.1:7486", "/o", "--advertise", lab])).is_ok());
+        for service in [
+            "_alab._tcp",
+            "_alab-vault._tcp",
+            "_alab-lab-._tcp",
+            "_http._tcp",
+        ] {
+            let said = Ask::parse(&args(&[
+                "/s",
+                "192.168.64.5:7486",
+                "/o",
+                "--advertise",
+                service,
+            ]));
+            assert!(
+                said.as_ref()
+                    .is_err_and(|e| e.contains("no lab members service")),
+                "{service} was taken: {said:?}"
+            );
+        }
+        for wide in ["0.0.0.0:7486", "[::]:7486", "224.0.0.251:7486"] {
+            let said = Ask::parse(&args(&["/s", wide, "/o", "--advertise", lab]));
+            assert!(said.is_err(), "{wide} was taken: {said:?}");
+        }
+        assert!(Ask::parse(&args(&["/s", "192.168.64.5:7486", "/o", "--advertise"])).is_err());
+
+        let shipped = aterm_agent::node_service::alab_tcp_dns_sd_args(
+            "alab-1a2b3c4d",
+            aterm_agent::node_service::AlabTcpTxt {
+                role: aterm_agent::node_service::NodeRole::Member,
+                fleet_port: 7486,
+                window: true,
+            },
+        );
+        let ours = advert_args(lab, "alab-1a2b3c4d", 7486);
+        assert_eq!(
+            ours,
+            [
+                "-R",
+                "alab-1a2b3c4d",
+                lab,
+                "local",
+                "7486",
+                "v=1",
+                "role=member",
+                "fleet=7486",
+                "window=1"
+            ]
+        );
+        let differs: Vec<(&String, &String)> =
+            shipped.iter().zip(&ours).filter(|(a, b)| a != b).collect();
+        assert_eq!(
+            differs,
+            [(&"_alab._tcp".to_owned(), &lab.to_owned())],
+            "only the service differs from the node job's registration"
+        );
     }
 }

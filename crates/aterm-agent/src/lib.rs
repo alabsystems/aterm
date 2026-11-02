@@ -60,6 +60,8 @@ pub mod fleet_log;
 /// fleet.
 #[cfg(unix)]
 mod fleet_member;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub use fleet_member::test_sync_from_vault_at;
 /// `aterm members`: Macs joining ALab and the members that let them in.
 #[cfg(unix)]
 pub mod members_cli;

@@ -221,6 +221,12 @@ impl Ledger {
         Ok(())
     }
 
+    /// Whether this ledger belongs to a Commons root (a vault with Commons control), whose
+    /// decisions name their authors.
+    pub(super) fn trusted(&self) -> bool {
+        self.trust.is_some()
+    }
+
     pub(super) fn evidence(&self, recipient: &Recipient) -> Option<Evidence> {
         self.entries.get(&recipient.0).copied()
     }

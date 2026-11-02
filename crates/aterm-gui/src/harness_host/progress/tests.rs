@@ -73,6 +73,7 @@ fn fixture() -> (HostHandle, Arc<Mutex<Kept>>) {
         born: Some(BORN),
         state: None,
         labels: BTreeSet::new(),
+        policy: Arc::clone(&kept.account.progress_policy),
         execution_until: None,
         value,
     });
@@ -698,6 +699,714 @@ fn service_progress_retries_a_busy_activity_read_and_then_shows_sign_in() {
                 retained
             );
         }
+    }
+}
+
+fn app_execution_progress(
+    until: Instant,
+) -> (crate::App, HostHandle, Arc<Mutex<Kept>>, u64, String) {
+    use aterm_agent::harness::account_progress::{
+        EXECUTION_PREPARED_FINDING, OwnClaimBlocker, OwnClaimFinding,
+    };
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+    let mut app = crate::App::headless_for_test();
+    app.proxy = None;
+    let local = app.focused_session_id(crate::WindowId(0)).unwrap();
+    let sid = app.session_sid(local).unwrap();
+    let (host, kept) = fixture();
+    {
+        let mut map = host.shared.kept.lock().unwrap();
+        let entry = map.remove(SID).unwrap();
+        map.insert(sid.clone(), entry);
+    }
+    {
+        let mut kept = kept.lock().unwrap();
+        kept.snapshot.as_mut().unwrap().tab = sid.clone();
+        let mut bound = kept.account.progress.take().unwrap();
+        bound.snapshot.tab = sid.clone();
+        bound.execution_until = Some(until);
+        bound.value.observed_at = 100;
+        bound.value.account = Some("recorded-account".into());
+        bound.value.known = Some(2);
+        bound.value.eligible = Some(1);
+        bound.value.phase = ProgressPhase::Waiting;
+        bound.value.wall = Some("weekly".into());
+        bound.value.next_at = Some(200);
+        bound.value.details.push(EXECUTION_PREPARED_FINDING.into());
+        bound.value.own_claim = Some(OwnClaimFinding {
+            blocker: OwnClaimBlocker::HeldElsewhere { until: 150 },
+            pinned: true,
+        });
+        kept.account.execution_progress = Some(bound);
+    }
+    {
+        let ctx = app.pool.get(local).unwrap().ctx.clone();
+        let mut timeline = ctx.timeline.lock().unwrap();
+        timeline.note_foreground_group(4242);
+        timeline.set_program(4242, Some("node".into()));
+        timeline.set_agent_reader_program_for_test(Some(Program::Claude));
+        timeline.set_claude_footer(
+            4242,
+            Some(BORN),
+            Some(FooterFacts {
+                owner: Some(FactsOwner {
+                    floor: Some(BORN),
+                    session_id: CONVERSATION.into(),
+                }),
+                ..Default::default()
+            }),
+        );
+    }
+    app.harness = Some(host.clone());
+    (app, host, kept, local, sid)
+}
+
+fn service_at(app: &mut crate::App, mono: Instant, wall: i64) {
+    app.service_harness_account_progress_with_reader(
+        mono,
+        |host, sid, pid, birth, conversation| {
+            host.account_progress_read_with_activity(
+                sid,
+                pid,
+                birth,
+                conversation,
+                || (mono, Some(wall)),
+                |_, _, _| Some(Vec::new()),
+            )
+        },
+    );
+}
+
+fn with_progress_writer<T: Send, R>(writer: &Mutex<T>, run: impl FnOnce() -> R) -> R {
+    std::thread::scope(|scope| {
+        let (ready, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let worker = scope.spawn(move || {
+            let _guard = writer.lock().unwrap();
+            ready.send(()).expect("the App waits for its writer");
+            match released.recv_timeout(Duration::from_secs(60)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the App did not return before its writer's hang detector");
+                }
+            }
+        });
+        held.recv_timeout(Duration::from_secs(60))
+            .expect("the actual writer acquired its mutex");
+        // Only the worker owns a guard. Dropping this sender also releases it if `run`
+        // unwinds, before thread::scope joins; no test guard nests App/global locks.
+        let result = run();
+        drop(release);
+        worker.join().expect("the writer released its mutex");
+        result
+    })
+}
+
+fn publish_test_off(host: &HostHandle, sid: &str, off: bool) {
+    let policy = OffSessions {
+        words: HashMap::from([(
+            sid.to_owned(),
+            if off {
+                Autopilot::Off
+            } else {
+                Autopilot::Cruise
+            },
+        )]),
+        default: Autopilot::Cruise,
+    };
+    let mut hooks = host.hooks.clone();
+    hooks.note = Arc::new(|_| {});
+    publish_off(
+        &host.shared,
+        &Workers::default(),
+        &HashMap::new(),
+        &policy,
+        &hooks,
+    );
+}
+
+#[test]
+fn off_policy_reads_are_nonblocking_and_a_changed_verdict_cannot_publish() {
+    for change_policy in [false, true] {
+        let start = Instant::now();
+        let (mut app, host, kept, local, sid) =
+            app_execution_progress(start + Duration::from_secs(10));
+        let ctx = app.pool.get(local).unwrap().ctx.clone();
+        {
+            let mut kept = kept.lock().unwrap();
+            let mut normal = kept.account.execution_progress.take().unwrap();
+            normal.execution_until = None;
+            kept.account.progress = Some(normal);
+        }
+        service_at(&mut app, start, 100);
+        let retained = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .claude_footer()
+            .unwrap()
+            .account_progress
+            .clone();
+        if change_policy {
+            let model = aterm_models_harness::account_progress_policy_model();
+            let mut policy = model.init_state();
+            for action in ["Read", "Deliver"] {
+                assert!(model.fire(action, &mut policy));
+            }
+            let initial = Arc::clone(&kept.lock().unwrap().account.progress_policy);
+            app.service_harness_account_progress_with_reader(
+                start,
+                |host, sid, pid, born, talk| {
+                    let result = host.account_progress_read_with_activity(
+                        sid,
+                        pid,
+                        born,
+                        talk,
+                        || (start, Some(100)),
+                        |_, _, _| Some(Vec::new()),
+                    );
+                    assert!(model.fire("Read", &mut policy));
+                    publish_test_off(host, sid, true);
+                    assert!(model.fire("Off", &mut policy));
+                    result
+                },
+            );
+            assert!(model.fire("Deliver", &mut policy));
+            let view =
+                crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
+            let (epoch, record_epoch, record_value) = {
+                let kept = kept.lock().unwrap();
+                (
+                    i64::from(!Arc::ptr_eq(&initial, &kept.account.progress_policy)),
+                    i64::from(!kept.account.progress.as_ref().unwrap().policy_is(&initial)),
+                    i64::from(
+                        kept.account.progress.as_ref().unwrap().value.observed_at
+                            != retained.as_ref().unwrap().observed_at,
+                    ),
+                )
+            };
+            let off = host.shared.lock().off.contains(&sid);
+            for (field, actual) in [
+                ("turn", i64::from(off)),
+                ("epoch", epoch),
+                ("record_epoch", record_epoch),
+                ("record_value", record_value),
+                ("producer_epoch", 3),
+                (
+                    "view",
+                    if view.phase == ProgressPhase::Unknown {
+                        3
+                    } else {
+                        1
+                    },
+                ),
+                ("next", i64::from(view.next_at.is_some())),
+            ] {
+                assert_eq!(policy[field], actual, "{field}: {policy:?}");
+            }
+            for invariant in &model.invariants {
+                assert!(
+                    model.check_invariant(invariant.name, &policy),
+                    "{}",
+                    invariant.name
+                );
+            }
+            let mut former = policy.clone();
+            former.insert("view", 1);
+            former.insert("next", 1);
+            assert!(!model.check_invariant("StaleReadWithdrawsClaims", &former));
+        } else {
+            with_progress_writer(&host.shared.state, || service_at(&mut app, start, 100));
+        }
+        let facts = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .claude_footer()
+            .unwrap()
+            .clone();
+        assert!(facts.account_progress_busy);
+        assert_eq!(facts.account_progress, retained);
+        assert_eq!(facts.account_progress_view().unwrap().next_at, None);
+        assert_eq!(
+            app.harness_progress_next_poll,
+            Some(start + Duration::from_secs(1))
+        );
+        service_at(&mut app, start + Duration::from_secs(1), 100);
+        let facts = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .claude_footer()
+            .unwrap()
+            .clone();
+        assert!(!facts.account_progress_busy);
+        assert_eq!(
+            facts.account_progress_view().unwrap().phase,
+            if change_policy {
+                ProgressPhase::Paused
+            } else {
+                ProgressPhase::Waiting
+            }
+        );
+        assert_eq!(
+            kept.lock()
+                .unwrap()
+                .account
+                .progress
+                .as_ref()
+                .unwrap()
+                .value,
+            retained.unwrap()
+        );
+    }
+}
+
+#[test]
+fn off_without_a_retained_session_is_explicit_but_invents_no_account() {
+    use aterm_agent::harness::account_progress::SESSION_AUTOPILOT_OFF_FINDING;
+    let (host, _) = fixture();
+    host.shared.kept.lock().unwrap().remove(SID);
+    let mut hooks = host.hooks.clone();
+    let notes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let noted = Arc::clone(&notes);
+    hooks.note = Arc::new(move |note| {
+        assert!(matches!(note, HostNote::AccountProgress));
+        noted.fetch_add(1, Ordering::SeqCst);
+    });
+    let wanted = HashMap::from([(SID.to_owned(), Program::Claude)]);
+    let off = OffSessions {
+        words: HashMap::new(),
+        default: Autopilot::Off,
+    };
+    for _ in 0..2 {
+        publish_off(&host.shared, &Workers::default(), &wanted, &off, &hooks);
+        assert_eq!(notes.load(Ordering::SeqCst), 1);
+    }
+    let progress = read(&host).unwrap();
+    assert_eq!(progress.phase, ProgressPhase::Paused);
+    assert_eq!(
+        (
+            progress.observed_at,
+            progress.known,
+            progress.eligible,
+            progress.next_at
+        ),
+        (0, None, None, None)
+    );
+    assert_eq!(progress.account, None);
+    assert_eq!(progress.details, [SESSION_AUTOPILOT_OFF_FINDING]);
+}
+
+#[test]
+fn an_off_observation_cannot_cross_a_rebound_process_or_conversation() {
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+    for (pid, born, talk) in [
+        (4243, BORN, CONVERSATION),
+        (4242, BORN + 1, CONVERSATION),
+        (4242, BORN, "another-conversation"),
+    ] {
+        let now = Instant::now();
+        let (mut app, host, kept, local, sid) =
+            app_execution_progress(now + Duration::from_secs(10));
+        let ctx = app.pool.get(local).unwrap().ctx.clone();
+        {
+            let mut kept = kept.lock().unwrap();
+            let mut normal = kept.account.execution_progress.take().unwrap();
+            normal.execution_until = None;
+            kept.account.progress = Some(normal);
+        }
+        publish_test_off(&host, &sid, true);
+        app.service_harness_account_progress_with_reader(
+            now,
+            |host, sid, old_pid, old_born, old_talk| {
+                let read = host.account_progress_read_with_activity(
+                    sid,
+                    old_pid,
+                    old_born,
+                    old_talk,
+                    || (now, Some(100)),
+                    |_, _, _| Some(Vec::new()),
+                );
+                assert_eq!(
+                    read.as_ref().unwrap().progress.as_ref().unwrap().phase,
+                    ProgressPhase::Paused
+                );
+                let mut timeline = ctx.timeline.lock().unwrap();
+                timeline.note_foreground_group(pid);
+                timeline.set_program(pid, Some("claude".into()));
+                timeline.set_claude_footer(
+                    pid,
+                    Some(born),
+                    Some(FooterFacts {
+                        owner: Some(FactsOwner {
+                            floor: Some(born),
+                            session_id: talk.into(),
+                        }),
+                        ..Default::default()
+                    }),
+                );
+                read
+            },
+        );
+        let timeline = ctx.timeline.lock().unwrap();
+        let facts = timeline.claude_footer().unwrap();
+        assert_eq!(facts.account_progress, None);
+        assert!(!facts.account_progress_busy);
+    }
+}
+
+fn check_app_busy_expiry_laws(facts: &aterm_agent::harness::footer::FooterFacts) {
+    use aterm_agent::harness::account_progress::{
+        EXECUTION_PREPARED_FINDING, RECOVERY_HISTORY_PREFIX,
+    };
+    let model = aterm_models_harness::account_execution_visibility_model();
+    let mut context = model.init_state();
+    context.insert("case", 21); // An expired gate whose observation requires another display read.
+    for action in ["Observe", "Elapse", "Project"] {
+        assert!(model.fire(action, &mut context));
+    }
+    let project = |facts: &aterm_agent::harness::footer::FooterFacts| {
+        let mut state = context.clone();
+        let view = facts.account_progress_view().unwrap();
+        state.insert(
+            "view",
+            match view.phase {
+                ProgressPhase::Unknown => 8,
+                ProgressPhase::Waiting => 1,
+                _ => panic!("this fixture projects only waiting and unknown recovery"),
+            },
+        );
+        state.insert("deadline", i64::from(view.next_at.is_some()));
+        state.insert(
+            "current",
+            i64::from(view.details.iter().any(|s| s == EXECUTION_PREPARED_FINDING)),
+        );
+        state.insert(
+            "historical",
+            i64::from(view.details.iter().any(|s| {
+                s.strip_prefix(RECOVERY_HISTORY_PREFIX) == Some(EXECUTION_PREPARED_FINDING)
+            })),
+        );
+        state
+    };
+    let actual = project(facts);
+    let mut former = facts.clone();
+    former.account_progress_busy = false; // Former outer-Err behavior retained these same facts.
+    let former = project(&former);
+    // Only these four display fields are projected; this is not a new full transition proof
+    // or a claim that the model's gate/inventory inputs cover App mutex contention.
+    for law in [
+        "NormalPhaseRestored",
+        "ActualRecheckShown",
+        "CurrentHoldRequiresUnexpiredLease",
+        "ExpiredFindingIsHistorical",
+    ] {
+        assert!(model.check_invariant(law, &actual), "{law}: {actual:?}");
+        assert!(
+            !model.check_invariant(law, &former),
+            "former outer-Err behavior escaped {law}"
+        );
+    }
+}
+
+#[test]
+fn an_unavailable_supervisor_read_withdraws_current_claims_across_execution_expiry() {
+    use aterm_agent::harness::account_progress::{
+        EXECUTION_PREPARED_FINDING, EXECUTION_REFRESH_FINDING, OBSERVER_BUSY_FINDING,
+        RECOVERY_HISTORY_PREFIX,
+    };
+    for hold_map in [true, false] {
+        let start = Instant::now();
+        let until = start + Duration::from_secs(10);
+        let (mut app, host, kept, local, sid) = app_execution_progress(until);
+        let ctx = app.pool.get(local).unwrap().ctx.clone();
+        service_at(&mut app, start, 100);
+        let retained = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .claude_footer()
+            .unwrap()
+            .account_progress
+            .clone()
+            .unwrap();
+        assert_eq!(app.harness_progress_next_poll, Some(until));
+        assert_eq!(retained.eligible, Some(1));
+        let mut previous = None;
+        for step in 0..3 {
+            let now = until + Duration::from_secs(step);
+            // A concurrent writer holds each actual production lock. The App thread owns
+            // no guard, and its timeline stays available for the unavailable-read fallback.
+            let read = || service_at(&mut app, now, 99); // Wall rollback cannot renew the lease.
+            if hold_map {
+                with_progress_writer(&host.shared.kept, read);
+            } else {
+                with_progress_writer(kept.as_ref(), read);
+            }
+            let facts = ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .unwrap()
+                .clone();
+            assert!(facts.account_progress_busy);
+            assert_eq!(facts.account_progress.as_ref(), Some(&retained));
+            check_app_busy_expiry_laws(&facts);
+            let view = facts.account_progress_view().unwrap().into_owned();
+            assert_eq!(view.phase, ProgressPhase::Unknown);
+            assert_eq!(view.eligible, None);
+            assert_eq!(view.next_at, None);
+            assert_eq!(view.observed_at, retained.observed_at);
+            assert_eq!(view.account, retained.account);
+            assert_eq!(view.known, retained.known);
+            assert_eq!(view.wall, retained.wall);
+            assert_eq!(view.own_claim, retained.own_claim);
+            assert_eq!(
+                view.details.first().map(String::as_str),
+                Some(OBSERVER_BUSY_FINDING)
+            );
+            assert!(view.details.contains(&format!(
+                "{RECOVERY_HISTORY_PREFIX}{EXECUTION_PREPARED_FINDING}"
+            )));
+            if let Some(previous) = &previous {
+                assert_eq!(previous, &view);
+            }
+            previous = Some(view.clone());
+            assert_eq!(
+                app.harness_progress_next_poll,
+                Some(now + Duration::from_secs(1))
+            );
+            let footer = aterm_agent::harness::footer::account_progress_text(&view, false);
+            assert!(footer.contains(&aterm_agent::harness::footer::account_progress_phase(&view)));
+            let old_next = aterm_agent::harness::usage::rfc3339_utc(200);
+            assert!(!footer.contains(&old_next));
+
+            // Actual menu opening uses its production facts adapter; absent proxy prevents
+            // its independent optional account reader from touching any account records.
+            app.open_fact_menu(
+                crate::WindowId(0),
+                local,
+                crate::claude_lights::Fact::Account,
+                (0, 0),
+                false,
+            );
+            let menu = &app.autopilot_menu.as_ref().unwrap().rows;
+            let notes: Vec<_> = menu
+                .iter()
+                .filter_map(|row| match row {
+                    crate::autopilot_menu::MenuRow::Note { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                notes
+                    .iter()
+                    .any(|line| line.contains(OBSERVER_BUSY_FINDING))
+            );
+            assert!(notes.iter().all(|line| !line.contains(&old_next)));
+            assert!(!notes.contains(&EXECUTION_PREPARED_FINDING));
+            let lab = app.harness_state().lab;
+            let lab = lab
+                .sessions
+                .iter()
+                .find(|session| session.local_id == local)
+                .unwrap();
+            assert!(
+                lab.facts
+                    .iter()
+                    .any(|(_, value)| value == OBSERVER_BUSY_FINDING)
+            );
+            assert!(lab.facts.iter().all(
+                |(_, value)| value != EXECUTION_PREPARED_FINDING && !value.contains(&old_next)
+            ));
+            let observed =
+                crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
+            assert_eq!(observed, view);
+            let reply = crate::harness_recovery_verb::cmd("recovery", true, || Ok(Some(observed)));
+            for field in [
+                "phase=unknown",
+                "eligible=-",
+                "next_at=-",
+                "known=2",
+                "observed_at=100",
+            ] {
+                assert!(
+                    reply.split_whitespace().any(|word| word == field),
+                    "{reply}"
+                );
+            }
+        }
+        // The reader becomes available, but an old receipt remains expired even with the
+        // wall clock behind its original observation. Its source record was never rewritten.
+        service_at(&mut app, until + Duration::from_secs(3), 99);
+        let facts = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .claude_footer()
+            .unwrap()
+            .clone();
+        assert!(!facts.account_progress_busy);
+        let observed = facts.account_progress_view().unwrap();
+        assert_eq!(observed.phase, ProgressPhase::Unknown);
+        assert_eq!(observed.next_at, None);
+        assert_eq!(
+            observed.details.first().map(String::as_str),
+            Some(EXECUTION_REFRESH_FINDING)
+        );
+        assert_eq!(app.harness_progress_next_poll, None);
+        assert_eq!(
+            kept.lock()
+                .unwrap()
+                .account
+                .execution_progress
+                .as_ref()
+                .unwrap()
+                .value,
+            retained
+        );
+        assert!(host.shared.kept.lock().unwrap().contains_key(&sid));
+    }
+}
+
+#[test]
+fn a_successful_same_decision_clears_the_apps_busy_projection_before_expiry() {
+    let start = Instant::now();
+    let until = start + Duration::from_secs(10);
+    let (mut app, host, kept, local, _) = app_execution_progress(until);
+    let ctx = app.pool.get(local).unwrap().ctx.clone();
+    service_at(&mut app, start, 100);
+    let retained = ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .claude_footer()
+        .unwrap()
+        .account_progress
+        .clone();
+    // A real host note bypasses the still-future lease wake; its real reader must encounter
+    // a concurrent writer's production map. No new decision or synthetic error is supplied.
+    with_progress_writer(&host.shared.kept, || {
+        app.account_progress_noted(start + Duration::from_secs(1));
+    });
+    assert!(
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .claude_footer()
+            .unwrap()
+            .account_progress_busy
+    );
+    service_at(&mut app, start + Duration::from_secs(2), 100);
+    let facts = ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .claude_footer()
+        .unwrap()
+        .clone();
+    assert!(!facts.account_progress_busy);
+    assert_eq!(facts.account_progress, retained);
+    assert_eq!(
+        facts.account_progress_view().unwrap().as_ref(),
+        retained.as_ref().unwrap()
+    );
+    assert_eq!(app.harness_progress_next_poll, Some(until));
+    assert_eq!(
+        kept.lock()
+            .unwrap()
+            .account
+            .execution_progress
+            .as_ref()
+            .unwrap()
+            .value,
+        retained.unwrap()
+    );
+}
+
+#[test]
+fn an_unavailable_read_cannot_mark_a_rebound_foreground_as_busy() {
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+    for (new_pid, new_birth, new_conversation) in [
+        (4243, BORN, CONVERSATION),
+        (4242, BORN + 1, CONVERSATION),
+        (4242, BORN, "new-conversation"),
+    ] {
+        let start = Instant::now();
+        let until = start + Duration::from_secs(10);
+        let (mut app, host, _, local, _) = app_execution_progress(until);
+        let ctx = app.pool.get(local).unwrap().ctx.clone();
+        service_at(&mut app, start, 100);
+        let mut unavailable = false;
+        with_progress_writer(&host.shared.kept, || {
+            app.service_harness_account_progress_with_reader(
+                until,
+                |host, sid, pid, birth, conversation| {
+                    let result = host.account_progress_read_with_activity(
+                        sid,
+                        pid,
+                        birth,
+                        conversation,
+                        || (until, Some(99)),
+                        |_, _, _| panic!("the actual held map must refuse first"),
+                    );
+                    unavailable = result.is_err();
+                    let mut timeline = ctx.timeline.lock().unwrap();
+                    timeline.note_foreground_group(new_pid);
+                    timeline.set_program(new_pid, Some("node".into()));
+                    timeline.set_agent_reader_program_for_test(Some(Program::Claude));
+                    timeline.set_claude_footer(
+                        new_pid,
+                        Some(new_birth),
+                        Some(FooterFacts {
+                            owner: Some(FactsOwner {
+                                floor: Some(new_birth),
+                                session_id: new_conversation.into(),
+                            }),
+                            ..Default::default()
+                        }),
+                    );
+                    result
+                },
+            );
+        });
+        assert!(
+            unavailable,
+            "the real concurrent writer must make the read unavailable"
+        );
+        let facts = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .claude_footer()
+            .unwrap()
+            .clone();
+        assert!(!facts.account_progress_busy);
+        assert!(facts.account_progress.is_none());
+        assert_eq!(
+            app.harness_progress_next_poll,
+            Some(until + Duration::from_secs(1))
+        );
+        service_at(&mut app, until + Duration::from_secs(1), 99);
+        assert!(
+            !ctx.timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .unwrap()
+                .account_progress_busy
+        );
+        assert!(
+            ctx.timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .unwrap()
+                .account_progress
+                .is_none()
+        );
     }
 }
 

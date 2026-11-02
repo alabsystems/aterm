@@ -5971,6 +5971,246 @@ fn node_listener_on(
     (port, running, serving)
 }
 
+/// A person's drive is served by a listener that dropped its first connection, as one at its slots
+/// does. NEGATIVE CONTROL: `drive` reaching its node once, with no [`passes`]: the dial hangs up and
+/// this fails.
+#[test]
+fn a_drive_is_served_by_a_listener_that_hung_up_on_its_first_connection() {
+    let host = identity(&node_of(0xd8), 4);
+    let me = identity(&node_of(0x3b), 8);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let serving = std::thread::spawn({
+        let host = host.clone();
+        move || {
+            drop(listener.accept().unwrap());
+            node_listener_on(listener, host, &[FleetOp::Drive])
+        }
+    });
+    let target = Target {
+        host: "127.0.0.1".to_owned(),
+        addr: None,
+        port,
+        node: Some(host.node().to_owned()),
+        key: Some(host.key()),
+    };
+    let driving = drive(
+        &target,
+        &Keyring::default(),
+        (&secret(6), &me),
+        (Instant::now() + HANG, HANG),
+    );
+    assert!(driving.is_ok(), "{:?}", driving.err());
+    drop(driving);
+    let (_, running, served) = serving.join().unwrap();
+    running.store(false, Ordering::Release);
+    served.join().unwrap();
+}
+
+/// Repeated capacity refusals stay transient while a drive has time for another pass, and the pass
+/// after them is served.
+#[test]
+fn a_drive_retries_repeated_capacity_refusals() {
+    let now = Instant::now();
+    let mut attempts = 0;
+    let reached = passes((now + HANG, now + HANG), |_| {
+        attempts += 1;
+        if attempts <= 2 { Err(busy()) } else { Ok(()) }
+    });
+    assert!(reached.is_ok(), "{reached:?}");
+    assert_eq!(attempts, 3);
+}
+
+/// Any other dial takes one pass however long its budget: a heartbeat, a join's place and a vault
+/// round meet a full listener once, and a join's next place keeps its time. NEGATIVE CONTROL:
+/// [`dial_avoiding`] taking [`passes`]: the count is 4.
+#[test]
+fn a_dial_takes_one_pass_however_long_its_budget() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (ended, end) = std::sync::mpsc::channel::<()>();
+    let hanging = std::thread::spawn({
+        let accepted = Arc::clone(&accepted);
+        move || {
+            listener.set_nonblocking(true).unwrap();
+            while end.try_recv().is_err() {
+                match listener.accept() {
+                    Ok(connection) => {
+                        accepted.fetch_add(1, Ordering::SeqCst);
+                        drop(connection);
+                    }
+                    Err(_) => std::thread::yield_now(),
+                }
+            }
+        }
+    });
+    let dialled = dial(
+        "127.0.0.1",
+        None,
+        port,
+        (&secret(6), None),
+        FleetOp::Survey,
+        HANG,
+    );
+    ended.send(()).unwrap();
+    hanging.join().unwrap();
+    assert!(dialled.is_err(), "a listener that only hangs up served");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+fn busy() -> Unreached {
+    Unreached::Handshake(
+        SocketAddr::from(([127, 0, 0, 1], 7100)),
+        FleetError::AddressBusy,
+    )
+}
+
+/// A listener at a cap on every pass gets all of them, and the reason is the first's. NEGATIVE
+/// CONTROL: a past-proof return ahead of `served_later` in [`passes`]: the count is 2.
+#[test]
+fn a_drive_keeps_dialling_a_listener_at_its_cap_until_its_passes_are_spent() {
+    let now = Instant::now();
+    let mut tried = 0;
+    let dialled: Result<(), _> = passes((now + HANG, now + HANG), |_| {
+        tried += 1;
+        Err(busy())
+    });
+    assert_eq!(tried, AGAIN_AFTER.len() + 1);
+    assert!(
+        matches!(
+            dialled,
+            Err(Unreached::Handshake(_, FleetError::AddressBusy))
+        ),
+        "{dialled:?}"
+    );
+}
+
+/// A later pass's definite refusal is what the dial reports; one that only could not connect, or
+/// this machine's own state, says nothing of the listener, and the first reason stands. NEGATIVE CONTROL: [`passes`] returning the
+/// first reason on any answer that is not worth another pass: the refusal is lost.
+#[test]
+fn a_later_passs_refusal_stands_and_a_later_connect_failure_does_not() {
+    let at = SocketAddr::from(([127, 0, 0, 1], 7100));
+    let now = Instant::now();
+    let mut tried = 0;
+    let refused: Result<(), _> = passes((now + HANG, now + HANG), |_| {
+        tried += 1;
+        Err(if tried == 1 {
+            busy()
+        } else {
+            Unreached::Handshake(at, FleetError::Refused)
+        })
+    });
+    assert!(
+        matches!(refused, Err(Unreached::Handshake(_, FleetError::Refused))),
+        "{refused:?}"
+    );
+    let now = Instant::now();
+    let mut tried = 0;
+    let gone: Result<(), _> = passes((now + HANG, now + HANG), |_| {
+        tried += 1;
+        Err(if tried == 1 {
+            busy()
+        } else {
+            Unreached::Connect(at, io::ErrorKind::ConnectionRefused.into())
+        })
+    });
+    assert!(
+        matches!(gone, Err(Unreached::Handshake(_, FleetError::AddressBusy))),
+        "{gone:?}"
+    );
+    let now = Instant::now();
+    let mut tried = 0;
+    let local: Result<(), _> = passes((now + HANG, now + HANG), |_| {
+        tried += 1;
+        Err(if tried == 1 {
+            busy()
+        } else {
+            Unreached::Local("could not look it up".to_owned())
+        })
+    });
+    assert!(
+        matches!(local, Err(Unreached::Handshake(_, FleetError::AddressBusy))),
+        "this machine's own state says nothing of the listener: {local:?}"
+    );
+}
+
+/// Each further pass ends by `dial_by`, and none starts once its pause would pass it: what stays is
+/// a turn's to answer in. NEGATIVE CONTROL: `pass(deadline)` for a further pass: the deadlines match
+/// and the first assert fails. Dropping the `dial_by` check: three more passes run.
+#[test]
+fn a_further_pass_keeps_to_the_time_a_reply_is_not_owed() {
+    let now = Instant::now();
+    let (deadline, dial_by) = (now + HANG, now + Duration::from_millis(300));
+    let mut ends = Vec::new();
+    let dialled: Result<(), _> = passes((deadline, dial_by), |by| {
+        ends.push(by);
+        Err(busy())
+    });
+    assert!(dialled.is_err());
+    assert_eq!(ends, [deadline, dial_by]);
+}
+
+/// A drive's further passes end the same way into any deadline: a 28 s one keeps a turn's longest
+/// wait, an 8 s one that asks for no wait may still try again, and one shorter than that ends with
+/// its deadline. NEGATIVE CONTROL: the end counted back from the deadline by a turn's longest wait:
+/// the 8 s deadline's end is before it started.
+#[test]
+fn a_drives_further_passes_end_the_same_way_into_any_deadline() {
+    let now = Instant::now();
+    let room = Duration::from_millis(22_000);
+    let long = Duration::from_secs(28);
+    assert!(now + long - further_passes_end((now + long, long)) >= room);
+    let short = Duration::from_secs(8);
+    assert_eq!(
+        further_passes_end((now + short, short)),
+        now + DRIVE_DIAL_WITHIN
+    );
+    let shorter = Duration::from_secs(2);
+    assert_eq!(further_passes_end((now + shorter, shorter)), now + shorter);
+}
+
+/// A stale recorded address does not hide a listener that could serve later: the kept reason is what
+/// the listener did, which [`passes`] decides on. NEGATIVE CONTROL: `walk` keeping the first address's
+/// connect failure: the listener at the name's address is not reported and this fails.
+#[test]
+fn a_dead_address_does_not_hide_a_listener_that_could_serve_later() {
+    let port = 7100;
+    let at = SocketAddr::from(([127, 0, 0, 1], port));
+    let walked: Result<(), _> = walk(
+        ("localhost", Some(Ipv4Addr::LOCALHOST.into()), port),
+        (Instant::now() + HANG, HANG),
+        (&[], |_, _| vec![SocketAddr::from(([127, 0, 0, 2], 7100))]),
+        |to| {
+            AtAddr::Passed(if to == at {
+                Unreached::Connect(to, io::ErrorKind::ConnectionRefused.into())
+            } else {
+                Unreached::Deadline(Stage::Handshake, HANG)
+            })
+        },
+    );
+    assert!(
+        matches!(&walked, Err(why) if why.served_later()),
+        "{walked:?}"
+    );
+}
+
+/// A refusal on the first pass is final: only a listener that could serve later is dialled again.
+#[test]
+fn a_drive_a_listener_refuses_takes_one_pass() {
+    let now = Instant::now();
+    let mut tried = 0;
+    let dialled: Result<(), _> = passes((now + HANG, now + HANG), |_| {
+        tried += 1;
+        Err(Unreached::Handshake(
+            SocketAddr::from(([127, 0, 0, 1], 7100)),
+            FleetError::Refused,
+        ))
+    });
+    assert_eq!(tried, 1, "{dialled:?}");
+}
+
 #[test]
 fn a_silent_recorded_address_gives_way_to_a_name_without_losing_the_bound_key() {
     let host = identity(&node_of(0xd7), 4);
@@ -6818,6 +7058,103 @@ fn c19_dormant_at_14_days_and_expiry_at_90_days() {
     assert_eq!(book, vec![fresh, manual_peer]);
 }
 
+/// A listener that has not read its deny list yet refuses every dialer that proved the fleet
+/// secret, a node proof or none, naming [`FleetError::DenyListUnread`] in its own refusal and
+/// answering `NO capacity` on the wire: the dialer reads it as busy, to dial again later, which
+/// disowns no one. Once its deny list is read, the same dialer is admitted.
+///
+/// NEGATIVE CONTROLS (2026-11-01): with `listener_proves` not checking `unread` and
+/// `Denied::refuses` and `Denied::is_empty` ignoring it (the shape before), the first dial is
+/// admitted (`a listener with no deny list read must refuse a proven peer`); with the listener
+/// answering `NO unread` on the wire, which a dialer from this build reads but an older one takes
+/// as a refused proof, the dial fails with that (`expected a busy listener to dial again, got:
+/// Handshake(127.0.0.1:<port>, DenyListUnread)`).
+#[test]
+fn a_listener_that_has_not_read_its_deny_list_refuses_every_proven_peer_until_it_has() {
+    let secret = FleetSecret::new(&[0x43; 32]).unwrap();
+    let listener_id = identity(&node_of(0x11), 0x11);
+    let peer_id = identity(&node_of(0x31), 0x31);
+    let read = Arc::new(AtomicBool::new(false));
+    let refusals = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = tcp_listener.local_addr().unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let listening = Listening {
+        secret: secret.clone(),
+        scope: FleetScope::Content,
+        node: Some(listener_id),
+        serves: EVERY_OP,
+        slots: 8,
+        per_source: 8,
+        lifetime: HANG,
+    };
+    let server = std::thread::spawn({
+        let running = Arc::clone(&running);
+        let read = Arc::clone(&read);
+        let refusals = Arc::clone(&refusals);
+        move || {
+            crate::fleet::serve_offering_with_ask_within(
+                &tcp_listener,
+                (
+                    &listening,
+                    Arc::new(|| (FleetScope::Content, EVERY_OP)),
+                    Arc::new(move || {
+                        Arc::new(if read.load(Ordering::Acquire) {
+                            crate::fleet::Denied::default()
+                        } else {
+                            crate::fleet::Denied::not_yet_read()
+                        })
+                    }),
+                ),
+                None,
+                &running,
+                HANG,
+                |served, _| served.answer(|s| s.write_all(b"OK 0\n")),
+                move |event| {
+                    if let FleetEvent::Refused { reason, .. } = event {
+                        refusals.lock().unwrap().push(reason);
+                    }
+                },
+            );
+        }
+    });
+    let dial_as = |me: Option<&NodeIdentity>| {
+        dial(
+            "127.0.0.1",
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            addr.port(),
+            (&secret, me),
+            FleetOp::Survey,
+            HANG,
+        )
+    };
+
+    for me in [Some(&peer_id), None] {
+        let Err(err) = dial_as(me) else {
+            panic!("a listener with no deny list read must refuse a proven peer");
+        };
+        assert!(
+            matches!(err, Unreached::Handshake(_, FleetError::AddressBusy)) && !err.disowns(),
+            "expected a busy listener to dial again, got: {err:?}"
+        );
+    }
+    let unread = FleetError::DenyListUnread.to_string();
+    let heard = refusals.lock().unwrap().clone();
+    assert!(
+        heard.len() == 2 && heard.iter().all(|reason| *reason == unread),
+        "the listener names why it refused: {heard:?}"
+    );
+
+    read.store(true, Ordering::Release);
+    if let Err(err) = dial_as(Some(&peer_id)) {
+        panic!("once its deny list is read, the peer must be admitted: {err:?}");
+    }
+
+    running.store(false, Ordering::Release);
+    let _ = TcpStream::connect(addr);
+    let _ = server.join();
+}
+
 #[test]
 fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
     let secret = FleetSecret::new(&[0x42; 32]).unwrap();
@@ -6828,6 +7165,7 @@ fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
     let deny = Arc::new(crate::fleet::Denied {
         nodes: vec![revoked_id.node().to_owned()],
         keys: vec![removed_id.key()],
+        unread: false,
     });
 
     let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -7015,6 +7353,12 @@ fn an_issuer_that_signs_no_entry_is_heartbeat_past_the_three() {
     );
 }
 
+/// Heartbeats go to the members that answer, the issuer dark or not; and this Mac's network place
+/// hears each member that proved its key, where it answered, every round with how many answered,
+/// and the book's admitted members (`note_place`), so the place reads the ALab LAN from proven
+/// answers only.
+/// NEGATIVE CONTROL: dropping the `note_place` call leaves the place's evidence empty, and this
+/// test fails at "the place heard each member that proved its key".
 #[test]
 fn heartbeats_go_to_the_members_that_answer_with_the_issuer_dark() {
     let secret_bytes = [0x55; SECRET_LEN];
@@ -7113,6 +7457,43 @@ fn heartbeats_go_to_the_members_that_answer_with_the_issuer_dark() {
         "{:?}",
         read_answered(a_state.dir())
     );
+    let place_dir = aterm_netplace::record::dir(b_state.dir());
+    let heard = aterm_netplace::heard::read(&place_dir);
+    let mut heard_members: Vec<String> = heard
+        .answers
+        .iter()
+        .map(|answer| answer.member.clone())
+        .collect();
+    heard_members.sort_unstable();
+    heard_members.dedup();
+    let mut proven =
+        [&a, &c].map(|who| aterm_netplace::member_key(aterm_netplace::Lane::Fleet, who.node()));
+    proven.sort_unstable();
+    assert_eq!(
+        heard_members, proven,
+        "the place heard each member that proved its key, never the one the log holds out"
+    );
+    assert!(
+        heard
+            .answers
+            .iter()
+            .all(|answer| answer.addr == Some(IpAddr::from([127, 0, 0, 1]))),
+        "{heard:?}"
+    );
+    assert_eq!(
+        heard
+            .rounds
+            .iter()
+            .map(|round| round.answered)
+            .collect::<Vec<_>>(),
+        [2],
+        "the round, with how many answered"
+    );
+    assert_eq!(
+        aterm_netplace::heard::read_book(&place_dir).map(|book| book.members.len()),
+        Some(2),
+        "the book's members the log admits"
+    );
     let b_book = read_peers(b_state.dir()).unwrap();
     let a_entry = b_book
         .iter()
@@ -7165,6 +7546,119 @@ fn heartbeats_go_to_the_members_that_answer_with_the_issuer_dark() {
         "the dial that missed is noted: {:?}",
         read_missed(b_state.dir())
     );
+    assert!(
+        aterm_netplace::heard::read(&place_dir)
+            .rounds
+            .iter()
+            .any(|round| round.answered == 0),
+        "a round no member answered is heard too"
+    );
+}
+
+/// AWAY, A HEARTBEAT ROUND PASSES OVER THE MEMBERS BEHIND THE ALAB LAN. On a phone hotspot (the
+/// place's facts scripted), the first round on the network dials every member, the one whose
+/// route leaves through the hotspot toward the home LAN too; the next round dials the member it
+/// can reach and passes over that one, which notes no miss of it.
+/// NEGATIVE CONTROLS: dialling every member whatever the pacing says (`Pace::dials` → `true`)
+/// dials the member behind the ALab LAN in the paced round, and "the paced round passes it over"
+/// fails; never dialling a full round (`Round::dials` without `self.full ||`) passes it over in the
+/// first round too, and "the first round on a network dials every member" fails.
+#[cfg(unix)]
+#[test]
+fn away_a_heartbeat_round_passes_over_the_members_behind_the_alab_lan() {
+    let secret_bytes = [0x5a; SECRET_LEN];
+    let secret = FleetSecret::new(&secret_bytes).unwrap();
+    let (a_state, b_state) = (State::new("hb-away-a"), State::new("hb-away-b"));
+    for state in [&a_state, &b_state] {
+        write_key(state.dir(), &secret_bytes).unwrap();
+    }
+    let a = identity(&node_of(0x21), 0x21);
+    let b = identity(&node_of(0x22), 0x22);
+    let behind = identity(&node_of(0x23), 0x23);
+    let log: MemberKeys = [&a, &b, &behind]
+        .map(|who| (who.key(), Standing::Member))
+        .into_iter()
+        .collect();
+    let a_at = Issuing::member(secret.clone(), a_state.dir(), a.clone(), log.clone());
+    // `0.0.0.1` names no host (a dial of it fails at once); the script routes it out through
+    // the hotspot's own interface, the way the home LAN's addresses leave a hotspot. Each entry
+    // was seen now, so no round prunes it as expired.
+    let seen = unix_ms_now();
+    let entry = |who: &NodeIdentity, ip: [u8; 4], port: u16| Peer {
+        node: Some(who.node().to_owned()),
+        host: std::net::Ipv4Addr::from(ip).to_string(),
+        via: Via::Joined,
+        seen_ms: seen,
+        ..keyed(0, who.key(), ip, port)
+    };
+    write_book(
+        b_state.dir(),
+        &[
+            entry(&a, [127, 0, 0, 1], a_at.port),
+            entry(&behind, [0, 0, 0, 1], 7199),
+        ],
+    );
+    let reg = Registration {
+        node: b.node().to_owned(),
+        host: "m12.local".to_owned(),
+        port: 7199,
+        version: "0.148.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let script = aterm_netplace::facts::parse_script(
+        "route en0 172.20.10.2/28 via 172.20.10.1 hw 02:00:00:00:00:01\n\
+         path usable expensive wifi\n\
+         via 0.0.0.1 172.20.10.2\n",
+    );
+    let behind_key = format!("node={}", behind.node());
+    aterm_netplace::facts::script_here(script, || {
+        let round = || {
+            heartbeat_members(
+                b_state.dir(),
+                (&secret, &b),
+                &reg,
+                HANG,
+                (Some(&log), &Vec::new),
+            )
+            .expect("the book reads")
+        };
+        let answered = round();
+        assert_eq!(
+            answered
+                .iter()
+                .map(|done| done.node.as_str())
+                .collect::<Vec<_>>(),
+            [a.node()]
+        );
+        assert!(
+            read_missed(b_state.dir()).contains_key(&behind_key),
+            "the first round on a network dials every member: {:?}",
+            read_missed(b_state.dir())
+        );
+        assert!(
+            read_peers(b_state.dir())
+                .unwrap()
+                .iter()
+                .any(|peer| peer.node.as_deref() == Some(behind.node())),
+            "the member behind the ALab LAN stays in the book"
+        );
+        std::fs::remove_file(b_state.dir().join(ANSWERED_FILE)).expect("the stamps");
+        let answered = round();
+        assert_eq!(
+            answered
+                .iter()
+                .map(|done| done.node.as_str())
+                .collect::<Vec<_>>(),
+            [a.node()],
+            "the member this network reaches"
+        );
+        assert!(
+            !read_missed(b_state.dir()).contains_key(&behind_key),
+            "the paced round passes it over: {:?}",
+            read_missed(b_state.dir())
+        );
+    });
 }
 
 /// A heartbeat round reads, beside the member that answered last, the members it asked longest ago
@@ -9673,4 +10167,125 @@ fn the_per_address_seam_raises_the_allowance_and_never_lowers_it() {
         JOINED_PER_ADDRESS,
         "tests read no seam"
     );
+}
+
+/// A heartbeat dial that got no answer is silence (a timeout, a host down, no route to an
+/// address off this network: the home LAN's addresses from a phone hotspot) or something else
+/// (a host answered and refused, or this Mac's own Local Network privacy refused a connect to an
+/// address on this network), and only silence lets the network place call a remembered home
+/// network one members were once on.
+/// NEGATIVE CONTROL: taking every no-route as silence (`HostUnreachable | ... =>
+/// on_this_network(at.ip())` made `=> false`) reads home with Local Network turned off as
+/// silent, and "this Mac's privacy refused an on-link member" fails.
+#[test]
+fn a_dial_this_mac_or_a_host_refused_is_no_silence() {
+    use std::io::{Error, ErrorKind};
+    let home: IpAddr = "192.168.4.9".parse().unwrap();
+    let off: IpAddr = "10.20.30.40".parse().unwrap();
+    let at = |ip: IpAddr| SocketAddr::new(ip, 7100);
+    let on_link = |addr: IpAddr| addr == home;
+    let off_link = |_: IpAddr| false;
+    let connect = |kind: ErrorKind| Unreached::Connect(at(home), Error::from(kind));
+    assert!(
+        dial_blocked(&connect(ErrorKind::HostUnreachable), on_link),
+        "this Mac's privacy refused an on-link member"
+    );
+    assert!(dial_blocked(&connect(ErrorKind::PermissionDenied), on_link));
+    assert!(
+        !dial_blocked(
+            &Unreached::Connect(at(off), Error::from(ErrorKind::HostUnreachable)),
+            off_link
+        ),
+        "no route to an address off this network is silence"
+    );
+    assert!(dial_blocked(
+        &connect(ErrorKind::ConnectionRefused),
+        off_link
+    ));
+    assert!(!dial_blocked(&connect(ErrorKind::TimedOut), on_link));
+    assert!(!dial_blocked(
+        &Unreached::Deadline(Stage::Connect, Duration::from_secs(1)),
+        on_link
+    ));
+    assert!(dial_blocked(
+        &Unreached::Deadline(Stage::Handshake, Duration::from_secs(1)),
+        off_link
+    ));
+    assert!(dial_blocked(
+        &Unreached::Unproved {
+            at: at(off),
+            node: "n".to_owned()
+        },
+        off_link
+    ));
+}
+
+/// What a check reads of the instance that answered ([`Answerer::of`]): a window's version where
+/// its first `instance` line says `window=1` or no `window=` word (an older aterm's), `Windowless`
+/// for `window=0`, and nothing for a line with no version word, a version that is not one (a
+/// peer's escape bytes never reach the `peers` table), or a `window=` word other than 0 or 1.
+/// NEGATIVE CONTROL: an `of` that reads `version=` whatever `window=` says fails "a node job with
+/// no window open"; one that keeps a version unchecked fails "an escape is no version".
+#[test]
+fn a_check_reads_which_instance_answered_from_its_instance_line() {
+    let of =
+        |lines: &[&str]| Answerer::of(&lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>());
+    let window = |v: &str| Answerer::Window(v.to_owned());
+    assert_eq!(
+        of(&["instance pid=7 host=m16 version=0.146.0 sessions=6 node=n window=1 window_last=9"]),
+        window("0.146.0"),
+        "a window"
+    );
+    assert_eq!(
+        of(&["instance pid=7 host=m version=0.147.0 sessions=0 node=n instances=0 window=0"]),
+        Answerer::Windowless,
+        "a node job with no window open"
+    );
+    assert_eq!(
+        of(&["instance pid=1 host=m version=0.95.0 sessions=0 node=n"]),
+        window("0.95.0"),
+        "an older aterm's window says no window= word"
+    );
+    assert_eq!(
+        of(&["instance pid=1 host=m version=0.148.0%2Bg5bb7817df4 window=1"]),
+        window("0.148.0+g5bb7817df4"),
+        "a version is pct-decoded"
+    );
+    assert_eq!(
+        of(&["instance pid=1 host=m version=%1B%5B2J window=1"]),
+        Answerer::Unsaid,
+        "an escape is no version"
+    );
+    assert_eq!(
+        of(&["instance pid=1 host=m window=1"]),
+        Answerer::Unsaid,
+        "no version"
+    );
+    assert_eq!(
+        of(&["instance pid=1 version=0.1.0 window=2"]),
+        Answerer::Unsaid,
+        "a window= word other than 0 or 1"
+    );
+    assert_eq!(of(&["s1 phase=idle"]), Answerer::Unsaid, "no instance line");
+    assert_eq!(
+        of(&[
+            "instance pid=1 version=0.146.0 window=1",
+            "instance pid=2 version=0.147.0 window=1"
+        ]),
+        window("0.146.0"),
+        "the first instance line"
+    );
+}
+
+/// `addresses_within` hands back what a dial's lookup walks: an IP literal as itself, and nothing
+/// for a name the loopback guard refuses or no time is left to look up.
+#[test]
+fn addresses_within_is_the_dials_lookup() {
+    assert_eq!(
+        addresses_within("192.168.1.237", Duration::ZERO),
+        [IpAddr::from([192, 168, 1, 237])]
+    );
+    assert!(addresses_within("m22.local", Duration::ZERO).is_empty());
+    let guarded = crate::loopback::forced(true, || addresses_within("m22.local", HANG));
+    assert!(guarded.is_empty(), "{guarded:?}");
 }

@@ -131,6 +131,9 @@ impl TerminalHandler<'_> {
         let width = char_width(translated, self.modes.ambiguous_width_double);
 
         if width == 0 {
+            if is_c1_control(translated) {
+                return;
+            }
             self.transient.last_combining_was_zwj = translated == '\u{200D}';
             self.add_combining_to_previous_cell(translated);
             if translated == '\u{FE0F}' {
@@ -340,6 +343,10 @@ impl TerminalHandler<'_> {
             } else {
                 let width = char_width(c, cjk);
                 if width == 0 {
+                    if is_c1_control(c) {
+                        i += 1;
+                        continue;
+                    }
                     self.transient.last_combining_was_zwj = c == '\u{200D}';
                     self.add_combining_to_previous_cell(c);
                     if c == '\u{FE0F}' {
@@ -532,45 +539,45 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// The cell a zero-width mark attaches to: [`Self::preceding_cell`], or the cell under the cursor when none exists.
+    /// The cell a zero-width mark attaches to: [`Self::preceding_cell`], or when none exists the
+    /// glyph under the cursor, a wide one's lead if the cursor stands on its spacer (a left margin
+    /// can fall there).
     #[inline]
     fn combining_target_cell(&self) -> (u16, u16) {
-        self.preceding_cell()
-            .unwrap_or((self.grid.cursor_row(), self.grid.cursor_col()))
+        self.preceding_cell().unwrap_or_else(|| {
+            let (row, col) = (self.grid.cursor_row(), self.grid.cursor_col());
+            if col > 0 && self.grid.is_wide_continuation_at(row, col) {
+                (row, col - 1)
+            } else {
+                (row, col)
+            }
+        })
     }
 
+    /// The glyph a zero-width mark continues: the parked one under a pending wrap, else the one
+    /// left of the cursor, and a wide glyph's lead rather than its spacer. Column 0 and the left
+    /// margin have none, on a row that continues the one above too, and no mark reaches across
+    /// a left margin (xterm's `char_was_written` cleared by CR or a motion gives the cursor's
+    /// own cell there, as Alacritty's zero-width push does).
     fn preceding_cell(&self) -> Option<(u16, u16)> {
         let row = self.grid.cursor_row();
         let col = self.grid.cursor_col();
+        let at_left_margin =
+            self.grid.has_horizontal_margins() && col == self.grid.horizontal_margins().left;
 
-        if col == 0 && row == 0 && !self.grid.pending_wrap() {
-            return None;
-        }
-
-        let (target_row, target_col) = if self.grid.pending_wrap() {
-            (row, col)
-        } else if col > 0 {
-            (row, col - 1)
+        let target_col = if self.grid.pending_wrap() {
+            col
+        } else if col > 0 && !at_left_margin {
+            col - 1
         } else {
-            let is_continuation = self.grid.row(row).is_some_and(aterm_grid::Row::is_wrapped);
-            if !is_continuation {
-                return None;
-            }
-            let prev_row = row.saturating_sub(1);
-            (
-                prev_row,
-                self.grid.effective_cols_for_row(prev_row).saturating_sub(1),
-            )
+            return None;
         };
 
-        let (final_row, final_col) =
-            if target_col > 0 && self.grid.is_wide_continuation_at(target_row, target_col) {
-                (target_row, target_col - 1)
-            } else {
-                (target_row, target_col)
-            };
-
-        Some((final_row, final_col))
+        if target_col > 0 && self.grid.is_wide_continuation_at(row, target_col) {
+            Some((row, target_col - 1))
+        } else {
+            Some((row, target_col))
+        }
     }
 
     fn add_combining_to_previous_cell(&mut self, combining: char) {
@@ -597,6 +604,18 @@ impl TerminalHandler<'_> {
                 .or_else(|| extra.complex_char().and_then(|s| s.chars().next_back()))
                 == Some(ZWJ)
         })
+    }
+
+    /// Where a selector's change of width has to stop for the glyph at `(row, col)`, one past the
+    /// last column it may use: the right margin of a glyph inside it, as a wide glyph's own write
+    /// stops there, else the row's end.
+    fn cluster_line_end(&self, row: u16, col: u16) -> u16 {
+        let right = self.grid.horizontal_margins().right;
+        if self.grid.has_horizontal_margins() && col <= right {
+            right.saturating_add(1)
+        } else {
+            self.grid.effective_cols_for_row(row)
+        }
     }
 
     fn widen_previous_cell_for_vs16(&mut self) {
@@ -626,7 +645,7 @@ impl TerminalHandler<'_> {
 
         let cont_col = col + 1;
 
-        if cont_col >= self.grid.effective_cols_for_row(row) {
+        if cont_col >= self.cluster_line_end(row, col) {
             return;
         }
 
@@ -637,6 +656,9 @@ impl TerminalHandler<'_> {
             colors.without_extras_flag(),
             base_flags.wide_continuation_of(),
         );
+        // A glyph the spacer cuts in half goes whole: its other half takes the writer's BCE blank,
+        // as a print over half a wide glyph blanks it.
+        let fill = Cell::bce_blank(self.style.cached_colors());
         let ecols = self.grid.effective_cols_for_row(row);
         let orphan_col = if self.grid.cell(row, cont_col).is_some_and(Cell::is_wide) {
             let oc = cont_col + 1;
@@ -657,7 +679,7 @@ impl TerminalHandler<'_> {
                     if existing.flags().contains(CellFlags::WIDE) {
                         let orphan_col = cont_col + 1;
                         if orphan_col < row_data.cols() {
-                            row_data.set(orphan_col, crate::grid::Cell::EMPTY);
+                            row_data.set(orphan_col, fill);
                         }
                     }
                 }
@@ -672,6 +694,9 @@ impl TerminalHandler<'_> {
         self.mirror_vs16_spacer_extras(row, col, cont_col);
 
         if let Some(oc) = orphan_col {
+            if fill.colors().bg_is_rgb() {
+                self.grid.fill_bce_rgb_range(row, oc, oc.saturating_add(1));
+            }
             self.grid.damage_mut().mark_cell(row, oc);
         }
         self.grid.damage_mut().mark_cell(row, col);
@@ -732,7 +757,7 @@ impl TerminalHandler<'_> {
         let base_flags = cell.flags();
 
         let cont_col = col + 1;
-        if cont_col >= self.grid.effective_cols_for_row(row) {
+        if cont_col >= self.cluster_line_end(row, col) {
             return;
         }
 
@@ -821,6 +846,13 @@ impl TerminalHandler<'_> {
         self.add_combining_to_previous_cell(ri);
         true
     }
+}
+
+/// Whether a character is a C1 control (U+0080-U+009F), which the UTF-8 decoder hands the print
+/// path. It takes no column and is no mark, so it changes nothing: a cell never holds a control.
+#[inline]
+const fn is_c1_control(c: char) -> bool {
+    matches!(c as u32, 0x80..=0x9F)
 }
 
 /// Whether a character is a regional indicator (U+1F1E6-U+1F1FF). A local
@@ -935,6 +967,110 @@ mod tests {
             term.grid().cell_extra(0, 1).is_none(),
             "the cell under the cursor is untouched while a left cell exists"
         );
+    }
+
+    #[test]
+    fn a_c1_control_from_utf8_changes_nothing() {
+        // `a` then one control: the single-glyph lane; between two U+00E9s: the bulk lane.
+        for text in ["a\u{9b}b", "\u{e9}\u{9b}\u{e9}\u{85}b"] {
+            for term in whole_and_fragmented(text) {
+                assert_eq!(
+                    term.cell_grapheme(0, 0).as_deref(),
+                    Some(&text[..text.chars().next().map_or(0, char::len_utf8)]),
+                    "{text:?}: no cell holds the control"
+                );
+                assert!(
+                    (0..4).all(|col| term.grid().cell_extra(0, col).is_none()),
+                    "{text:?}"
+                );
+            }
+        }
+        // And it leaves a joiner open, as it leaves everything.
+        for term in whole_and_fragmented("\u{1F468}\u{200D}\u{9b}\u{1F4BB}") {
+            assert_eq!(
+                term.grid().cell_extra(0, 0).map(|e| e.combining()),
+                Some(['\u{200D}', '\u{1F4BB}'].as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn a_mark_at_column_0_of_a_continued_row_accents_that_cell() {
+        let mut term = Terminal::new(2, 4);
+        term.process("abcde\r\u{301}".as_bytes());
+        assert!(
+            term.grid().row(1).is_some_and(aterm_grid::Row::is_wrapped),
+            "precondition: the row continues the one above"
+        );
+        assert!(
+            term.grid().cell_extra(0, 3).is_none(),
+            "the glyph that ends the row above keeps its text (xterm, Alacritty)"
+        );
+        assert_eq!(
+            term.grid().cell_extra(1, 0).map(|e| e.combining()),
+            Some(['\u{301}'].as_slice())
+        );
+    }
+
+    #[test]
+    fn a_mark_at_a_left_margin_stays_inside_it() {
+        let mut term = Terminal::new(1, 10);
+        term.process("abc\x1b[?69h\x1b[3;6s\x1b[1;3H\u{301}".as_bytes());
+        assert!(
+            term.grid().cell_extra(0, 1).is_none(),
+            "the cell outside the margin is another region's"
+        );
+        assert_eq!(
+            term.grid().cell_extra(0, 2).map(|e| e.combining()),
+            Some(['\u{301}'].as_slice())
+        );
+    }
+
+    #[test]
+    fn a_mark_on_a_spacer_at_a_left_margin_rides_the_lead() {
+        let mut term = Terminal::new(1, 10);
+        term.process("\u{4E2D}\x1b[?69h\x1b[2;6s\x1b[1;2H\u{301}".as_bytes());
+        assert_eq!(term.cell_grapheme(0, 0).as_deref(), Some("\u{4E2D}\u{301}"));
+        assert!(term.grid().cell_extra(0, 1).is_none());
+    }
+
+    #[test]
+    fn a_selector_changes_no_width_across_a_right_margin() {
+        let mut term = Terminal::new(1, 8);
+        term.process("\x1b[?69h\x1b[1;2sa\u{2600}\u{FE0F}".as_bytes());
+        let grid = term.grid();
+        assert!(
+            !grid.cell(0, 1).is_some_and(|c| c.is_wide()),
+            "the VS16 glyph stays narrow on the margin's last column"
+        );
+        assert!(grid.pending_wrap(), "and its wrap stays pending");
+        assert_eq!(
+            term.cell_grapheme(0, 1).as_deref(),
+            Some("\u{2600}\u{FE0F}")
+        );
+
+        let mut term = Terminal::new(1, 8);
+        term.process("x\u{1F600}\x1b[?69h\x1b[1;2s\x1b[1;3H\u{FE0E}".as_bytes());
+        assert!(
+            term.grid().cell(0, 1).is_some_and(|c| c.is_wide()),
+            "a glyph straddling the margin keeps both cells, as a VS15 on the line's edge does"
+        );
+    }
+
+    #[test]
+    fn a_vs16_that_cuts_a_wide_glyph_blanks_its_other_half_in_the_pen() {
+        let mut term = Terminal::new(1, 8);
+        term.process("\u{2600}\u{4E2D}\x1b[44m\x1b[1;2H\u{FE0F}".as_bytes());
+        let orphan = *term.grid().cell(0, 2).expect("the orphan's cell");
+        assert_eq!(orphan.char(), ' ');
+        assert!(
+            orphan.colors().bg_is_indexed() && orphan.colors().bg_index() == 4,
+            "a print over half a wide glyph blanks the other half with the BCE blank"
+        );
+
+        let mut term = Terminal::new(1, 8);
+        term.process("\u{2600}\u{4E2D}\x1b[48;2;1;2;3m\x1b[1;2H\u{FE0F}".as_bytes());
+        assert_eq!(term.grid().bg_rgb_at(0, 2), Some([1, 2, 3]));
     }
 
     #[test]

@@ -299,6 +299,140 @@ fn example_c_a_cargo_lock_wait_is_capped_until_named_then_fine_behind_a_running_
 }
 
 #[test]
+fn a_named_lock_counts_by_its_holder_after_polling_and_expires_on_progress() {
+    for (holder, stopped) in [(Some(5120), false), (None, false), (Some(5120), true)] {
+        let mut w = World::new();
+        for _ in 0..OWN_MIN {
+            w.jobs
+                .learn(&command_class("cargo build", JobKind::Shell), 12_000);
+        }
+        w.shell_tab(2, 2, 210);
+        w.run_fg(2, 61, "cargo build", sleeper(5120, "cargo"));
+        if stopped {
+            w.p(5120).state = ProcState::Stopped;
+        }
+        let mut waiter = sleeper(7700, "cargo");
+        waiter.syscalls_per_s = 40;
+        waiter.wakeups_per_s = 20;
+        w.run_fg(1, 77, "cargo build", waiter);
+        let before = run_to(&mut w, 240_000, |w, _| {
+            if !stopped {
+                w.line(2);
+            }
+        });
+        let row = before.row("b77").unwrap();
+        assert_eq!((row.class, row.verdict), (Class::Polling, Verdict::Stuck));
+        assert_eq!(
+            before.row("b61").unwrap().class,
+            if stopped {
+                Class::Stopped
+            } else {
+                Class::Running
+            }
+        );
+
+        w.advance(TICK_MS);
+        if !stopped {
+            w.line(2);
+        }
+        w.name(
+            1,
+            NamedWait {
+                leader: 7700,
+                word: TierB::Lock,
+                holder,
+            },
+        );
+        let first = w.observe();
+        let row = first.row("b77").unwrap();
+        assert_eq!(row.class, Class::Waiting);
+        assert_eq!(row.named.as_ref().map(|n| n.word), Some(TierB::Lock));
+        assert_eq!(
+            row.verdict,
+            Verdict::Stuck,
+            "legitimacy still takes two ticks"
+        );
+        w.advance(TICK_MS);
+        if !stopped {
+            w.line(2);
+        }
+        let after = w.observe();
+        let row = after.row("b77").unwrap();
+        assert_eq!(row.class, Class::Waiting);
+        assert_eq!(row.named.as_ref().map(|n| n.word), Some(TierB::Lock));
+        assert!(row.tick.progress.is_none(), "the waiter printed nothing");
+        if holder.is_none() || stopped {
+            assert_eq!(row.verdict, Verdict::Stuck);
+            assert_eq!(row.standing, Some(aterm_vitals::jobs::Standing::Capable));
+            assert!(row.phi_milli.is_some_and(|phi| phi >= 8_000));
+            let said = row.said();
+            assert!(
+                said.split_whitespace()
+                    .any(|word| word == TierB::Lock.word())
+            );
+            if let Some(pid) = holder {
+                assert!(said.contains(&pid.to_string()));
+                let mut unsafe_name = row.clone();
+                unsafe_name
+                    .named
+                    .as_mut()
+                    .unwrap()
+                    .holder
+                    .as_mut()
+                    .unwrap()
+                    .exe = "co\u{202e}mp\niler\0".into();
+                let said = unsafe_name.said();
+                assert!(said.contains(&pid.to_string()));
+                assert!(said.chars().all(|c| !c.is_control() && c != '\u{202e}'));
+            } else {
+                assert!(said.contains("unknown"));
+            }
+            let mut polling = row.clone();
+            polling.class = Class::Polling;
+            let named = polling.said();
+            polling.named = None;
+            assert_eq!(
+                named,
+                polling.said(),
+                "polling keeps its stronger explanation"
+            );
+            for word in [TierB::Read, TierB::Event, TierB::Unparsed] {
+                let mut unconfirmed = row.clone();
+                unconfirmed.wait.as_mut().unwrap().name = WaitName::Tcp;
+                unconfirmed.named.as_mut().unwrap().word = word;
+                let named = unconfirmed.said();
+                unconfirmed.named = None;
+                assert_eq!(named, unconfirmed.said());
+            }
+            continue;
+        }
+        assert_eq!(row.verdict, Verdict::Fine);
+        assert_eq!(row.standing, Some(aterm_vitals::jobs::Standing::Legit));
+        assert_eq!(row.phi_milli, Some(0));
+        let owner = row.named.as_ref().unwrap().holder.as_ref().unwrap();
+        assert_eq!((owner.pid, owner.class), (5120, Some(Class::Running)));
+
+        w.advance(TICK_MS);
+        w.line(1);
+        w.line(2);
+        let progress = w.observe();
+        let row = progress.row("b77").unwrap();
+        assert_eq!((row.class, row.verdict), (Class::Running, Verdict::Fine));
+        assert!(
+            row.named.is_none(),
+            "a real output invalidates the old naming"
+        );
+        let after = run_to(&mut w, 240_000, |w, _| w.line(2));
+        let row = after.row("b77").unwrap();
+        assert_eq!((row.class, row.verdict), (Class::Polling, Verdict::Stuck));
+        assert!(
+            row.named.is_none(),
+            "the prior episode grants no future wait"
+        );
+    }
+}
+
+#[test]
 fn example_d_tail_f_in_an_agent_foreground_call_never_returns() {
     let mut w = World::new();
     let mut tail = sleeper(8103, "tail");

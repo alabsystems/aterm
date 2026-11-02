@@ -5,6 +5,7 @@
 
 use super::caps::Caps;
 use super::engines::{Astream, Aterm, Snap};
+use astream_term::screen::MAX_COMBINING;
 use std::fmt::Write as _;
 
 /// splitmix64: dependency-free, and the same stream on every host.
@@ -287,20 +288,84 @@ fn num(r: &mut Rng, limit: u16) -> String {
 
 /// East Asian Wide and Fullwidth glyphs every width table agrees on (CJK ideographs, kana,
 /// Hangul, fullwidth forms): Unicode's East Asian Width, xterm's `wcwidth`, Ghostty's and aterm's
-/// tables all give each two columns. Emoji are left out: their width turns on presentation
-/// selectors and grapheme rules the engines draw differently.
+/// tables all give each two columns. Emoji come apart, as [`CLUSTER_PIECES`], for what a selector
+/// or a neighbour does to them.
 const WIDE_GLYPHS: &[char] = &[
     '\u{4e2d}', '\u{6587}', '\u{3042}', '\u{30a2}', '\u{ac00}', '\u{ff21}', '\u{ff57}',
 ];
 
-/// `len` glyphs, one in four wide when the fold models wide glyphs.
-fn text(r: &mut Rng, len: usize, wide: bool) -> Vec<u8> {
+/// Assigned combining marks (General Category Mn or Me) every width table leaves no column:
+/// Combining Diacritical Marks, Cyrillic, Hebrew, Arabic and Thai. Variation selectors and the
+/// joiner, which can change a glyph's width or the next glyph's cell, are [`CLUSTER_PIECES`].
+pub const MARK_RANGES: &[(u32, u32)] = &[
+    (0x300, 0x36F),
+    (0x483, 0x489),
+    (0x591, 0x5BD),
+    (0x5BF, 0x5BF),
+    (0x5C1, 0x5C2),
+    (0x5C4, 0x5C5),
+    (0x5C7, 0x5C7),
+    (0x64B, 0x65F),
+    (0x670, 0x670),
+    (0xE31, 0xE31),
+    (0xE34, 0xE3A),
+    (0xE47, 0xE4E),
+];
+
+/// One or a few marks; now and then more than the cap of a cell, so a cell's last ones drop.
+fn push_marks(r: &mut Rng, s: &mut String) {
+    let n = if r.chance(1, 16) {
+        MAX_COMBINING as u64 + 1 + r.below(3)
+    } else {
+        1 + r.below(3)
+    };
+    for _ in 0..n {
+        let (lo, hi) = r.pick(MARK_RANGES);
+        let u = lo + r.below(u64::from(hi - lo) + 1) as u32;
+        s.extend(char::from_u32(u));
+    }
+}
+
+/// What a cluster is built from: text-default emoji a VS16 widens (and one that is not), emoji
+/// a VS15 narrows and a skin tone may join, regional indicators, the skin tones, the selectors and
+/// the joiner.
+const CLUSTER_PIECES: &[char] = &[
+    '\u{a9}',
+    '\u{2600}',
+    '\u{261d}',
+    '\u{2764}',
+    '\u{2713}',
+    '\u{1f600}',
+    '\u{1f44d}',
+    '\u{1f468}',
+    '\u{1f4bb}',
+    '\u{1f1fa}',
+    '\u{1f1f8}',
+    '\u{1f3fb}',
+    '\u{1f3fd}',
+    '\u{fe0f}',
+    '\u{fe0f}',
+    '\u{fe0e}',
+    '\u{fe0e}',
+    '\u{200d}',
+    '\u{200d}',
+];
+
+/// `len` glyphs, one in four wide when the fold models wide glyphs, one in eight followed by
+/// marks when it models marks.
+fn text(r: &mut Rng, len: usize, caps: Caps) -> Vec<u8> {
     let mut s = String::new();
     for _ in 0..len {
-        if wide && r.chance(1, 4) {
+        if caps.wide_glyphs && r.chance(1, 4) {
             s.push(r.pick(WIDE_GLYPHS));
         } else {
             s.push(r.pick(GLYPHS));
+        }
+        if caps.combining_marks && r.chance(1, 8) {
+            push_marks(r, &mut s);
+        }
+        if caps.clusters && r.chance(1, 8) {
+            s.push(r.pick(CLUSTER_PIECES));
         }
     }
     s.into_bytes()
@@ -469,10 +534,10 @@ impl Gen {
         let (cols, rows, caps) = (self.cols, self.rows, self.caps);
         let lim = cols.max(rows);
         let r = &mut self.r;
-        let plain = match r.below(40) {
+        let plain = match r.below(43) {
             0..=8 => {
                 let n = run_len(r, cols);
-                text(r, n, caps.wide_glyphs)
+                text(r, n, caps)
             }
             9..=12 => {
                 let mut set: Vec<&[u8]> =
@@ -515,7 +580,7 @@ impl Gen {
                     _ => rgb(r, 48),
                 };
                 t.extend(csi(&bg, 'm'));
-                t.extend(text(r, len, caps.wide_glyphs));
+                t.extend(text(r, len, caps));
                 if r.chance(1, 2) {
                     t.extend(erase(r, caps));
                 }
@@ -594,7 +659,7 @@ impl Gen {
                 };
                 if r.chance(1, 3) {
                     let n = run_len(r, cols);
-                    t.extend(text(r, n, caps.wide_glyphs));
+                    t.extend(text(r, n, caps));
                 }
                 t
             }
@@ -625,9 +690,20 @@ impl Gen {
                 };
                 return (Kind::Resize { cols: to }, Vec::new());
             }
+            // Marks with no glyph before them, wherever the tokens so far left the cursor: from a
+            // pending wrap, at column 0, at a left margin, after a motion.
+            40..=42 if caps.combining_marks => {
+                let mut s = String::new();
+                push_marks(r, &mut s);
+                if caps.clusters && r.chance(1, 2) {
+                    s.clear();
+                    s.push(r.pick(CLUSTER_PIECES));
+                }
+                s.into_bytes()
+            }
             _ => {
                 let n = run_len(r, cols);
-                text(r, n, caps.wide_glyphs)
+                text(r, n, caps)
             }
         };
         (Kind::Plain, plain)
@@ -682,6 +758,91 @@ pub struct Mismatch {
     pub aterm: Snap,
 }
 
+/// The edits a mark's cell can move or go by: their final bytes, and what each does.
+pub const MARK_OPS: [(u8, &str); 9] = [
+    (b'@', "ICH"),
+    (b'P', "DCH"),
+    (b'X', "ECH"),
+    (b'L', "IL"),
+    (b'M', "DL"),
+    (b'S', "SU"),
+    (b'T', "SD"),
+    (b'J', "ED"),
+    (b'K', "EL"),
+];
+
+/// Where the generated marks landed (see `clusters::the_generated_marks_reach_every_placement`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MarkReach {
+    /// A mark fed with a wrap pending.
+    pub from_wrap: u64,
+    /// A mark fed with a cell left of the cursor to take it.
+    pub left_of_cursor: u64,
+    /// A mark fed at column 0 of a row that continues no other.
+    pub at_column_0: u64,
+    /// A mark fed at column 0 of a row that continues the one above.
+    pub at_wrapped_column_0: u64,
+    /// A mark fed at a left margin past column 0.
+    pub at_left_margin: u64,
+    /// Chunks after which a cell holds as many marks as it can.
+    pub at_cap: u64,
+    /// Width changes applied with a mark on the screen.
+    pub resized: u64,
+    /// Per [`MARK_OPS`], the chunks of that edit that changed where marks are.
+    pub moved_by: [u64; MARK_OPS.len()],
+}
+
+impl MarkReach {
+    fn before(&mut self, chunk: &[u8], t: &Aterm) {
+        let Some(c) = std::str::from_utf8(chunk)
+            .ok()
+            .and_then(|s| s.chars().next())
+        else {
+            return;
+        };
+        if astream_term::char_display_width(c) != 0 || c.is_control() {
+            return;
+        }
+        let p = t.mark_placement();
+        if p.wrap {
+            self.from_wrap += 1;
+        } else if p.col == 0 {
+            if p.continued {
+                self.at_wrapped_column_0 += 1;
+            } else {
+                self.at_column_0 += 1;
+            }
+        } else if p.at_left_margin {
+            self.at_left_margin += 1;
+        } else {
+            self.left_of_cursor += 1;
+        }
+    }
+
+    fn after(&mut self, chunk: &[u8], before: &Snap, after: &Snap) {
+        if after
+            .cells
+            .iter()
+            .any(|c| c.marks.as_slice().len() == MAX_COMBINING)
+        {
+            self.at_cap += 1;
+        }
+        let edit = chunk.first() == Some(&0x1b)
+            && before
+                .cells
+                .iter()
+                .zip(&after.cells)
+                .any(|(b, a)| b.marks != a.marks);
+        if edit
+            && let Some(i) = chunk
+                .last()
+                .and_then(|f| MARK_OPS.iter().position(|(op, _)| op == f))
+        {
+            self.moved_by[i] += 1;
+        }
+    }
+}
+
 /// What the resizes of a run started from (see `resizes::the_generated_resizes_reach_the_rule`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Reach {
@@ -701,6 +862,8 @@ pub struct Reach {
     pub cut_off: u64,
     /// Width changes applied with the cursor on a row that continues the one above.
     pub on_continuation: u64,
+    /// Where the marks landed.
+    pub marks: MarkReach,
 }
 
 /// Run `p` through both engines, comparing after every chunk.
@@ -721,6 +884,7 @@ pub fn run_reaching(p: &Program, reach: &mut Reach) -> Option<Mismatch> {
             aterm: st,
         });
     }
+    let mut last = st;
     for (i, tok) in p.tokens.iter().enumerate() {
         if let Kind::Resize { cols } = tok.kind {
             // One that aterm's main-screen rewrap would make move cells, the fold cannot judge.
@@ -738,6 +902,8 @@ pub fn run_reaching(p: &Program, reach: &mut Reach) -> Option<Mismatch> {
                 reach.past_text += moved * u64::from(past_text);
                 reach.cut_off += u64::from(!before.wrap && before.cursor.1 >= cols);
                 reach.on_continuation += moved * u64::from(on_continuation);
+                reach.marks.resized +=
+                    moved * u64::from(before.cells.iter().any(|c| !c.marks.as_slice().is_empty()));
                 a.resize(cols, p.rows);
                 t.resize(cols, p.rows);
             }
@@ -750,9 +916,11 @@ pub fn run_reaching(p: &Program, reach: &mut Reach) -> Option<Mismatch> {
                     aterm: st,
                 });
             }
+            last = st;
             continue;
         }
         for chunk in &tok.chunks {
+            reach.marks.before(chunk, &t);
             a.feed(chunk);
             t.feed(chunk);
             let (sa, st) = (a.snap(), t.snap());
@@ -764,6 +932,8 @@ pub fn run_reaching(p: &Program, reach: &mut Reach) -> Option<Mismatch> {
                     aterm: st,
                 });
             }
+            reach.marks.after(chunk, &last, &st);
+            last = st;
         }
     }
     None
@@ -794,6 +964,34 @@ pub fn shrink(p: &Program, first: &Mismatch, caps: Caps) -> (Program, Mismatch) 
             if let Some(m) = run(&cand) {
                 best = cand;
                 why = m;
+            }
+        }
+    }
+    // A run of plain text can be long: cut it down glyph by glyph. No escape sequence is cut, so
+    // the program stays in the subset.
+    for i in 0..best.tokens.len() {
+        for c in 0..best.tokens[i].chunks.len() {
+            let Some(text) = std::str::from_utf8(&best.tokens[i].chunks[c])
+                .ok()
+                .filter(|t| !t.contains('\x1b'))
+            else {
+                continue;
+            };
+            let mut glyphs: Vec<char> = text.chars().collect();
+            let mut g = 0;
+            while g < glyphs.len() {
+                let mut fewer = glyphs.clone();
+                fewer.remove(g);
+                let mut cand = best.clone();
+                cand.tokens[i].chunks[c] = fewer.iter().collect::<String>().into_bytes();
+                match run(&cand) {
+                    Some(m) => {
+                        best = cand;
+                        why = m;
+                        glyphs = fewer;
+                    }
+                    None => g += 1,
+                }
             }
         }
     }

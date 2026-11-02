@@ -162,7 +162,7 @@ pub fn retired_jobs(paths: &Paths, exe: &Path) -> Vec<(String, PathBuf)> {
 
 /// [`retired_jobs`], asking another program whether it has the old verb with `has_verb`.
 #[cfg(unix)]
-fn retired_jobs_with(
+pub(crate) fn retired_jobs_with(
     paths: &Paths,
     exe: &Path,
     has_verb: impl Fn(&Path) -> Option<bool>,
@@ -178,7 +178,7 @@ fn retired_jobs_with(
 /// 0.144.0 answers `help caffeine` ([`old_verb_probe_args`]) with 0, and every later one with an
 /// error ([`crate::code::answers`]). `None` when it gave no answer.
 #[cfg(unix)]
-fn has_old_verb(program: &Path) -> Option<bool> {
+pub(crate) fn has_old_verb(program: &Path) -> Option<bool> {
     crate::code::answers(program, old_verb_probe_args())
 }
 

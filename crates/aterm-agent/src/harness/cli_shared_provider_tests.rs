@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// Unix only, where `shared_provider::read_staged_bytes` reads owner-private staged bytes;
+/// off Unix `shared_provider_private_snapshot_refuses_where_private_evidence_is_unavailable`
+/// holds the refusal.
+#[cfg(unix)]
 #[test]
 fn shared_provider_private_snapshot_detects_same_identity_token_replacement_and_creation() {
     let temp = aterm_tempfile::tempdir().unwrap();
@@ -19,6 +23,30 @@ fn shared_provider_private_snapshot_detects_same_identity_token_replacement_and_
     original.check_current().unwrap();
     std::fs::write(&path, b"synthetic-other").unwrap();
     assert!(original.check_current().is_err());
+}
+
+/// Off Unix `shared_provider::read_staged_bytes` refuses staged file reads rather than trusting
+/// unverified file permissions.
+#[cfg(not(unix))]
+#[test]
+fn shared_provider_private_snapshot_refuses_where_private_evidence_is_unavailable() {
+    let temp = aterm_tempfile::tempdir().unwrap();
+    let path = temp.path().join(".credentials.json");
+    for present in [false, true] {
+        if present {
+            std::fs::write(&path, b"synthetic-first").unwrap();
+        }
+        for private in [false, true] {
+            let err = match PrivateSnapshot::read(path.clone(), private) {
+                Ok(_) => panic!("expected off-Unix refusal (present={present}, private={private})"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err,
+                "private shared-login evidence is unavailable on this platform"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]

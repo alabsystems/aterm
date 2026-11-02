@@ -24,7 +24,7 @@ fn parse(value: Option<&OsStr>, guard: Option<&OsStr>) -> crate::Result<Option<u
         .filter(|port| *port != 0);
     match (port, guard) {
         (Some(port), Some(guard)) if guard == "1" => Ok(Some(port)),
-        _ => Err(crate::Error(format!(
+        _ => Err(crate::Error::new(&format!(
             "{} requires a nonzero port and {}=1; refusing the attachment",
             super::LOOPBACK_PORT_ENV,
             aterm_net::loopback::SEAM,

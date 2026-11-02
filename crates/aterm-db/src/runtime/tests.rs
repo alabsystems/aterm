@@ -253,6 +253,72 @@ fn tries_in_ten_minutes(each: Duration, mut wait: impl FnMut() -> Duration) -> u
     tries
 }
 
+/// Real control-writer and custody contention use the runtime's failure adapter,
+/// then its retry scheduler. Virtual attempts require no wall-clock delay.
+#[test]
+fn local_writer_contention_keeps_a_bounded_retry_instead_of_failure_backoff() {
+    let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let held = crate::table::Session::open(&bootstrap).unwrap();
+    let mut refusals = Refusals::new(false);
+    let mut waits = Vec::new();
+    for _ in 0..8 {
+        let error = Endpoint::from_bootstrap_until(&bootstrap, Instant::now())
+            .err()
+            .expect("the other local session owns the control journal");
+        let status = refusal("control endpoint")(error);
+        assert_eq!(status, Status::Retrying("control endpoint"));
+        waits.push(refusals.after(Some(status), None));
+    }
+    assert_eq!(
+        waits,
+        vec![POLL; 8],
+        "temporary writer contention must not accumulate the permanent-failure backoff"
+    );
+    drop(held);
+    assert!(Endpoint::from_bootstrap(&bootstrap).unwrap().is_some());
+
+    let custody = aterm_uds::private_file::PrivateLock::take(
+        &lab.paths[0].dir,
+        "commons.lock",
+        Duration::ZERO,
+        "held",
+    )
+    .unwrap();
+    let error = Bootstrap::required_with_journal_until(&lab.paths[0], Instant::now())
+        .err()
+        .expect("the other custody observation still owns its lock");
+    let status = refusal("secrets custody")(error);
+    assert_eq!(status, Status::Retrying("secrets custody"));
+    assert_eq!(refusals.after(Some(status), None), POLL);
+    drop(custody);
+}
+
+#[test]
+fn unclassified_io_and_error_words_keep_persistent_refusal_backoff() {
+    let statuses = [
+        refusal("transport")(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            crate::BUSY,
+        )),
+        refusal("transport")(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "network timeout",
+        )),
+        refusal("transport")(crate::Error::new(crate::BUSY)),
+    ];
+    let mut refusals = Refusals::new(false);
+    let waits: Vec<_> = statuses
+        .into_iter()
+        .map(|status| {
+            assert_eq!(status, Status::Refused("transport"));
+            refusals.after(Some(status), None)
+        })
+        .collect();
+    let base = TICK * 2;
+    assert_eq!(waits, [base, base * 2, base * 4]);
+}
+
 /// A window's owner tries a persistent refusal (local configuration or trust state) again at a
 /// doubling wait, up to [`REFUSED_MAX`], not every 200 ms: each try rebuilds custody, an endpoint
 /// and a transport. The background owner keeps [`POLL`], so it yields to a window that opens
@@ -290,7 +356,7 @@ fn a_persistent_refusal_backs_off_to_thirty_seconds_and_a_served_run_resets_it()
     assert_eq!(refusals.after(refused, None), base * 2);
     assert_eq!(refusals.after(None, None), base);
     assert_eq!(refusals.after(refused, None), base);
-    // Every other status keeps the mode's wait and the streak.
+    // An offline outcome keeps the mode's wait and the streak.
     assert_eq!(refusals.after(Some(Status::Offline), None), base);
     assert_eq!(refusals.after(refused, None), base * 2);
     let mut background = Refusals::new(true);

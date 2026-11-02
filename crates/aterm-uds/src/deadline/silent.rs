@@ -6,6 +6,8 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(unix)]
+use super::held_words;
 use super::{Refused, TRUST};
 use crate::host::could_not_run;
 
@@ -48,17 +50,6 @@ fn trust_silent_words(held: Option<crate::process::HeldNow>) -> String {
         ));
     }
     words
-}
-
-/// The words a test's wait ends COULD NOT RUN with when its child `pid` is held at macOS's program check past `waited`, its hang detector: `held` is [`crate::process::at_program_check`]'s answer, asked before the child is killed. `None` unless it is held, so any other silence stays the test's own failure.
-#[must_use]
-pub fn held_words(pid: u32, waited: Duration, held: Option<bool>) -> Option<String> {
-    (held == Some(true)).then(|| {
-        format!(
-            "macOS's program check held this test's program (pid {pid}) past its {waited:?} \
-             hang detector; nothing was verified"
-        )
-    })
 }
 
 /// End the calling test COULD NOT RUN when `out` is an `hdiutil` run that failed with `Operation timed out` (a wedged disk-image service, after about 121 s).

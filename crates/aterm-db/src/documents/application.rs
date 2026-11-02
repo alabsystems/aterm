@@ -137,6 +137,27 @@ pub(crate) fn observe_store_until<T>(
     deadline: std::time::Instant,
     action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
 ) -> Result<T> {
+    observe_store_if_declared_until(paths, descriptor, deadline, action)?
+        .ok_or_else(|| Error::new("application table is not initialized"))
+}
+
+/// Observe an application when its declaration is retained in the existing catalog.
+/// An absent declaration is `None`; invalid custody, catalog or declared table
+/// storage remains an error. This creates neither a declaration nor a store.
+pub(crate) fn observe_store_if_declared<T>(
+    paths: &Paths,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<Option<T>> {
+    observe_store_if_declared_until(paths, descriptor, admission_deadline(), action)
+}
+
+fn observe_store_if_declared_until<T>(
+    paths: &Paths,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    deadline: std::time::Instant,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<Option<T>> {
     pass_current(deadline)?;
     let paths = crate::generation::observed_paths_until(paths, deadline)?;
     let paths = &paths;
@@ -146,10 +167,10 @@ pub(crate) fn observe_store_until<T>(
     let descriptor = descriptor(&bootstrap)?;
     let directory = Directory::new(paths, bootstrap.trust());
     let snapshot = directory.snapshot_existing(&session)?;
-    let entry = snapshot
-        .entries
-        .get(&descriptor.scope.digest())
-        .ok_or_else(|| Error::new("application table is not initialized"))?;
+    pass_current(deadline)?;
+    let Some(entry) = snapshot.entries.get(&descriptor.scope.digest()) else {
+        return Ok(None);
+    };
     if entry.state != State::Subscribed
         || entry
             .declarations
@@ -162,7 +183,7 @@ pub(crate) fn observe_store_until<T>(
     }
     let store = directory.observe_table(&session, descriptor.scope)?;
     pass_current(deadline)?;
-    action(&session, &store, descriptor.scope)
+    action(&session, &store, descriptor.scope).map(Some)
 }
 
 fn pass_current(deadline: std::time::Instant) -> Result<()> {

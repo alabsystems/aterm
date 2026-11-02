@@ -488,18 +488,12 @@ impl Decision {
     /// What tells this decision from every other one of the day, the same at every reading while its rows stand.
     #[must_use]
     pub fn id(&self) -> String {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        let bytes = self
-            .sid
-            .bytes()
-            .chain([0, self.kind.tag()])
-            .chain(self.t_ms.to_le_bytes())
-            .chain(self.asked.bytes());
-        for byte in bytes {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        format!("{hash:016x}")
+        let mut hash = aterm_hash::Fnv1a64::new();
+        hash.write(self.sid.as_bytes());
+        hash.write(&[0, self.kind.tag()]);
+        hash.write(&self.t_ms.to_le_bytes());
+        hash.write(self.asked.as_bytes());
+        format!("{:016x}", hash.finish())
     }
 }
 

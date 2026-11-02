@@ -5,7 +5,9 @@
 
 use std::fmt::Write as _;
 
-use super::{Class, Findings, JobKind, JobRow, StartWait, Verdict, Wait, WaitName};
+use super::{
+    Class, Findings, JobKind, JobRow, NamedRow, StartWait, TierB, Verdict, Wait, WaitName,
+};
 
 /// φ × 1000 as the row prints it.
 #[must_use]
@@ -183,14 +185,24 @@ impl JobRow {
                         person_name(&s.name)
                     );
                 }
-                let on = match self.class {
-                    Class::Polling => "waking with no progress".to_owned(),
-                    Class::Zombie => "an unreaped child".to_owned(),
-                    _ => self
-                        .wait
-                        .as_ref()
-                        .map_or_else(|| "a wait".to_owned(), wait_words),
-                };
+                let on = self
+                    .named
+                    .as_ref()
+                    .filter(|named| {
+                        self.class == Class::Waiting
+                            && !matches!(named.word, TierB::Read | TierB::Event | TierB::Unparsed)
+                    })
+                    .map_or_else(
+                        || match self.class {
+                            Class::Polling => "waking with no progress".to_owned(),
+                            Class::Zombie => "an unreaped child".to_owned(),
+                            _ => self
+                                .wait
+                                .as_ref()
+                                .map_or_else(|| "a wait".to_owned(), wait_words),
+                        },
+                        named_wait_words,
+                    );
                 format!("{rank} on {on}, {age}")
             }
         }
@@ -238,7 +250,24 @@ fn wait_fields(o: &mut String, w: &Wait) {
     }
 }
 
-/// The wait as the person reads it after "quiet on" / "stuck on".
+/// The recorded Tier B reason; formatting observes no new lock ownership.
+fn named_wait_words(named: &NamedRow) -> String {
+    if named.word != TierB::Lock {
+        return named.word.word().to_owned();
+    }
+    named.holder.as_ref().map_or_else(
+        || "a file lock (recorded holder unknown)".to_owned(),
+        |holder| {
+            format!(
+                "a file lock (recorded holder pid {}: {})",
+                holder.pid,
+                person_name(&holder.exe)
+            )
+        },
+    )
+}
+
+/// The Tier A wait as the person reads it after "quiet on" / "stuck on".
 fn wait_words(w: &Wait) -> String {
     match w.name {
         WaitName::Tcp => match &w.tcp {

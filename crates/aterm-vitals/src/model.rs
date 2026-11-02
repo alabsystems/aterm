@@ -705,6 +705,32 @@ pub struct NetView {
     pub tab_sockets: Vec<(u64, u32)>,
 }
 
+/// This Mac's network place (where it is, whether the internet answers, how much of the ALab
+/// LAN it reaches), as aterm-netplace words it: the host fills it from the place record and this
+/// crate prints it as it came, so `sys` says what every other reporter says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaceView {
+    /// The `place` line's words, after its label.
+    pub line: String,
+    /// The `place` JSON object's fields, in order.
+    pub fields: Vec<(&'static str, PlaceValue)>,
+}
+
+/// One value of a [`PlaceView`]'s JSON object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlaceValue {
+    /// A word or an address.
+    Text(String),
+    /// A count or a unix-ms time.
+    Count(u64),
+    /// A yes or no.
+    Flag(bool),
+    /// Not known; the word is one of the `sys` unavailable words (`not_sampled`).
+    Absent(&'static str),
+    /// A nested object, its fields in order.
+    Object(Vec<(&'static str, PlaceValue)>),
+}
+
 /// Category of vertical event marker overlaid on a multi-scale time-series strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StripEventKind {
@@ -1904,6 +1930,9 @@ pub struct Snapshot {
     pub volume: Option<VolumeSample>,
     /// Network interfaces, rates, and TCP connection counts, where readable.
     pub net: Option<NetView>,
+    /// This Mac's network place, set by the host from the place record; `None` where no
+    /// record or reading was had.
+    pub place: Option<PlaceView>,
     /// The machine.
     pub global: ScopeView,
     /// This instance and its tabs; `None` until two sweeps exist.
@@ -3184,6 +3213,8 @@ impl Vitals {
             mem,
             volume: s.volume.clone(),
             net,
+            // The host sets the place after the absorb, as it sets the slots.
+            place: None,
             global,
             aterm: pass.aterm,
             tabs: pass.tabs,

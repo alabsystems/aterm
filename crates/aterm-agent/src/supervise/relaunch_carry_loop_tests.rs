@@ -331,3 +331,64 @@ fn a_relaunch_that_owes_no_carry_on_goes_on_at_the_loops_first_point() {
         "Land's instruction at once: {first:?}"
     );
 }
+
+/// A RESTART PROMPT'S SHORT REPLY MEASURES ITS BACK-OFF FROM THE REPLY, NOT FROM A POINT JUDGED BEFORE
+/// IT: a prompt a draft or Off held has outlasted the back-off by the time it is typed, and the
+/// loop's own prompt came on its heels (`+31 s` in the 2026-11-01 re-check, and again for
+/// `continued:check` in run rvd1 of 2026-11-02) while the clock had run out with nothing able to be
+/// typed. A restart prompt is typed either way, by what the agent's last words claimed (a carry-on,
+/// or the done check's), and its reply is read either way, as work going on or as a claim of done.
+/// CONTROL: past its back-off from that reply the loop's own prompt comes, as Cruise's every turn end
+/// does, so nothing stops the loop.
+#[test]
+fn a_held_carry_ons_short_reply_measures_the_back_off_from_the_reply() {
+    use crate::supervise::policy::turn_end::{RULE_CONTINUE, RULE_DONE_CHECK};
+    const DONE: &str = "All tasks are complete and verified; nothing is left to do.";
+    const HALF: &str = "The parser reads the first half.";
+    const GOES_ON: &str = "Picked it up; the second half is next.";
+    let at_rest = |said: &str| {
+        let mut r = rows(&[&format!("⏺ {said}"), ""]);
+        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        r
+    };
+    let backoff = crate::supervise::policy::turn_end::TurnEndTiming::default().short_backoff;
+    for (case, kind, before, answer, then) in [
+        ("carry-on", HostTurn::CarryOn, HALF, GOES_ON, RULE_CONTINUE),
+        ("check, work", HostTurn::Check, DONE, GOES_ON, RULE_CONTINUE),
+        ("check, done", HostTurn::Check, DONE, DONE, RULE_DONE_CHECK),
+    ] {
+        let mut m = Mock::new(vec![busy_screen()]);
+        let (mut s, dir) = policy_session(&mut m, "held-carry-clock");
+        let mut opts = hosted(30);
+        opts.policy.autopilot = Autopilot::Cruise;
+        opts.idle_host = Some(Carrier::owing(false) as Arc<dyn IdleHost>);
+        s.program = Some("claude".to_owned());
+        let point = point_at(&s, at_rest(before), 1);
+        let first = s.turn_end_at_point(&point, None, &opts);
+        assert!(
+            matches!(first, Ok(TurnEndAction::WaitUntil { .. })),
+            "{case}: the first short turn's back-off: {first:?}"
+        );
+        // The hold: the back-off runs out while nothing can be typed.
+        s.test_clock().skip(backoff + Duration::from_secs(1));
+        let typed = s.fx.mono();
+        s.turn_end.host_typed(typed, kind);
+        let worked = Duration::from_secs(3);
+        s.test_clock().skip(worked);
+        let reply = s.fx.mono();
+        let point = point_at(&s, at_rest(answer), 2);
+        let after = s.turn_end_at_point(&point, Some(worked), &opts);
+        assert!(
+            matches!(&after, Ok(TurnEndAction::WaitUntil { until, .. }) if *until >= reply + backoff),
+            "{case}: the back-off from the reply: {after:?}"
+        );
+        s.test_clock().skip(backoff);
+        let point = point_at(&s, at_rest(answer), 2);
+        let later = s.turn_end_at_point(&point, None, &opts);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            matches!(&later, Ok(TurnEndAction::Type { rule_id, .. }) if *rule_id == then),
+            "{case}: CONTROL: Cruise goes on past it: {later:?}"
+        );
+    }
+}

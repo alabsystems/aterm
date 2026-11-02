@@ -28,6 +28,9 @@ pub mod ai_pool;
 #[cfg(unix)]
 pub mod ai_signin;
 pub mod align;
+mod auth_deadline;
+#[cfg(test)]
+mod auth_deadline_tests;
 pub mod browser_window;
 pub mod claims;
 pub mod cli;
@@ -55,6 +58,7 @@ pub mod laps;
 pub mod lights;
 pub mod login_drive;
 pub mod login_latch;
+pub mod mail_browser;
 pub mod mail_recovery;
 pub mod mailbox_routes;
 pub mod muse_usage;

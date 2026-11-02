@@ -102,6 +102,10 @@ impl Connection {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.stream.local_addr()
     }
+    /// The peer endpoint of this exact connected socket, including an accepted one.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.peer_addr()
+    }
     /// Interrupt this exact connection without exposing another reader/writer.
     pub fn cancellation(&self) -> io::Result<Cancellation> {
         let stream = aterm_uds::kept_out(|| self.stream.try_clone())?;

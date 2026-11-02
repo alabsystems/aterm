@@ -149,7 +149,7 @@ impl PendingClose {
     /// Whether the wire's `confirm yes|no` answers this question.
     pub(crate) const fn wire_may_answer(&self) -> bool {
         match &self.asked_by {
-            ExitActor::Sid(_) | ExitActor::Ctl => true,
+            ExitActor::Sid(_) | ExitActor::Ctl | ExitActor::Harness => true,
             #[cfg(any(unix, test))]
             ExitActor::Bridge => true,
             ExitActor::Human | ExitActor::Unknown => false,

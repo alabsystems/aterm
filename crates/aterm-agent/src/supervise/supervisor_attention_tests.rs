@@ -974,3 +974,218 @@ fn a_previously_managed_claim_never_downgrades_to_unsupported_or_released_writes
         unsets
     );
 }
+
+/// Every window-hosted loop's door (`HostCtl::call_checked` in `aterm-gui`): a write that names no
+/// duty gets `duty_denied`'s words, and one under a duty the session keeps goes on to the host.
+struct HostDoor<'m> {
+    mock: &'m mut Mock,
+    typed: Vec<(crate::harness::contract::Scope, String)>,
+    refused: Vec<String>,
+}
+
+impl Ctl for HostDoor<'_> {
+    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+        let words: Vec<&str> = args
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('@'))
+            .collect();
+        if claim::is_write(&words) {
+            self.refused.push(words.join(" "));
+            return Ok(CtlReply {
+                code: 1,
+                stdout: String::new(),
+                stderr: "aterm-ctl: ERR denied supervisor input authority\n".to_string(),
+            });
+        }
+        self.mock.call(args)
+    }
+
+    fn builtin_authority(&mut self, _: &str) -> super::super::duty::BuiltinAuthority {
+        super::super::duty::BuiltinAuthority::complement(7, [])
+    }
+
+    fn call_for_duty(
+        &mut self,
+        duty: crate::harness::contract::Scope,
+        revision: u64,
+        args: &[&str],
+    ) -> Option<Result<CtlReply, String>> {
+        assert_eq!(revision, 7, "{args:?}");
+        self.typed.push((duty, args.join(" ")));
+        Some(self.mock.call(args))
+    }
+}
+
+/// A session behind the door, its claim held as a tab's is.
+fn behind_the_door<'d, 'm>(door: &'d mut HostDoor<'m>) -> Session<'d, HostDoor<'m>> {
+    let clock = virtual_clock();
+    door.mock.run_on(&clock);
+    let mut s = Session::new(door, Some("@s-door".to_string()));
+    s.set_fx(Fx::over(ClockSource::Scripted(clock)));
+    s.set_builtin_duties(true);
+    s.program = Some("claude".to_string());
+    s.take_claim(&mut Alone);
+    assert!(matches!(s.claim, claim::Claim::Held { .. }));
+    s
+}
+
+/// Claude Code 2.1.316's dialog for `--dangerously-skip-permissions`, as `lab text` read it.
+fn bypass_dialog() -> Vec<String> {
+    rows(&[
+        "────────────────────────────────────────────────────────────────",
+        "  WARNING: Claude Code running in Bypass Permissions mode",
+        "  In Bypass Permissions mode, Claude Code will not ask for your approval before running \
+         potentially dangerous commands.",
+        "  This mode should only be used in a sandboxed container/VM that has restricted internet \
+         access and can easily be restored if damaged.",
+        "  By proceeding, you accept all responsibility for actions taken while running in Bypass \
+         Permissions mode.",
+        "  https://code.claude.com/docs/en/security",
+        "  ❯ No, exit",
+        "    Yes, I accept",
+        "  Enter to confirm · Esc to cancel",
+    ])
+}
+
+/// THE BADGE OVER A DIALOG NO DUTY ANSWERS GOES UP AND COMES DOWN. Nothing is pressed on such a
+/// dialog, so `duty::prompt_scope` names no duty for it; the badge over it went out naming none,
+/// and a hosted loop's door refused it. Measured 2026-11-02 on Claude Code 2.1.316: `attention=-`
+/// through the whole bypass dialog beside a journal saying `ESCALATED`, then a take-down owed every
+/// 2 s for the rest of the session. CONTROL: the door still refuses a write that names no duty.
+#[test]
+fn a_dialog_of_no_kind_aterm_reads_is_told_and_taken_down_through_the_hosted_door() {
+    let mut m = Mock::new(vec![bypass_dialog()]);
+    let mut door = HostDoor {
+        mock: &mut m,
+        typed: Vec::new(),
+        refused: Vec::new(),
+    };
+    {
+        let mut s = behind_the_door(&mut door);
+        let point = {
+            let screen = s.screen().expect("the dialog");
+            s.turn_of(screen)
+        };
+        assert_eq!(point.phase, Phase::Prompt);
+        s.escalate_point(&point, None, &mut Alone).expect("told");
+        assert!(
+            s.ctl
+                .mock
+                .attention
+                .as_deref()
+                .is_some_and(|a| a.starts_with("claude other: ")),
+            "a person is told of the dialog: {:?}\n{:?}",
+            s.ctl.mock.attention,
+            s.ctl.refused
+        );
+        assert!(!s.attention_pending, "the badge is up: nothing owed");
+        s.close_box(point.screen.seq, &mut Alone).expect("down");
+        assert_eq!(s.ctl.mock.attention, None, "{:?}", s.ctl.refused);
+        assert!(!s.attention_pending, "the badge is down: nothing owed");
+        assert_eq!(s.attention_retry_at, None);
+        assert!(
+            !s.call(&["meta", "set", "attention", "x"]).unwrap().ok(),
+            "CONTROL: the door refuses a write with no duty"
+        );
+    }
+    assert_eq!(door.refused, ["meta set attention x"]);
+    assert_eq!(door.typed.len(), 2, "{:?}", door.typed);
+    assert!(
+        door.typed
+            .iter()
+            .all(|(duty, _)| *duty == crate::harness::contract::Scope::Approvals),
+        "{:?}",
+        door.typed
+    );
+    assert!(m.presses().is_empty(), "nothing is pressed on it");
+}
+
+/// AN ENTRY A LOOP BEFORE THIS ONE LEFT COMES DOWN THROUGH THE DOOR AS WELL: the new loop raised
+/// neither, so it had no duty to name, whether it took the entry down at its start as stale or
+/// adopted it and took it down when its point left. With the take-down refused the badge stood past
+/// its point, and the retry ran every 2 s, with no dialog on the screen at all.
+#[test]
+fn an_entry_a_loop_before_this_one_left_comes_down_through_the_hosted_door() {
+    let mut m = Mock::new(vec![idle_screen()]);
+    m.attention = Some("claude other: a dialog that left with the old loop".to_string());
+    let mut door = HostDoor {
+        mock: &mut m,
+        typed: Vec::new(),
+        refused: Vec::new(),
+    };
+    {
+        let mut s = behind_the_door(&mut door);
+        s.reconcile(&mut Alone).expect("the stale entry");
+        assert_eq!(s.ctl.mock.attention, None, "{:?}", s.ctl.refused);
+        assert!(!s.attention_pending);
+        s.ctl.mock.attention = Some("claude other: adopted".to_string());
+        s.attention_desired = None;
+        s.attention_ours = Some("claude other: adopted".to_string());
+        s.box_ask = Some(BoxAsk {
+            key: "the adopted point".to_string(),
+            memory: false,
+        });
+        s.close_box(1, &mut Alone).expect("the adopted entry");
+        assert_eq!(s.ctl.mock.attention, None, "{:?}", s.ctl.refused);
+        assert!(!s.attention_pending);
+    }
+    assert!(door.refused.is_empty(), "{:?}", door.refused);
+}
+
+/// A TAKE-DOWN THE HOST KEEPS REFUSING HOLDS BACK NO LATER TURN END (a real Claude Code's first
+/// turn under the lab's stub, run ctl0, 2026-11-02: 105 lines of `take-down still owed` and its turn
+/// never judged). Each retry ended the wait before the 5 s the loop re-reads the screen after, so a
+/// turn too short for `await agent` to see stayed unread for as long as the refusal stood. The loop
+/// finds the turn, and the badge stays up and owed, so a person is told nothing false. NEGATIVE
+/// CONTROL: nothing owed, the same turn is found at the same re-read.
+#[test]
+fn a_take_down_the_host_keeps_refusing_holds_back_no_later_turn_end() {
+    let resting = || {
+        let mut r = rows(&["⏺ Ready.", ""]);
+        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        r
+    };
+    let replied = || {
+        let mut r = rows(&["⏺ Hi! A turn too short to read busy.", ""]);
+        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        r
+    };
+    for owed in [true, false] {
+        let mut m = Mock::new(vec![resting(), replied()]);
+        m.agent_pushes = true;
+        m.stall_sleep = Some(Duration::from_secs(60));
+        let mut s = virtual_session(&mut m, None);
+        active_claim(&mut s);
+        s.caps.await_agent = Some(true);
+        s.busy_read = true;
+        s.setup.redecide_after_skip = Duration::from_secs(2);
+        let point = box_point(&mut s);
+        if owed {
+            s.ctl.attention = Some("claude other: gone".to_string());
+            s.attention_ours = Some("claude other: gone".to_string());
+            for _ in 0..512 {
+                s.ctl
+                    .attention_replies
+                    .push_back(err("denied supervisor input authority"));
+            }
+            s.clear_attention_entry().expect("refused, not lost");
+            assert!(s.attention_pending, "the take-down is owed");
+        }
+        let mut deadline = s.fx.mono() + Duration::from_secs(120);
+        let end = s
+            .wait_for_next(point, &auto(30), &[], &mut deadline, &mut Alone)
+            .expect("the wait");
+        assert!(
+            end.is_none(),
+            "owed {owed}: the turn was never found: {:#?}",
+            s.ctl.requests
+        );
+        assert_eq!(s.attention_pending, owed, "{:#?}", s.ctl.requests);
+        assert_eq!(
+            s.ctl.attention.is_some(),
+            owed,
+            "the badge stays until down"
+        );
+    }
+}

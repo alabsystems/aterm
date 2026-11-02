@@ -73,6 +73,10 @@ pub(crate) fn usage_source_transition(
                 default_home: true,
                 stored_login: true,
             };
+            let current_login = root.path().join("login").join("current");
+            let current_login = current_login.to_str().unwrap();
+            let new_login = root.path().join("login").join("new");
+            let new_login = new_login.to_str().unwrap();
             let mut logins = Logins::default();
             if case == 15 {
                 note_renewed(
@@ -80,12 +84,12 @@ pub(crate) fn usage_source_transition(
                     &mut logins,
                     "main",
                     None,
-                    "/login/current",
+                    current_login,
                     None,
                     NOW,
                 );
                 store.save_logins(&logins).unwrap();
-                who.login = Some("/login/current".into());
+                who.login = Some(current_login.into());
             }
             let captured = store
                 .read_usage_roster((case != 1).then_some(path.as_path()), NOW)
@@ -109,7 +113,7 @@ pub(crate) fn usage_source_transition(
                         &mut logins,
                         "main",
                         None,
-                        "/login/new",
+                        new_login,
                         None,
                         NOW,
                     );
@@ -138,7 +142,7 @@ pub(crate) fn usage_source_transition(
                 16 => who.stored_login = false,
                 17 => {
                     let target = Row {
-                        dir: Some("/login/new".into()),
+                        dir: Some(new_login.into()),
                         ..row.clone()
                     };
                     let other_row = Row {

@@ -122,23 +122,30 @@ pub const USAGE: &str = "\
                                    second identity that approves joins: aterm init --only workstation
                                    --vault <it> with its join password typed: to the password prompt,
                                    typed to a synced secret on disk, typed to the end
-                  vault-phrase     a new Mac let in by a member's Allow and the phrase it shows (F10), on
-                                   the guest's loopback alone: a seed identity founds a vault on
+                  vault-phrase     a new Mac let in by a member's Allow and the phrase it shows (F10),
+                                   found by its own browse: a seed identity founds a vault on
                                    127.0.0.1 (never advertised) with a synthetic GitHub token, publish
                                    token and AI accounts list in [everyone] and runs its approver; a
                                    second identity, a member that is no admin (asked, approved by the
                                    seed, enrolled in its Commons), allows (the guest helper running
-                                   F10's members desk on its custody behind an ask-only listener on
-                                   127.0.0.1, which presses Allow for the first Mac that asks; the
-                                   phrase read off its record, never a window); a third runs aterm
-                                   members join --no-wait --at <the member> (install.sh's ask), aterm
-                                   members join with the phrase typed at its prompt, then its
-                                   subscriber: the ask to the member's row, to the phrase shown and
-                                   typed, to each file on disk, to members status reading In; FAILED
-                                   unless the phrase came from that member, every file is the seed's
-                                   value, the joiner reads In, every aterm listener is on loopback, and
-                                   every _alab-vault._tcp and _alab._tcp browse, in the guest and on
-                                   this Mac, ran and heard no guest advert
+                                   F10's members desk on its custody behind an ask-only listener at
+                                   the guest's own address, registered under a lab members service
+                                   made for the run, _alab-lab-<nonce>._tcp, which no ALab Mac
+                                   browses; it presses Allow for the first Mac that asks; the phrase
+                                   read off its record, never a window); a third, with
+                                   ATERM_LAB_MEMBER_SERVICE naming that service and no --at, runs
+                                   aterm members join --no-wait (install.sh's ask), aterm members join
+                                   with the phrase typed at its prompt, then its subscriber: the ask
+                                   to the member's row, to the phrase shown and typed, to each file on
+                                   disk, to members status reading In; FAILED unless the phrase came
+                                   from that member, every file is the seed's value, the joiner reads
+                                   In, its browse found the member (asked at the guest's address, the
+                                   guest's browse of the lab service hearing the member alone), every
+                                   ask came from the guest, every aterm listener but the member's is
+                                   on loopback, and every _alab-vault._tcp and _alab._tcp browse, in
+                                   the guest and on this Mac, ran and heard no guest advert (NOT RUN,
+                                   nothing of the joiner's run, on an app that does not name the
+                                   variable)
                   successor        install.sh --version N (the release before the latest), then the
                                    updater to the latest with a window open, and the successor's setup
                                    and Full Disk Access lines in its first 30 s
@@ -2629,20 +2636,29 @@ fn guest_heard(g: &Guest, service: &str) -> Result<Result<advert::Split, String>
         service,
         &|index| Some(format!("the guest's interface {index}")),
         &advert::this_macs_addresses(),
-        &mut |args: &[String]| {
-            let words: Vec<String> = args.iter().map(|a| crate::util::shell_quote(a)).collect();
-            g.sh(
-                &format!(
-                    "{GUEST_NUX}/{GUEST_HELPER} dns-sd {} {out} {}",
-                    advert::RESOLVE_SECS,
-                    words.join(" ")
-                ),
-                STEP,
-            )?;
-            g.read(&out)
-        },
+        &mut guest_dns_sd(g, &out),
     )?;
     Ok(Ok(split))
+}
+
+/// The guest's `dns-sd` for [`advert::split`] and [`advert::place`]: each run is the guest
+/// helper's `dns-sd` for [`advert::RESOLVE_SECS`] into the guest file `out`, read back.
+fn guest_dns_sd<'a>(
+    g: &'a Guest,
+    out: &'a str,
+) -> impl FnMut(&[String]) -> Result<String, Fail> + 'a {
+    move |args: &[String]| {
+        let words: Vec<String> = args.iter().map(|a| crate::util::shell_quote(a)).collect();
+        g.sh(
+            &format!(
+                "{GUEST_NUX}/{GUEST_HELPER} dns-sd {} {out} {}",
+                advert::RESOLVE_SECS,
+                words.join(" ")
+            ),
+            STEP,
+        )?;
+        g.read(out)
+    }
 }
 
 /// What a [`BROWSE_SECS`] `dns-sd -B <service> local.` on this Mac heard (its transcript, under

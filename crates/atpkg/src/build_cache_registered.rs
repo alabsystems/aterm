@@ -251,19 +251,21 @@ pub struct Registered {
 }
 
 impl Registered {
+    fn matches(&self, receipt: &Receipt) -> bool {
+        receipt.root == self.root
+            && receipt.identity == self.identity
+            && receipt.nonce == self.nonce
+            && receipt.owners == self.owners
+            && receipt.owners_unknown == self.owners_unknown
+    }
+
     /// Whether this still names the same active cache and owners under its creation receipt.
     /// Retired stages and a replaced root are not current, even when [`roots`] retains their
     /// receipts so the reclaimer can finish them. This read does not authorize a removal.
     #[must_use]
     pub fn is_current(&self, home: &Path) -> bool {
         read(&self.receipt_path).is_some_and(|receipt| {
-            receipt.root == self.root
-                && receipt.identity == self.identity
-                && receipt.nonce == self.nonce
-                && receipt.owners == self.owners
-                && receipt.owners_unknown == self.owners_unknown
-                && receipt.pending.is_none()
-                && same(home, &receipt)
+            self.matches(&receipt) && receipt.pending.is_none() && same(home, &receipt)
         })
     }
 }
@@ -324,18 +326,24 @@ fn index(home: &Path) -> Option<PathBuf> {
     let mut held = creation::pin(home)?;
     for component in Path::new(INDEX).components() {
         at.push(component);
-        held = index_child(&held, component.as_os_str(), &at)?;
+        held = directory_child(&held, component.as_os_str(), &at, creation::Point::Index)?;
     }
     let gates = at.join("locks.noindex");
-    index_child(&held, std::ffi::OsStr::new("locks.noindex"), &gates)?;
+    directory_child(
+        &held,
+        std::ffi::OsStr::new("locks.noindex"),
+        &gates,
+        creation::Point::Index,
+    )?;
     Some(at)
 }
 
 #[cfg(unix)]
-fn index_child(
+fn directory_child(
     parent: &aterm_dirfd::OwnedFd,
     name: &std::ffi::OsStr,
     path: &Path,
+    point: creation::Point,
 ) -> Option<aterm_dirfd::OwnedFd> {
     match aterm_dirfd::mkdirat(parent, name, aterm_dirfd::Mode::from_bits(0o700)) {
         Ok(()) => {}
@@ -355,8 +363,8 @@ fn index_child(
         return None;
     }
     // Synchronize even an existing component: a previous attempt may have stopped after mkdir.
-    creation::sync_directory(&child, creation::Point::Index)?;
-    creation::sync_directory(parent, creation::Point::Index)?;
+    creation::sync_directory(&child, point)?;
+    creation::sync_directory(parent, point)?;
     Some(child)
 }
 
@@ -1076,9 +1084,10 @@ fn short_version_query(word: &str) -> bool {
     })
 }
 
-/// Only a recognized builtin query can skip owner observation. In particular, a query name
-/// used as an option value, an external alias or the lint's arguments is not a query command.
-fn query_command(args: &[String], tool: super::Tool) -> bool {
+/// Known builtin commands that produce no build output need no owner observation: queries
+/// and clean. Clean must reach Cargo even for an unregistered target, without adopting it.
+/// A command name used as an option value, an external alias or lint argument proves none of this.
+fn non_producing_command(args: &[String], tool: super::Tool) -> bool {
     if tool == super::Tool::Tippy {
         return false;
     }
@@ -1105,7 +1114,10 @@ fn query_command(args: &[String], tool: super::Tool) -> bool {
                 || word.starts_with("--explain=")
                 || word.starts_with("-Z")
                 || word.starts_with("-C") => {}
-            _ => return word == "help" || crate::reroute::LANE_FREE_QUERIES.contains(&word),
+            _ => {
+                return matches!(word, "help" | "clean")
+                    || crate::reroute::LANE_FREE_QUERIES.contains(&word);
+            }
         }
     }
     false
@@ -1124,7 +1136,7 @@ fn observe(
     home: &Path,
     machine: &super::Machine<'_>,
 ) -> std::io::Result<Observation> {
-    if query_command(args, tool)
+    if non_producing_command(args, tool)
         || args
             .iter()
             .take_while(|word| word.as_str() != "--")
@@ -1485,6 +1497,9 @@ fn observe_for_producer(
     machine: &super::Machine<'_>,
     require_explicit: bool,
 ) -> std::io::Result<bool> {
+    if non_producing_command(args, tool) {
+        return Ok(false);
+    }
     // A nested compiler can inherit the exact directory our shim placed. Classify the
     // original call, not that derived environment, before deciding ownership is required.
     if let Some(typed) = equivalent_placement_args(args, tool, machine) {
@@ -1506,11 +1521,10 @@ fn observe_for_producer(
             require_explicit,
         );
     }
-    let query = query_command(args, tool)
-        || args
-            .iter()
-            .take_while(|word| word.as_str() != "--")
-            .any(|word| matches!(word.as_str(), "-h" | "--help" | "-V" | "--version"));
+    let query = args
+        .iter()
+        .take_while(|word| word.as_str() != "--")
+        .any(|word| matches!(word.as_str(), "-h" | "--help" | "-V" | "--version"));
     let explicit = requires_managed_explicit(args, home, machine);
     let refusal = || {
         std::io::Error::other(
@@ -1660,9 +1674,9 @@ pub fn shim_helper(text: &str) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-/// Internal compiler-shim entry, with no store/profile/credential discovery. Explicit targets
-/// require managed ownership even for older shim argv; `--require-owned-if-explicit` names that
-/// contract. A producer's `--require-owned` additionally requires ownership for every call.
+/// Internal compiler-shim entry, with no store/profile/credential discovery. Explicit producer
+/// targets require managed ownership even for older shim argv; `--require-owned-if-explicit`
+/// names that contract. A producer's `--require-owned` additionally requires ownership for every call.
 pub fn run_hidden(args: &[std::ffi::OsString]) -> std::process::ExitCode {
     if args.len() == 1 && args[0] == "--capabilities" {
         println!("{REGISTER_CAPABILITY}");
@@ -1778,6 +1792,75 @@ fn recover_unstarted(
     }
     *receipt = cleared;
     true
+}
+
+/// Retire exactly one explicitly requested, genuinely registered ordinary cache. This is
+/// separate from automatic age/owner policy: an empty legacy owner roster grants no
+/// automatic deletion, but does not prevent a caller naming its own disposable cache.
+/// Retention, package custody, unknown ownership, changed identities, Cargo locks and
+/// process-use uncertainty still refuse. No tag or owner record is manufactured.
+///
+/// # Errors
+/// An unregistered or unsupported root, retained/package/unknown custody, or a pass that
+/// cannot admit any retirement returns a refusal. Returned partial outcomes are not success.
+#[cfg(unix)]
+pub fn retire(
+    home: &Path,
+    root: &Path,
+    record: &mut dyn FnMut(&Path, super::Unused) -> bool,
+) -> Result<Vec<(PathBuf, super::Unused)>, String> {
+    retire_on(home, root, record, &super::fence::Fence::default())
+}
+
+#[cfg(unix)]
+fn retire_on(
+    home: &Path,
+    root: &Path,
+    record: &mut dyn FnMut(&Path, super::Unused) -> bool,
+    fence: &super::fence::Fence<'_>,
+) -> Result<Vec<(PathBuf, super::Unused)>, String> {
+    if !root.is_absolute() || !scope(home, root) {
+        return Err("retirement needs one exact absolute cache root under this home".into());
+    }
+    let cache = roots(home)
+        .into_iter()
+        .find(|cache| cache.root == root)
+        .ok_or("cache has no current genuine registration")?;
+    let receipt = read(&cache.receipt_path).ok_or("cache registration cannot be read")?;
+    if receipt.retained || receipt.creating.is_some() {
+        return Err("cache is retained or its creation is incomplete".into());
+    }
+    if receipt.package.is_some() || receipt.owners_unknown {
+        return Err("package or unknown owner custody cannot be retired by this request".into());
+    }
+    let removed = reclaim_selected_on(
+        home,
+        std::time::SystemTime::now(),
+        super::RECLAIM_GONE,
+        None,
+        record,
+        fence,
+        Selection::Requested(&cache),
+    );
+    if removed.is_empty() {
+        return Err(
+            "cache is active, changed, or could not admit retirement; nothing removed".into(),
+        );
+    }
+    Ok(removed)
+}
+
+/// Unsupported hosts cannot retire a registered cache.
+///
+/// # Errors
+/// Always returns an unsupported-host refusal.
+#[cfg(not(unix))]
+pub fn retire(
+    _: &Path,
+    _: &Path,
+    _: &mut dyn FnMut(&Path, super::Unused) -> bool,
+) -> Result<Vec<(PathBuf, super::Unused)>, String> {
+    Err("registered cache retirement is unavailable on this host".into())
 }
 
 /// The eligible registered-cache parts, including held locks, for the existing read-only
@@ -1940,7 +2023,22 @@ pub(super) fn reclaim_on(
     record: &mut dyn FnMut(&Path, super::Unused) -> bool,
     fence: &super::fence::Fence<'_>,
 ) -> Vec<(PathBuf, super::Unused)> {
-    reclaim_selected_on(home, now, gone_after, placing, record, fence, None)
+    reclaim_selected_on(
+        home,
+        now,
+        gone_after,
+        placing,
+        record,
+        fence,
+        Selection::Automatic,
+    )
+}
+
+#[cfg(unix)]
+enum Selection<'a> {
+    Automatic,
+    Package(package::Context<'a>),
+    Requested(&'a Registered),
 }
 
 #[cfg(unix)]
@@ -1951,16 +2049,16 @@ fn reclaim_selected_on(
     placing: Option<&super::checkout::Placing>,
     record: &mut dyn FnMut(&Path, super::Unused) -> bool,
     fence: &super::fence::Fence<'_>,
-    policy_context: Option<package::Context<'_>>,
+    selection: Selection<'_>,
 ) -> Vec<(PathBuf, super::Unused)> {
-    let selected_cache = policy_context.as_ref().and_then(|context| context.cache);
-    let kernel = policy_context
-        .as_ref()
-        .map_or(&package::Live as &dyn package::Kernel, |context| {
-            context.kernel
-        });
+    let (selected_cache, requested, kernel) = match selection {
+        Selection::Automatic => (None, None, &package::Live as &dyn package::Kernel),
+        Selection::Package(context) => (context.cache, None, context.kernel),
+        Selection::Requested(root) => (None, Some(root), &package::Live as &dyn package::Kernel),
+    };
     let mut intents = super::Intents::new(record);
-    for cache in roots(home) {
+    let candidates = requested.map_or_else(|| roots(home), |wanted| vec![wanted.clone()]);
+    for cache in candidates {
         let Some(preliminary) = read(&cache.receipt_path) else {
             continue;
         };
@@ -1987,10 +2085,17 @@ fn reclaim_selected_on(
         let Some(mut receipt) = read(&cache.receipt_path) else {
             continue;
         };
-        if receipt.retained {
+        if receipt.retained
+            || receipt.creating.is_some()
+            || requested.is_some_and(|wanted| !wanted.matches(&receipt))
+            || !package::same_declaration(preliminary.package.as_ref(), receipt.package.as_ref())
+        {
             continue;
         }
         if receipt.root != cache.root || !scope(home, &receipt.root) {
+            continue;
+        }
+        if requested.is_some() && (receipt.package.is_some() || receipt.owners_unknown) {
             continue;
         }
         if let Some(coordinator) = &coordination
@@ -2031,18 +2136,14 @@ fn reclaim_selected_on(
                 );
                 continue;
             }
-            let pending_locks = if coordination.is_some() {
-                let payload = pending.directory.join(PAYLOAD);
-                match std::fs::symlink_metadata(&payload) {
-                    Ok(_) => match super::locks_under(&payload) {
-                        Ok(locks) => locks,
-                        Err(_) => continue,
-                    },
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            let payload = pending.directory.join(PAYLOAD);
+            let pending_locks = match std::fs::symlink_metadata(&payload) {
+                Ok(_) => match super::locks_under(&payload) {
+                    Ok(locks) => locks,
                     Err(_) => continue,
-                }
-            } else {
-                Vec::new()
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(_) => continue,
             };
             let Some(_held_pending) = super::hold(&pending_locks) else {
                 continue;
@@ -2121,18 +2222,22 @@ fn reclaim_selected_on(
         let budget = coordination
             .as_ref()
             .and_then(|guard| guard.reason_on(home, &receipt, kernel));
-        let whole = budget
-            .map(|why| super::unused(&cache.root, &|_| Some(why)))
+        let whole = requested
+            .map(|_| super::unused(&cache.root, &|_| Some(super::Unused::Requested)))
             .or_else(|| {
-                gone.then(|| {
-                    super::unused(&cache.root, &|seen| {
-                        let idle = super::age(now, seen.newest);
-                        (idle >= gone_after).then_some(super::Unused::Gone {
-                            idle,
-                            after: gone_after,
+                budget
+                    .map(|why| super::unused(&cache.root, &|_| Some(why)))
+                    .or_else(|| {
+                        gone.then(|| {
+                            super::unused(&cache.root, &|seen| {
+                                let idle = super::age(now, seen.newest);
+                                (idle >= gone_after).then_some(super::Unused::Gone {
+                                    idle,
+                                    after: gone_after,
+                                })
+                            })
                         })
                     })
-                })
             });
         if let Some(Some((held_cargo, why))) = whole {
             if !same(home, &receipt)
@@ -2170,7 +2275,9 @@ fn reclaim_selected_on(
             }
             let staged = directory.join(PAYLOAD);
             if !same(home, &receipt)
-                || (coordination.is_none() && !owners_gone(home, &receipt, placing))
+                || (coordination.is_none()
+                    && requested.is_none()
+                    && !owners_gone(home, &receipt, placing))
                 || coordination
                     .as_ref()
                     .is_some_and(|guard| !guard.current(home, &receipt))
@@ -2265,7 +2372,7 @@ fn reclaim_selected_on(
         } else {
             // An opted-in live package is bounded only by whole-generation retirement.
             // It never uses the ordinary stale-unit/partial current-deps pruning path.
-            if coordination.is_some() {
+            if coordination.is_some() || requested.is_some() {
                 continue;
             }
             let permitted = || retention::allows(&cache.receipt_path, &receipt);
@@ -2492,6 +2599,271 @@ mod tests {
 
         fn later(&self) -> SystemTime {
             SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60)
+        }
+    }
+
+    #[test]
+    fn explicit_retirement_handles_a_tagless_legacy_roster_without_granting_automatic_deletion() {
+        let world = World::new();
+        world.build();
+        let other = world.home.join("other-output.noindex");
+        assert!(create_checked(&world.home, &other, &world.owner).unwrap());
+        std::fs::create_dir_all(other.join("debug/deps")).unwrap();
+        std::fs::write(other.join("debug/.cargo-lock"), b"").unwrap();
+        std::fs::write(other.join("debug/deps/keep"), b"another cache").unwrap();
+        let path = world.path();
+        let mut receipt = read(&path).unwrap();
+        receipt.owners.clear();
+        write(&path, &receipt).unwrap();
+        let tag = world.target.join("CACHEDIR.TAG");
+        if tag.exists() {
+            std::fs::remove_file(&tag).unwrap();
+        }
+        let processes = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+        let fence = super::super::fence::Fence::new(&processes);
+        assert!(
+            reclaim_on(
+                &world.home,
+                world.later(),
+                Duration::ZERO,
+                None,
+                &mut |_, _| true,
+                &fence
+            )
+            .is_empty()
+        );
+        assert!(world.target.join("debug/deps/keep").is_file());
+        let removed = retire_on(&world.home, &world.target, &mut |_, _| true, &fence).unwrap();
+        assert!(
+            matches!(removed.as_slice(), [(root, super::super::Unused::Requested)] if root == &world.target)
+        );
+        assert!(!world.target.exists());
+        assert_eq!(
+            std::fs::read(other.join("debug/deps/keep")).unwrap(),
+            b"another cache"
+        );
+        assert!(world.owner.join("Cargo.toml").is_file());
+    }
+
+    #[test]
+    fn explicit_retirement_refuses_unregistered_retained_and_unknown_custody() {
+        for kind in ["unregistered", "retained", "unknown"] {
+            let world = World::new();
+            if kind == "unregistered" {
+                std::fs::create_dir(&world.target).unwrap();
+                std::fs::write(world.target.join("keep"), b"unclaimed data").unwrap();
+            } else {
+                world.build();
+                if kind == "retained" {
+                    retain(&world.home, &world.target).unwrap();
+                } else {
+                    let path = world.path();
+                    let mut receipt = read(&path).unwrap();
+                    receipt.owners_unknown = true;
+                    write(&path, &receipt).unwrap();
+                }
+            }
+            let processes = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+            assert!(
+                retire_on(
+                    &world.home,
+                    &world.target,
+                    &mut |_, _| true,
+                    &super::super::fence::Fence::new(&processes)
+                )
+                .is_err(),
+                "{kind}"
+            );
+            assert!(world.target.is_dir(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn explicit_retirement_keeps_cargo_locks_and_unknown_or_live_processes_authoritative() {
+        let world = World::new();
+        world.build();
+        let clear = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+        let held = crate::lock::Flock::try_lock(
+            std::fs::File::open(world.target.join("debug/.cargo-lock")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            retire_on(
+                &world.home,
+                &world.target,
+                &mut |_, _| true,
+                &super::super::fence::Fence::new(&clear)
+            )
+            .is_err()
+        );
+        drop(held);
+        for unknown in [false, true] {
+            let processes = |_: &[PathBuf], _: &[u32]| {
+                if unknown {
+                    return Err(std::io::Error::other("process census unavailable"));
+                }
+                Ok(aterm_uds::holders::PathScan {
+                    users: vec![aterm_uds::holders::PathUse {
+                        pid: 42,
+                        how: "exe",
+                        path: world.target.join("debug/deps/keep"),
+                    }],
+                    ..Default::default()
+                })
+            };
+            assert!(
+                retire_on(
+                    &world.home,
+                    &world.target,
+                    &mut |_, _| true,
+                    &super::super::fence::Fence::new(&processes)
+                )
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read(world.target.join("debug/deps/keep")).unwrap(),
+                b"reusable output"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_retirement_keeps_a_late_holder_staged_and_resumes_only_the_identified_payload() {
+        let world = World::new();
+        world.build();
+        let processes = |dirs: &[PathBuf], _: &[u32]| {
+            let moved = dirs.iter().any(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("atpkg-cache-retiring-"))
+                    && p.is_dir()
+            });
+            Ok(aterm_uds::holders::PathScan {
+                users: moved
+                    .then(|| aterm_uds::holders::PathUse {
+                        pid: 42,
+                        how: "exe",
+                        path: world.target.join("debug/deps/keep"),
+                    })
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            })
+        };
+        let _ = retire_on(
+            &world.home,
+            &world.target,
+            &mut |_, _| true,
+            &super::super::fence::Fence::new(&processes),
+        );
+        let pending = read(&world.path()).unwrap().pending.unwrap();
+        assert_eq!(
+            std::fs::read(pending.directory.join(PAYLOAD).join("debug/deps/keep")).unwrap(),
+            b"reusable output"
+        );
+        let clear = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+        let held = crate::lock::Flock::try_lock(
+            std::fs::File::open(pending.directory.join(PAYLOAD).join("debug/.cargo-lock")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            retire_on(
+                &world.home,
+                &world.target,
+                &mut |_, _| true,
+                &super::super::fence::Fence::new(&clear)
+            )
+            .is_err()
+        );
+        assert!(
+            pending
+                .directory
+                .join(PAYLOAD)
+                .join("debug/deps/keep")
+                .is_file()
+        );
+        drop(held);
+        let removed = retire_on(
+            &world.home,
+            &world.target,
+            &mut |_, _| true,
+            &super::super::fence::Fence::new(&clear),
+        )
+        .unwrap();
+        assert!(matches!(
+            removed.as_slice(),
+            [(_, super::super::Unused::Unfinished)]
+        ));
+        assert!(!pending.directory.exists());
+    }
+
+    #[test]
+    fn explicit_retirement_does_not_take_a_replacement_published_after_its_intent() {
+        let world = World::new();
+        world.build();
+        let clear = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+        let old = world.home.join("preserved.noindex");
+        let mut record = |_: &Path, _: super::super::Unused| {
+            std::fs::rename(&world.target, &old).unwrap();
+            std::fs::create_dir(&world.target).unwrap();
+            std::fs::write(world.target.join("keep"), b"replacement data").unwrap();
+            true
+        };
+        let outcomes = retire_on(
+            &world.home,
+            &world.target,
+            &mut record,
+            &super::super::fence::Fence::new(&clear),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcomes.as_slice(),
+            [(_, super::super::Unused::Refused { .. })]
+        ));
+        assert_eq!(
+            std::fs::read(world.target.join("keep")).unwrap(),
+            b"replacement data"
+        );
+        assert_eq!(
+            std::fs::read(old.join("debug/deps/keep")).unwrap(),
+            b"reusable output"
+        );
+    }
+
+    #[test]
+    fn explicit_retirement_rechecks_its_captured_snapshot_against_the_locked_fresh_receipt() {
+        for replaced in [false, true] {
+            let world = World::new();
+            world.build();
+            let wanted = roots(&world.home).pop().unwrap();
+            let saved = world.home.join("saved-output.noindex");
+            if replaced {
+                std::fs::rename(&world.target, &saved).unwrap();
+                world.build();
+            } else {
+                let other = world.another_owner();
+                assert!(create_checked(&world.home, &world.target, &other).unwrap());
+            }
+            let clear = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+            let removed = reclaim_selected_on(
+                &world.home,
+                SystemTime::now(),
+                Duration::ZERO,
+                None,
+                &mut |_, _| true,
+                &super::super::fence::Fence::new(&clear),
+                Selection::Requested(&wanted),
+            );
+            assert!(removed.is_empty(), "replaced={replaced}");
+            assert_eq!(
+                std::fs::read(world.target.join("debug/deps/keep")).unwrap(),
+                b"reusable output"
+            );
+            if replaced {
+                assert_eq!(
+                    std::fs::read(saved.join("debug/deps/keep")).unwrap(),
+                    b"reusable output"
+                );
+            }
         }
     }
 
@@ -3745,6 +4117,19 @@ mod tests {
             ),
             (super::super::Tool::Targo, vec!["tippy", "-vV"]),
             (super::super::Tool::Tippy, vec!["-vV"]),
+            (
+                super::super::Tool::Targo,
+                vec!["--config", "clean", "--unverified", "build"],
+            ),
+            (
+                super::super::Tool::Targo,
+                vec!["--unverified", "clean-alias"],
+            ),
+            (
+                super::super::Tool::Targo,
+                vec!["--unverified", "run", "--", "clean"],
+            ),
+            (super::super::Tool::Tippy, vec!["clean"]),
         ] {
             let args = words.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(
@@ -3756,6 +4141,241 @@ mod tests {
         drop(permissions);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!read(&path).unwrap().owners_unknown);
+    }
+
+    #[cfg(target_os = "macos")]
+    const CLEAN_FRONT_HOME: &str = "ATPKG_TEST_CLEAN_FRONT_HOME";
+    #[cfg(target_os = "macos")]
+    const CLEAN_FRONT_TOOL: &str = "ATPKG_TEST_CLEAN_FRONT_TOOL";
+    #[cfg(target_os = "macos")]
+    const CLEAN_FRONT_WORDS: &str = "ATPKG_TEST_CLEAN_FRONT_WORDS";
+
+    /// This original test image enters the real shim front, which execs the requested
+    /// underlying tool. A refusal returns before that tool can print or remove anything.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clean_front_child_if_asked() {
+        if std::env::var_os(CLEAN_FRONT_HOME).is_none() {
+            return;
+        }
+        let words: Vec<String> =
+            aterm_json::from_str(&std::env::var(CLEAN_FRONT_WORDS).unwrap()).unwrap();
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "--shim".into(),
+            "targo".into(),
+            "-".into(),
+            std::env::var_os(CLEAN_FRONT_TOOL).unwrap(),
+        ];
+        args.extend(words.into_iter().map(std::ffi::OsString::from));
+        let code = crate::build_admit::run_hidden(&args);
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            75
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn through_clean_front(world: &World, tool: &Path, words: &[String]) -> std::process::Output {
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        // Terse progress leaves the exec'd tool's first output line unprefixed.
+        command
+            .args([
+                "--exact",
+                "build_cache::registered::tests::clean_front_child_if_asked",
+                "--quiet",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(&world.owner)
+            .env_clear()
+            .env("HOME", &world.home)
+            .env(CLEAN_FRONT_HOME, &world.home)
+            .env(CLEAN_FRONT_TOOL, tool)
+            .env(CLEAN_FRONT_WORDS, aterm_json::to_string(words).unwrap())
+            .env(
+                crate::build_admit::LEDGER_ENV,
+                world.home.join("ledger.noindex"),
+            );
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        aterm_uds::deadline::ends_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clean_reaches_the_tool_without_adopting_unknown_or_changing_registered_output() {
+        for registered in [false, true] {
+            let world = World::new();
+            if registered {
+                world.build();
+            } else {
+                std::fs::create_dir(&world.target).unwrap();
+            }
+            let sentinel = world.target.join("keep");
+            std::fs::write(&sentinel, b"clean itself owns removal").unwrap();
+            let before = std::fs::read(world.path()).ok();
+            let marker = std::fs::read(world.target.join(MARKER)).ok();
+            let target = format!("--target-dir={}", world.target.display());
+            for words in [
+                vec!["clean".into(), target.clone()],
+                vec![
+                    "--config".into(),
+                    "build.build-dir='custom-output'".into(),
+                    "clean".into(),
+                    target.clone(),
+                ],
+                vec!["metadata".into(), target.clone()],
+            ] {
+                // Echo is an in-place tool, not a copied image or a script. Its output
+                // proves the actual front handed it these words and did not return 75.
+                let out = through_clean_front(&world, Path::new("/bin/echo"), &words);
+                assert!(out.status.success(), "{registered}: {out:?}");
+                assert!(
+                    String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .any(|line| line == words.join(" ")),
+                    "{registered}: words={words:?}, output={out:?}"
+                );
+                assert_eq!(std::fs::read(world.path()).ok(), before);
+                assert_eq!(std::fs::read(world.target.join(MARKER)).ok(), marker);
+                assert_eq!(
+                    std::fs::read(&sentinel).unwrap(),
+                    b"clean itself owns removal"
+                );
+            }
+            let words = vec![
+                "--config".into(),
+                "build.build-dir='custom-output'".into(),
+                "--unverified".into(),
+                "check".into(),
+                target.clone(),
+            ];
+            let out = through_clean_front(&world, Path::new("/bin/echo"), &words);
+            assert_eq!(out.status.code(), Some(75), "{out:?}");
+            assert!(
+                !String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|line| line == words.join(" "))
+            );
+            assert_eq!(std::fs::read(world.path()).ok(), before);
+            assert_eq!(std::fs::read(world.target.join(MARKER)).ok(), marker);
+            if !registered {
+                let words = vec!["--unverified".into(), "check".into(), target];
+                let out = through_clean_front(&world, Path::new("/bin/echo"), &words);
+                assert_eq!(out.status.code(), Some(75), "{out:?}");
+                assert!(
+                    !String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .any(|line| line == words.join(" "))
+                );
+                assert!(!world.path().exists() && !world.target.join(MARKER).exists());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_real_clean_and_rebuild_publish_fresh_owned_output_over_only_a_missing_root() {
+        let world = World::new();
+        std::fs::write(
+            world.owner.join("Cargo.toml"),
+            "[package]\nname = 'cache-clean-probe'\nversion = '0.0.0'\nedition = '2024'\n[workspace]\n",
+        ).unwrap();
+        std::fs::create_dir(world.owner.join("src")).unwrap();
+        std::fs::write(
+            world.owner.join("src/lib.rs"),
+            "pub const BUILT: usize = 1;\n",
+        )
+        .unwrap();
+        let target = format!("--target-dir={}", world.target.display());
+        let build = vec![
+            "--unverified".into(),
+            "check".into(),
+            "--offline".into(),
+            "-j1".into(),
+            target.clone(),
+        ];
+        // Cargo supplies the actual driver used to compile this image. Managed creation,
+        // both clean calls and the final rebuild enter the production shim front.
+        let driver = Path::new(env!("CARGO"));
+        let out = through_clean_front(&world, driver, &build);
+        assert!(out.status.success(), "initial managed compilation: {out:?}");
+        let before = read(&world.path()).unwrap();
+        let recorded = std::fs::read(world.path()).unwrap();
+        let tag = std::fs::read(world.target.join("CACHEDIR.TAG")).unwrap();
+        assert_eq!(
+            tag,
+            format!("{}\n", aterm_toolchain::lasting::CACHEDIR_TAG_SIGNATURE).as_bytes()
+        );
+        assert!(same(&world.home, &before));
+        let out = through_clean_front(&world, driver, &["clean".into(), target.clone()]);
+        assert!(out.status.success(), "registered cleanup: {out:?}");
+        assert!(!world.target.exists(), "Cargo removed this private target");
+        assert_eq!(std::fs::read(world.path()).unwrap(), recorded);
+
+        // Model another producer by having Cargo itself recreate generated output and its
+        // standard tag, outside managed admission. Its tag grants no ownership, and the
+        // historical receipt must not acknowledge this unregistered replacement.
+        let mut foreign = aterm_uds::spawnfd::command(driver);
+        foreign
+            .args(&build)
+            .current_dir(&world.owner)
+            .env_clear()
+            .env("HOME", &world.home);
+        if let Some(path) = std::env::var_os("PATH") {
+            foreign.env("PATH", path);
+        }
+        let out = aterm_uds::deadline::ends_within(&mut foreign, aterm_spec::wait::MUST_HAPPEN);
+        assert!(
+            out.status.success(),
+            "unregistered compiler output: {out:?}"
+        );
+        let foreign_tag = std::fs::read(world.target.join("CACHEDIR.TAG")).unwrap();
+        assert!(
+            foreign_tag.starts_with(aterm_toolchain::lasting::CACHEDIR_TAG_SIGNATURE.as_bytes())
+        );
+        assert!(!world.target.join(MARKER).exists());
+        assert_eq!(std::fs::read(world.path()).unwrap(), recorded);
+        std::fs::write(world.target.join("keep"), b"unknown replacement").unwrap();
+        let refused = through_clean_front(&world, Path::new("/bin/echo"), &build);
+        assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+        assert!(!world.target.join(MARKER).exists());
+        assert_eq!(
+            std::fs::read(world.target.join("CACHEDIR.TAG")).unwrap(),
+            foreign_tag
+        );
+        assert_eq!(
+            std::fs::read(world.target.join("keep")).unwrap(),
+            b"unknown replacement"
+        );
+        assert_eq!(std::fs::read(world.path()).unwrap(), recorded);
+        let out = through_clean_front(&world, driver, &["clean".into(), target]);
+        assert!(out.status.success(), "unregistered cleanup: {out:?}");
+        assert!(!world.target.exists());
+        assert_eq!(std::fs::read(world.path()).unwrap(), recorded);
+
+        let out = through_clean_front(&world, driver, &build);
+        assert!(out.status.success(), "{out:?}");
+        let after = read(&world.path()).unwrap();
+        assert_ne!(
+            after.nonce, before.nonce,
+            "a new creation, not the historical receipt"
+        );
+        assert_eq!(after.identity, identity(&world.target).unwrap());
+        assert_eq!(after.owners, [world.owner]);
+        assert!(!after.owners_unknown && after.creating.is_none() && after.pending.is_none());
+        assert!(world.target.join(MARKER).is_file());
+        assert_eq!(
+            std::fs::read(world.target.join("CACHEDIR.TAG")).unwrap(),
+            tag
+        );
+        assert!(same(&world.home, &after));
+        assert!(
+            world.target.join("debug/deps").is_dir(),
+            "the actual compiler wrote output"
+        );
     }
 
     #[test]

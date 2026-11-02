@@ -63,7 +63,7 @@ pub fn help() -> String {
     format!("usage: aterm doctor {GRAMMAR}\n{HELP_ROWS}")
 }
 
-const ROWS: [(&str, &str, &str, &str); 14] = [
+const ROWS: [(&str, &str, &str, &str); 15] = [
     ("shell:", SHELL, "shell", "the shell aterm starts"),
     (
         "privacy:",
@@ -101,6 +101,12 @@ const ROWS: [(&str, &str, &str, &str); 14] = [
         "base.machine.services",
         "machine",
         "what macOS's own services hold in memory",
+    ),
+    (
+        "network:",
+        "base.machine.network",
+        "machine",
+        "where this Mac is on the network",
     ),
     (
         "awake:",

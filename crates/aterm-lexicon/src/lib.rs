@@ -1293,12 +1293,7 @@ fn char_count_le_3(s: &str) -> bool {
 /// byte-level (not char-level) so the hash of a `&str` slice never allocates.
 #[inline]
 fn fnv1a64(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
+    aterm_hash::fnv1a_64(s.as_bytes())
 }
 
 /// Maximal run of token characters starting at `i`, treating an apostrophe or

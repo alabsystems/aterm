@@ -678,10 +678,10 @@ impl Files for Table {
 /// A test image's file identity: one per name, the same for every path a table links to it.
 #[cfg(test)]
 pub(crate) fn test_id(name: &str) -> FileId {
-    let ino = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    });
-    FileId { dev: 7, ino }
+    FileId {
+        dev: 7,
+        ino: aterm_hash::fnv1a_64(name.as_bytes()),
+    }
 }
 
 /// The wall-ms span in which a block's execs count: from its C stamp less [`LEAD_MS`] (never

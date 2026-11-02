@@ -250,39 +250,23 @@ fn digest(payloads: &[Payload]) -> String {
 
 /// A PTY at `rows` x `cols`: `(master, slave)`, both close-on-exec.
 fn open_pty(rows: u16, cols: u16) -> Result<(OwnedFd, OwnedFd), String> {
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let mut size = libc::winsize {
+    let (master, slave) =
+        aterm_pty::open_pty_pair().map_err(|err| format!("open_pty_pair: {err}"))?;
+    // SAFETY: `open_pty_pair` returned two fresh close-on-exec descriptors owned only here.
+    let pair = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let size = libc::winsize {
         ws_row: rows,
         ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    // SAFETY: both out-params are writable `c_int`s; the name and termios pointers are null, so
-    // `openpty` writes no name and sets no attributes; `size` is an initialized `winsize` it
-    // only reads.
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        )
-    };
-    if rc != 0 {
-        return Err(format!("openpty: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: `openpty` succeeded, so both are open descriptors this process alone owns.
-    let pair = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    for fd in [&pair.0, &pair.1] {
-        // SAFETY: `fd` is an open descriptor this process owns; F_SETFD takes an int flag.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-            return Err(format!(
-                "FD_CLOEXEC on the PTY: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+    // SAFETY: `pair.1` is an open PTY slave descriptor and `size` is an initialized `winsize`
+    // `TIOCSWINSZ` only reads.
+    if unsafe { libc::ioctl(pair.1.as_raw_fd(), libc::TIOCSWINSZ, &raw const size) } != 0 {
+        return Err(format!(
+            "TIOCSWINSZ on the PTY: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(pair)
 }

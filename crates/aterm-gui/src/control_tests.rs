@@ -17536,6 +17536,67 @@ fn the_supervisor_key_is_owner_only_shown_in_the_roster_and_released_with_its_co
     assert!(row().ends_with(" supervisor=-"));
 }
 
+/// THE NEGATIVE CONTROL'S aterm (`lab harness-proof`, `ATERM_DEV_NO_CONTRACT3=1`): an aterm that
+/// serves no contract 3 answers a claim naming `contract=` as the v2 grammar does, `ERR usage`, and
+/// stores nothing, whether the holder is rostered or foreign; the serving aterm reads the same
+/// words as a v3 claim (a rostered holder's goes to its proof, a foreign one is stored unproven);
+/// a v2 claim is read alike by both.
+#[test]
+fn an_aterm_serving_no_contract_three_refuses_a_claim_naming_one() {
+    let h = registered_session(0, -1, b"");
+    let sup = |serves: bool, conn: u64, rest: &str| {
+        control_session::cmd_meta_supervisor_serving(
+            &h.ctx,
+            Scope::Owner,
+            Some(conn),
+            &|_| None,
+            rest,
+            serves,
+        )
+        .expect("a supervisor line")
+        .0
+    };
+    let holder = || {
+        h.ctx
+            .meta
+            .lock()
+            .unwrap()
+            .live_claim(crate::metrics::now_us())
+            .map(|c| c.holder.clone())
+    };
+    let rostered = "set supervisor grok-alab@4242 contract=3 scope=relaunch,upgrade";
+    let foreign = "set supervisor muse-alab@4242 contract=3 scope=relaunch,upgrade";
+    for line in [rostered, foreign] {
+        let refused = sup(false, 7, line);
+        assert!(
+            refused.starts_with("ERR usage: meta set supervisor <holder> [ttl=<ms>]"),
+            "{line}: {refused}"
+        );
+        assert_eq!(holder(), None, "{line}: nothing is claimed");
+    }
+    assert!(
+        sup(true, 7, rostered).starts_with("ERR unproven"),
+        "the serving aterm proves a rostered holder's v3 claim"
+    );
+    assert_eq!(
+        sup(true, 7, foreign),
+        "OK\n",
+        "a foreign v3 claim, unproven"
+    );
+    assert_eq!(holder().as_deref(), Some("muse-alab@4242"));
+    release_connection_claims_of(&h, 7);
+    assert_eq!(holder(), None);
+    assert_eq!(sup(false, 8, "set supervisor sup-a"), "OK\n", "a v2 claim");
+    assert_eq!(holder().as_deref(), Some("sup-a"));
+}
+
+/// Release `h`'s claims bound to connection `conn`.
+fn release_connection_claims_of(h: &crate::session_store::SessionHandle, conn: u64) {
+    let store = session_store::new_store();
+    store.write().unwrap().register(h.clone());
+    release_connection_claims(&store, None, conn);
+}
+
 /// Build an [`ActiveHandle`] over a `pipe_session` handle.
 #[cfg(unix)]
 fn active_for_handle(h: &crate::session_store::SessionHandle) -> ActiveHandle {

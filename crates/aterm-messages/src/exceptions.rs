@@ -67,6 +67,10 @@ pub enum Family {
     /// docs/DESIGN-automatic-alab-lan-admission-2026-10-29.md): a fact for later, never an alert
     /// on screen; the member desk's whole answer and the admin approver's, every look.
     Join,
+    /// This Mac away from the `ALab` LAN (`network.place.away`,
+    /// docs/DESIGN-network-place-2026-11-01.md): one Info fact while it is, none once it is back;
+    /// never an alert and never NEEDS YOU.
+    NetworkPlace,
 }
 
 impl Family {
@@ -98,6 +102,7 @@ impl Family {
             Self::Setup => "setup",
             Self::Secrets => "secrets.need",
             Self::Join => "members.join",
+            Self::NetworkPlace => "network.place",
         }
     }
 
@@ -121,7 +126,8 @@ impl Family {
             | Self::HugeDir
             | Self::ServiceMemory
             | Self::Secrets
-            | Self::Join => Mode::Level,
+            | Self::Join
+            | Self::NetworkPlace => Mode::Level,
             Self::Privacy
             | Self::Update
             | Self::UpgradeHost
@@ -139,7 +145,7 @@ impl Family {
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -163,6 +169,7 @@ impl Family {
         Self::Setup,
         Self::Secrets,
         Self::Join,
+        Self::NetworkPlace,
     ];
 
     /// The message tag the family's entries carry.
@@ -187,7 +194,8 @@ impl Family {
             | Self::HugeDir
             | Self::ServiceMemory
             | Self::Setup
-            | Self::Secrets => tags::SYSTEM,
+            | Self::Secrets
+            | Self::NetworkPlace => tags::SYSTEM,
             Self::Render => tags::RENDER,
             Self::Terminal | Self::Removed => tags::CONFIG,
             Self::FabricState => tags::FABRIC,

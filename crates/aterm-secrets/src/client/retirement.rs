@@ -1751,12 +1751,16 @@ pub fn admin_revoke_stolen(
 /// # Errors
 /// `aterm-swarm-roster` or `ai-pool.toml` is present and malformed.
 pub fn repair_half_done_revokes(doc: &mut Document) -> crate::Result<Option<String>> {
-    repair_half_done_revokes_with_log(doc, None)
+    repair_half_done_revokes_with_log(doc, None, &std::collections::BTreeSet::new())
 }
 
+/// [`repair_half_done_revokes`] under `log`: a row whose Mac the log removed or left out of
+/// `[everyone]` is stale too, except that a Mac `readmit` names (an approval the mirror carries
+/// back after a heal, [`super::own_head`]) is not stale for being left out.
 pub(super) fn repair_half_done_revokes_with_log(
     doc: &mut Document,
     log: Option<&crate::membership_log::Log>,
+    readmit: &std::collections::BTreeSet<Recipient>,
 ) -> crate::Result<Option<String>> {
     let active_recipients: std::collections::BTreeSet<String> =
         doc.machines().into_iter().map(|m| m.recipient).collect();
@@ -1911,10 +1915,11 @@ pub(super) fn repair_half_done_revokes_with_log(
                 || log.is_some_and(|l| {
                     Recipient::parse(&member.recipient).is_ok_and(|rec| {
                         l.recipient_is_removed(&rec)
-                            || l.audience_left_out_recipient(
-                                &crate::membership_log::EpochAudience::Everyone,
-                                &rec,
-                            )
+                            || (!readmit.contains(&rec)
+                                && l.audience_left_out_recipient(
+                                    &crate::membership_log::EpochAudience::Everyone,
+                                    &rec,
+                                ))
                             || l.membership()
                                 .members()
                                 .iter()

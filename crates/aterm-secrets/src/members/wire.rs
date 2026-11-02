@@ -4,8 +4,9 @@
 //! The `ask` exchange's lines: one ASCII line per message, `verb key=value…`, values in hex,
 //! padded base64 or percent-escaped text. The member speaks first with its greeting.
 
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 use std::io::{Read, Write};
+use std::time::Duration;
 
 /// The longest line either side reads.
 pub(super) const MAX_LINE: usize = 4096;
@@ -162,18 +163,48 @@ pub(super) fn refusal(why: &str) -> String {
     format!("NO why={}", escape_within(why, MAX_WHY))
 }
 
-/// The answer line `line`, `OK …` taken apart, or the error its `NO` names.
+/// A `NO` line naming `why` that also says the member is busy (`busy=1`): its run touched no
+/// phrase, so the joiner sends the same words again while the phrase can live, for `left`, the
+/// whole seconds the phrase that run would take has left (`left=`). A joiner before it reads
+/// `why` alone.
+pub(super) fn busy_refusal(why: &str, left: Duration) -> String {
+    format!(
+        "NO busy=1 left={} why={}",
+        left.as_secs(),
+        escape_within(why, MAX_WHY)
+    )
+}
+
+/// The phrase life a busy answer `line` names (`left=`, [`busy_refusal`]); `None` from a member
+/// that names none.
+pub(super) fn busy_left(line: &str) -> Option<Duration> {
+    let left = Line::parse(line).get("left").ok()?;
+    Some(left)
+        .filter(|left| {
+            !left.is_empty() && left.len() <= 10 && left.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|left| left.parse().ok())
+        .map(Duration::from_secs)
+}
+
+/// The answer line `line`, `OK …` taken apart, or the error its `NO` names
+/// ([`ErrorKind::MemberBusy`] for a [`busy_refusal`]).
 pub(super) fn answer(line: &str) -> Result<Line<'_>> {
     let parsed = Line::parse(line);
     match parsed.verb {
         "OK" => Ok(parsed),
-        "NO" => Err(Error::new(
-            parsed
+        "NO" => {
+            let why = parsed
                 .get("why")
                 .ok()
                 .and_then(|why| unescape_within(why, MAX_WHY).ok())
-                .unwrap_or_else(|| "the member refused".to_owned()),
-        )),
+                .unwrap_or_else(|| "the member refused".to_owned());
+            Err(if parsed.get("busy") == Ok("1") {
+                Error::of_kind(ErrorKind::MemberBusy, why)
+            } else {
+                Error::new(why)
+            })
+        }
         _ => Err(Error::new("the member answered something else")),
     }
 }

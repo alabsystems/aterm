@@ -22,6 +22,7 @@ aterm ctl @self sys procs           # this tab's processes, busiest first
 aterm ctl @self sys disk            # this tab's folders' volumes, and who writes
 aterm ctl @self sys net             # interfaces, throughput, TCP states
 aterm ctl @self sys jobs            # this tab's commands and tool calls: still making progress?
+aterm ctl @self sys name job=<id>   # explicit macOS stack observation of one quiet wait
 aterm ctl @self sys why             # who uses what deviates most (CPU or memory), and why
 aterm ctl @self sys [<view>] since=<cursor>  # what changed since the reply that printed next=<cursor>
 ```
@@ -47,6 +48,16 @@ aterm ctl @self sys [<view>] since=<cursor>  # what changed since the reply that
 `no_progress=1` beside `quiet`: the tool call used almost no CPU in that silence.
 
 ## Wait instead of polling
+
+For a quiet or stuck waiting job, Owner may ask `sys name job=<id>` or `sys name
+task=<id>`. This explicitly runs one bounded macOS stack sample outside the UI
+and probe threads. It checks process birth/exec identity and current job progress
+again before publishing a fixed wait word. It names no file-lock holder. The
+reply is `OK named=<word> job=<id> [holder=unknown] took_ms=<n>` or a fixed
+`ERR unavailable name why=<reason>`; raw stacks stay private. A conflicting,
+unrecognized or unauthenticated stack is `named-unparsed`, never a guessed wait.
+Other platforms report `unsupported`. One request is in flight per instance and
+one result is accepted per current job episode and identity/progress revision.
 
 ```sh
 aterm ctl @self await sys quiet for=20s timeout=600000              # the machine has gone quiet

@@ -122,18 +122,16 @@ pub fn launch_key(home: Option<&str>, flags: &[String]) -> String {
     if home.is_none() && flags.is_empty() {
         return "home".to_owned();
     }
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hash = aterm_hash::Fnv1a64::new();
     let words = home
         .iter()
         .map(|h| format!("HOME={h}"))
         .chain(flags.iter().cloned());
     for word in words {
-        for b in word.bytes().chain(std::iter::once(0)) {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        hash.write(word.as_bytes());
+        hash.write_u8(0);
     }
-    format!("h{hash:016x}")
+    format!("h{:016x}", hash.finish())
 }
 
 /// The harness state directory every window and `aterm harness` on this machine shares.

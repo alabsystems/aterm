@@ -13,6 +13,24 @@ use aterm_types::network_state::{
 };
 
 fn fixture() -> LabState {
+    use aterm_agent::harness::account_progress::{
+        AccountProgress, OwnClaimBlocker, OwnClaimFinding,
+    };
+    let mut progress = AccountProgress::unknown(100);
+    progress.account = Some("fixture-account".into());
+    progress.phase = aterm_agent::harness::account_progress::ProgressPhase::Waiting;
+    progress.own_claim = Some(OwnClaimFinding {
+        blocker: OwnClaimBlocker::HeldElsewhere { until: 200 },
+        pinned: true,
+    });
+    let claim_rows = crate::lab_screen::progress_facts_at(Some(&progress), Some(150))
+        .into_iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "Own account claim" | "Claim recorded until" | "Claim timing" | "Switch blocker"
+            )
+        });
     let mut network = NetworkStateSnapshot::default();
     network.network.visibility = aterm_types::network_state::Visibility::Active;
     network.network.history = HistoryState::Ready;
@@ -65,7 +83,10 @@ fn fixture() -> LabState {
                 ("Recovery".into(), "Waiting".into()),
                 ("Blocker".into(), "No eligible alternate account".into()),
                 ("Next event".into(), "2026-11-01T00:00:00Z".into()),
-            ],
+            ]
+            .into_iter()
+            .chain(claim_rows)
+            .collect(),
         }],
         collecting: false,
     }
@@ -550,6 +571,15 @@ fn lab_facts_remain_whole_in_wide_compact_and_scaled_settings() {
             }
             assert!(label(&drawn, "lab/account/0/row/login").contains("Signed out"));
             assert!(label(&drawn, "lab/session/7/row/next-event").contains("2026-11-01T00:00:00Z"));
+            assert!(
+                label(&drawn, "lab/session/7/row/own-account-claim").contains("at the decision")
+            );
+            assert!(
+                label(&drawn, "lab/session/7/row/claim-recorded-until")
+                    .contains("1970-01-01T00:03:20Z")
+            );
+            assert!(label(&drawn, "lab/session/7/row/claim-timing").contains("not rechecked"));
+            assert!(label(&drawn, "lab/session/7/row/switch-blocker").contains("pinned"));
         }
     }
 }

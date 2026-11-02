@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Formal model of the membership log's evaluator: set-union merges, `Remove` against `Admit`,
-//! mutual removes, cutoffs, the quorum `Remove`, and labels
-//! (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.2, F11).
+//! mutual removes, cutoffs, the quorum `Remove`, labels, and honest writes under an epoch a
+//! removed Mac minted past its cutoff (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.2, F11, F21).
 
 use aterm_spec::derive::*;
 
@@ -23,9 +23,11 @@ use aterm_spec::derive::*;
 /// | 4 | A, B | A removes B | B admits Z, unaware | | B in, Z in |
 /// | 5 | A, B, C, D | A removes B, C and D | B's quorum remove of A | C's quorum remove of A | A, B, C, D in |
 /// | 6 | B, S | B removes S | S's lone quorum remove of B | | B in, S in |
+/// | 7 | A, R, Y; `E0` holds `S=v0` | A removes R | R mints `E`, wraps it to all, puts `T` | later, Y puts `S=v1` under `E` | read by Y: `S`, `T` there, `E` newest or winning |
 ///
 /// A label is 0 for none, 1 for a bare m5 and 2 for m5 with the Mac's own suffix; the mutants
-/// add 3 (m6) and 4 (m7).
+/// add 3 (m6) and 4 (m7). In scenario 7 `u` is 1 for `S=v0` and 2 for `S=v1`; R and Y each
+/// sign before they hear of R's removal.
 ///
 /// `c<who><i>` counts the times island `i`'s label for X, Y or Z changed from one label to
 /// another. `d1` and `d2` mark an island that took a record and has not evaluated since.
@@ -68,19 +70,25 @@ pub fn membership_model() -> Model {
                 sc = 6;
                 u1 = 1; v1 = 1; u2 = 1; v2 = 1;
             }
+            action KeyedWrite when (sc == 0) {
+                sc = 7;
+                u1 = 1; u2 = 1;
+            }
 
             action Sign1 when (sc > 0 && d1 == 0 && d2 == 0 && a1 == 0) {
                 a1 = 1; d1 = 1;
             }
-            // The quorum shares (sc 5, 6) follow the removal they answer.
+            // The quorum shares (sc 5, 6) follow the removal they answer; R's epoch (sc 7)
+            // comes before R hears of its removal.
             action Sign2 when (sc > 0 && d1 == 0 && d2 == 0 && b2 == 0 &&
-                (sc <= 4 || b1 == 1)) {
+                (sc <= 4 || (sc == 7 && b1 == 0) || (sc <= 6 && b1 == 1))) {
                 b2 = 1; d2 = 1;
             }
             // Z's admission comes after X and Y are settled everywhere; C's share follows the
-            // removal.
+            // removal; Y writes under R's epoch before it hears of R's removal.
             action Sign3 when (d1 == 0 && d2 == 0 && b3 == 0 &&
-                ((sc == 1 && a1 == 1 && a2 == 1 && b1 == 1 && b2 == 1) || (sc == 5 && b1 == 1))) {
+                ((sc == 1 && a1 == 1 && a2 == 1 && b1 == 1 && b2 == 1) || (sc == 5 && b1 == 1) ||
+                 (sc == 7 && b2 == 1 && b1 == 0))) {
                 b3 = 1; d2 = 1;
             }
             action Deliver1 when (d1 == 0 && d2 == 0 && a1 == 1 && b1 == 0) {
@@ -89,7 +97,9 @@ pub fn membership_model() -> Model {
             action Deliver2 when (d1 == 0 && d2 == 0 && b2 == 1 && a2 == 0) {
                 a2 = 1; d1 = 1;
             }
-            action Deliver3 when (d1 == 0 && d2 == 0 && b3 == 1 && a3 == 0) {
+            // Y's write under R's epoch (sc 7) travels after that epoch.
+            action Deliver3 when (d1 == 0 && d2 == 0 && b3 == 1 && a3 == 0 &&
+                (sc <= 6 || a2 == 1)) {
                 a3 = 1; d1 = 1;
             }
 
@@ -111,9 +121,11 @@ pub fn membership_model() -> Model {
                     1 - a1
                 } else { if sc == 5 {
                     if Buggy == 6 || a2 + a3 <= 1 { 1 } else { 0 }
-                } else {
+                } else { if sc == 6 {
                     if Buggy == 7 { 1 - a2 } else { 1 }
-                } } } } };
+                } else {
+                    if a3 == 1 { if Buggy == 8 && a1 == 1 { 1 } else { 2 } } else { 1 }
+                } } } } } };
                 v1 = if sc == 1 {
                     if Buggy == 1 {
                         if v1 > 0 { v1 } else { if a2 == 0 { 0 } else { if u1 + w1 > 0 { 2 } else { 1 } } }
@@ -130,9 +142,11 @@ pub fn membership_model() -> Model {
                     if Buggy == 5 { a2 } else { if a2 == 1 && a1 == 0 { 1 } else { 0 } }
                 } else { if sc == 5 {
                     if Buggy == 6 || a2 + a3 <= 1 { 1 - a1 } else { 1 }
-                } else {
+                } else { if sc == 6 {
                     if Buggy == 7 && a2 == 1 { 1 } else { 1 - a1 }
-                } } } } };
+                } else {
+                    if a2 == 1 && (a1 == 0 || (Buggy == 9 && a3 == 1)) { 1 } else { 0 }
+                } } } } } };
                 w1 = if sc == 1 {
                     if Buggy == 1 {
                         if w1 > 0 { w1 } else { if a3 == 0 { 0 } else { if u1 + v1 > 0 { 2 } else { 1 } } }
@@ -143,9 +157,11 @@ pub fn membership_model() -> Model {
                     } }
                 } else { if sc == 5 {
                     if Buggy == 6 || a2 + a3 <= 1 { 1 - a1 } else { 1 }
+                } else { if sc == 7 {
+                    if a2 == 1 && (a1 == 0 || (Buggy == 10 && a3 == 1)) { 1 } else { 0 }
                 } else {
                     0
-                } };
+                } } };
                 x1 = if sc == 5 {
                     if Buggy == 6 || a2 + a3 <= 1 { 1 - a1 } else { 1 }
                 } else {
@@ -192,9 +208,11 @@ pub fn membership_model() -> Model {
                     1 - b1
                 } else { if sc == 5 {
                     if Buggy == 6 || b2 + b3 <= 1 { 1 } else { 0 }
-                } else {
+                } else { if sc == 6 {
                     if Buggy == 7 { 1 - b2 } else { 1 }
-                } } } } };
+                } else {
+                    if b3 == 1 { if Buggy == 8 && b1 == 1 { 1 } else { 2 } } else { 1 }
+                } } } } } };
                 v2 = if sc == 1 {
                     if Buggy == 1 {
                         if v2 > 0 { v2 } else { if b2 == 0 { 0 } else { if u2 + w2 > 0 { 2 } else { 1 } } }
@@ -211,9 +229,11 @@ pub fn membership_model() -> Model {
                     if Buggy == 5 { b2 } else { if b2 == 1 && b1 == 0 { 1 } else { 0 } }
                 } else { if sc == 5 {
                     if Buggy == 6 || b2 + b3 <= 1 { 1 - b1 } else { 1 }
-                } else {
+                } else { if sc == 6 {
                     if Buggy == 7 && b2 == 1 { 1 } else { 1 - b1 }
-                } } } } };
+                } else {
+                    if b2 == 1 && (b1 == 0 || (Buggy == 9 && b3 == 1)) { 1 } else { 0 }
+                } } } } } };
                 w2 = if sc == 1 {
                     if Buggy == 1 {
                         if w2 > 0 { w2 } else { if b3 == 0 { 0 } else { if u2 + v2 > 0 { 2 } else { 1 } } }
@@ -224,9 +244,11 @@ pub fn membership_model() -> Model {
                     } }
                 } else { if sc == 5 {
                     if Buggy == 6 || b2 + b3 <= 1 { 1 - b1 } else { 1 }
+                } else { if sc == 7 {
+                    if b2 == 1 && (b1 == 0 || (Buggy == 10 && b3 == 1)) { 1 } else { 0 }
                 } else {
                     0
-                } };
+                } } };
                 x2 = if sc == 5 {
                     if Buggy == 6 || b2 + b3 <= 1 { 1 - b1 } else { 1 }
                 } else {
@@ -279,7 +301,17 @@ pub fn membership_model() -> Model {
             invariant OneMemberIsNeverAQuorum: sc <= 5 || sc > 6 ||
                 ((d1 == 1 || a1 + a2 <= 1 || (u1 == 1 && v1 == 0)) &&
                  (d2 == 1 || b1 + b2 <= 1 || (u2 == 1 && v2 == 0)));
-            bound EvaluationBox: sc <= 6 && u1 <= 4 && v1 <= 4 && w1 <= 4 && x1 <= 1 &&
+            // Buggy 8: an epoch that stopped counting opens for nobody, so Y's write reverts
+            // (main before F21).
+            invariant HonestWriteOnACutEpochStands: sc <= 6 ||
+                ((d1 == 1 || a3 == 0 || u1 == 2) && (d2 == 1 || b3 == 0 || u2 == 2));
+            // Buggy 9: a dependent makes everything under its epoch count, R's own write too.
+            invariant RemovedMinterStaysCut: sc <= 6 ||
+                ((d1 == 1 || a1 == 0 || v1 == 0) && (d2 == 1 || b1 == 0 || v2 == 0));
+            // Buggy 10: an epoch a write depends on counts again, so writers reuse it.
+            invariant KeyedEpochIsNeverNewest: sc <= 6 ||
+                ((d1 == 1 || a1 == 0 || w1 == 0) && (d2 == 1 || b1 == 0 || w2 == 0));
+            bound EvaluationBox: sc <= 7 && u1 <= 4 && v1 <= 4 && w1 <= 4 && x1 <= 1 &&
                 u2 <= 4 && v2 <= 4 && w2 <= 4 && x2 <= 1 &&
                 cu1 <= 2 && cv1 <= 2 && cw1 <= 2 && cu2 <= 2 && cv2 <= 2 && cw2 <= 2;
         }

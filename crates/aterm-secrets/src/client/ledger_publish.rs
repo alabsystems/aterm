@@ -60,6 +60,13 @@ pub struct ObservedHead {
     pub(crate) commons_bound: bool,
 }
 
+impl ObservedHead {
+    /// The admission evidence this head's admin locker holds.
+    pub(super) fn admissions(&self) -> &super::admission::Ledger {
+        &self.admissions
+    }
+}
+
 impl Drop for ObservedHead {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.seed);
@@ -225,7 +232,7 @@ pub(super) fn candidate_server_urls(
     urls
 }
 
-fn decode_verified_head(
+pub(super) fn decode_verified_head(
     paths: &Paths,
     url_label: String,
     bytes: Vec<u8>,
@@ -369,13 +376,17 @@ pub(super) fn reconcile_merged_metadata(
     doc: &mut Document,
     heads: &[ObservedHead],
 ) -> crate::Result<()> {
-    reconcile_merged_metadata_with_log(doc, heads, None)
+    reconcile_merged_metadata_with_log(doc, heads, None, &BTreeSet::new())
 }
 
+/// [`reconcile_merged_metadata`] under `log`: a row the log removed, denies or left out of
+/// `[everyone]` is pruned, except that a Mac `readmit` names (an approval this Mac carries back
+/// after a heal, [`super::own_head`]) is not pruned for being left out.
 pub(super) fn reconcile_merged_metadata_with_log(
     doc: &mut Document,
     heads: &[ObservedHead],
     log: Option<&crate::membership_log::Log>,
+    readmit: &BTreeSet<Recipient>,
 ) -> crate::Result<()> {
     if heads.is_empty() {
         return Ok(());
@@ -511,10 +522,11 @@ pub(super) fn reconcile_merged_metadata_with_log(
             let removed_in_log = log.is_some_and(|l| {
                 Recipient::parse(&m.recipient).is_ok_and(|rec| {
                     l.recipient_is_removed(&rec)
-                        || l.audience_left_out_recipient(
-                            &crate::membership_log::EpochAudience::Everyone,
-                            &rec,
-                        )
+                        || (!readmit.contains(&rec)
+                            && l.audience_left_out_recipient(
+                                &crate::membership_log::EpochAudience::Everyone,
+                                &rec,
+                            ))
                         || super::log_entries::recipient_denied_by_roster_or_log(
                             Some(&merged_roster),
                             l,
@@ -666,10 +678,11 @@ pub(super) fn reconcile_merged_metadata_with_log(
             let removed_in_log = log.is_some_and(|l| {
                 Recipient::parse(recipient).is_ok_and(|rec| {
                     l.recipient_is_removed(&rec)
-                        || l.audience_left_out_recipient(
-                            &crate::membership_log::EpochAudience::Everyone,
-                            &rec,
-                        )
+                        || (!readmit.contains(&rec)
+                            && l.audience_left_out_recipient(
+                                &crate::membership_log::EpochAudience::Everyone,
+                                &rec,
+                            ))
                         || super::log_entries::recipient_denied_by_roster_or_log(
                             Some(&merged_roster),
                             l,
@@ -737,7 +750,7 @@ pub(super) fn reconcile_merged_metadata_with_log(
 
     // Complete any half-done revoke cascade (e.g. account-pool warm slots or steward lease of a
     // Mac revoked on one branch while reallocated or renewed on another).
-    let _ = retirement::repair_half_done_revokes_with_log(doc, log)?;
+    let _ = retirement::repair_half_done_revokes_with_log(doc, log, readmit)?;
     Ok(())
 }
 
@@ -1053,14 +1066,15 @@ pub fn publish_to_servers(
     publish_to_servers_for_admin(paths, &config, urls, bytes)
 }
 
-/// Read back the served head from `admin.config.source` after an admission publish and verify that
-/// `served.seq >= expected_seq` and every recipient in `approved_recipients` is recorded in the
-/// served document (or `code-only` if concurrently revoked), before retiring the queued request
-/// (`QueuedAdmissionPublished`, `DESIGN-alab-swarm` §3.4 rule 6).
+/// Read back a served head after an admission publish, using signed-policy mirrors when the
+/// configured source cannot confirm it. Verify that `served.seq >= expected_seq` and every
+/// recipient in `approved_recipients` is recorded in that served document (or `code-only` if
+/// concurrently revoked), before retiring the queued request (`QueuedAdmissionPublished`,
+/// `DESIGN-alab-swarm` §3.4 rule 6).
 ///
 /// # Errors
-/// The source returns no verified envelope at `>= expected_seq`, its admin locker cannot be
-/// decrypted, or any approved recipient is absent from the served head.
+/// No source returns a verified envelope at `>= expected_seq` with a decryptable admin locker
+/// and every approved recipient present in its served head.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1083,12 +1097,72 @@ pub fn verify_approved_in_served_head(
         .signer
         .ok_or_else(|| Error::new("vault has no pinned signer for read-back"))?;
     let identity = machine_identity(paths)?;
-    let served_bytes = match transport::fetch_as(
-        &admin.config.source,
-        None,
-        READ_BACK_DEADLINE,
-        Some(&identity.recipient().to_bech32()),
-    )? {
+    let recipient = identity.recipient().to_bech32();
+    let until = Instant::now() + servers_within(READ_BACK_DEADLINE);
+    let confirm = |source: &Source, within: Duration| {
+        let fetched = match source {
+            Source::Url(url) => transport::fetch_within_as(url, None, within, Some(&recipient))?,
+            Source::Path(_) => transport::fetch_as(source, None, within, Some(&recipient))?,
+        };
+        verify_admission_head(
+            &admin.config,
+            &pin,
+            &identity,
+            fetched,
+            expected_seq,
+            approved_recipients,
+        )
+    };
+    // Leave time for mirrors even when the primary accepts a connection but stops answering.
+    let primary = confirm(&admin.config.source, servers_within(PROBE_DEADLINE));
+    if primary.is_ok() || matches!(admin.config.source, Source::Path(_)) {
+        return primary;
+    }
+    let mut urls = Vec::new();
+    for url in policy_peer_urls(paths, &admin.config) {
+        if let Source::Url(primary) = &admin.config.source
+            && !transport::describe(&url).eq_ignore_ascii_case(&transport::describe(primary))
+        {
+            push_unique_endpoint(&mut urls, &url);
+        }
+    }
+    let confirmed = std::thread::scope(|scope| {
+        let check = |url: String| {
+            let within = until
+                .checked_duration_since(Instant::now())
+                .filter(|within| !within.is_zero())
+                .ok_or_else(|| {
+                    Error::of_kind(
+                        crate::ErrorKind::TimedOut,
+                        "admission read-back deadline elapsed",
+                    )
+                })?;
+            confirm(&Source::Url(url), within)
+        };
+        let attempts: Vec<_> = urls
+            .into_iter()
+            .map(|url| scope.spawn(move || check(url)))
+            .collect();
+        // Join every attempt even after a success. No network worker outlives this check,
+        // and all mirror reads share the remaining read-back deadline.
+        let mut confirmed = false;
+        for attempt in attempts {
+            confirmed |= attempt.join().is_ok_and(|result| result.is_ok());
+        }
+        confirmed
+    });
+    if confirmed { Ok(()) } else { primary }
+}
+
+fn verify_admission_head(
+    config: &Config,
+    pin: &[u8; 32],
+    identity: &Identity,
+    fetched: Fetched,
+    expected_seq: u64,
+    approved_recipients: &[String],
+) -> crate::Result<()> {
+    let served_bytes = match fetched {
         Fetched::Body(bytes) => bytes,
         Fetched::Missing | Fetched::NoNewer(_) => {
             return Err(Error::new(
@@ -1096,13 +1170,8 @@ pub fn verify_approved_in_served_head(
             ));
         }
     };
-    let (served_env, _, _) = envelope::verify_for_reader(
-        &served_bytes,
-        &admin.config.name,
-        &pin,
-        &admin.config.followed,
-        None,
-    )?;
+    let (served_env, _, _) =
+        envelope::verify_for_reader(&served_bytes, &config.name, pin, &config.followed, None)?;
     if served_env.seq < expected_seq {
         return Err(Error::new(format!(
             "read-back after approval saw seq {}, below published seq {expected_seq}",
@@ -1112,7 +1181,7 @@ pub fn verify_approved_in_served_head(
     let locker = served_env
         .admin_locker()
         .ok_or_else(|| Error::new("read-back envelope has no admin locker"))?;
-    let plain = age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes())
+    let plain = age::decrypt(std::slice::from_ref(identity), locker.armored.as_bytes())
         .map_err(|e| Error::new(format!("read-back admin locker: {e}")))?;
     let opened = parse_admin(&plain)?;
     opened.admissions.validate(&opened.doc, served_env.seq)?;

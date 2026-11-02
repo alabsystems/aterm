@@ -27,7 +27,7 @@ default-members = [
     "crates/aterm-hash", "crates/aterm-http", "crates/aterm-journal", "crates/aterm-jpeg", "crates/aterm-json",
     "crates/aterm-keeper", "crates/aterm-lexicon", "crates/aterm-libc",
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-lz4",
-    "crates/aterm-macro-support", "crates/aterm-mail", "crates/aterm-mail-bigint", "crates/aterm-messages", "crates/aterm-net", "crates/aterm-objc",
+    "crates/aterm-macro-support", "crates/aterm-mail", "crates/aterm-mail-bigint", "crates/aterm-messages", "crates/aterm-net", "crates/aterm-netplace", "crates/aterm-objc",
     "crates/aterm-models-agh", "crates/aterm-models-aos", "crates/aterm-models-atpkg", "crates/aterm-models-core", "crates/aterm-models-effects",
     "crates/aterm-models-db", "crates/aterm-models-gui", "crates/aterm-models-harness", "crates/aterm-models-misc",
     "crates/aterm-models-native", "crates/aterm-models-release", "crates/aterm-models-render",
@@ -79,7 +79,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.148.0"
+version = "0.149.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -99,7 +99,7 @@ serde = { package = "aterm-serde", path = "crates/aterm-serde" }
 # Resolves to crates/aterm-libc through [patch.crates-io] below.
 libc = "0.2"
 # TLS for aterm-http and aterm-net (the fleet); `ring` backend, no aws-lc C build.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Shared version floor for every direct `ring` edge; default features off so each
 # member enables only what it needs (`alloc` in atpkg for RSA, `default` in
 # signing tools and tests).
@@ -211,6 +211,8 @@ aterm-models-swarm = { path = "crates/aterm-models-swarm" }
 aterm-models-update = { path = "crates/aterm-models-update" }
 # Fleet mutual authentication over TLS 1.3, LAN peer listener, and relay.
 aterm-net = { path = "crates/aterm-net" }
+# This Mac's network place: where it is (ALab LAN, remote, offline), its internet, its keeper.
+aterm-netplace = { path = "crates/aterm-netplace" }
 aterm-objc = { path = "crates/aterm-objc" }
 aterm-observe = { path = "crates/aterm-observe" }
 aterm-parser = { path = "crates/aterm-parser" }
@@ -469,6 +471,17 @@ opt-level = 2
 [profile.dev.package.astream-digest]
 opt-level = 2
 
+# FNV-1a and CRC-32 are astream-wire's: `aterm_hash::fnv_mix_u64` is one call to
+# its `fnv1a_64_mix_u64`, and neither that nor the Clean-origin multiply under it
+# is `#[inline]`, so in dev each per-frame fingerprint step leaves the caller's
+# crate. effects_suite, alternating, 18 of 18 cores busy: the step at opt-level 0
+# 237.1 -> 239.5 CPU-s, at 2 237.2 -> 237.2 (a release build's fat LTO inlines it
+# either way, and opt-test inherits release's level). A cold compile of the crate
+# takes no longer (254 -> 235 CPU-s). Only opt-level moves; debug assertions and
+# overflow checks stay on.
+[profile.dev.package.astream-wire]
+opt-level = 2
+
 # The zstd encoder and decoder in dev: zstd_suite holds the encoder to libzstd's
 # ratio at level 19 and re-encodes megabyte inputs cut every way, all through
 # the optimal parser. Alone, alternating at a load of 9-21: zstd_suite 14.0 ->
@@ -552,6 +565,19 @@ inherits = "release"
 debug-assertions = true
 lto = false
 codegen-units = 16
+strip = false
+
+# `verify perf fabric --profile shipped`: the release's code generation with the seams the
+# bench drives compiled in by `--features dev-seams`, not by debug assertions. Fat LTO and one
+# codegen unit are named here so a later change to `[profile.release]` shows up as this arm
+# differing rather than drifting silently; symbols stay so a sample of it reads. A profile of
+# its own, so its binaries land in `target/fabric-shipped/`, which no other build rewrites
+# under the lane's identity check.
+[profile.fabric-shipped]
+inherits = "release"
+lto = true
+codegen-units = 1
+debug-assertions = false
 strip = false
 
 # `lab trail-diff`'s dump (`aterm-gui --example trail_dump`, docs/design/PRISM-GLASS.md

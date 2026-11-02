@@ -19769,6 +19769,398 @@ fn a_persons_login_after_aterms_back_out_is_left_alone() {
     );
 }
 
+/// The weekly limit the measured hand-off of 2026-10-31 stood over, its reset `reset`, and the
+/// state that waits on it
+/// ([`a_persons_login_left_over_a_weekly_limit_is_closed_once_its_reset_passes`]).
+fn weekly_walled_at(t: Instant, reset: Instant) -> TurnEndState {
+    let mut wall = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)",
+        Some(JOB),
+    );
+    wall.reset_at = Some(reset);
+    wall.resumes_by_itself = true;
+    let mut st = TurnEndState::default();
+    let a = act(&mut st, &wall, t);
+    assert!(
+        waits_until(&a, reset + st.timing.auto_resume_grace),
+        "{a:?}"
+    );
+    st
+}
+
+/// The measured hand-off of a person's own `/login` over the weekly limit, their newest key `ago`
+/// before the read (`None`: none known).
+fn handoff_over_limit(ago: Option<Duration>) -> TurnEndReading {
+    use aterm_phase::prompt::fixtures::LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302;
+    TurnEndReading {
+        person: ago,
+        ..captured(
+            LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302,
+            None,
+            Duration::ZERO,
+        )
+    }
+}
+
+/// A PERSON'S OWN `/login` LEFT OVER A USAGE LIMIT IS CLOSED ONCE THE LIMIT'S ACT IS DUE (the
+/// measured incident of 2026-10-31: Claude Code 2.1.302's browser hand-off stood 33 h past the
+/// weekly reset, the tab told `limited` and never resumed). Before the reset the dialog's tab
+/// waits for the reset and its grace, a wake that leaves no limit unhandled; then, once the dialog
+/// stood `OVER_LIMIT_UNUSED` past the person's newest key, aterm closes it with the dialog's own
+/// Esc (`login-over-limit@v1`), and on the first frame after that Esc the limit's resume is typed.
+#[test]
+fn a_persons_login_left_over_a_weekly_limit_is_closed_once_its_reset_passes() {
+    use super::super::login::{OVER_LIMIT_UNUSED, RULE_LOGIN_OVER_LIMIT};
+    use aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED_OVER_WEEKLY_LIMIT_2_1_302;
+    let t = t0();
+    let reset = t + 10 * 60 * MIN;
+    let mut st = weekly_walled_at(t, reset);
+    let due = reset + GRACE;
+    let opened = t + 60 * MIN;
+    let dialog = handoff_over_limit(Some(Duration::from_secs(5)));
+    assert_eq!(
+        dialog.login_screen,
+        Some(aterm_phase::LoginScreen::Browser),
+        "{dialog:#?}"
+    );
+    let a = at(&mut st, &dialog, opened);
+    assert!(
+        waits_until(&a, due),
+        "the reset is the dialog's wake: {a:?}"
+    );
+    let aged = |now: Instant| handoff_over_limit(Some(now.saturating_duration_since(opened)));
+    let a = at(&mut st, &aged(due - MIN), due - MIN);
+    assert!(
+        waits_until(&a, due),
+        "nothing pressed before the grace: {a:?}"
+    );
+    let cancel = TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_OVER_LIMIT,
+    };
+    let a = act(&mut st, &aged(due), due);
+    assert_eq!(a, cancel, "closed once the limit's act is due");
+    assert!(OVER_LIMIT_UNUSED < due - opened, "the dialog stood unused");
+    let after = |now: Instant| TurnEndReading {
+        person: Some(now.saturating_duration_since(opened)),
+        ..captured(
+            LOGIN_INTERRUPTED_OVER_WEEKLY_LIMIT_2_1_302,
+            Some(reset),
+            Duration::ZERO,
+        )
+    };
+    let uncovered = due + Duration::from_secs(2);
+    let r = after(uncovered);
+    assert!(r.login_interrupted && r.login_screen.is_none(), "{r:#?}");
+    // Claude Code's own continue, still drawn, has its grace to fire; past it aterm types the
+    // limit's resume at the composer the Esc uncovered.
+    let a = at(&mut st, &r, uncovered);
+    let resumes = match &a {
+        TurnEndAction::WaitUntil { until, .. } => *until,
+        a => {
+            assert_eq!(a.rule_id(), Some(RULE_LIMIT_RESUME), "{a:?}");
+            uncovered
+        }
+    };
+    assert!(
+        resumes <= reset + st.timing.auto_resume_grace,
+        "no later than Claude Code's own continue's grace: {a:?}"
+    );
+    let a = at(&mut st, &after(resumes), resumes);
+    assert_eq!(
+        a.rule_id(),
+        Some(RULE_LIMIT_RESUME),
+        "the limit's resume, at the composer the Esc uncovered: {a:?}"
+    );
+}
+
+/// THE NEGATIVE CONTROLS OF `login-over-limit@v1`: a person's own hand-off stays theirs where no
+/// limit's act is owed under it (no limit, Autopilot off, `resume_limits` off, a landed task under
+/// Land), and where a key of theirs is newer than `OVER_LIMIT_UNUSED` (the tab waits for that age,
+/// not the person), their newest key deciding over an older touch beside it. (aterm's own `/login`
+/// is no case here: its track is the login wall's, which owes no limit's act, and a limit drawn or
+/// seeded replaces that track, so `login_over_limit_due` and `login_typed_at` are never both
+/// `Some`.)
+#[test]
+fn a_persons_login_over_no_owed_act_or_under_their_hand_is_theirs() {
+    use super::super::login::{OVER_LIMIT_UNUSED, RULE_LOGIN_OVER_LIMIT};
+    let t = t0();
+    let reset = t + 10 * 60 * MIN;
+    let past = reset + 2 * 60 * MIN;
+    let old = Some(12 * 60 * MIN);
+    let cancel = TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_OVER_LIMIT,
+    };
+    let mut st = weekly_walled_at(t, reset);
+    let a = at(&mut st, &handoff_over_limit(old), past);
+    assert_eq!(a, cancel, "the control's own premise: {a:?}");
+
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &handoff_over_limit(old), past);
+    assert_eq!(a, TurnEndAction::Nothing, "no limit tracked: {a:?}");
+
+    let mut st = weekly_walled_at(t, reset);
+    let a = at(
+        &mut st,
+        &under(Autopilot::Off, handoff_over_limit(old)),
+        past,
+    );
+    assert_eq!(a, TurnEndAction::Nothing, "Autopilot off: {a:?}");
+
+    let off = SupervisorConfig {
+        resume_limits: false,
+        ..cfg()
+    };
+    let mut st = weekly_walled_at(t, reset);
+    let a = at_under(&mut st, &handoff_over_limit(old), past, &off);
+    assert_eq!(a.rule_id(), None, "resume_limits off: {a:?}");
+
+    // A loop that starts on a landing its record holds and the wall its ledger left open (the
+    // loop's own two seeds).
+    let mut st = TurnEndState::default();
+    assert!(st.seed_task_done());
+    st.seed_named_reset(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)",
+        reset,
+        Duration::ZERO,
+        true,
+        None,
+        t,
+    );
+    assert!(
+        st.task_done() && st.waited_limit().is_some(),
+        "the landed premise"
+    );
+    let a = decide_turn_end(&st, &land(handoff_over_limit(old)), &cfg(), past);
+    assert_eq!(a.rule_id(), None, "a landed task rests under Land: {a:?}");
+    let a = decide_turn_end(&st, &handoff_over_limit(old), &cfg(), past);
+    assert_eq!(a, cancel, "Cruise never rests: {a:?}");
+
+    let mut st = weekly_walled_at(t, reset);
+    let key = Duration::from_secs(40);
+    let a = at(&mut st, &handoff_over_limit(Some(key)), past);
+    assert!(
+        waits_until(&a, past - key + OVER_LIMIT_UNUSED),
+        "a key of theirs holds the Esc for its age: {a:?}"
+    );
+    let mut st = weekly_walled_at(t, reset);
+    let newer = TurnEndReading {
+        key: Some(key),
+        ..handoff_over_limit(old)
+    };
+    let a = at(&mut st, &newer, past);
+    assert!(
+        waits_until(&a, past - key + OVER_LIMIT_UNUSED),
+        "their newest key holds it, not an older touch: {a:?}"
+    );
+}
+
+/// The measured `/login` dialog `text` of a person's own, their newest key `ago` before the read.
+fn dialog_over_limit(text: &str, ago: Option<Duration>) -> TurnEndReading {
+    TurnEndReading {
+        person: ago,
+        ..captured(text, None, Duration::ZERO)
+    }
+}
+
+/// A PERSON'S OWN `/login` LEFT AT ITS METHOD PICKER OR AT ITS ERROR STATE OVER A USAGE LIMIT
+/// (hand-built frames: the measured picker and error drawn over the weekly limit) is closed as its
+/// browser hand-off is (the review of 2026-11-02: the person of 2026-10-31 passed the picker in a
+/// second, and one step earlier the tab would have stood as long): the reset and
+/// its grace are the dialog's wake, and then its own Esc (`login-over-limit@v1`), which at the
+/// picker starts no sign-in. CONTROL: Console's menu, which only the person's pick opens, stays
+/// theirs.
+#[test]
+fn a_persons_picker_or_error_left_over_a_weekly_limit_is_closed_as_its_handoff_is() {
+    use super::super::login::RULE_LOGIN_OVER_LIMIT;
+    use aterm_phase::LoginScreen;
+    use aterm_phase::prompt::fixtures::{
+        LOGIN_CONSOLE_MENU, LOGIN_ERROR, LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302,
+        LOGIN_PICKER_2_1_310, login_over_weekly_limit,
+    };
+    let t = t0();
+    let reset = t + 10 * 60 * MIN;
+    let due = reset + GRACE;
+    let old = Some(12 * 60 * MIN);
+    let cancel = TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_OVER_LIMIT,
+    };
+    for (text, what) in [
+        (login_over_weekly_limit(LOGIN_PICKER_2_1_310), "picker"),
+        (login_over_weekly_limit(LOGIN_ERROR), "error"),
+        (
+            LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302.to_string(),
+            "hand-off",
+        ),
+    ] {
+        let dialog = dialog_over_limit(&text, old);
+        assert!(
+            matches!(
+                dialog.login_screen,
+                Some(LoginScreen::Picker(_) | LoginScreen::Failed | LoginScreen::Browser)
+            ) && dialog.wall != Some(WallKind::Auth),
+            "{what}: {dialog:#?}"
+        );
+        let mut st = weekly_walled_at(t, reset);
+        let a = at(&mut st, &dialog, reset - 60 * MIN);
+        assert!(
+            waits_until(&a, due),
+            "{what}: the reset and its grace are the dialog's wake: {a:?}"
+        );
+        let a = at(&mut st, &dialog, due);
+        assert_eq!(a, cancel, "{what}: closed once the limit's act is due");
+    }
+    let menu = dialog_over_limit(LOGIN_CONSOLE_MENU, old);
+    assert_eq!(
+        menu.login_screen,
+        Some(LoginScreen::ConsoleMenu),
+        "{menu:#?}"
+    );
+    let mut st = weekly_walled_at(t, reset);
+    let a = at(&mut st, &menu, due);
+    assert_eq!(
+        a.rule_id(),
+        None,
+        "Console's menu stays the person's: {a:?}"
+    );
+}
+
+/// THE ROSTER'S ARMS OF `login_over_limit_due`, EACH WITH ITS CONTROL: a move onto another account
+/// closes a person's own `/login` over the limit before the reset only where the move reaches the
+/// tab (accounts on) and the hour's moves are not spent; a clearing the roster measured closes it
+/// before the reset, unless the resume answered that clearing already. Elsewhere the reset and its
+/// grace are its wake.
+#[test]
+fn a_persons_login_over_a_limit_is_closed_early_only_where_the_roster_owes_the_act() {
+    use super::super::login::RULE_LOGIN_OVER_LIMIT;
+    let t = t0();
+    let reset = t + 10 * 60 * MIN;
+    let due = reset + GRACE;
+    let now = t + 60 * MIN;
+    let old = Some(12 * 60 * MIN);
+    let cancel = TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_OVER_LIMIT,
+    };
+    let moved = TurnEndReading {
+        restartable: true,
+        ..advised(&handoff_over_limit(old), "work-2")
+    };
+    let mut st = weekly_walled_at(t, reset);
+    assert_eq!(
+        at(&mut st, &moved, now),
+        cancel,
+        "the premise: a move closes it early"
+    );
+
+    let off = SupervisorConfig {
+        accounts: crate::harness::accounts::Mode::Off,
+        ..cfg()
+    };
+    let mut st = weekly_walled_at(t, reset);
+    let a = at_under(&mut st, &moved, now, &off);
+    assert!(
+        waits_until(&a, due),
+        "accounts off: no move reaches the tab, so the reset is the wake: {a:?}"
+    );
+
+    let mut st = weekly_walled_at(t, reset);
+    st.seed_account_moves(&[Duration::from_secs(60); ACCOUNT_MOVES_PER_WINDOW], now);
+    let a = at(&mut st, &moved, now);
+    assert!(waits_until(&a, due), "the hour's moves spent: {a:?}");
+
+    let cleared = advised_resume(&handoff_over_limit(old), 1_000);
+    let mut st = weekly_walled_at(t, reset);
+    assert_eq!(
+        at(&mut st, &cleared, now),
+        cancel,
+        "a measured clearing closes it before the reset"
+    );
+    let mut st = weekly_walled_at(t, reset);
+    st.seed_account_resumed(2_000);
+    let a = at(&mut st, &cleared, now);
+    assert!(waits_until(&a, due), "a clearing already answered: {a:?}");
+}
+
+/// A PERSON'S OWN `/login` LEFT OVER A USAGE LIMIT AND ANOTHER ACCOUNT ADVISED: the move is due at
+/// once, so the dialog is closed as soon as it stood unused, not at the reset, and the move
+/// follows at the composer.
+#[test]
+fn a_persons_login_over_a_limit_with_an_account_to_move_to_is_closed_before_the_reset() {
+    use super::super::login::{OVER_LIMIT_UNUSED, RULE_LOGIN_OVER_LIMIT};
+    let t = t0();
+    let reset = t + 10 * 60 * MIN;
+    let opened = t + MIN;
+    let mut st = weekly_walled_at(t, reset);
+    let over = |ago: Duration| TurnEndReading {
+        restartable: true,
+        ..advised(&handoff_over_limit(Some(ago)), "work-2")
+    };
+    let a = at(&mut st, &over(Duration::ZERO), opened);
+    assert!(
+        waits_until(&a, opened + OVER_LIMIT_UNUSED),
+        "the move waits for the dialog to stand unused: {a:?}"
+    );
+    let now = opened + OVER_LIMIT_UNUSED;
+    let a = at(&mut st, &over(OVER_LIMIT_UNUSED), now);
+    assert_eq!(
+        a,
+        TurnEndAction::Cancel {
+            rule_id: RULE_LOGIN_OVER_LIMIT
+        },
+        "closed hours before the reset"
+    );
+    assert!(now < reset);
+}
+
+/// A PERSON'S `/login` STILL DRAWN AFTER ATERM'S ESC: nothing pressed while it may still be closing
+/// (`take_within`, doubled at each Esc), the Esc again once that pause is over, and after
+/// `OVER_LIMIT_BACKS_MAX` Escs that left it drawn nothing more pressed: the person is told now,
+/// the one key that closes it theirs. A screen that reads no dialog ends the count.
+#[test]
+fn a_persons_login_aterm_cannot_close_is_told_now_after_its_last_esc() {
+    use super::super::exception::{Exception, Urgency, exception_for};
+    use super::super::login::{OVER_LIMIT_BACKS_MAX, RULE_LOGIN_OVER_LIMIT};
+    let t = t0();
+    let reset = t + 10 * 60 * MIN;
+    let mut st = weekly_walled_at(t, reset);
+    let cancel = TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_OVER_LIMIT,
+    };
+    let old = Some(12 * 60 * MIN);
+    let dialog = handoff_over_limit(old);
+    let mut now = reset + 60 * MIN;
+    for n in 1..=OVER_LIMIT_BACKS_MAX {
+        let a = act(&mut st, &dialog, now);
+        assert_eq!(a, cancel, "Esc {n}");
+        assert_ne!(
+            exception_for(&st, &dialog, &cfg(), now),
+            Some(Exception::login_over_limit()),
+            "Esc {n}: nobody told to close it yet"
+        );
+        let pause =
+            crate::supervise::ladder::doubling(st.timing.take_within, n - 1, BACK_OUT_PAUSE_MAX);
+        let a = at(&mut st, &dialog, now + pause - Duration::from_secs(1));
+        assert!(
+            waits_until(&a, now + pause),
+            "Esc {n}: its pause holds the next: {a:?}"
+        );
+        now += pause;
+    }
+    let a = at(&mut st, &dialog, now);
+    assert_eq!(a.rule_id(), None, "no Esc past the last: {a:?}");
+    let told = exception_for(&st, &dialog, &cfg(), now);
+    assert_eq!(told, Some(Exception::login_over_limit()), "{told:?}");
+    assert_eq!(told.map(|e| e.when), Some(Urgency::Now));
+    let gone = idle("Suites are running.", None);
+    let _ = at(&mut st, &gone, now + MIN);
+    assert_eq!(
+        st.login_over_limit_backs(),
+        0,
+        "a screen with no dialog ends the count"
+    );
+}
+
 fn on_credits(r: &TurnEndReading, reset: Option<Instant>) -> TurnEndReading {
     TurnEndReading {
         credits: Some(CreditsCarry {

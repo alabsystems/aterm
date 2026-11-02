@@ -425,17 +425,12 @@ pub fn refused_marker(source: &str, login: &str) -> String {
 /// FNV-1a over the source and the lowercased login: the record's key, so the record names no
 /// address.
 fn login_digest(source: &str, login: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let keyed = format!(
         "{}\n{}",
         source.trim().to_ascii_lowercase(),
         login.trim().to_ascii_lowercase()
     );
-    for byte in keyed.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
+    format!("{:016x}", aterm_hash::fnv1a_64(keyed.as_bytes()))
 }
 
 /// One login's failures in the record: how many in a row, and the last one's time.

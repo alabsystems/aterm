@@ -81,18 +81,6 @@ pub(crate) fn from_hex(s: &str, out: &mut [u8]) -> Option<()> {
     Some(())
 }
 
-/// Constant-time byte equality for fixed-length secret comparisons.
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= *x ^ *y;
-    }
-    diff == 0
-}
-
 /// Fill `buf` with cryptographically secure random bytes from the OS CSPRNG,
 /// via [`aterm_uds::rand::fill`], the workspace's one audited entropy surface.
 #[cfg_attr(trust_verify, trust::skip)]

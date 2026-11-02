@@ -23,6 +23,9 @@
 //!    transcript_ir(Y_J, "", Y_M, ""))`.
 //! 6. M → J: the bundle, sealed with ChaCha20-Poly1305 under `HKDF-SHA256(ISK, "bundle")`
 //!    ([`MemberSession::seal_bundle`], [`JoinerSession::open_bundle`]).
+//! 7. J → M, where J's run asked for it: `HMAC-SHA256(HKDF-SHA256(ISK, "ack"), SHA-256(sealed))`
+//!    once J opened and checked the bundle ([`JoinerSession::open_bundle_acknowledged`]), which M
+//!    checks ([`Acknowledging::check`]) before it counts the bundle delivered.
 //!
 //! The member runs every step through its [`Phrases`] book, which holds each phrase it shows: a
 //! phrase starts at most one run, a run that fails or aborts burns it, and an expired phrase
@@ -212,6 +215,7 @@ struct Keys {
     joiner: hmac::Key,
     member: hmac::Key,
     bundle: aead::LessSafeKey,
+    ack: hmac::Key,
     transcript: Vec<u8>,
 }
 
@@ -235,6 +239,7 @@ impl Keys {
             joiner: mac(b"J"),
             member: mac(b"M"),
             bundle: aead::LessSafeKey::new(aead::UnboundKey::from(bundle)),
+            ack: mac(b"ack"),
             transcript,
         }
     }
@@ -244,6 +249,12 @@ impl Keys {
         tag.copy_from_slice(hmac::sign(key, transcript).as_ref());
         tag
     }
+}
+
+/// J's acknowledgement of the sealed bundle `sealed` under a run's ack key: its tag over the
+/// bundle's SHA-256.
+fn ack_tag(key: &hmac::Key, sealed: &[u8]) -> Tag {
+    Keys::tag(key, digest::digest(&digest::SHA256, sealed).as_ref())
 }
 
 /// The one nonce a bundle key ever seals under: each run seals one bundle.
@@ -336,6 +347,7 @@ impl JoinerConfirming {
             .map_err(|_| wrong_phrase())?;
         Ok(JoinerSession {
             bundle: self.keys.bundle,
+            ack: self.keys.ack,
         })
     }
 }
@@ -343,9 +355,20 @@ impl JoinerConfirming {
 /// J once both tags matched: it opens M's one bundle.
 pub struct JoinerSession {
     bundle: aead::LessSafeKey,
+    ack: hmac::Key,
 }
 
 impl JoinerSession {
+    /// The bundle M sealed in this run, and J's acknowledgement of it (step 7), which J sends once
+    /// it has checked what the bundle holds.
+    ///
+    /// # Errors
+    /// As [`JoinerSession::open_bundle`].
+    pub fn open_bundle_acknowledged(self, sealed: &[u8]) -> Result<(SecretBytes, Tag)> {
+        let ack = ack_tag(&self.ack, sealed);
+        Ok((self.open_bundle(sealed)?, ack))
+    }
+
     /// The bundle M sealed in this run.
     ///
     /// # Errors
@@ -374,9 +397,41 @@ impl JoinerSession {
 /// M once it admitted: it seals one bundle for J.
 pub struct MemberSession {
     bundle: aead::LessSafeKey,
+    ack: hmac::Key,
+}
+
+/// What M checks J's acknowledgement of its sealed bundle against (step 7,
+/// [`MemberSession::seal_bundle_acknowledged`]).
+pub struct Acknowledging {
+    ack: hmac::Key,
+    digest: digest::Digest,
+}
+
+impl Acknowledging {
+    /// Whether `tag` is J's acknowledgement of the bundle this run sealed: only J, which holds
+    /// the run's key, makes it, and only over the bytes M sealed.
+    ///
+    /// # Errors
+    /// When it is not.
+    pub fn check(&self, tag: &Tag) -> Result<()> {
+        hmac::verify(&self.ack, self.digest.as_ref(), tag)
+            .map_err(|_| Error::new("the new Mac's acknowledgement of its bundle did not verify"))
+    }
 }
 
 impl MemberSession {
+    /// [`MemberSession::seal_bundle`], and what J's acknowledgement of the sealed bytes is
+    /// checked against.
+    ///
+    /// # Errors
+    /// As [`MemberSession::seal_bundle`].
+    pub fn seal_bundle_acknowledged(self, plain: &[u8]) -> Result<(Vec<u8>, Acknowledging)> {
+        let ack = hmac::Key::clone(&self.ack);
+        let sealed = self.seal_bundle(plain)?;
+        let digest = digest::digest(&digest::SHA256, &sealed);
+        Ok((sealed, Acknowledging { ack, digest }))
+    }
+
     /// `plain` sealed for J under this run's bundle key. The session ends here, so the key seals
     /// once.
     ///
@@ -655,6 +710,7 @@ impl Phrases {
         Ok((
             MemberSession {
                 bundle: run.keys.bundle,
+                ack: run.keys.ack,
             },
             tag,
         ))

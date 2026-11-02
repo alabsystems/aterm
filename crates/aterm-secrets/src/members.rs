@@ -35,8 +35,9 @@ pub fn refuse<S: std::io::Write + ?Sized>(stream: &mut S, why: &str) -> crate::R
 
 /// Relay one `ask` exchange between the joining Mac's stream and the member desk's, as the node
 /// job does when it holds the fleet port and the window holds the desk: the member speaks first,
-/// then each side in turn, the bundle's bytes after the line that counts them, until the
-/// member's last answer.
+/// then each side in turn, the bundle's bytes after the line that counts them, then the joining
+/// Mac's acknowledgement of them where its run asked to give one (`ack=1`), until the member's
+/// last answer.
 ///
 /// # Errors
 /// Either stream failed, or a line broke the exchange's bounds.
@@ -45,6 +46,7 @@ where
     J: std::io::Read + std::io::Write + ?Sized,
     M: std::io::Read + std::io::Write + ?Sized,
 {
+    let mut acks = false;
     loop {
         let line = wire::read_line(member)?;
         wire::write_line(joiner, &line)?;
@@ -60,12 +62,18 @@ where
                 return Err(crate::Error::new("the member's bundle was cut short"));
             }
             joiner.flush()?;
+            if acks {
+                let line = wire::read_line(joiner)?;
+                wire::write_line(member, &line)?;
+            }
             return Ok(());
         }
         if parsed.verb == "NO" || parsed.get("state").is_ok() {
             return Ok(());
         }
         let line = wire::read_line(joiner)?;
+        let asked = wire::Line::parse(&line);
+        acks |= asked.verb == "run" && asked.get("ack").is_ok_and(|ack| ack == "1");
         wire::write_line(member, &line)?;
     }
 }

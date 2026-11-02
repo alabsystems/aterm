@@ -115,6 +115,8 @@ struct State {
     /// The last pull a `sys jobs` sent, the engine armed: another view's pull keeps the
     /// engine's cadence, so a `sys jobs` keeps its own gap too.
     last_jobs_pull: Option<Instant>,
+    /// The explicit naming operation spanning capture, sampling and fresh publication.
+    naming: Option<crate::sys_naming::Live>,
     pacing: Pacing,
 }
 
@@ -183,7 +185,84 @@ impl Shared {
 
     /// Take the sender back so the probe thread hears the hang-up and ends.
     pub(crate) fn uninstall(&self) {
-        self.lock().tx = None;
+        let mut state = self.lock();
+        state.tx = None;
+        if let Some(live) = state.naming.take() {
+            *live.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        }
+    }
+
+    /// One naming operation per instance; a shutdown invalidates its lease as well as the sender.
+    pub(crate) fn enter_naming(
+        &self,
+    ) -> Result<crate::sys_naming::Lease<'_>, crate::sys_naming::Error> {
+        use crate::sys_naming::{Error, Lease};
+        let mut state = self.lock();
+        if state.tx.is_none() {
+            return Err(Error::Unavailable);
+        }
+        if state
+            .naming
+            .as_ref()
+            .is_some_and(|live| *live.lock().unwrap_or_else(PoisonError::into_inner))
+        {
+            return Err(Error::Busy);
+        }
+        let live = Arc::new(Mutex::new(true));
+        state.naming = Some(Arc::clone(&live));
+        Ok(Lease::new(self, live))
+    }
+
+    pub(crate) fn leave_naming(&self, live: &crate::sys_naming::Live) {
+        *live.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        let mut state = self.lock();
+        if state
+            .naming
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, live))
+        {
+            state.naming = None;
+        }
+    }
+
+    /// A distinct probe request. Its sender clone is dropped before waiting, so no sampler
+    /// worker keeps the probe thread alive after shutdown.
+    pub(crate) fn request_name(
+        &self,
+        live: &crate::sys_naming::Live,
+        operation: crate::sys_naming::Operation,
+    ) -> Result<crate::sys_naming::Answer, crate::sys_naming::Error> {
+        use crate::sys_naming::{BOUND, CANCEL_POLL, Error, Request};
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        let request = Request::new(operation, Arc::clone(live), reply);
+        {
+            let sender = self.lock().tx.clone().ok_or(Error::Unavailable)?;
+            sender
+                .try_send(Msg::Name(Box::new(request)))
+                .map_err(|error| match error {
+                    TrySendError::Full(_) => Error::Busy,
+                    TrySendError::Disconnected(_) => Error::Unavailable,
+                })?;
+        }
+        let deadline = Instant::now() + BOUND;
+        loop {
+            if crate::control::caller_hung_up()
+                || !*live.lock().unwrap_or_else(PoisonError::into_inner)
+            {
+                return Err(Error::Canceled);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Error::Timeout);
+            }
+            match answer.recv_timeout(left.min(CANCEL_POLL)) {
+                Ok(reply) => return reply,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Error::Unavailable);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
     }
 
     /// Record the probe thread's newest layout.
@@ -1064,8 +1143,8 @@ pub(crate) fn cmd_sys(
         Ok(q) => q,
         Err(usage) => return usage.to_owned(),
     };
-    if q.name.is_some() {
-        return "ERR unavailable name why=not_sampled\n".to_owned();
+    if let Some(target) = q.name.as_ref() {
+        return crate::sys_naming::command(&SYS, session, target.clone(), owner_class, q.json);
     }
     let (held, state) = SYS.fresh_for(
         &q,

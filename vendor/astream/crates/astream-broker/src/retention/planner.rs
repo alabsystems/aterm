@@ -235,15 +235,45 @@ pub fn stamped_at(stamps: &[(u64, u64)], off: u64, now: u64) -> u64 {
     }
 }
 
+/// What the planning reads of one retained record: its offset, its subject (which
+/// decides its class) and its bytes ([`record_bytes`]); and, when the entry carries it,
+/// the whole record, which the planning needs only for a record below the cut that a
+/// hold rule carries.
+pub trait Planned {
+    /// The record's offset.
+    fn offset(&self) -> u64;
+    /// The record's subject.
+    fn subject(&self) -> &str;
+    /// The record's bytes, as [`record_bytes`] counts them.
+    fn bytes(&self) -> u64;
+    /// The whole record, or `None` for an entry that carries only the summary.
+    fn whole(&self) -> Option<Arc<BrokerRecord>>;
+}
+
+impl Planned for Arc<BrokerRecord> {
+    fn offset(&self) -> u64 {
+        self.seq.0
+    }
+    fn subject(&self) -> &str {
+        &self.subject
+    }
+    fn bytes(&self) -> u64 {
+        record_bytes(self)
+    }
+    fn whole(&self) -> Option<Arc<BrokerRecord>> {
+        Some(Arc::clone(self))
+    }
+}
+
 /// What the planning reads: the log as one moment saw it.
-pub struct View<'a> {
+pub struct View<'a, R: Planned = Arc<BrokerRecord>> {
     /// The log's base: its oldest retained offset.
     pub base: u64,
     /// The cut never rises above it: the subscriber-visible head (and, replicated, what every
     /// follower holds).
     pub ceiling: u64,
-    /// The retained records, from the base, in offset order.
-    pub records: &'a [Arc<BrokerRecord>],
+    /// The retained records, from the base, in offset order (whole, or summaries).
+    pub records: &'a [R],
     /// Optional broker-stamped wall times aligned with `records`.
     pub record_bts: &'a [Option<u64>],
     /// The tick's stamps ([`stamp`]), taken at `now` before the planning.
@@ -276,6 +306,9 @@ pub struct Plan {
     pub cut: u64,
     /// Records below the cut, at or above the base, to carry: each with its stamp.
     pub carry: Vec<Held>,
+    /// Indices into `View::records` (with `(at_ms, bt_ms)`) of carried records whose view
+    /// entry held only a summary (`Planned::whole` was `None`).
+    pub(crate) carry_unloaded: Vec<(usize, u64, Option<u64>)>,
     /// Held offsets (below the base) given up.
     pub remove: Vec<u64>,
     /// Subject floors that rise, to the offset after the newest record of it given up.
@@ -303,17 +336,18 @@ impl Plan {
     pub fn is_empty(&self, base: u64) -> bool {
         self.cut <= base
             && self.carry.is_empty()
+            && self.carry_unloaded.is_empty()
             && self.remove.is_empty()
             && self.floors.is_empty()
     }
 
-    fn give_up(&mut self, rec: &BrokerRecord, why: Why) {
-        let floor = rec.seq.0.saturating_add(1);
-        let f = self.floors.entry(rec.subject.clone()).or_insert(0);
+    fn give_up(&mut self, offset: u64, subject: &str, why: Why) {
+        let floor = offset.saturating_add(1);
+        let f = self.floors.entry(subject.to_string()).or_insert(0);
         *f = (*f).max(floor);
-        self.given.note(rec.seq.0, &rec.subject);
+        self.given.note(offset, subject);
         if why != Why::Read {
-            let n = self.lost.entry((rec.subject.clone(), why)).or_insert(0);
+            let n = self.lost.entry((subject.to_string(), why)).or_insert(0);
             *n = n.saturating_add(1);
         }
     }
@@ -326,19 +360,21 @@ struct Walk {
     aged_to: u64,
 }
 
-fn walk(rules: &Retention, v: &View<'_>) -> Walk {
+fn walk<R: Planned>(rules: &Retention, v: &View<'_, R>) -> Walk {
     let mut bytes = rules.per_class(0u64);
     let mut aged_to = v.base;
     for rec in v.records {
-        let c = rules.class_of(&rec.subject);
+        let c = rules.class_of(rec.subject());
         if let Some(slot) = bytes.get_mut(c) {
-            *slot = slot.saturating_add(record_bytes(rec));
+            *slot = slot.saturating_add(rec.bytes());
         }
         let rule = rules.rule(c);
         if rule.class == Class::Prefix {
-            let age = v.now.saturating_sub(stamped_at(v.stamps, rec.seq.0, v.now));
+            let age = v
+                .now
+                .saturating_sub(stamped_at(v.stamps, rec.offset(), v.now));
             if rule.aged(age) {
-                aged_to = aged_to.max(rec.seq.0.saturating_add(1));
+                aged_to = aged_to.max(rec.offset().saturating_add(1));
             }
         }
     }
@@ -372,7 +408,7 @@ fn limits(rules: &Retention, retained: &[u64], held: &[u64]) -> Vec<u64> {
 /// THE CUT the rules take on `v`: walking up from the base, each class's oldest retained
 /// records go below the cut until what the class keeps above it is within its `limit`, and
 /// every prefix record past its age is below it. Not yet held to the ceiling.
-fn natural_cut(rules: &Retention, v: &View<'_>, w: &Walk, limit: &[u64]) -> u64 {
+fn natural_cut<R: Planned>(rules: &Retention, v: &View<'_, R>, w: &Walk, limit: &[u64]) -> u64 {
     let mut need = rules.per_class(0u64);
     let mut left = 0usize;
     for (c, n) in need.iter_mut().enumerate() {
@@ -385,19 +421,19 @@ fn natural_cut(rules: &Retention, v: &View<'_>, w: &Walk, limit: &[u64]) -> u64 
     }
     let mut cut = v.base;
     for rec in v.records {
-        if left == 0 && rec.seq.0 >= w.aged_to {
+        if left == 0 && rec.offset() >= w.aged_to {
             break;
         }
-        let c = rules.class_of(&rec.subject);
+        let c = rules.class_of(rec.subject());
         if let Some(n) = need.get_mut(c) {
             if *n > 0 {
-                *n = n.saturating_sub(record_bytes(rec));
+                *n = n.saturating_sub(rec.bytes());
                 if *n == 0 {
                     left = left.saturating_sub(1);
                 }
             }
         }
-        cut = rec.seq.0.saturating_add(1);
+        cut = rec.offset().saturating_add(1);
     }
     cut.max(w.aged_to)
 }
@@ -408,7 +444,33 @@ fn natural_cut(rules: &Retention, v: &View<'_>, w: &Walk, limit: &[u64]) -> u64 
 /// within its limit (its bytes, at least a `slack` under what it had when it was past
 /// them) by giving up its oldest, retained above the cut counted first — and the room each
 /// class has left.
-pub fn plan(rules: &Retention, v: &View<'_>, forced: Option<u64>) -> Plan {
+/// [`plan`], over a view whose entries may be summaries: `load(i)` gives the whole record
+/// at index `i` of `v.records` for an entry that does not carry it, and is asked only for
+/// a record below the cut that a hold rule carries. A record that cannot be loaded cannot
+/// be carried, so the planning changes nothing (the cut stays at the base) rather than
+/// cut away a record its rule still holds.
+pub fn plan_with<R: Planned>(
+    rules: &Retention,
+    v: &View<'_, R>,
+    forced: Option<u64>,
+    load: impl Fn(usize) -> Option<Arc<BrokerRecord>>,
+) -> Plan {
+    let mut p = plan(rules, v, forced);
+    for (idx, at_ms, bt_ms) in std::mem::take(&mut p.carry_unloaded) {
+        let Some(rec) = load(idx) else {
+            return Plan {
+                cut: v.base,
+                headroom: u64::MAX,
+                room: rules.per_class(u64::MAX),
+                ..Plan::default()
+            };
+        };
+        p.carry.push(Held { rec, at_ms, bt_ms });
+    }
+    p
+}
+
+pub fn plan<R: Planned>(rules: &Retention, v: &View<'_, R>, forced: Option<u64>) -> Plan {
     let mut p = Plan {
         cut: v.base,
         headroom: u64::MAX,
@@ -421,7 +483,7 @@ pub fn plan(rules: &Retention, v: &View<'_>, forced: Option<u64>) -> Plan {
         let c = rules.class_of(&h.rec.subject);
         let rule = rules.rule(c);
         // A record its rule no longer holds (the rules changed) goes as a read one does.
-        let why = if !rule.holds_records() || rule.read(&h.rec, v.groups) {
+        let why = if !rule.holds_records() || rule.read(&h.rec.subject, off, v.groups) {
             Some(Why::Read)
         } else if rule.aged(v.now.saturating_sub(h.at_ms)) {
             Some(Why::Aged)
@@ -431,7 +493,7 @@ pub fn plan(rules: &Retention, v: &View<'_>, forced: Option<u64>) -> Plan {
         match why {
             Some(w) => {
                 p.remove.push(off);
-                p.give_up(&h.rec, w);
+                p.give_up(off, &h.rec.subject, w);
             }
             None => {
                 let b = record_bytes(&h.rec);
@@ -456,37 +518,31 @@ pub fn plan(rules: &Retention, v: &View<'_>, forced: Option<u64>) -> Plan {
     p.cut = cut;
     let kept = kept_bytes(rules, v, cut);
     let below = usize::try_from(cut.saturating_sub(v.base)).unwrap_or(usize::MAX);
-    let mut fresh: BTreeMap<u64, Held> = BTreeMap::new();
+    let mut fresh: BTreeMap<u64, (usize, &R, u64, Option<u64>)> = BTreeMap::new();
     for (idx, rec) in v.records.iter().take(below).enumerate() {
-        if is_hidden_subject(&rec.subject) {
+        let (off, subject) = (rec.offset(), rec.subject());
+        if is_hidden_subject(subject) {
             continue;
         }
-        let c = rules.class_of(&rec.subject);
+        let c = rules.class_of(subject);
         let rule = rules.rule(c);
         if !rule.holds_records() {
             continue;
         }
-        let at_ms = stamped_at(v.stamps, rec.seq.0, v.now);
-        if rule.read(rec, v.groups) {
-            p.give_up(rec, Why::Read);
+        let at_ms = stamped_at(v.stamps, off, v.now);
+        if rule.read(subject, off, v.groups) {
+            p.give_up(off, subject, Why::Read);
         } else if rule.aged(v.now.saturating_sub(at_ms)) {
-            p.give_up(rec, Why::Aged);
+            p.give_up(off, subject, Why::Aged);
         } else {
             if let Some(list) = by_class.get_mut(c) {
-                list.push((rec.seq.0, record_bytes(rec), true));
+                list.push((off, rec.bytes(), true));
             }
             let bt_ms = match v.record_bts.get(idx) {
                 Some(&b) => b,
                 None => None,
             };
-            fresh.insert(
-                rec.seq.0,
-                Held {
-                    rec: Arc::clone(rec),
-                    at_ms,
-                    bt_ms,
-                },
-            );
+            fresh.insert(off, (idx, rec, at_ms, bt_ms));
         }
     }
     // Each class within its limit: what it keeps above the cut first, then its held
@@ -508,14 +564,20 @@ pub fn plan(rules: &Retention, v: &View<'_>, forced: Option<u64>) -> Plan {
                 break;
             }
             total = total.saturating_sub(b);
-            let rec = if is_new {
-                fresh.remove(&off).map(|h| h.rec)
+            let subj = if is_new {
+                match fresh.remove(&off) {
+                    Some((_, rec, _, _)) => Some(rec.subject()),
+                    None => None,
+                }
             } else {
                 p.remove.push(off);
-                v.held.get(&off).map(|h| Arc::clone(&h.rec))
+                match v.held.get(&off) {
+                    Some(h) => Some(h.rec.subject.as_str()),
+                    None => None,
+                }
             };
-            if let Some(rec) = rec {
-                p.give_up(&rec, Why::Bytes);
+            if let Some(subj) = subj {
+                p.give_up(off, subj, Why::Bytes);
             }
         }
         let used = above.saturating_add(total);
@@ -533,20 +595,29 @@ pub fn plan(rules: &Retention, v: &View<'_>, forced: Option<u64>) -> Plan {
     }
     p.kept = kept;
     p.room = room;
-    p.carry = fresh.into_values().collect();
+    for (idx, rec, at_ms, bt_ms) in fresh.into_values() {
+        match rec.whole() {
+            Some(whole) => p.carry.push(Held {
+                rec: whole,
+                at_ms,
+                bt_ms,
+            }),
+            None => p.carry_unloaded.push((idx, at_ms, bt_ms)),
+        }
+    }
     p.remove.sort_unstable();
     p.remove.dedup();
     p
 }
 
 /// Each class's bytes in the retained suffix from `cut`.
-fn kept_bytes(rules: &Retention, v: &View<'_>, cut: u64) -> Vec<u64> {
+fn kept_bytes<R: Planned>(rules: &Retention, v: &View<'_, R>, cut: u64) -> Vec<u64> {
     let mut acc = rules.per_class(0u64);
     let skip = usize::try_from(cut.saturating_sub(v.base)).unwrap_or(usize::MAX);
     for rec in v.records.iter().skip(skip) {
-        let c = rules.class_of(&rec.subject);
+        let c = rules.class_of(rec.subject());
         if let Some(slot) = acc.get_mut(c) {
-            *slot = slot.saturating_add(record_bytes(rec));
+            *slot = slot.saturating_add(rec.bytes());
         }
     }
     acc

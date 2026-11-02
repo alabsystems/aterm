@@ -26,12 +26,12 @@ use aterm_net::fleet::{FleetOp, FleetScope};
 use aterm_uds::{CtlListener, CtlStream};
 
 use super::{
-    CENSUS_REFRESH_EVERY, FACTS_HEARTBEAT_EVERY, HeartbeatClock, Serving, Wanted, admit_driver_at,
-    denied_under, fleet_event, fleet_slots, grants_of, heartbeat_every, holds_in,
-    judge_vault_join_at, level_of, lifetime, lists_driver_at, maybe_refresh_local_census_at,
-    push_facts_to_issuer_with_denied, receive_pushed_facts_at, refuse_driver, register_member_at,
-    retry, serve_census_request_at, serve_mail_code_request_at, share_book_at, share_units,
-    spawn_member_heartbeat_at, update_denied_nodes_cache,
+    CENSUS_REFRESH_EVERY, DENY_LIST_UNREAD, DeniedCache, FACTS_HEARTBEAT_EVERY, HeartbeatClock,
+    Serving, Wanted, admit_driver_at, denied_under, fleet_event, fleet_slots, grants_of,
+    heartbeat_every, holds_in, judge_vault_join_at, level_of, lifetime, lists_driver_at,
+    maybe_refresh_local_census_at, push_facts_to_issuer_with_denied, receive_pushed_facts_at,
+    refuse_driver, register_member_at, retry, serve_census_request_at, serve_mail_code_request_at,
+    share_book_at, share_units, spawn_member_heartbeat_at, update_denied_nodes_cache,
 };
 
 const RELAY_PREFIX: &str = "wf-";
@@ -154,7 +154,9 @@ impl WindowLauncher for LiveWindowLauncher {
         }
 
         use aterm_uds::spawnfd::Stdio;
-        let _child = aterm_uds::spawnfd::command(&exe)
+        let mut window = aterm_uds::spawnfd::command(&exe);
+        window.envs(crate::descriptor_limit::window_launcher_limit());
+        let _child = window
             .arg("--window")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -756,8 +758,10 @@ pub struct NodeServeConfig {
     pub home_dir: Option<PathBuf>,
     /// Path to `aterm.toml`, if known.
     pub config_path: Option<PathBuf>,
-    /// Vault paths for the `_alab._tcp` advert and headless automatic admission (`None`
-    /// disables both).
+    /// Vault paths for the `_alab._tcp` advert, the deny list and headless automatic admission
+    /// (`None`: an isolated run, which reads no vault, so its deny list names no one and `dns-sd`
+    /// ticks and automatic admission are off; a live run that finds no vault does not start,
+    /// [`node_vault_paths`]).
     pub vault_paths: Option<aterm_secrets::client::Paths>,
     /// This Mac's membership log, whose verdict admits a handshake, a join and a drive (`None`:
     /// the book's keyring alone).
@@ -782,9 +786,29 @@ pub struct NodeServeConfig {
     pub lan_may_go: fn() -> bool,
 }
 
+/// The vault a node job reads its deny list and membership log from: none in an isolated run (a
+/// test, a lab's scratch state, CI), which reads no vault and so has a deny list that names no
+/// one; otherwise this user's (`live`).
+///
+/// # Errors
+/// A live run whose vault cannot be found (no home directory): a job that cannot read its deny
+/// list must not serve as though the list named no one.
+fn node_vault_paths(
+    isolated: bool,
+    live: impl FnOnce() -> aterm_secrets::Result<aterm_secrets::client::Paths>,
+) -> Result<Option<aterm_secrets::client::Paths>, String> {
+    if isolated {
+        return Ok(None);
+    }
+    live().map(Some).map_err(|error| {
+        format!("no vault to read the deny list from ({error}), so this job does not serve")
+    })
+}
+
 /// Foreground entry point for `aterm node serve` (`systems.alab.aterm-node`, C20–C23).
 #[must_use]
 pub fn run_node_serve() -> ExitCode {
+    crate::descriptor_limit::raise_descriptor_limit_for_node();
     let Some(state_dir) = aterm_types::dirs::state_dir() else {
         eprintln!("aterm node serve: state directory is unavailable");
         return ExitCode::FAILURE;
@@ -794,9 +818,13 @@ pub fn run_node_serve() -> ExitCode {
     let config_path = crate::app_config::config_path();
     let isolated =
         std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some();
-    let vault_paths = (!isolated)
-        .then(|| aterm_secrets::client::Paths::live().ok())
-        .flatten();
+    let vault_paths = match node_vault_paths(isolated, aterm_secrets::client::Paths::live) {
+        Ok(paths) => paths,
+        Err(why) => {
+            eprintln!("aterm node serve: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
     let members = vault_paths
         .as_ref()
         .map(|paths| Arc::new(aterm_agent::fleet_log::LocalLog::of(paths)));
@@ -891,7 +919,9 @@ fn spawn_claims_upkeep(relay_dir: PathBuf, stop: Arc<AtomicBool>) {
 /// Run the node job supervision loop with explicit paths and seams.
 #[must_use]
 pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
-    crate::qos::set_self(crate::qos::Role::Background);
+    if !cfg!(test) {
+        crate::qos::set_self(crate::qos::Role::Background);
+    }
     let lock = match NodeJobLock::try_acquire(&cfg.state_dir) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
@@ -912,6 +942,12 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
         }
     };
     let _held_lock = lock;
+    // This Mac's network place is kept while no window runs too (the keeper is one per Mac:
+    // whichever process holds its lock). A unit test's scratch state starts none.
+    #[cfg(unix)]
+    if !cfg!(test) {
+        let _ = aterm_netplace::keeper::start(&cfg.state_dir);
+    }
     // Held only while this job serves the port or is about to bind it: a window leaves the port
     // to a job that holds it, and serves it (or says why it cannot) while this job idles.
     let mut port_lock: Option<NodeJobLock> = None;
@@ -920,7 +956,7 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
         crate::network_moved::hear_alab_tcp(&[advertiser.instance()]);
         crate::network_moved::alab_tcp()
     });
-    let denied_cache: Arc<Mutex<Option<Arc<[String]>>>> = Arc::new(Mutex::new(None));
+    let denied_cache: Arc<Mutex<DeniedCache>> = Arc::new(Mutex::new(DeniedCache::new()));
     let mut waits_for_step = false;
 
     while !cfg.stop.load(Ordering::Acquire) {
@@ -1160,17 +1196,28 @@ fn wanted_for_node(cfg: &NodeServeConfig) -> Option<Wanted> {
 /// The swarm deny list now, read again only when one of the vault files it reads changed
 /// ([`aterm_secrets::client::swarm_denied_nodes_now`]): the listener asks it for each proved
 /// dialer and its hand-over, and the watch every tick, so an unchanged vault is never decrypted
-/// again. `cache` keeps the last authoritative list through a mid-apply or failed read.
+/// again. `cache` keeps the last authoritative list through a mid-apply or failed read, and
+/// `None` until one was read, under which every proved dialer is refused
+/// ([`super::update_denied_nodes_cache`]). A job that reads no vault (`vault_paths` `None`: an
+/// isolated run, [`node_vault_paths`]) has a deny list that names no one.
 fn denied_nodes_for(
     vault_paths: Option<&aterm_secrets::client::Paths>,
-    cache: &Mutex<Option<Arc<[String]>>>,
-) -> Arc<[String]> {
+    cache: &Mutex<DeniedCache>,
+) -> Option<Arc<[String]>> {
     let observed = match vault_paths {
         Some(paths) => aterm_secrets::client::swarm_denied_nodes_now(paths),
-        None => Ok(None),
+        None => Ok(Some(Vec::new())),
     };
-    let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
-    update_denied_nodes_cache(&mut guard, observed)
+    let (denied, said) = update_denied_nodes_cache(
+        &mut cache.lock().unwrap_or_else(PoisonError::into_inner),
+        observed,
+    );
+    match said {
+        Some(line) if denied.is_none() => aterm_log::warn!("node job {line}"),
+        Some(line) => aterm_log::info!("node job {line}"),
+        None => {}
+    }
+    denied
 }
 
 struct NodeOpenEntry {
@@ -1310,7 +1357,7 @@ fn serve_one_node_generation(
     initial_wanted: &Wanted,
     secret: aterm_net::fleet::FleetSecret,
     advertiser: &Arc<AlabTcpAdvertiser>,
-    denied_cache: &Arc<Mutex<Option<Arc<[String]>>>>,
+    denied_cache: &Arc<Mutex<DeniedCache>>,
     browse: Option<&Arc<aterm_secrets::discover::Watch>>,
 ) -> bool {
     let running = Arc::new(AtomicBool::new(true));
@@ -1371,7 +1418,9 @@ fn serve_one_node_generation(
         std::thread::Builder::new()
             .name("aterm-node-watch".to_owned())
             .spawn(move || {
-                crate::qos::set_self(crate::qos::Role::Background);
+                if !cfg!(test) {
+                    crate::qos::set_self(crate::qos::Role::Background);
+                }
                 let mut last_facts_push = Instant::now();
                 let mut last_census_refresh = Instant::now();
                 let hb_in_flight = Arc::new(AtomicBool::new(false));
@@ -1420,11 +1469,20 @@ fn serve_one_node_generation(
                     let keys = aterm_net::fleet_member::Keyring::read(&state_dir);
                     let mut log = members_watch.as_ref().and_then(|members| members.keys());
                     let denied = denied_nodes_for(vault_paths.as_ref(), &denied_watch);
-                    let _ = open_watch.cut_unserved(
-                        &serving,
-                        &|n, key| holds_in(&keys, log.as_deref(), n, key),
-                        &denied,
-                    );
+                    // No deny list read yet: every open drive or content read is cut, as the
+                    // handshake refuses each new connection, until one is read.
+                    let unread = Serving {
+                        scope: FleetScope::Facts,
+                        grants: Vec::new(),
+                    };
+                    let _ = match denied.as_deref() {
+                        Some(denied) => open_watch.cut_unserved(
+                            &serving,
+                            &|n, key| holds_in(&keys, log.as_deref(), n, key),
+                            denied,
+                        ),
+                        None => open_watch.cut_unserved(&unread, &|_, _| false, &[]),
+                    };
 
                     if let Some(vp) = vault_paths.as_ref() {
                         adv_watch.tick(
@@ -1435,7 +1493,11 @@ fn serve_one_node_generation(
                         );
                     }
 
-                    if last_facts_push.elapsed() >= FACTS_HEARTBEAT_EVERY {
+                    // No deny list read yet: this Mac's facts go to no one, and its heartbeat dials no
+                    // one, until one is.
+                    if let Some(denied) = denied.as_deref()
+                        && last_facts_push.elapsed() >= FACTS_HEARTBEAT_EVERY
+                    {
                         last_facts_push = Instant::now();
                         push_node_facts_heartbeat(
                             &state_dir,
@@ -1443,14 +1505,17 @@ fn serve_one_node_generation(
                             home_dir.as_deref(),
                             config_path.as_deref(),
                             &secret_watch,
-                            (&denied, log.as_deref()),
+                            (denied, log.as_deref()),
                         );
                     }
                     if last_census_refresh.elapsed() >= CENSUS_REFRESH_EVERY {
                         last_census_refresh = Instant::now();
                         maybe_refresh_local_census_at(&state_dir, home_dir.as_deref());
                     }
-                    if let Some(woke) = heartbeat.due(Instant::now()) {
+                    // A round still out takes no move: the move waits for the round after it.
+                    if let Some(woke) = heartbeat
+                        .due_when_free(Instant::now(), hb_in_flight.load(Ordering::Acquire))
+                    {
                         super::say_heartbeat_woke("node job", woke);
                         if log.as_deref().is_some_and(|keys| {
                             proved.as_ref().is_some_and(|(_, key)| !keys.admits(key))
@@ -1467,13 +1532,19 @@ fn serve_one_node_generation(
                         {
                             log = members_watch.as_ref().and_then(|members| members.keys());
                         }
-                        spawn_member_heartbeat_at(
-                            &state_dir,
-                            addr,
-                            secret_watch.clone(),
-                            &hb_in_flight,
-                            (denied, log, browse_watch.clone()),
-                        );
+                        match denied {
+                            Some(denied) => spawn_member_heartbeat_at(
+                                &state_dir,
+                                addr,
+                                secret_watch.clone(),
+                                &hb_in_flight,
+                                (denied, log, browse_watch.clone()),
+                                vault_paths.clone(),
+                            ),
+                            None => {
+                                aterm_log::debug!("node job heartbeat skipped: {DENY_LIST_UNREAD}")
+                            }
+                        }
                     }
                 }
             })
@@ -1543,7 +1614,7 @@ fn serve_one_node_generation(
             Arc::new(move || {
                 let log = members_for_gate.as_ref().and_then(|members| members.keys());
                 denied_under(
-                    &denied_nodes_for(vault_for_gate.as_ref(), &denied_for_gate),
+                    denied_nodes_for(vault_for_gate.as_ref(), &denied_for_gate).as_deref(),
                     log.as_deref(),
                 )
             }),
@@ -1553,7 +1624,14 @@ fn serve_one_node_generation(
         HANDSHAKE,
         move |served, op| {
             let peer = served.peer_addr();
-            let denied = denied_nodes_for(vault_paths.as_ref(), &denied_for_serve);
+            // The handshake refused this connection while no deny list was read; one read since
+            // is kept, so this is defense in depth: an unread list serves no op.
+            let Some(denied) = denied_nodes_for(vault_paths.as_ref(), &denied_for_serve) else {
+                if op == FleetOp::Drive {
+                    return refuse_driver(served, peer, DENY_LIST_UNREAD, false);
+                }
+                return Err(std::io::Error::other(DENY_LIST_UNREAD));
+            };
             let log = members.as_ref().and_then(|members| members.keys());
             if op == FleetOp::Join {
                 let proof = served.peer_node().cloned();
@@ -1661,12 +1739,16 @@ fn serve_one_node_generation(
                         let now_serving = serving_fn();
                         let now_keys = aterm_net::fleet_member::Keyring::read(&state_dir);
                         let now_log = members.as_ref().and_then(|m| m.keys());
-                        let now_denied = denied_nodes_for(vault_paths.as_ref(), &denied_for_serve);
-                        now_serving.serves(
-                            content,
-                            grant_ref,
-                            &|n, key| holds_in(&now_keys, now_log.as_deref(), n, key),
-                            &now_denied,
+                        // No deny list read now: nothing is served.
+                        denied_nodes_for(vault_paths.as_ref(), &denied_for_serve).is_some_and(
+                            |now_denied| {
+                                now_serving.serves(
+                                    content,
+                                    grant_ref,
+                                    &|n, key| holds_in(&now_keys, now_log.as_deref(), n, key),
+                                    &now_denied,
+                                )
+                            },
                         )
                     };
                 let (near, far) = aterm_uds::kept_out(CtlStream::pair)?;

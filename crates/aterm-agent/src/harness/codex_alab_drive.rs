@@ -976,7 +976,11 @@ pub(super) fn snapshot_with_claim(
         pid,
         start,
         shell,
-        version: ca::package_version(&exe).map(|v| v.to_string()),
+        version: if ca::alab_bytes(&exe) {
+            ca::product_version(&exe)
+        } else {
+            ca::package_version(&exe).map(|v| v.to_string())
+        },
         program: exe,
         argv: args.argv.clone(),
         session: thread,

@@ -217,7 +217,8 @@ bench-support = []
 # (`ATERM_PTY_IDLE_POLL_US`, `ATERM_TRACE_BOOST`) and to the state-root rule
 # (`ATERM_STATE_HOME`, aterm-types), to the harness's live-upgrade settle
 # (`ATERM_UPGRADE_QUIET_S`, aterm-agent) and to the fabric endpoint's stale
-# horizon (`ATERM_FABRIC_STALE_AFTER_MS`, aterm-gui-fabric). A debug build
+# horizon and handler tally (`ATERM_FABRIC_STALE_AFTER_MS`,
+# `ATERM_FABRIC_HANDLER_TALLY`, aterm-gui-fabric). A debug build
 # compiles them anyway. The release cutter NEVER enables it — `aterm-release`'s
 # buildplan pins that — so a shipped binary reads none of them.
 dev-seams = [
@@ -327,6 +328,10 @@ aterm-slog = { workspace = true }
 # The fleet: the opt-in (secure-default-OFF) TLS listener whose proved LAN
 # peers the control server serves as `Scope::Fleet` (see fleet_listen.rs).
 aterm-net = { workspace = true }
+# This Mac's network place (where it is, whether the internet answers, how much of the ALab LAN
+# it reaches) and its one wording: `status`'s `net=` fields, `sys net`'s place, the network deck
+# and the menu bar (net_place.rs), and this process's keeper candidate.
+aterm-netplace = { workspace = true }
 # Portable control-socket stream (std Unix sockets on Unix, AF_UNIX-over-winsock
 # on Windows) + the latest-alias/CSPRNG/pid-liveness helpers control_auth uses.
 aterm-uds = { workspace = true }

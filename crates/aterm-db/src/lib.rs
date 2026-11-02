@@ -18,6 +18,9 @@ aterm_secrets::memoized_x25519_in_tests!();
 pub mod accounts;
 #[cfg(unix)]
 pub mod admission;
+pub mod alab;
+#[cfg(unix)]
+pub mod att;
 #[cfg(unix)]
 pub mod catalog;
 #[cfg(unix)]
@@ -51,6 +54,7 @@ pub mod runtime;
 pub mod service_state;
 #[cfg(unix)]
 pub mod table;
+pub mod typed;
 
 /// Resolve application storage to an already admitted, fully preserved writer
 /// generation. Call before opening its secrets bootstrap or table directory.
@@ -112,26 +116,42 @@ pub fn inspect_writer_recovery(paths: &aterm_secrets::client::Paths) -> Result<a
 }
 
 /// A refusal that identifies the failed boundary without quoting payloads or keys.
-#[derive(Debug)]
-pub struct Error(pub String);
+pub struct Error(pub String, FailureKind);
+
+#[derive(Clone, Copy)]
+enum FailureKind {
+    Other,
+    Busy,
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Error").field(&self.0).finish()
+    }
+}
 /// What [`Error::busy`] says.
 const BUSY: &str = "another local writer holds this table; nothing changed, retry shortly";
 const SNAPSHOT_CHANGED: &str = "table witness advanced during observation; reopen and verify";
 impl Error {
     pub(crate) fn new(reason: &str) -> Self {
-        Self(reason.into())
+        Self(reason.into(), FailureKind::Other)
     }
     /// Another local writer held the store this needed, and nothing changed.
     pub(crate) fn busy() -> Self {
-        Self(BUSY.into())
+        Self(BUSY.into(), FailureKind::Busy)
     }
     /// A newer witness needs fresh verification; the changed handle refuses reads.
     pub(crate) fn snapshot_changed() -> Self {
-        Self(SNAPSHOT_CHANGED.into())
+        Self(SNAPSHOT_CHANGED.into(), FailureKind::Busy)
     }
     /// Whether local contention or a newer snapshot requires a fresh observation.
     pub(crate) fn is_busy(&self) -> bool {
-        self.0 == BUSY || self.0 == SNAPSHOT_CHANGED
+        matches!(self.1, FailureKind::Busy)
+    }
+
+    /// Add local diagnostic context without changing the failure's classification.
+    pub(crate) fn context(self, context: &str) -> Self {
+        Self(format!("{context}: {}", self.0), self.1)
     }
 }
 impl fmt::Display for Error {
@@ -142,7 +162,20 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
-        Self(value.to_string())
+        // An I/O WouldBlock can be a network timeout, not local writer contention.
+        Self(value.to_string(), FailureKind::Other)
+    }
+}
+impl From<aterm_secrets::Error> for Error {
+    fn from(value: aterm_secrets::Error) -> Self {
+        let kind = match value.kind() {
+            aterm_secrets::ErrorKind::JournalBusy
+            | aterm_secrets::ErrorKind::CustodyBusy
+            | aterm_secrets::ErrorKind::VaultBusy
+            | aterm_secrets::ErrorKind::VaultChanged => FailureKind::Busy,
+            _ => FailureKind::Other,
+        };
+        Self(value.to_string(), kind)
     }
 }
 /// Database boundary result.
@@ -150,3 +183,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod error_tests;

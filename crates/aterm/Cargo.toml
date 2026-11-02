@@ -111,10 +111,16 @@ aterm-digest = { workspace = true }
 # base layer, the vault and the repositories. `aterm machines` itself stays macOS-only
 # (`machines_unavailable` in src/main.rs).
 aterm-machines = { workspace = true }
+# `aterm init`'s `base.agents.primer` (src/doctor.rs): the window's automatic primer pass, for a
+# Mac no window primes. Already in the graph through aterm-cli and atpkg.
+aterm-primer = { workspace = true }
 # The fleet members an `aterm pkg` download races by default (`src/unit_peers.rs`,
 # `aterm_net::fleet_member::member_addrs`, unix-only). Already in the graph through aterm-gui;
 # the fleet listener's live test dials a real instance with it too.
 aterm-net = { workspace = true }
+# Away from the ALab LAN a download races only the members the network reaches
+# (`src/unit_peers.rs`, `aterm_netplace::routes`). Already in the graph through aterm-net.
+aterm-netplace = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The transparent session's cancellable first-run countdown owns the tty before

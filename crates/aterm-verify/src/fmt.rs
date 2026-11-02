@@ -820,22 +820,15 @@ mod tests {
             };
             tools = crate::run_toolchain(&discovered, &repo);
         }
-        if tools.trustfmt.is_none() {
-            aterm_uds::host::could_not_run(format!(
-                "{}, so this machine cannot show the check either way",
-                tools.missing_trustfmt_label()
-            ));
-        }
+        let untidy_lib =
+            "pub struct E {\n    error: String,\n}\npub fn wrong(  ) ->usize{let x=1;x}\n";
         let t = tree(&[
             (
                 "Cargo.toml",
                 "[package]\nname = \"fx\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
             ),
             ("rustfmt.toml", "edition = \"2021\"\n"),
-            (
-                "src/lib.rs",
-                "pub struct E {\n    error: String,\n}\npub fn wrong(  ) ->usize{let x=1;x}\n",
-            ),
+            ("src/lib.rs", untidy_lib),
         ]);
         let root = t.path().to_path_buf();
         let scratch = t.path().join(".scratch");
@@ -864,6 +857,32 @@ mod tests {
             run(&ctx, &mut r);
             r
         };
+        if tools.trustfmt.is_none() {
+            #[cfg(windows)]
+            {
+                let want = [(Outcome::Skip, tools.missing_trustfmt_label())];
+                for fix in [false, true] {
+                    let r = check(fix);
+                    let rows: Vec<(Outcome, String)> =
+                        r.outcomes().map(|(o, l)| (o, l.to_string())).collect();
+                    assert_eq!(rows, want, "fix={fix}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(root.join("src/lib.rs")).expect("read"),
+                    untidy_lib
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("src/new.rs")).expect("read"),
+                    untidy
+                );
+                return;
+            }
+            #[cfg(not(windows))]
+            aterm_uds::host::could_not_run(format!(
+                "{}, so this machine cannot show the check either way",
+                tools.missing_trustfmt_label()
+            ));
+        }
         let red = check(false);
         let rows: Vec<(Outcome, String)> =
             red.outcomes().map(|(o, l)| (o, l.to_string())).collect();

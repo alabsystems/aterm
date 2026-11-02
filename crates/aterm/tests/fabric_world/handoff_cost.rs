@@ -83,11 +83,13 @@ fn quit(w: &mut World) {
 const QUIT_BYE: (&str, &str) = ("ATERM_DEBUG_QUIT_BYE", "handoff");
 /// What a bridge's start says it did to the run record.
 const START: &str = "aterm-link: the run record says a bridge runs";
-/// What a start that found its record on the media by the proof says (R6, `StateDir::begin_run`).
+/// What a start that found its record on the media by the proof says (R6, `StateDir::begin_run`),
+/// and the stem of that proof's name in the state dir (`StateDir::proof_path`).
 const PROVEN_START: &str = "run.durable";
 /// What the mirror says of the floor of the node's total, raised or admitted.
 const FLOOR: &str = "aterm-link: mirror: the floor of the node's total";
-/// What the mirror says of a floor it admitted by the proof (R6, `Bridge::mirror_floor_covers`).
+/// What the mirror says of a floor it admitted by the proof (R6, `Bridge::mirror_floor_covers`),
+/// and the stem of that proof's name in the state dir.
 const PROVEN_FLOOR: &str = "logfloor.durable";
 
 /// **A HANDOFF FLUSHES NOTHING, ITS SUCCESSOR'S START WRITES NOTHING WHERE THE
@@ -95,9 +97,9 @@ const PROVEN_FLOOR: &str = "logfloor.durable";
 /// Eight sessions in use leave sixteen torn-kind files written with no flush;
 /// the instance hands off: its bridge flushes nothing and leaves the run open.
 /// Its successor, on the same dir in the same boot, finds the OPEN its
-/// predecessor's start published in full and linked as `run.durable`, and
-/// writes nothing (R6); its mirror admits the floor `logfloor.durable` links
-/// without a flush. It hands off in turn, and the test takes both proofs
+/// predecessor's start published in full and proved by a `run.durable` name, and
+/// writes nothing (R6); its mirror admits the floor a `logfloor.durable` name
+/// proves without a flush. It hands off in turn, and the test takes both proofs
 /// away: the next successor, the CONTROL, establishes its OPEN fence by two
 /// full flushes, as every successor did before R6. It quits, and its clean
 /// stop flushes every one of the sixteen it inherited where it is (nothing
@@ -151,14 +153,21 @@ fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
         "the floor its predecessor raised, admitted by its proof with no flush: {floor:?}"
     );
 
-    for proof in ["run.durable", "logfloor.durable"] {
-        match std::fs::remove_file(w.state.join(proof)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                panic!("take {proof} away: {e}")
-            }
-            _ => {}
+    let mut taken = 0;
+    for entry in std::fs::read_dir(&w.state)
+        .expect("the state dir reads")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if [PROVEN_START, PROVEN_FLOOR]
+            .iter()
+            .any(|stem| name.starts_with(stem))
+        {
+            std::fs::remove_file(entry.path()).unwrap_or_else(|e| panic!("take {name} away: {e}"));
+            taken += 1;
         }
     }
+    assert_eq!(taken, 2, "this dir's two proofs, named for it, taken away");
     let bare = log_len(&w);
     let gui = w.gui.insert(World::relaunch_gui_shipping_flushes(&w));
     w.token = World::wait_for_owned_token_of(&w.ctl_sock, gui, &w.gui_log);

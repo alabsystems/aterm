@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 
 pub use step::{Fault, Progress, Tick, Track};
-pub use units::Jobs;
+pub use units::{Jobs, NamingError, NamingSelector, NamingTicket, NamingWaiter};
 pub use wait::TierB;
 
 /// How long a job reads `running` after a progress event.
@@ -340,6 +340,9 @@ pub struct JobProc {
     /// and each exec take a new one, so it moves where the pid, the start and the name stay
     /// (`exec zsh`); `None` elsewhere.
     pub version: Option<u64>,
+    /// The program's exec identity where the host read one for this member; unlike `version`,
+    /// this is not limited to tab roots. An unavailable value remains unavailable.
+    pub exec_version: Option<u64>,
 }
 
 /// What keeps a process whose one thread never ran from its first instruction past 20 s
@@ -888,7 +891,7 @@ pub enum WaitName {
     Unnamed,
     /// Tier B: a file lock.
     Lock,
-    /// Tier B: a plain `read` (a canonical terminal read).
+    /// Tier B: a plain `read`; its descriptor and terminal status are unproven.
     Read,
     /// Tier B: a Mach message.
     Ipc,

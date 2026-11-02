@@ -541,6 +541,13 @@ fn settings_override_and_optional_fallback_follow_go_flag_rules() {
         !has_settings_override(&w("agy -- --settings /tmp/s.json")),
         "nothing past -- is a flag"
     );
+    assert_eq!(settings_override(&w("agy --effort high")), None);
+    assert_eq!(settings_override(&w("agy --settings")), Some(None));
+    assert_eq!(
+        settings_override(&w("agy -settings=/tmp/a.json --settings /tmp/b.json")),
+        Some(Some("/tmp/b.json")),
+        "Go's last --settings before -- wins"
+    );
     assert_eq!(config_dir_or(&w("agy"), None, None), None);
     assert_eq!(
         config_dir_or(&w("agy"), Some("rel"), Some(Path::new("rel"))),

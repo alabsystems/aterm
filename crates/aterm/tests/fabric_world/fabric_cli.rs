@@ -1218,7 +1218,12 @@ fn tail_replays_from_an_offset_hides_bodies_and_follows_live() {
     let all = Tail::spawn(&s, &["tail", "--from", "0"]);
     let rows = tail_rows(&all, 3);
     for (row, (off, kind)) in rows.iter().zip(offs.iter().zip(["task", "note", "ask"])) {
-        let cols: Vec<&str> = row.split_whitespace().collect();
+        // [`msg`]'s instant is fixed, so across a daylight-saving change from today its time
+        // column names its own offset (`aterm_link::fabric::clock_at`), a word this count skips.
+        let cols: Vec<&str> = row
+            .split_whitespace()
+            .filter(|c| !c.starts_with("UTC"))
+            .collect();
         assert_eq!(cols[0], format!("@{off}"), "{row}");
         assert_eq!(cols[2], kind, "{row}");
         assert!(

@@ -4426,7 +4426,7 @@ impl SessionTimeline {
     pub(crate) fn task_carry_row(&self) -> Option<String> {
         self.task
             .as_ref()
-            .map(crate::task_record::TaskRecord::carry_row)
+            .map(|task| task.carry_row(std::time::Instant::now()))
     }
 
     /// The published program for foreground group `pgid`, or `None` when the publication names
@@ -5016,6 +5016,7 @@ impl SessionTimeline {
             && new.owner == old.owner
         {
             new.account_progress = old.account_progress.clone();
+            new.account_progress_busy = old.account_progress_busy;
         }
         let is_muse_or_agy = match self
             .agent
@@ -5422,19 +5423,44 @@ impl SessionTimeline {
         conversation: Option<&str>,
         progress: Option<aterm_agent::harness::account_progress::AccountProgress>,
     ) -> bool {
-        let Some((pid, birth, facts)) = self.claude_footer.as_mut() else {
+        let Some(facts) = self.account_progress_facts_mut(pgid, started, conversation) else {
             return false;
         };
-        if self.agent.program_pgid != pgid
-            || *pid != pgid
-            || *birth != started
-            || facts.owner.as_ref().map(|owner| owner.session_id.as_str()) != conversation
-            || facts.account_progress == progress
-        {
+        if facts.account_progress == progress && !facts.account_progress_busy {
             return false;
         }
         facts.account_progress = progress;
+        facts.account_progress_busy = false;
         true
+    }
+
+    /// Withdraw current recovery claims without replacing the retained observation.
+    pub(crate) fn set_account_progress_busy(
+        &mut self,
+        pgid: i32,
+        started: Option<u64>,
+        conversation: Option<&str>,
+    ) -> bool {
+        let Some(facts) = self.account_progress_facts_mut(pgid, started, conversation) else {
+            return false;
+        };
+        let changed = !facts.account_progress_busy;
+        facts.account_progress_busy = true;
+        changed
+    }
+
+    fn account_progress_facts_mut(
+        &mut self,
+        pgid: i32,
+        started: Option<u64>,
+        conversation: Option<&str>,
+    ) -> Option<&mut aterm_agent::harness::footer::FooterFacts> {
+        let (pid, birth, facts) = self.claude_footer.as_mut()?;
+        (self.agent.program_pgid == pgid
+            && *pid == pgid
+            && *birth == started
+            && facts.owner.as_ref().map(|owner| owner.session_id.as_str()) == conversation)
+            .then_some(facts)
     }
 
     /// The active goal of the agent in front, one line ([`aterm_agent::harness::goal`]): what
@@ -6537,6 +6563,50 @@ mod account_progress_tests {
         );
         assert!(!timeline.set_account_progress(42, Some(100), Some("one"), Some(progress)));
         assert_eq!(snapshot(&timeline), None);
+    }
+
+    #[test]
+    fn progress_unavailability_is_bound_and_only_a_fresh_read_clears_it() {
+        let mut timeline = SessionTimeline::for_test();
+        timeline.agent.program_pgid = 42;
+        timeline.set_claude_footer(42, Some(100), Some(facts("one")));
+        let progress = AccountProgress::unknown(101);
+        timeline.set_account_progress(42, Some(100), Some("one"), Some(progress.clone()));
+        assert!(timeline.set_account_progress_busy(42, Some(100), Some("one")));
+        assert!(!timeline.set_account_progress_busy(42, Some(100), Some("one")));
+        timeline.set_claude_footer(42, Some(100), Some(facts("one")));
+        assert!(timeline.claude_footer().unwrap().account_progress_busy);
+        assert_eq!(
+            timeline.claude_footer().unwrap().account_progress,
+            Some(progress.clone())
+        );
+        for (pid, birth, owner) in [
+            (43, Some(100), "one"),
+            (42, Some(102), "one"),
+            (42, Some(100), "two"),
+        ] {
+            assert!(!timeline.set_account_progress(
+                pid,
+                birth,
+                Some(owner),
+                Some(progress.clone())
+            ));
+            assert!(timeline.claude_footer().unwrap().account_progress_busy);
+        }
+        assert!(timeline.set_account_progress(42, Some(100), Some("one"), Some(progress.clone())));
+        assert!(!timeline.claude_footer().unwrap().account_progress_busy);
+        for (pid, birth, owner) in [
+            (43, Some(100), "one"),
+            (42, Some(102), "one"),
+            (42, Some(100), "two"),
+        ] {
+            assert!(!timeline.set_account_progress_busy(pid, birth, Some(owner)));
+            assert!(!timeline.claude_footer().unwrap().account_progress_busy);
+        }
+        timeline.set_account_progress_busy(42, Some(100), Some("one"));
+        timeline.set_claude_footer(42, Some(102), Some(facts("two")));
+        assert!(!timeline.claude_footer().unwrap().account_progress_busy);
+        assert_eq!(timeline.claude_footer().unwrap().account_progress, None);
     }
 
     #[test]

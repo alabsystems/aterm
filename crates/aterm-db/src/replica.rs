@@ -54,7 +54,7 @@ impl ProbeMismatch {
             Self::History {
                 head_matches,
                 basis_matches,
-            } => Error(format!(
+            } => Error::new(&format!(
                 "application repair needs matching control history (head_matches={head_matches}, basis_matches={basis_matches})"
             )),
         }
@@ -648,7 +648,7 @@ impl Replica {
         } else {
             Session::observe(bootstrap)
         }
-        .map_err(|error| Error(format!("table repair session admission: {error}")))?;
+        .map_err(|error| error.context("table repair session admission"))?;
         #[cfg(test)]
         tests::session_boundary(1);
         if session.actor() != self.actor {
@@ -668,7 +668,9 @@ impl Replica {
             .map(|(_, config)| crate::catalog::policy::Policy::read(config))
             .transpose()?;
         let bootstrap = Bootstrap::cached_until(&self.paths, admission_deadline())
-            .map_err(|error| Error(format!("table repair bootstrap custody admission: {error}")))?
+            .map_err(|error| {
+                Error::from(error).context("table repair bootstrap custody admission")
+            })?
             .ok_or_else(|| Error::new("table repair lost secrets custody"))?;
         let (observation, legacy_observation) =
             self.observe(&bootstrap, peer, None, false, |session| {
@@ -1575,8 +1577,8 @@ impl Round<'_> {
     ) -> Result<()> {
         self.active_table.set(Some(id));
         let at = |stage: &str, error: Error| {
-            Error(format!(
-                "table repair {} {stage}: {error}",
+            error.context(&format!(
+                "table repair {} {stage}",
                 aterm_codec::hex::encode_lower(&id)
             ))
         };

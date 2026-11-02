@@ -18,7 +18,15 @@ fn each_arm_parses_from_its_name_and_nothing_else_does() {
         Profile::Dev,
         "the arm every entry so far ran"
     );
-    for bad in ["", "release", "opt-test", "Dev", "debug", "test"] {
+    for bad in [
+        "",
+        "release",
+        "opt-test",
+        "fabric-shipped",
+        "Dev",
+        "debug",
+        "test",
+    ] {
         assert!(Profile::parse(bad).is_err(), "{bad}");
     }
 }
@@ -36,6 +44,11 @@ fn a_binary_names_the_arm_whose_directory_holds_it() {
     assert_eq!(
         Profile::of_binary(Path::new("/w/target/opt-test/aterm")),
         Some(Profile::Opt)
+    );
+    assert_eq!(
+        Profile::of_binary(Path::new("/w/target/fabric-shipped/aterm")),
+        Some(Profile::Shipped),
+        "a directory no `--release` build writes"
     );
     assert_eq!(
         Profile::of_binary(Path::new("/w/target/aarch64-apple-darwin/opt-test/aterm")),
@@ -87,4 +100,22 @@ fn a_rewritten_binary_is_another_identity() {
     assert_ne!(identity(&exe).expect("reads"), first);
     std::fs::remove_dir_all(&dir).expect("cleanup");
     assert!(identity(&exe).is_err(), "no file is no identity");
+}
+
+#[test]
+fn the_shipped_arm_is_the_releases_code_generation_with_its_seams_by_feature() {
+    let shipped = Profile::Shipped;
+    assert_eq!(shipped.cargo_features(), ["--features", "dev-seams"]);
+    assert!(!shipped.debug_assertions());
+    assert_eq!(shipped.every_crate_at(), Some("3"));
+    assert_eq!(shipped.lto(), Some("true"));
+    assert_eq!(shipped.codegen_units(), Some(1));
+    for arm in [Profile::Dev, Profile::Opt] {
+        assert!(arm.cargo_features().is_empty(), "{arm:?}");
+        assert!(arm.debug_assertions(), "{arm:?}");
+    }
+    assert_eq!(Profile::Opt.lto(), Some("false"));
+    assert_eq!(Profile::Opt.codegen_units(), Some(16));
+    assert_eq!(Profile::Dev.lto(), None);
+    assert_eq!(Profile::Dev.codegen_units(), None);
 }

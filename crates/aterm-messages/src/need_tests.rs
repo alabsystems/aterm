@@ -1545,3 +1545,24 @@ fn a_builders_own_detail_lines_are_not_reordered_by_the_ask() {
     assert_eq!(bare.detail.len(), 2);
     assert_eq!(bare.detail[1], "Type claude --resume in the tab");
 }
+
+/// A key holds the low 16 bits of a long subject's FNV-1a, and a key a person's stored state holds
+/// does not move: the literal was read from a run of the fold this crate spelled out before.
+#[test]
+fn a_long_subjects_key_hashes_it_with_aterm_hashs_fold_and_a_stored_key_does_not_move() {
+    let long = "s-3e79b5bde172ad0088ad".repeat(3);
+    let hash = aterm_hash::fnv1a_64(long.as_bytes()) & 0xffff;
+    let key = Fingerprint::new("harness.upgrade", &long, "own-work");
+    assert!(
+        key.as_str().contains(&format!("~{hash:04x}.")),
+        "{}",
+        key.as_str()
+    );
+    assert_eq!(key.as_str(), "harness.upgrade.s-3e79b5bde1~4f65.own-work");
+    let tight = Fingerprint::new(&"f".repeat(24), &long, &"c".repeat(20));
+    assert!(
+        tight.as_str().contains(&format!(".{hash:04x}.")),
+        "{}",
+        tight.as_str()
+    );
+}

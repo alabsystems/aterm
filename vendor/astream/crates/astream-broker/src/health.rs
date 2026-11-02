@@ -17,8 +17,10 @@
 //! is attached, what is parked — is an operator's, read on the host, so it goes in a
 //! file beside the log, mode 0600: only the user the broker runs as reads it (an embedder
 //! that keeps its log in a 0700 directory, as aterm does, adds that directory's rule),
-//! which is R5's read grant on one machine, and no request tag is spent. (An
-//! attach-gated request for it remains possible, and is not built.)
+//! which is R5's read grant on one machine, and this file spends no request tag. R5's wire
+//! request is built too ([`Client::stats`](crate::Client::stats), tag 0x13), which a guarded
+//! broker gates on a read grant over `/f/<F>/>`. A request gated on the attach alone, which
+//! a narrower ring could read, remains possible, and is not built.
 //!
 //! An embedder that wrote its own file of these facts would invent a format, a pid
 //! convention and a staleness rule astream never sees; this is the one format, and

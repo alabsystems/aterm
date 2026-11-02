@@ -539,7 +539,7 @@ impl Fnv {
     #[inline]
     #[must_use]
     pub const fn new() -> Fnv {
-        Fnv(0xcbf2_9ce4_8422_2325)
+        Fnv(aterm_hash::FNV64_OFFSET)
     }
 
     /// The digest so far.
@@ -549,14 +549,14 @@ impl Fnv {
         self.0
     }
 
-    /// Folds `v`'s eight little-endian bytes.
+    /// Folds `v`'s eight little-endian bytes: `aterm_hash::fnv1a_64_u64_le`, inline (see [`fnv1a`]).
     #[inline]
     pub const fn u64(&mut self, v: u64) {
         let bytes = v.to_le_bytes();
         let mut i = 0;
         while i < 8 {
             self.0 ^= bytes[i] as u64;
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+            self.0 = self.0.wrapping_mul(aterm_hash::FNV64_PRIME);
             i += 1;
         }
     }
@@ -606,14 +606,16 @@ impl Fnv {
     }
 }
 
-/// FNV-1a 64 over `bytes`: a frame's key in [`LaneTick::key`].
+/// FNV-1a 64 over `bytes`: a frame's key in [`LaneTick::key`]. The fold stays spelled out here and
+/// in [`Fnv::u64`]: the Trust lane proves these bodies panic-free, and a call to `aterm_hash`'s is
+/// an unproved callee to it. `the_lanes_folds_are_aterm_hashs` holds them to `aterm_hash`'s.
 #[inline]
 const fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut h = aterm_hash::FNV64_OFFSET;
     let mut i = 0;
     while i < bytes.len() {
         h ^= bytes[i] as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h = h.wrapping_mul(aterm_hash::FNV64_PRIME);
         i += 1;
     }
     h

@@ -33,8 +33,10 @@ pub(crate) struct HumanInputStamp {
     last_plain_enter: AtomicU64,
     /// THE OUTGOING PROCESS'S AGE OF THE LAST GESTURE, in milliseconds plus
     /// one (so `0` stays "none carried"), as of [`Self::carried_at`]
-    /// ([`Self::carry`]): read only while no gesture of this process is
-    /// stamped (`at` is `0`), every one of which is later.
+    /// ([`Self::carry`]): read as the last gesture ([`Self::ms_since`]) only
+    /// while no gesture of this process is stamped (`at` is `0`), every one
+    /// of which is later, and, whatever was stamped here, as the bound on a
+    /// carried typing age with no awake row ([`Self::typed_awake_ms`]).
     carried_ms: AtomicU64,
     /// When the carried age was taken here ([`crate::metrics::now_us`]).
     carried_at: AtomicU64,
@@ -58,6 +60,13 @@ pub(crate) struct HumanInputStamp {
     /// The Mac's sleep since boot when the carried typing age was taken here, as
     /// [`Self::typed_slept`] is.
     typed_carried_slept: AtomicU64,
+    /// THE OUTGOING PROCESS'S TYPING AGE IN AWAKE TIME, in milliseconds plus one (`0`: none
+    /// carried), as of [`Self::typed_awake_carried_at`] ([`Self::carry_typed_awake`]): the
+    /// carried [`Self::typed_carried_ms`] counts the sleep before the carry, which the awake
+    /// clock a task record crosses on does not ([`Self::typed_awake_ms`]).
+    typed_awake_carried_ms: AtomicU64,
+    /// When the carried awake typing age was taken here ([`crate::metrics::now_us`]).
+    typed_awake_carried_at: AtomicU64,
     /// WHEN THE HOST BEGAN SERVING THE SESSION, on this process's clock
     /// ([`crate::metrics::now_us`], microseconds): its start here, or the
     /// Commit a seamless successor adopted it at — earlier than this
@@ -82,6 +91,8 @@ impl Default for HumanInputStamp {
             typed_carried_at: AtomicU64::new(0),
             typed_slept: AtomicU64::new(0),
             typed_carried_slept: AtomicU64::new(0),
+            typed_awake_carried_ms: AtomicU64::new(0),
+            typed_awake_carried_at: AtomicU64::new(0),
             served_from_us: AtomicI64::new(
                 i64::try_from(crate::metrics::now_us()).unwrap_or(i64::MAX),
             ),
@@ -246,6 +257,12 @@ impl HumanInputStamp {
         if let Some(at) = self.at.load(Ordering::Relaxed).checked_sub(1) {
             return Some(now_us.saturating_sub(at) / 1000);
         }
+        self.carried_ms_since(now_us)
+    }
+
+    /// Milliseconds from the last gesture the outgoing process carried ([`Self::carry`]) to
+    /// `now_us`, in awake time; `None` with none carried.
+    fn carried_ms_since(&self, now_us: u64) -> Option<u64> {
         let age = self.carried_ms.load(Ordering::Acquire).checked_sub(1)?;
         let at = self.carried_at.load(Ordering::Relaxed);
         Some(age.saturating_add(now_us.saturating_sub(at) / 1000))
@@ -260,7 +277,8 @@ impl HumanInputStamp {
     }
 
     /// [`Self::typed_ms_since`] with `slept` the Mac's sleep since boot now ([`slept_us`]): the
-    /// awake time since the typing, plus the sleep since where both readings of it are known.
+    /// awake time since the typing, plus the sleep since where both readings of it are known; a
+    /// carried age is the outgoing process's own reading, the sleep before the carry in it.
     pub(crate) fn typed_ms_at(&self, now_us: u64, slept: Option<u64>) -> Option<u64> {
         let asleep = |then: &AtomicU64| match (then.load(Ordering::Relaxed).checked_sub(1), slept) {
             (Some(then), Some(now)) => now.saturating_sub(then) / 1000,
@@ -281,6 +299,43 @@ impl HumanInputStamp {
             age.saturating_add(now_us.saturating_sub(at) / 1000)
                 .saturating_add(asleep(&self.typed_carried_slept)),
         )
+    }
+
+    /// Milliseconds from the person's last typing to `now_us` in awake time, the clock
+    /// [`crate::metrics::now_us`] and an [`std::time::Instant`] keep, which stop while the Mac
+    /// sleeps: since the typing stamped here, else the carried awake age
+    /// ([`Self::carry_typed_awake`]) plus the time since, else, where only an age that may count
+    /// sleep was carried (an outgoing build before the awake row, or a legacy gesture kept as a
+    /// possible key), the awake age of the last gesture the outgoing process carried
+    /// ([`Self::carried_ms_since`]) where it is sooner, which no typing before the update can be
+    /// later than; a gesture made here before any typing here is no typing, so it never shortens
+    /// that age. `None` with no typing stamp.
+    pub(crate) fn typed_awake_ms(&self, now_us: u64) -> Option<u64> {
+        if let Some(at) = self.typed_at.load(Ordering::Acquire).checked_sub(1) {
+            return Some(now_us.saturating_sub(at) / 1000);
+        }
+        if let Some(age) = self
+            .typed_awake_carried_ms
+            .load(Ordering::Acquire)
+            .checked_sub(1)
+        {
+            let at = self.typed_awake_carried_at.load(Ordering::Relaxed);
+            return Some(age.saturating_add(now_us.saturating_sub(at) / 1000));
+        }
+        let carried = self.typed_ms_at(now_us, None)?;
+        Some(
+            self.carried_ms_since(now_us)
+                .map_or(carried, |gesture| gesture.min(carried)),
+        )
+    }
+
+    /// THE OUTGOING PROCESS'S TYPING AGE IN AWAKE TIME, CARRIED: `age_ms` as of `now_us` on the
+    /// adopting clock ([`Self::typed_awake_ms`]).
+    #[cfg(any(unix, test))]
+    pub(crate) fn carry_typed_awake(&self, age_ms: u64, now_us: u64) {
+        self.typed_awake_carried_at.store(now_us, Ordering::Relaxed);
+        self.typed_awake_carried_ms
+            .store(age_ms.saturating_add(1), Ordering::Release);
     }
 
     /// The person typed at `now_us`, `slept` the Mac's sleep since boot then ([`slept_us`]).
@@ -404,10 +459,18 @@ impl crate::App {
     ) -> Option<std::path::PathBuf> {
         use crate::seamless::PersonStamp;
         let now_us = crate::metrics::now_us();
+        let now = std::time::Instant::now();
+        let job_seen = &self.claim_job_seen;
         let stamps: Vec<(u64, PersonStamp)> = ids
             .iter()
             .filter_map(|&id| Some((id, &self.pool.get(id)?.ctx.human_input)))
             .flat_map(|(id, stamp)| {
+                let seen = job_seen.get(&id).map(|&seen| {
+                    PersonStamp::JobSeen(
+                        u64::try_from(now.saturating_duration_since(seen).as_millis())
+                            .unwrap_or(u64::MAX),
+                    )
+                });
                 let carried = match stamp.ms_since(now_us) {
                     Some(age) => Some(PersonStamp::Keyed(age)),
                     None => stamp.unkeyed_ms(now_us).map(PersonStamp::Unkeyed),
@@ -415,9 +478,12 @@ impl crate::App {
                 let typed = stamp
                     .typed_ms_since(now_us)
                     .map_or(PersonStamp::Untyped, PersonStamp::Typed);
+                let awake = stamp.typed_awake_ms(now_us).map(PersonStamp::TypedAwake);
                 carried
                     .into_iter()
                     .chain(std::iter::once(typed))
+                    .chain(awake)
+                    .chain(seen)
                     .map(move |carried| (id, carried))
             })
             .collect();
@@ -441,7 +507,9 @@ impl crate::App {
     /// says how — then each one the sidecar names by its outgoing id carries its keyed age
     /// ([`HumanInputStamp::carry`]) or how long it was served unkeyed
     /// ([`HumanInputStamp::serve_from`]). Each modern writer says whether typing is recorded;
-    /// without that provenance, a legacy keyed age conservatively counts as a possible key.
+    /// without that provenance, a legacy keyed age conservatively counts as a possible key. The
+    /// claim look's last sight of a program in an ended claim worker's tab crosses too
+    /// (`App::claim_job_seen`), so the tab's reading time after that program is not cut short.
     pub(crate) fn take_carried_person_stamps(&mut self) {
         let now_us = crate::metrics::now_us();
         for session in self.pool.iter() {
@@ -461,12 +529,15 @@ impl crate::App {
             .filter(|(_, stamp)| {
                 matches!(
                     stamp,
-                    crate::seamless::PersonStamp::Typed(_) | crate::seamless::PersonStamp::Untyped
+                    crate::seamless::PersonStamp::Typed(_)
+                        | crate::seamless::PersonStamp::TypedAwake(_)
+                        | crate::seamless::PersonStamp::Untyped
                 )
             })
             .map(|(named, _)| *named)
             .collect();
         let mut carried = 0_usize;
+        let mut job_seen = Vec::new();
         for (named, stamp) in stamps {
             if let Some(session) = self
                 .pool
@@ -488,8 +559,27 @@ impl crate::App {
                     crate::seamless::PersonStamp::Typed(age_ms) => {
                         session.ctx.human_input.carry_typed(age_ms, now_us);
                     }
+                    crate::seamless::PersonStamp::TypedAwake(age_ms) => {
+                        session.ctx.human_input.carry_typed_awake(age_ms, now_us);
+                    }
                     crate::seamless::PersonStamp::Untyped => {}
+                    crate::seamless::PersonStamp::JobSeen(age_ms) => job_seen.push((named, age_ms)),
                 }
+            }
+        }
+        let now = std::time::Instant::now();
+        for (named, age_ms) in job_seen {
+            let adopted = self
+                .pool
+                .sessions
+                .iter()
+                .find(|(_, pooled)| pooled.session.handoff_local_id == Some(named))
+                .map(|(&id, _)| id);
+            if let Some(adopted) = adopted {
+                let seen = now
+                    .checked_sub(std::time::Duration::from_millis(age_ms))
+                    .unwrap_or(now);
+                self.claim_job_seen.insert(adopted, seen);
             }
         }
         if carried > 0 {
@@ -728,9 +818,10 @@ mod tests {
     /// the outgoing process writes, for the sessions it hands over, the age
     /// of each one's last person's gesture — a stamp it carried itself from
     /// an earlier update included — and for a session nobody keyed, how long
-    /// it served it so (`-<age>`, the review's KR-2); the successor's Commit
-    /// carries each onto the shell adopted under the id it names and
-    /// consumes the sidecar.
+    /// it served it so (`-<age>`, the review's KR-2), and how long ago the claim
+    /// look last saw a program in an ended claim worker's tab (`j<id>`, the
+    /// 2026-11-02 review); the successor's Commit carries each onto the shell
+    /// adopted under the id it names and consumes the sidecar.
     #[cfg(unix)]
     #[test]
     fn the_persons_stamps_cross_a_seamless_update_at_its_commit() {
@@ -768,11 +859,22 @@ mod tests {
             .carry_typed(80_000, now);
         outgoing
             .pool
+            .get(keyed)
+            .expect("live")
+            .ctx
+            .human_input
+            .carry_typed_awake(70_000, now);
+        outgoing
+            .pool
             .get(untouched)
             .expect("live")
             .ctx
             .human_input
             .serve_from(600_000, now);
+        let program_seen = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(50))
+            .expect("up 50 s");
+        outgoing.claim_job_seen.insert(untouched, program_seen);
         let written = outgoing
             .write_person_stamps_of(&[keyed, untouched], path.clone())
             .expect("written");
@@ -780,19 +882,30 @@ mod tests {
         let body = std::fs::read_to_string(&path).expect("the sidecar");
         let rows: Vec<&str> = body.lines().collect();
         assert!(
-            rows.len() == 4
+            rows.len() == 6
                 && rows[0].starts_with(&format!("{keyed} 9"))
                 && rows[1].starts_with(&format!("t{keyed} 8"))
-                && rows[2].starts_with(&format!("{untouched} -6"))
-                && rows[3] == format!("t{untouched} -"),
-            "the keyed age, its typing's and the unkeyed one: {body:?}"
+                && rows[2].starts_with(&format!("a{keyed} 7"))
+                && rows[3].starts_with(&format!("{untouched} -6"))
+                && rows[4] == format!("t{untouched} -")
+                && rows[5].starts_with(&format!("j{untouched} 5")),
+            "the keyed age, its typing's (and in awake time), the unkeyed one and the claim \
+             look's last sight of a program: {body:?}"
         );
 
         let read = |carried: Option<std::path::PathBuf>| {
             let mut successor = App::headless_for_test();
             let _ = successor.insert_logical_window(crate::stub_session(1), 24, 80);
-            let ids: Vec<u64> = successor.pool.sessions.keys().copied().collect();
-            for (&id, named) in ids.iter().zip([keyed, untouched]) {
+            // Each adopted shell is named by the other's outgoing id (both apps number theirs
+            // 0 and 1), so a stamp carried under the named id, not the adopted one, shows.
+            let mut ids: Vec<u64> = successor.pool.sessions.keys().copied().collect();
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                [keyed, untouched],
+                "PRECONDITION: the same ids on both sides"
+            );
+            for (&id, named) in ids.iter().zip([untouched, keyed]) {
                 let session = successor.pool.sessions.get_mut(&id).expect("live");
                 session.session.handoff_local_id = Some(named);
                 session
@@ -811,6 +924,11 @@ mod tests {
                         stamp.ms_since(now),
                         stamp.unkeyed_ms(now),
                         stamp.typed_ms_since(now),
+                        stamp.typed_awake_ms(now),
+                        successor
+                            .claim_job_seen
+                            .get(&id)
+                            .map(|seen| seen.elapsed().as_millis()),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -819,17 +937,22 @@ mod tests {
         assert!(
             matches!(
                 carried[..],
-                [(Some(keyed), None, Some(typed)), (None, Some(served), None)]
-                    if keyed >= 90_000 && typed >= 80_000 && served >= 600_000
+                [
+                    (None, Some(served), None, None, Some(seen)),
+                    (Some(keyed), None, Some(typed), Some(awake), None),
+                ]
+                    if keyed >= 90_000 && typed >= 80_000 && (70_000..80_000).contains(&awake)
+                        && served >= 600_000 && (50_000..3_600_000).contains(&seen)
             ),
-            "(keyed, untouched): {carried:?}"
+            "(adopted as untouched, adopted as keyed): {carried:?}"
         );
         assert!(!path.exists(), "consumed");
         let none = read(Some(path.clone()));
         assert!(
             matches!(
                 none[..],
-                [(None, Some(a), None), (None, Some(b), None)] if a < 60_000 && b < 60_000
+                [(None, Some(a), None, None, None), (None, Some(b), None, None, None)]
+                    if a < 60_000 && b < 60_000
             ),
             "NEGATIVE CONTROL: no sidecar, never keyed and served since the Commit: {none:?}"
         );
@@ -875,6 +998,62 @@ mod tests {
             typed.ms_since(now),
             "no sleep since: the gesture's own age"
         );
+    }
+
+    /// THE AWAKE TYPING AGE LEAVES THE SLEEP OUT, A CARRIED ONE TOO (2026-11-02 review): a claim
+    /// worker's task record crosses a seamless update on the awake clock, so the typing age the
+    /// look holds it against may not count the sleep before the update that the carried age
+    /// does. Stamped here, the awake time since; carried with its awake row, that age; carried
+    /// with only the age that counts sleep (an older writer), the carried last gesture's awake age
+    /// where it is sooner, which no typing before the update is later than, and never a click
+    /// made here, which is no typing. CONTROL: no typing, none.
+    #[test]
+    fn the_awake_typing_age_leaves_the_sleep_out() {
+        const SLEPT_MS: u64 = 8 * 3600 * 1000;
+        let here = HumanInputStamp::default();
+        here.stamp_typed(1_000_000, Some(5_000_000));
+        assert_eq!(here.typed_awake_ms(4_000_000), Some(3_000));
+
+        let older = HumanInputStamp::default();
+        older.carry(30_000, 1_000_000);
+        older.carry_typed_at(60_000 + SLEPT_MS, 1_000_000, None);
+        assert_eq!(
+            older.typed_ms_at(2_000_000, None),
+            Some(61_000 + SLEPT_MS),
+            "PRECONDITION: the carried age counts the sleep before the update"
+        );
+        assert_eq!(
+            older.typed_awake_ms(2_000_000),
+            Some(31_000),
+            "an older writer: the last gesture's awake age"
+        );
+        older.note(1_800_000, Gesture::Other);
+        assert_eq!(
+            older.typed_awake_ms(2_000_000),
+            Some(31_000),
+            "a click made here before any typing here is no typing"
+        );
+        older.carry_typed_awake(60_000, 1_000_000);
+        assert_eq!(
+            older.typed_awake_ms(2_000_000),
+            Some(61_000),
+            "the awake row"
+        );
+        older.stamp_typed(1_500_000, None);
+        assert_eq!(
+            older.typed_awake_ms(2_000_000),
+            Some(500),
+            "typed here since"
+        );
+
+        let legacy = HumanInputStamp::default();
+        legacy.carry_typed_at(45_000, 1_000_000, None);
+        assert_eq!(
+            legacy.typed_awake_ms(2_000_000),
+            Some(46_000),
+            "a possible key with no gesture carried beside it"
+        );
+        assert_eq!(HumanInputStamp::default().typed_awake_ms(2_000_000), None);
     }
 
     /// An older sidecar has no separate typing provenance. Its recent gesture may be a key,

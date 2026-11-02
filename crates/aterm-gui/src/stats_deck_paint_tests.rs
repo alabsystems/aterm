@@ -667,6 +667,7 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
     let long = snap.tab(FRONT).is_some_and(|t| t.label == LONG_TAB);
     DeckInput {
         network: None,
+        network_place: None,
         network_target: crate::network_deck::Target::Overview,
         snap: Some(snap),
         prev_snap: None,

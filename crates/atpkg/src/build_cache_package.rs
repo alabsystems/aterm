@@ -1311,7 +1311,7 @@ fn compact(
         None,
         &mut |_, _| true,
         fence,
-        Some(Context {
+        super::Selection::Package(Context {
             cache: Some(cache),
             kernel: &Live,
         }),

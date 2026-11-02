@@ -10,6 +10,7 @@ use astream_broker::{Broker, FlushCounts};
 use aterm_json::{Value, json};
 use aterm_link::ctl::Ctl;
 use aterm_link::wait_tally::{self, Hist, Row as TallyRow, Tally, Unit};
+use aterm_types::wait_tally::{HANDLER_FILE, HANDLER_SEAM, HandlerRow, HandlerTally};
 
 use super::{
     DEADLINE, FLEET, Row, Ruler, Ticks, World, await_durable, await_note, boot_world, bystanders,
@@ -51,6 +52,9 @@ struct Raw {
     /// The tally past the warm-up, and the one past the last reply.
     start: Tally,
     end: Tally,
+    /// aterm's own handler tally ([`handler_tally`]) at the same two moments.
+    handlers_start: HandlerTally,
+    handlers_end: HandlerTally,
     /// The broker's flushes between those two tallies
     /// ([`Broker::flush_counts`], read right after each: between two round
     /// trips, never inside one).
@@ -62,6 +66,8 @@ struct Raw {
     /// last reply (its window runs from `end`).
     paced: Vec<Round>,
     paced_end: Option<Tally>,
+    /// The handler tally past the last paced reply (its window runs from `handlers_end`).
+    paced_handlers_end: Option<HandlerTally>,
 }
 
 fn one_round(
@@ -133,6 +139,24 @@ fn await_tally(path: &Path, pid: i32, off: u64, what: &str) -> Tally {
     })
 }
 
+/// aterm's handler tally now: a wait with nothing to wait for has aterm write the line before it
+/// answers ([`aterm_types::wait_tally::HANDLER_SEAM`]), so the file holds every span that ended
+/// before this request, and the request itself counts in no row.
+///
+/// # Panics
+///
+/// A wait that answered anything but its timeout, or a line that is not this aterm's.
+fn handler_tally(ctl: &mut Ctl, path: &Path, pid: u32, sid: &str, since: u64) -> HandlerTally {
+    let line = format!("@{sid} await inbox since={since} kinds=note timeout=0");
+    let reply = super::request(ctl, &line);
+    assert_eq!(reply.header(), "OK timeout", "{line}");
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("aterm wrote no handler tally at {}: {e}", path.display()));
+    let tally = HandlerTally::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(tally.pid, pid, "{}", path.display());
+    tally
+}
+
 /// Park on `sid`'s inbox for the round's one message, `text`, and list it:
 /// `(its row, the stamp when the wait answered)`.
 ///
@@ -158,13 +182,18 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
     let mut ctl = w.ctl();
     let mut a_since = newest_id(&mut ctl, a);
     let mut b_since = newest_id(&mut ctl, b);
-    let mut start = (spec.warmup == 0).then(|| {
-        (
+    let handlers = w.instance_state().join(HANDLER_FILE);
+    let gui = w.gui.as_ref().expect("the world's aterm").id();
+    let mut start = if spec.warmup == 0 {
+        Some((
             await_tally(&path, pid, 0, "ping-pong, before the first round"),
             broker.flush_counts(),
             ticks(broker),
-        )
-    });
+            handler_tally(&mut ctl, &handlers, gui, a, a_since),
+        ))
+    } else {
+        None
+    };
     let mut measured = Vec::with_capacity(spec.pingpong);
     for i in 0..spec.warmup + spec.pingpong {
         let round = one_round(&mut ctl, clock, a, b, i, &mut a_since, &mut b_since);
@@ -173,6 +202,7 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
                 await_tally(&path, pid, round.pong_off, "ping-pong, after the warm-up"),
                 broker.flush_counts(),
                 ticks(broker),
+                handler_tally(&mut ctl, &handlers, gui, a, a_since),
             ));
         }
         if i >= spec.warmup {
@@ -183,7 +213,9 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
     let end = await_tally(&path, pid, last.pong_off, "ping-pong, after the last round");
     let flushes_end = broker.flush_counts();
     let ticks_end = ticks(broker);
-    let (start, flushes_start, ticks_start) = start.expect("taken before the first measured round");
+    let handlers_end = handler_tally(&mut ctl, &handlers, gui, a, a_since);
+    let (start, flushes_start, ticks_start, handlers_start) =
+        start.expect("taken before the first measured round");
     let first = spec.warmup + spec.pingpong;
     let paced: Vec<Round> = (first..first + spec.paced)
         .map(|i| {
@@ -199,14 +231,18 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
             "ping-pong, after the last paced round",
         )
     });
+    let paced_handlers_end = paced_end.map(|_| handler_tally(&mut ctl, &handlers, gui, a, a_since));
     Raw {
         rounds: measured,
         start,
         end,
+        handlers_start,
+        handlers_end,
         flushes: flushes_between(flushes_start, flushes_end),
         ticks: ticks_between(ticks_start, ticks_end),
         paced,
         paced_end,
+        paced_handlers_end,
     }
 }
 
@@ -444,7 +480,7 @@ fn tally_rows(d: &Tally, n: usize) -> Vec<String> {
         if d.dir {
             ""
         } else {
-            " The state dir's rows were not counted: a build without debug assertions."
+            " The state dir's rows were not counted: a build without its seams."
         }
     ));
     rows
@@ -523,6 +559,334 @@ fn tally_json(d: &Tally, n: usize, rt: Option<f64>) -> Value {
     })
 }
 
+/// A window's park beside the bench's own spans, each a mean per round trip in ms: the bench's
+/// turn (which a real agent replaces), aterm's answer to `post` with its socket, and what is left,
+/// wakes and idle. The loop may be working through part of a span, so [`ParkSplit::rest`] can read
+/// below zero; the spans are measured beside the park, not inside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ParkSplit {
+    park: f64,
+    /// B's wake to its post's request: its listing and its turn.
+    b_turn: f64,
+    /// A's wake to its next post's request (outside the round trip; [`PACE`] included when paced).
+    a_turn: f64,
+    /// A's post, request to reply.
+    a_post: f64,
+    /// B's post, request to reply.
+    b_post: f64,
+}
+
+impl ParkSplit {
+    fn of(rounds: &[Round], park_ns: u64) -> Option<Self> {
+        let n = rounds.len();
+        if n == 0 {
+            return None;
+        }
+        let per = |sum: f64| sum / n as f64;
+        let span = |f: fn(&Round) -> (u64, u64)| {
+            per(rounds
+                .iter()
+                .map(|r| {
+                    let (a, b) = f(r);
+                    ms(a, b)
+                })
+                .sum::<f64>())
+        };
+        Some(ParkSplit {
+            park: per(ns_ms(park_ns)),
+            b_turn: span(|r| (r.t_b_seen, r.t_b_call)),
+            a_turn: per(rounds
+                .windows(2)
+                .map(|w| ms(w[0].t_a_seen, w[1].t_call))
+                .sum::<f64>()),
+            a_post: span(|r| (r.t_call, r.t_ret)),
+            b_post: span(|r| (r.t_b_call, r.t_b_ret)),
+        })
+    }
+
+    fn rest(&self) -> f64 {
+        self.park - self.b_turn - self.a_turn - self.a_post - self.b_post
+    }
+
+    fn rows(&self) -> Vec<String> {
+        vec![
+            "| the park, split (each a mean per round trip) | ms |".to_string(),
+            "|---|---:|".to_string(),
+            format!(
+                "| **the loop parked on its mailbox (the bridge's tally)** | {:.3} |",
+                self.park
+            ),
+            format!(
+                "| the bench's turn: B's wake to its post | {:.3} |",
+                self.b_turn
+            ),
+            format!(
+                "| the bench's turn: A's wake to its next post (outside the round trip) | {:.3} |",
+                self.a_turn
+            ),
+            format!(
+                "| aterm's answer to A's `post`, with its socket | {:.3} |",
+                self.a_post
+            ),
+            format!(
+                "| aterm's answer to B's `post`, with its socket | {:.3} |",
+                self.b_post
+            ),
+            format!(
+                "| the rest: wakes and idle (below zero: the loop worked through part of a span \
+                 above) | {:.3} |",
+                self.rest()
+            ),
+        ]
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "what": "means per round trip in ms, beside the park rather than inside it: the bench's turn (which a real agent replaces), aterm's answer to post with its socket, and the rest, wakes and idle; the loop may be working through part of a span, so the rest can read below zero",
+            "park": stats::round3(self.park),
+            "b_turn": stats::round3(self.b_turn),
+            "a_turn": stats::round3(self.a_turn),
+            "a_post": stats::round3(self.a_post),
+            "b_post": stats::round3(self.b_post),
+            "rest": stats::round3(self.rest()),
+        })
+    }
+}
+
+/// What a row of aterm's handler tally ([`HandlerRow`]) times.
+const fn describe_handler(row: HandlerRow) -> &'static str {
+    match row {
+        HandlerRow::Deliver => "`deliver`",
+        HandlerRow::WakeWatchers => {
+            "of `deliver` and `outbox sent`: ringing the session's watchers"
+        }
+        HandlerRow::Outbox => "the outbox peek",
+        HandlerRow::Sent => "`outbox sent`",
+        HandlerRow::Sessions => "`sessions bridge`",
+        HandlerRow::OtherBridge => "every other bridge-only verb",
+        HandlerRow::Post => "`post`, to its push-lane event and wakes",
+        HandlerRow::Inbox => "`inbox`, the listing",
+        HandlerRow::AwaitArm => "`await inbox`: entry to its first park",
+        HandlerRow::AwaitWake => "`await inbox`: the row in the ring to the answer",
+    }
+}
+
+/// One request, timed from outside and by aterm's handler: what lies between is the socket, the
+/// reader thread's wake, and the request's framing and dispatch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RequestSplit {
+    what: &'static str,
+    /// The outside clock's calls and their total, in ns.
+    calls: u64,
+    outside_ns: u64,
+    /// The handler's calls and their total, in ns.
+    handled: u64,
+    handler_ns: u64,
+}
+
+impl RequestSplit {
+    fn outside_us(&self) -> Option<f64> {
+        (self.calls > 0).then(|| self.outside_ns as f64 / self.calls as f64 / 1e3)
+    }
+
+    fn handler_us(&self) -> Option<f64> {
+        (self.handled > 0).then(|| self.handler_ns as f64 / self.handled as f64 / 1e3)
+    }
+
+    fn share(&self) -> Option<f64> {
+        share(self.handler_ns as f64, self.outside_ns as f64)
+    }
+}
+
+/// Each verb the bridge's lane times, and the bench's `post`, beside aterm's handler for it.
+fn request_splits(waits: &Tally, handlers: &HandlerTally, rounds: &[Round]) -> Vec<RequestSplit> {
+    let lane = |what, row: TallyRow, handler: HandlerRow| RequestSplit {
+        what,
+        calls: waits.row(row).count,
+        outside_ns: waits.row(row).total,
+        handled: handlers.row(handler).count,
+        handler_ns: handlers.row(handler).total,
+    };
+    let mut splits = vec![
+        lane("`deliver`", TallyRow::LaneDeliver, HandlerRow::Deliver),
+        lane("the outbox peek", TallyRow::LaneOutbox, HandlerRow::Outbox),
+        lane("`outbox sent`", TallyRow::LaneSent, HandlerRow::Sent),
+        lane(
+            "`sessions bridge`",
+            TallyRow::LaneSessions,
+            HandlerRow::Sessions,
+        ),
+        lane(
+            "every other verb",
+            TallyRow::LaneOther,
+            HandlerRow::OtherBridge,
+        ),
+    ];
+    let lane_total = splits.iter().fold(
+        RequestSplit {
+            what: "**the verb lane, all**",
+            calls: 0,
+            outside_ns: 0,
+            handled: 0,
+            handler_ns: 0,
+        },
+        |sum, s| RequestSplit {
+            calls: sum.calls + s.calls,
+            outside_ns: sum.outside_ns + s.outside_ns,
+            handled: sum.handled + s.handled,
+            handler_ns: sum.handler_ns + s.handler_ns,
+            ..sum
+        },
+    );
+    splits.push(lane_total);
+    let post_us: u64 = rounds
+        .iter()
+        .map(|r| (r.t_ret - r.t_call) + (r.t_b_ret - r.t_b_call))
+        .sum();
+    splits.push(RequestSplit {
+        what: "the bench's `post`",
+        calls: 2 * rounds.len() as u64,
+        outside_ns: post_us * 1_000,
+        handled: handlers.row(HandlerRow::Post).count,
+        handler_ns: handlers.row(HandlerRow::Post).total,
+    });
+    splits
+}
+
+fn handler_rows(d: &HandlerTally, n: usize) -> Vec<String> {
+    let per = |v: f64| {
+        if n == 0 {
+            "–".to_string()
+        } else {
+            format!("{:.3}", v / n as f64)
+        }
+    };
+    let mut rows = vec![
+        "| aterm's handler (handler tally v=1) | count | per round trip | µs a call | ms per round \
+         trip | ≥ 1.05 ms | largest (ms) |"
+            .to_string(),
+        "|---|---:|---:|---:|---:|---:|---:|".to_string(),
+    ];
+    for row in HandlerRow::ALL {
+        let h = d.row(row);
+        rows.push(format!(
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            describe_handler(row),
+            h.count,
+            per(h.count as f64),
+            if h.count == 0 {
+                "–".to_string()
+            } else {
+                format!("{:.1}", h.total as f64 / h.count as f64 / 1e3)
+            },
+            per(ns_ms(h.total)),
+            h.at_least(TAIL_1MS),
+            largest(h),
+        ));
+    }
+    rows
+}
+
+fn split_rows(splits: &[RequestSplit], n: usize) -> Vec<String> {
+    let us = |v: Option<f64>| v.map_or("–".to_string(), |v| format!("{v:.1}"));
+    let per = |ns: u64| {
+        if n == 0 {
+            "–".to_string()
+        } else {
+            format!("{:.3}", ns_ms(ns) / n as f64)
+        }
+    };
+    let mut rows = vec![
+        "| request | calls | from outside (µs a call) | aterm's handler (µs a call) | the rest: \
+         socket, wake, framing (µs a call) | handler's share | from outside (ms per round trip) \
+         | handler (ms per round trip) |"
+            .to_string(),
+        "|---|---:|---:|---:|---:|---:|---:|---:|".to_string(),
+    ];
+    for s in splits {
+        let rest = s
+            .outside_us()
+            .zip(s.handler_us())
+            .map(|(outside, handler)| outside - handler);
+        rows.push(format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            s.what,
+            s.calls,
+            us(s.outside_us()),
+            us(s.handler_us()),
+            us(rest),
+            s.share()
+                .map_or("–".to_string(), |v| format!("{:.1}%", v * 100.0)),
+            per(s.outside_ns),
+            per(s.handler_ns),
+        ));
+    }
+    rows
+}
+
+fn handlers_json(d: &HandlerTally, splits: &[RequestSplit], n: usize) -> Value {
+    let per = |v: f64| (n > 0).then(|| stats::round3(v / n as f64));
+    let mut rows = aterm_json::Map::new();
+    for row in HandlerRow::ALL {
+        let h = d.row(row);
+        rows.insert(
+            row.name().to_string(),
+            json!({
+                "count": h.count,
+                "total_ns": h.total,
+                "count_per_round_trip": per(h.count as f64),
+                "ms_per_round_trip": per(ns_ms(h.total)),
+                "max_ns": h.max,
+                "bands": h.buckets.to_vec(),
+            }),
+        );
+    }
+    let requests: Vec<Value> = splits
+        .iter()
+        .map(|s| {
+            json!({
+                "what": s.what,
+                "calls": s.calls,
+                "outside_us_per_call": s.outside_us().map(stats::round3),
+                "handled": s.handled,
+                "handler_us_per_call": s.handler_us().map(stats::round3),
+                "handler_share": s.share(),
+                "outside_ms_per_round_trip": per(ns_ms(s.outside_ns)),
+                "handler_ms_per_round_trip": per(ns_ms(s.handler_ns)),
+            })
+        })
+        .collect();
+    json!({
+        "format": "handler-tally v=1",
+        "aterm_wall_ms": stats::round3(ns_ms(d.at_ns)),
+        "rows": Value::Object(rows),
+        "requests": requests,
+    })
+}
+
+/// A window's two splits, for the JSON and the entry: the park, and the requests.
+fn splits_report(
+    rounds: &[Round],
+    waits: &Tally,
+    handlers: &HandlerTally,
+) -> (Value, Value, Vec<String>) {
+    let n = rounds.len();
+    let splits = request_splits(waits, handlers, rounds);
+    let park = ParkSplit::of(rounds, waits.row(TallyRow::Park).total);
+    let mut md = vec![String::new()];
+    md.extend(park.iter().flat_map(ParkSplit::rows));
+    md.push(String::new());
+    md.extend(handler_rows(handlers, n));
+    md.push(String::new());
+    md.extend(split_rows(&splits, n));
+    md.push(String::new());
+    (
+        park.as_ref().map_or(Value::Null, ParkSplit::json),
+        handlers_json(handlers, &splits, n),
+        md,
+    )
+}
+
 fn flushes_rows(f: FlushCounts, n: usize) -> Vec<String> {
     let per = |v: u64, by: usize| {
         if by == 0 {
@@ -575,6 +939,12 @@ fn paced_report(raw: &Raw) -> (Value, Vec<String>) {
     let d = end
         .since(&raw.end)
         .unwrap_or_else(|e| panic!("ping-pong, paced: the bridge's wait tallies do not pair: {e}"));
+    let handlers = raw
+        .paced_handlers_end
+        .expect("taken with the last paced tally")
+        .since(&raw.handlers_end)
+        .unwrap_or_else(|e| panic!("ping-pong, paced: {e}"));
+    let (park_json, handlers_json, splits_md) = splits_report(&raw.paced, &d, &handlers);
     let rt_mean = stats::summarize(&round_trip).map(|s| s.mean);
     let pace_ms = u64::try_from(PACE.as_millis()).unwrap_or(u64::MAX);
     let json = json!({
@@ -585,6 +955,8 @@ fn paced_report(raw: &Raw) -> (Value, Vec<String>) {
         "pong_post_to_visible_ms": stats::to_json(&pong_leg),
         "turnaround_ms": stats::to_json(&turnaround),
         "wait_tally_v2": tally_json(&d, n, rt_mean),
+        "park_split": park_json,
+        "handlers": handlers_json,
     });
     let mut md = vec![
         String::new(),
@@ -609,14 +981,18 @@ fn paced_report(raw: &Raw) -> (Value, Vec<String>) {
     ];
     md.extend(tally_rows(&d, n));
     md.extend(attribution_rows(&d, n, rt_mean));
-    md.push(String::new());
+    md.extend(splits_md);
     (json, md)
 }
 
 /// The ping-pong world: boot with the tally on, on aterm's options for the arm's tier ([`boot_world`]), measure, read the log.
 pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the ping-pong world");
-    let mut w = boot_world("fbench-pp", spec, &[(wait_tally::SEAM, "1")]);
+    let mut w = boot_world(
+        "fbench-pp",
+        spec,
+        &[(wait_tally::SEAM, "1"), (HANDLER_SEAM, "1")],
+    );
     w.wait_ready();
     let served = served_line(&w, spec);
     let (a, b) = w.two_sessions();
@@ -719,6 +1095,11 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         .end
         .since(&raw.start)
         .unwrap_or_else(|e| panic!("ping-pong: the bridge's wait tallies do not pair: {e}"));
+    let handlers = raw
+        .handlers_end
+        .since(&raw.handlers_start)
+        .unwrap_or_else(|e| panic!("ping-pong: {e}"));
+    let (park_json, handlers_json, splits_md) = splits_report(&raw.rounds, &waits, &handlers);
     let blocked_ms = ns_ms(waits.blocked_ns());
     let blocked_share = window_ms.and_then(|w| share(blocked_ms, w));
     let p50 = |v: &[f64]| stats::summarize(v).map(|s| s.p50);
@@ -783,6 +1164,8 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             },
         },
         "wait_tally_v2": tally_json(&waits, n, rt_mean),
+        "park_split": park_json,
+        "handlers": handlers_json,
         "bystanders": spec.bystanders,
         "paced": paced_json,
         "census": census::to_json(&pp_census, 2 * n, (lo, hi)),
@@ -868,10 +1251,8 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     ]);
     md.extend(tally_rows(&waits, n));
     md.extend(attribution_rows(&waits, n, rt_mean));
-    md.extend([
-        String::new(),
-        "The broker's flushes over the same window, read at its two tallies:\n".to_string(),
-    ]);
+    md.extend(splits_md);
+    md.push("The broker's flushes over the same window, read at its two tallies:\n".to_string());
     md.extend(flushes_rows(raw.flushes, n));
     md.push(String::new());
     md.push(ticks_line(raw.ticks));
@@ -1264,6 +1645,107 @@ mod tests {
             Some(0.0)
         );
         assert!(attribution(&d, 0).is_empty());
+    }
+
+    #[allow(
+        dead_code,
+        reason = "a `harness = false` bench compiles `cfg(test)` but not its `#[test]`s"
+    )]
+    fn round(base: u64) -> super::Round {
+        super::Round {
+            ping: String::new(),
+            pong: String::new(),
+            t_call: base,
+            t_ret: base + 300,
+            t_b_seen: base + 1_000,
+            t_b_call: base + 1_100,
+            t_b_ret: base + 1_500,
+            t_a_seen: base + 2_000,
+            ping_off: 0,
+            pong_off: 0,
+        }
+    }
+
+    #[test]
+    fn the_park_split_reads_each_span_per_round_trip_and_keeps_the_rest_signed() {
+        use super::*;
+
+        let rounds = [round(0), round(2_400), round(4_800), round(7_200)];
+        let split = ParkSplit::of(&rounds, 8_000_000).expect("four rounds");
+        assert!((split.park - 2.0).abs() < 1e-9);
+        assert!((split.b_turn - 0.1).abs() < 1e-9);
+        assert!((split.a_post - 0.3).abs() < 1e-9);
+        assert!((split.b_post - 0.4).abs() < 1e-9);
+        assert!(
+            (split.a_turn - 0.3).abs() < 1e-9,
+            "three gaps of 0.4 ms over four round trips: {}",
+            split.a_turn
+        );
+        assert!((split.rest() - 0.9).abs() < 1e-9);
+        let rows = split.rows();
+        assert!(rows[2].contains("2.000"), "{rows:?}");
+        assert!(rows[7].ends_with("| 0.900 |"), "{rows:?}");
+        let busy = ParkSplit::of(&rounds, 800_000).expect("four rounds");
+        assert!(busy.rest() < 0.0, "the loop worked through the spans");
+        assert_eq!(ParkSplit::of(&[], 800_000), None);
+    }
+
+    #[test]
+    fn each_request_splits_into_its_handler_and_the_rest_and_the_lane_sums() {
+        use super::*;
+
+        let mut waits = Tally::default();
+        waits.rows[TallyRow::LaneDeliver.index()] = Hist {
+            count: 400,
+            total: 40_000_000,
+            ..Hist::default()
+        };
+        waits.rows[TallyRow::LaneSent.index()] = Hist {
+            count: 400,
+            total: 20_000_000,
+            ..Hist::default()
+        };
+        let mut handlers = HandlerTally::default();
+        handlers.rows[HandlerRow::Deliver.index()] = Hist {
+            count: 400,
+            total: 10_000_000,
+            ..Hist::default()
+        };
+        handlers.rows[HandlerRow::Post.index()] = Hist {
+            count: 4,
+            total: 400_000,
+            ..Hist::default()
+        };
+        let rounds = [round(0), round(2_400)];
+        let splits = request_splits(&waits, &handlers, &rounds);
+        let of = |what: &str| {
+            splits
+                .iter()
+                .find(|s| s.what == what)
+                .unwrap_or_else(|| panic!("no `{what}` in {splits:?}"))
+        };
+        let deliver = of("`deliver`");
+        assert_eq!(deliver.outside_us(), Some(100.0));
+        assert_eq!(deliver.handler_us(), Some(25.0));
+        assert_eq!(deliver.share(), Some(0.25));
+        let lane = of("**the verb lane, all**");
+        assert_eq!((lane.calls, lane.outside_ns), (800, 60_000_000));
+        assert_eq!((lane.handled, lane.handler_ns), (400, 10_000_000));
+        let post = of("the bench's `post`");
+        assert_eq!(post.calls, 4, "two posts a round trip");
+        assert_eq!(post.outside_ns, 2 * (300 + 400) * 1_000);
+        assert_eq!(post.handler_us(), Some(100.0));
+        let rows = split_rows(&splits, 2);
+        assert!(
+            rows.iter()
+                .any(|r| r == "| `deliver` | 400 | 100.0 | 25.0 | 75.0 | 25.0% | 20.000 | 5.000 |"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("| every other verb | 0 | – | – | – | – |")),
+            "{rows:?}"
+        );
     }
 
     #[test]

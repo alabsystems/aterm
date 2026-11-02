@@ -5319,6 +5319,27 @@ fn scripted_oauth_browser(
     super::super::headless_oauth::CdpClient,
     std::thread::JoinHandle<usize>,
 ) {
+    scripted_oauth_replies(move |method, reads| {
+        let result = match method {
+            "Target.createTarget" => aterm_json::json!({"targetId": "t1"}),
+            "Target.attachToTarget" => aterm_json::json!({"sessionId": "s1"}),
+            "Runtime.evaluate" => {
+                aterm_json::json!({"result": {"type": "object", "value": state(reads)}})
+            }
+            _ => aterm_json::json!({}),
+        };
+        Some(aterm_json::json!({"result": result}))
+    })
+}
+
+/// Supply a CDP reply body, or close the event pipe for a real EOF. The peer assigns the
+/// request ID, so the driver still reads and matches the actual wire response.
+fn scripted_oauth_replies(
+    mut reply: impl FnMut(&str, usize) -> Option<Value> + Send + 'static,
+) -> (
+    super::super::headless_oauth::CdpClient,
+    std::thread::JoinHandle<usize>,
+) {
     use super::super::headless_oauth::{CdpClient, split_nul_messages};
     let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
     let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
@@ -5335,17 +5356,17 @@ fn scripted_oauth_browser(
             for msg in split_nul_messages(&mut pending) {
                 let id = msg.get("id").and_then(Value::as_u64).unwrap_or(0);
                 let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-                let result = match method {
-                    "Target.createTarget" => aterm_json::json!({"targetId": "t1"}),
-                    "Target.attachToTarget" => aterm_json::json!({"sessionId": "s1"}),
-                    "Runtime.evaluate" => {
-                        reads += 1;
-                        aterm_json::json!({"result": {"type": "object", "value": state(reads)}})
-                    }
-                    _ => aterm_json::json!({}),
+                if method == "Runtime.evaluate" {
+                    reads += 1;
+                }
+                let Some(mut response) = reply(method, reads) else {
+                    return reads;
                 };
-                let mut bytes =
-                    aterm_json::to_vec(&aterm_json::json!({"id": id, "result": result})).unwrap();
+                response
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("id".into(), id.into());
+                let mut bytes = aterm_json::to_vec(&response).unwrap();
                 bytes.push(0);
                 if from_browser_w.write_all(&bytes).is_err() || method == "Browser.close" {
                     return reads;
@@ -5374,7 +5395,23 @@ fn drive_bot_check(
     bot_stall: Duration,
     poll: Duration,
 ) -> (Result<(), &'static str>, Vec<String>, usize, Option<Met>) {
-    let (mut cdp, browser) = scripted_oauth_browser(state);
+    drive_oauth_client(scripted_oauth_browser(state), bot_stall, poll, |_, _| {
+        Err("no mailbox in a test")
+    })
+}
+
+fn drive_oauth_client(
+    (mut cdp, browser): (
+        super::super::headless_oauth::CdpClient,
+        std::thread::JoinHandle<usize>,
+    ),
+    bot_stall: Duration,
+    poll: Duration,
+    mailbox: impl FnMut(
+        &mut super::super::headless_oauth::CdpClient,
+        Option<&str>,
+    ) -> Result<super::super::headless_oauth::MailboxCredential, &'static str>,
+) -> (Result<(), &'static str>, Vec<String>, usize, Option<Met>) {
     let mut delivered = Vec::new();
     let res = super::super::headless_oauth::drive_cdp_oauth_within(
         &mut cdp,
@@ -5382,7 +5419,7 @@ fn drive_bot_check(
         Some("one@example.com"),
         (aterm_spec::wait::MUST_HAPPEN, poll),
         bot_stall,
-        |_, _| Err("no mailbox in a test"),
+        mailbox,
         |cb| {
             delivered.push(cb.to_owned());
             Ok(200)
@@ -5392,6 +5429,162 @@ fn drive_bot_check(
     drop(cdp);
     let reads = browser.join().expect("stand-in browser");
     (res, delivered, reads, met)
+}
+
+#[test]
+fn oauth_control_eof_records_a_hostless_outcome_before_the_first_page() {
+    use super::super::headless_oauth::{
+        CdpClient, drive_cdp_oauth_within, split_nul_messages, take_met,
+    };
+    let (mut commands, to_browser) = std::io::pipe().unwrap();
+    let (from_browser, events) = std::io::pipe().unwrap();
+    drop(events);
+    let mut cdp = CdpClient::new(to_browser, from_browser);
+    let result = drive_cdp_oauth_within(
+        &mut cdp,
+        BOT_AUTHORIZE,
+        None,
+        (aterm_spec::wait::MUST_HAPPEN, Duration::ZERO),
+        aterm_spec::wait::MUST_HAPPEN,
+        |_, _| panic!("no page or mailbox was reached"),
+        |_| panic!("no callback was reached"),
+    );
+    assert!(result.is_err());
+    let met = take_met().unwrap();
+    assert_eq!(met, Met::new(MetWord::BrowserControl, None));
+    drop(cdp);
+    let mut bytes = Vec::new();
+    commands.read_to_end(&mut bytes).unwrap();
+    let messages = split_nul_messages(&mut bytes);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["method"].as_str(), Some("Target.createTarget"));
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome");
+    write_outcome(&path, &met);
+    let retained = read_outcome(&path).unwrap();
+    let history = super::super::sign_in_ladder::how_it_ended(
+        super::super::cli::Renewal::Failed,
+        None,
+        Some(&retained),
+    );
+    assert!(history.ends_with(&met.words()));
+}
+
+#[test]
+fn oauth_terminal_setup_and_evaluate_failures_record_browser_control() {
+    let malformed = aterm_json::json!({"result": {}});
+    let rejected = aterm_json::json!({"error": {"code": -1, "message": "private-path-and-code"}});
+    for (fault, reply) in [
+        ("Target.createTarget", Some(malformed.clone())),
+        ("Target.attachToTarget", Some(malformed)),
+        ("Page.enable", Some(rejected.clone())),
+        ("Runtime.enable", Some(rejected.clone())),
+        ("Page.navigate", Some(rejected.clone())),
+        ("Runtime.evaluate", Some(rejected)),
+        ("Runtime.evaluate", None),
+    ] {
+        let peer = scripted_oauth_replies(move |method, _| {
+            if method == fault {
+                return reply.clone();
+            }
+            let result = match method {
+                "Target.createTarget" => aterm_json::json!({"targetId": "t1"}),
+                "Target.attachToTarget" => aterm_json::json!({"sessionId": "s1"}),
+                _ => aterm_json::json!({}),
+            };
+            Some(aterm_json::json!({"result": result}))
+        });
+        let (result, callbacks, _, met) = drive_oauth_client(
+            peer,
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::ZERO,
+            |_, _| panic!("no mailbox was reached"),
+        );
+        assert!(result.is_err(), "{fault}");
+        assert!(callbacks.is_empty(), "{fault}");
+        assert_eq!(
+            met,
+            Some(Met::new(MetWord::BrowserControl, None)),
+            "{fault}"
+        );
+        assert!(!result.unwrap_err().contains("private"));
+    }
+}
+
+#[test]
+fn oauth_magic_link_navigation_failures_record_browser_control() {
+    use super::super::headless_oauth::MailboxCredential;
+    for state in ["submitted_email", "needs_mailbox"] {
+        let peer = scripted_oauth_replies(move |method, reads| {
+            if method == "Page.navigate" && reads > 0 {
+                return Some(aterm_json::json!({"error": {"code": -1}}));
+            }
+            let result = match method {
+                "Target.createTarget" => aterm_json::json!({"targetId": "t1"}),
+                "Target.attachToTarget" => aterm_json::json!({"sessionId": "s1"}),
+                "Runtime.evaluate" => {
+                    aterm_json::json!({"result": {"value": {"state": state, "url": "https://claude.com/login"}}})
+                }
+                _ => aterm_json::json!({}),
+            };
+            Some(aterm_json::json!({"result": result}))
+        });
+        let (result, callbacks, reads, met) = drive_oauth_client(
+            peer,
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::ZERO,
+            |_, _| {
+                Ok(MailboxCredential::MagicLink(
+                    "https://claude.com/verify?token=made-up".into(),
+                ))
+            },
+        );
+        assert!(result.is_err(), "{state}");
+        assert!(callbacks.is_empty());
+        assert_eq!(reads, 1);
+        assert_eq!(met, Some(Met::new(MetWord::BrowserControl, None)));
+    }
+}
+
+#[test]
+fn oauth_recoverable_bot_read_and_semantic_failures_are_not_browser_control() {
+    let peer = scripted_oauth_replies(|method, reads| {
+        if method == "Runtime.evaluate" && reads == 2 {
+            return Some(aterm_json::json!({"error": {"code": -1}}));
+        }
+        let result = match method {
+            "Target.createTarget" => aterm_json::json!({"targetId": "t1"}),
+            "Target.attachToTarget" => aterm_json::json!({"sessionId": "s1"}),
+            "Runtime.evaluate" if reads == 1 => {
+                aterm_json::json!({"result": {"value": {"state": "bot_check", "url": "https://claude.com/login"}}})
+            }
+            "Runtime.evaluate" => {
+                aterm_json::json!({"result": {"value": {"state": "callback", "url": BOT_CALLBACK}}})
+            }
+            _ => aterm_json::json!({}),
+        };
+        Some(aterm_json::json!({"result": result}))
+    });
+    let (result, callbacks, reads, met) = drive_oauth_client(
+        peer,
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::ZERO,
+        |_, _| panic!("no mailbox was reached"),
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(reads, 3);
+    assert_eq!(met, None);
+    for state in ["wrong_account", "needs_mailbox", "callback"] {
+        let (result, _, _, met) = drive_bot_check(
+            move |_| aterm_json::json!({"state": state, "url": "https://claude.com/login"}),
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::ZERO,
+        );
+        assert!(result.is_err(), "{state}");
+        assert_eq!(met, None, "{state}");
+    }
 }
 
 /// A Claude sign-in that meets Cloudflare's bot check waits on it, its reads not counted against
@@ -5589,4 +5782,36 @@ fn only_cloudflares_pages_stop_a_sign_in() {
     assert!(Met::new(MetWord::BotCheck, Some("claude.ai")).stopped());
     assert!(Met::new(MetWord::BlockPage, None).stopped());
     assert!(!Met::new(MetWord::Stall, Some("claude.ai")).stopped());
+    assert!(!Met::new(MetWord::BrowserStart, None).stopped());
+    assert!(!Met::new(MetWord::BrowserControl, None).stopped());
+}
+
+#[test]
+fn local_browser_outcomes_are_hostless_even_with_public_fields() {
+    for (word, token) in [
+        (MetWord::BrowserStart, "browser-start"),
+        (MetWord::BrowserControl, "browser-control"),
+    ] {
+        let expected = Met::new(word, None);
+        assert_eq!(Met::parse(&format!("{token}\n")), Some(expected.clone()));
+        for host in [
+            "claude.ai",
+            "private-path",
+            "https://private.test/?code=secret",
+            "x\ny",
+        ] {
+            assert_eq!(Met::new(word, Some(host)), expected);
+            let forged = Met {
+                word,
+                host: Some(host.to_owned()),
+            };
+            assert_eq!(forged.line(), token);
+            assert_eq!(forged.words(), expected.words());
+            assert_eq!(Met::parse(&format!("{token} {host}")), None);
+        }
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let path = tmp.path().join("outcome");
+        write_outcome(&path, &expected);
+        assert_eq!(read_outcome(&path), Some(expected));
+    }
 }

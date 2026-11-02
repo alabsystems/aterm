@@ -106,12 +106,24 @@ pub fn book_word(peers: &[Peer], node: &[u8; 32], from: Option<IpAddr>, now_ms: 
     }
 }
 
+/// [`book_word`] of a book read as `peers`: where it could not be read, the book that lets nothing
+/// move ([`Book::default`]), since an empty list would read as a fleet with no older member.
+#[must_use]
+pub fn book_word_read(
+    peers: Option<&[Peer]>,
+    node: &[u8; 32],
+    from: Option<IpAddr>,
+    now_ms: u64,
+) -> Book {
+    peers.map_or_else(Book::default, |peers| book_word(peers, node, from, now_ms))
+}
+
 /// Judge a `vault-join` channel from what it proved: `proof` (none on an `atf/1` channel that
 /// sent `node -`, which is refused), whether the fleet secret it proved is the vault's current
 /// fleet code (`code` = (listener's mark, vault's mark)), whether this Mac's drive admission takes
 /// the node (`driven`), the key the fleet book binds the proved node id to (`bound`), the
 /// roster's deny rows, the membership log's keys, and the book's peers at `now_ms` with the
-/// address the channel came from ([`book_word`]).
+/// address the channel came from ([`book_word_read`]; `None` where the book could not be read).
 ///
 /// # Errors
 /// The channel proved no node, or a node or key the deny rows name.
@@ -120,7 +132,7 @@ pub fn judge(
     code: (FleetMark, Option<FleetMark>),
     driven: bool,
     (bound, denied, log): (Option<NodeKey>, &[String], Option<&MemberKeys>),
-    (peers, from, now_ms): (&[Peer], Option<IpAddr>, u64),
+    (peers, from, now_ms): (Option<&[Peer]>, Option<IpAddr>, u64),
 ) -> Result<Judged, String> {
     let proof = proof.ok_or("vault-join needs a channel that proved its node key")?;
     if aterm_net::fleet::is_denied_node(&proof.node, denied)
@@ -137,7 +149,7 @@ pub fn judge(
         book: Book {
             node_id_held_out: other.is_some_and(|key| log.is_some_and(|log| log.holds_out(&key))),
             node_id_seated: other.is_some_and(|key| log.is_some_and(|log| log.admits(&key))),
-            ..book_word(peers, proof.key.bytes(), from, now_ms)
+            ..book_word_read(peers, proof.key.bytes(), from, now_ms)
         },
     })
 }
@@ -189,18 +201,21 @@ pub fn serve(
     paths: &Paths,
 ) -> aterm_secrets::Result<()> {
     let decide = |proving: &desk::Proving<'_>| client::prove_at(paths, proving, judged.book);
-    serve_deciding(stream, peer, judged, shared, paths, &decide)
+    let refuses = |proving: &desk::Proving<'_>| {
+        client::refuses_before_possession(paths, proving, judged.book)
+    };
+    serve_deciding(stream, peer, judged, shared, paths, (&decide, &refuses))
 }
 
-/// [`serve`], the desk's decision `decide`'s: the seam a test serves a judged channel through
-/// with a decision of its own, the rest as `serve` runs it.
+/// [`serve`], the desk's decision and its check before possession `decide`'s: the seam a test
+/// serves a judged channel through with a decision of its own, the rest as `serve` runs it.
 fn serve_deciding(
     stream: &mut dyn aterm_net::fleet::Duplex,
     peer: IpAddr,
     judged: &Judged,
     shared: Option<&Mutex<Desk>>,
     paths: &Paths,
-    decide: desk::Prove<'_>,
+    (decide, refuses): (desk::Prove<'_>, desk::Refuses<'_>),
 ) -> aterm_secrets::Result<()> {
     let own;
     let desk = match shared {
@@ -222,6 +237,7 @@ fn serve_deciding(
         &|_| Err(aterm_secrets::Error::new("no phrase runs over vault-join")),
         Some(desk::Proof {
             decide,
+            refuses,
             fleet: judged.fleet.then_some(judged.node),
         }),
     )

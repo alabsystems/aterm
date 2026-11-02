@@ -7,6 +7,11 @@ use std::cell::RefCell;
 #[test]
 fn prepared_launch_refuses_a_login_renewed_in_the_same_directory() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        // Kimi's overlay home (`accounts_overlay::make_link`) runs only on Unix;
+        // `an_overlay_row_is_never_started_on_where_aterm_makes_no_links` holds the refusal.
+        if cli == Cli::Kimi && !cfg!(unix) {
+            continue;
+        }
         for off in [false, true] {
             let world = World::new("launch-renewed");
             let work = world.two(cli);
@@ -366,6 +371,12 @@ fn launch_policy_conforms_for_automatic_and_pinned_launches() {
     for state in &states {
         for action in &model.actions {
             if model.action_enabled(action.name, state) {
+                // Provider 3 is Kimi, whose overlay home (`accounts_overlay::make_link`) runs
+                // only on Unix; `an_overlay_row_is_never_started_on_where_aterm_makes_no_links`
+                // holds the refusal.
+                if action.name == "Finish" && state["provider"] == 3 && !cfg!(unix) {
+                    continue;
+                }
                 steps.push((state, action.name));
             }
         }
@@ -389,7 +400,8 @@ fn launch_policy_conforms_for_automatic_and_pinned_launches() {
         );
         checked += usize::from(action == "Finish");
     }
-    assert_eq!(checked, 3 * 2 * 27);
+    let providers = if cfg!(unix) { 3 } else { 2 };
+    assert_eq!(checked, providers * 2 * 27);
     let mut stale = model.init_state();
     stale.insert("case", 3);
     stale.insert("phase", 1);
@@ -401,6 +413,12 @@ fn launch_policy_conforms_for_automatic_and_pinned_launches() {
 #[test]
 fn final_launch_check_preserves_failed_overlay_exclusions() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        // Kimi's spare row also needs an overlay home (`accounts_overlay::make_link`), which
+        // runs only on Unix; `an_overlay_row_is_never_started_on_where_aterm_makes_no_links`
+        // holds the refusal.
+        if cli == Cli::Kimi && !cfg!(unix) {
+            continue;
+        }
         let world = World::new("launch-fallback");
         world.two(cli);
         world.on_main(cli, &[]);

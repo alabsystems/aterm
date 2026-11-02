@@ -24,6 +24,50 @@ use crate::{child_output, launch_isolation};
 /// once the instance has said its socket listens.
 pub const POLL_GAP: Duration = Duration::from_millis(20);
 
+/// A world stays guarded through setup and the instance's life. Failed setup and a test's
+/// unwind retain its data; a ready instance's normal drop removes it after its owner ends.
+struct WorldGuard {
+    root: Option<PathBuf>,
+    ready: bool,
+}
+
+impl WorldGuard {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root: Some(root),
+            ready: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.root.as_deref().expect("the world is still guarded")
+    }
+
+    fn into_path(mut self) -> PathBuf {
+        self.root.take().expect("transfer the guarded world")
+    }
+
+    fn complete_setup(&mut self) {
+        self.ready = true;
+    }
+}
+
+impl Drop for WorldGuard {
+    fn drop(&mut self) {
+        let Some(root) = self.root.as_deref() else {
+            return;
+        };
+        if self.ready && !std::thread::panicking() {
+            remove_world(root);
+        } else {
+            eprintln!(
+                "KEPT {}: headless fixture setup or its test did not complete",
+                root.display()
+            );
+        }
+    }
+}
+
 /// One booted headless instance plus its scratch world.
 pub struct Instance {
     pub child: Child,
@@ -33,13 +77,14 @@ pub struct Instance {
     pub log: PathBuf,
     /// The control socket (`<tmp>/run/aterm/aterm.sock`).
     pub sock: String,
+    // Fields drop in order, after the owned child is stopped and the lifeline is cut.
+    world: WorldGuard,
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        remove_world(&self.tmp);
     }
 }
 
@@ -130,10 +175,11 @@ pub fn scratch_root(prefix: &str) -> PathBuf {
         if !launch_isolation::sock_fits(&root.path().join("run/aterm/aterm.sock")) {
             continue;
         }
-        if launch_isolation::prepare(root.path()).is_err() {
+        let world = WorldGuard::new(root.keep());
+        if launch_isolation::prepare(world.path()).is_err() {
             continue;
         }
-        return root.keep();
+        return world.into_path();
     }
     could_not_run("no scratch base with a socket path short enough for sun_path")
 }
@@ -217,14 +263,12 @@ fn boot_under(
     configure: impl FnOnce(&Path, &mut Command),
     ready: impl Fn(&Instance) -> bool,
 ) -> Instance {
-    let tmp = scratch_root(prefix);
+    let world = WorldGuard::new(scratch_root(prefix));
+    let tmp = world.path().to_path_buf();
     let log = tmp.join("gui.log");
     let (out, err) = match std::fs::File::create(&log).and_then(|f| Ok((f.try_clone()?, f))) {
         Ok(pair) => pair,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            could_not_run(format!("cannot open the instance log ({e})"))
-        }
+        Err(e) => could_not_run(format!("cannot open the instance log ({e})")),
     };
     let aterm = launch_isolation::aterm_executable();
     aterm_spec::wait::first_exec(&aterm, &["--help"]);
@@ -255,12 +299,10 @@ fn boot_under(
     if let Some(path) = &path
         && let Err(e) = launch_isolation::pin_login_path(&tmp, path)
     {
-        let _ = std::fs::remove_dir_all(&tmp);
         could_not_run(format!("cannot pin the scratch home's login PATH ({e})"));
     }
     let by_name = reached_by_name(standins, path.as_deref());
     if !by_name.is_empty() && cmd.get_args().any(|a| a == "-e" || a == "--") {
-        let _ = std::fs::remove_dir_all(&tmp);
         could_not_run(format!(
             "{STANDIN_UNRESOLVED}: none was asked — the boot session runs a program of its own \
              (`-e`), so no login shell of the instance can be asked what it names {by_name:?}"
@@ -268,10 +310,7 @@ fn boot_under(
     }
     let child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            could_not_run(format!("cannot launch aterm --headless ({e})"))
-        }
+        Err(e) => could_not_run(format!("cannot launch aterm --headless ({e})")),
     };
     let sock_path = tmp.join("run/aterm/aterm.sock");
     let mut inst = Instance {
@@ -280,13 +319,72 @@ fn boot_under(
         sock: sock_path.to_string_lossy().into_owned(),
         tmp,
         log,
+        world,
     };
     let log = inst.log.clone();
     await_ready(&mut inst, |i| &mut i.child, &mut signal, &log, ready);
     if !by_name.is_empty() {
         prove_standins_resolve(&inst, &by_name);
     }
+    inst.world.complete_setup();
     inst
+}
+
+#[test]
+fn setup_errors_keep_the_partial_world_and_success_transfers_its_cleanup() {
+    let failed = aterm_tempfile::Builder::new()
+        .prefix("headless-setup-failed-")
+        .tempdir()
+        .expect("failed setup world")
+        .keep();
+    let setup = || -> std::io::Result<()> {
+        let world = WorldGuard::new(failed.clone());
+        std::fs::write(world.path().join("evidence"), b"partial setup")?;
+        Err(std::io::Error::other("expected setup failure"))
+    };
+    assert!(setup().is_err());
+    assert_eq!(
+        std::fs::read(failed.join("evidence")).expect("failed setup evidence retained"),
+        b"partial setup"
+    );
+
+    let completed = aterm_tempfile::Builder::new()
+        .prefix("headless-setup-complete-")
+        .tempdir()
+        .expect("completed world")
+        .keep();
+    let mut world = WorldGuard::new(completed.clone());
+    std::fs::write(world.path().join("evidence"), b"completed").expect("completed evidence");
+    let root = world.into_path();
+    assert_eq!(
+        std::fs::read(root.join("evidence")).expect("transferred world still present"),
+        b"completed"
+    );
+    world = WorldGuard::new(root);
+    world.complete_setup();
+    drop(world);
+    assert!(!completed.exists(), "a completed world is still removed");
+}
+
+#[test]
+fn a_ready_world_is_retained_when_its_test_unwinds() {
+    let failed = aterm_tempfile::Builder::new()
+        .prefix("headless-test-failed-")
+        .tempdir()
+        .expect("test failure world")
+        .keep();
+    let outcome = std::panic::catch_unwind(|| {
+        let mut world = WorldGuard::new(failed.clone());
+        std::fs::write(world.path().join("evidence"), b"ready before unwind")
+            .expect("test evidence");
+        world.complete_setup();
+        panic!("expected headless fixture unwind");
+    });
+    assert!(outcome.is_err());
+    assert_eq!(
+        std::fs::read(failed.join("evidence")).expect("unwound test evidence retained"),
+        b"ready before unwind"
+    );
 }
 
 std::thread_local! {

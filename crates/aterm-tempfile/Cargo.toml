@@ -26,3 +26,6 @@ test-support = []
 # still depends on nothing; aterm-uds reaches aterm-tempfile only as its own
 # dev-dependency, so no cycle forms.
 aterm-uds = { workspace = true }
+# `fnv1a` is spelled out, so the crate still depends on nothing; its test holds it to the
+# workspace's FNV-1a. aterm-hash depends on astream-wire alone.
+aterm-hash = { workspace = true }

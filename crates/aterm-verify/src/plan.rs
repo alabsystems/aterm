@@ -241,6 +241,9 @@ pub fn named_skip(ctx: &Ctx, id: StageId) -> bool {
 #[must_use]
 pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let mut wanted = crate::checks::stages_of(&ctx.checks);
+    if ctx.cursor_pacing {
+        wanted.retain(|id| *id == StageId::GuiSmoke);
+    }
     if ctx.scope.selects_nothing() {
         wanted.retain(|id| *id != StageId::TestCompile);
     }
@@ -510,7 +513,7 @@ mod tests {
     use crate::checks::{CHECKS, Check, DEV, RELEASE};
     use std::path::PathBuf;
 
-    fn ctx(checks: &[Check], scope: Scope) -> Ctx {
+    pub(super) fn ctx(checks: &[Check], scope: Scope) -> Ctx {
         Ctx::new(
             PathBuf::from("/repo"),
             scope,
@@ -979,5 +982,22 @@ mod tests {
             let p = plan(&ctx(&[alone], Scope::workspace()));
             assert!(p.iter().all(|s| s.after_stages.is_empty()), "{alone:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cursor_pacing_tests {
+    #[test]
+    fn focused_pacing_builds_no_conformance_matrices() {
+        let mut context = super::tests::ctx(
+            &[crate::checks::Check::Measure],
+            crate::scope::Scope::workspace(),
+        );
+        context.cursor_pacing = true;
+        let stages = super::plan(&context);
+        assert_eq!(
+            stages.iter().map(|stage| stage.id).collect::<Vec<_>>(),
+            [super::StageId::GuiSmoke]
+        );
     }
 }

@@ -130,6 +130,9 @@ pub struct FooterFacts {
     pub account: Option<String>,
     /// The session's observed account recovery decision, independently of rotation policy.
     pub account_progress: Option<super::account_progress::AccountProgress>,
+    /// The last supervisor progress read was unavailable. The retained decision is history
+    /// until a successful read for this same process clears the flag.
+    pub account_progress_busy: bool,
     /// What the newest statement since the process started says of the top-effort key.
     pub top_effort: Option<bool>,
     /// The facts the person hid in this session by a click.
@@ -2490,6 +2493,7 @@ fn facts_for_entry_from(
         }),
         account: None,
         account_progress: None,
+        account_progress_busy: false,
         top_effort,
         off: FactMask::default(),
         subscription: None,
@@ -3422,6 +3426,7 @@ pub fn account_progress_phase(progress: &super::account_progress::AccountProgres
     use super::account_progress::ProgressPhase;
     match &progress.phase {
         ProgressPhase::Unknown => "State unknown".into(),
+        ProgressPhase::Paused => "Recovery paused".into(),
         ProgressPhase::Watching => "Watching".into(),
         ProgressPhase::Disabled => "Rotation off".into(),
         ProgressPhase::Limited => "Limit reached".into(),
@@ -3571,26 +3576,60 @@ fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
 impl FooterFacts {
     /// Reconcile account observations with a still-standing typed transcript limit.
     /// Without a recovery observation, only that limit and its provider reset are
-    /// known. An explicit recovery decision remains authoritative; an older idle
-    /// inventory observation cannot hide a newer transcript limit.
+    /// known. An available recovery decision remains authoritative; an older idle
+    /// inventory observation cannot hide a newer transcript limit. A busy supervisor
+    /// read keeps the decision as history and withdraws current recovery claims.
     #[must_use]
     pub fn account_progress_view(
         &self,
     ) -> Option<std::borrow::Cow<'_, super::account_progress::AccountProgress>> {
-        use super::account_progress::{AccountProgress, ProgressPhase};
-        let Some(progress) = self.account_progress.as_ref() else {
-            let wall = self.usage.as_ref()?.wall.as_ref()?;
-            let mut view = AccountProgress::unknown(0);
-            view.wall = Some(format!("{}; provider reset: {}", wall.label, wall.resets));
-            view.details.push(UNOBSERVED_RECOVERY_FINDING.into());
-            return Some(std::borrow::Cow::Owned(view));
+        use super::account_progress::{
+            AccountProgress, EXECUTION_HISTORY_PREFIX, OBSERVER_BUSY_FINDING, ProgressPhase,
+            RECOVERY_HISTORY_PREFIX,
         };
-        let mut view = std::borrow::Cow::Borrowed(progress);
-        if progress.wall.is_none()
-            && matches!(
-                progress.phase,
-                ProgressPhase::Watching | ProgressPhase::Unknown
-            )
+        let mut view = match self.account_progress.as_ref() {
+            Some(progress) => std::borrow::Cow::Borrowed(progress),
+            None => {
+                let wall = self.usage.as_ref().and_then(|usage| usage.wall.as_ref());
+                if wall.is_none() && !self.account_progress_busy {
+                    return None;
+                }
+                let mut view = AccountProgress::unknown(0);
+                view.wall =
+                    wall.map(|wall| format!("{}; provider reset: {}", wall.label, wall.resets));
+                view.details.push(UNOBSERVED_RECOVERY_FINDING.into());
+                std::borrow::Cow::Owned(view)
+            }
+        };
+        if view.phase == super::account_progress::ProgressPhase::Paused
+            && view.wall.is_none()
+            && let Some(wall) = self.usage.as_ref().and_then(|usage| usage.wall.as_ref())
+        {
+            view.to_mut().wall = Some(format!("{}; provider reset: {}", wall.label, wall.resets));
+        }
+        if self.account_progress_busy {
+            let progress = view.to_mut();
+            if progress.wall.is_none()
+                && let Some(wall) = self.usage.as_ref().and_then(|usage| usage.wall.as_ref())
+            {
+                progress.wall = Some(format!("{}; provider reset: {}", wall.label, wall.resets));
+            }
+            progress.phase = ProgressPhase::Unknown;
+            progress.eligible = None;
+            progress.next_at = None;
+            for detail in &mut progress.details {
+                if detail.as_str() != UNOBSERVED_RECOVERY_FINDING
+                    && !detail.starts_with(EXECUTION_HISTORY_PREFIX)
+                    && !detail.starts_with(RECOVERY_HISTORY_PREFIX)
+                {
+                    *detail = format!("{RECOVERY_HISTORY_PREFIX}{detail}");
+                }
+            }
+            progress.details.insert(0, OBSERVER_BUSY_FINDING.into());
+            return Some(view);
+        }
+        if view.wall.is_none()
+            && matches!(view.phase, ProgressPhase::Watching | ProgressPhase::Unknown)
             && let Some(wall) = self.usage.as_ref().and_then(|usage| usage.wall.as_ref())
         {
             let progress = view.to_mut();

@@ -269,33 +269,188 @@ fn a_due_falling_on_a_one_read_frame_of_another_point_stands_for_the_next_look()
     }
 }
 
+/// AN EDGE (`word_edge` with no standing `Due`, or `reach_edge` with a future `Due`) THAT FALLS
+/// ON A ONE-READ FRAME OF ANOTHER POINT (`Again::Moved`) DECIDES AT THE NEXT LOOK ONCE THE HANDED
+/// POINT IS BACK (`Session::edge_moved`), rather than sleeping forever or waiting out a distant
+/// `Due`.
+#[test]
+fn an_edge_falling_on_a_one_read_frame_of_another_point_decides_at_the_next_look() {
+    // 1. `word_edge` switching `land` -> `cruise` on a person's opening exchange (`RULE_LEFT`,
+    // `turn_end_due` is `None`): the edge's read sees a one-read torn frame, and the next look
+    // sees the handed point back on screen and sends the Cruise prompt without journaling a
+    // duplicate point.
+    {
+        let make = |said: &str| {
+            let mut r = rows(&[&format!("⏺ {said}"), ""]);
+            r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+            r
+        };
+        let end = make("Hi! What would you like me to work on?");
+        let torn = make("Hi! What would you like me");
+        let mut m = Mock::new(vec![busy_screen(), end.clone(), torn, end]);
+        m.human = vec!["2000"];
+        m.autopilot = Some("land");
+        m.takes_word = true;
+        m.stands.insert(1, Duration::from_millis(100));
+        m.stall_sleep = Some(Duration::from_secs(20));
+        m.meta_writes.push_back((
+            Duration::from_millis(200),
+            MetaWrite::Autopilot(Some("cruise")),
+        ));
+        m.vanish_after = Some(4);
+        m.exit_when = Some(|m| {
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("send ") || r.starts_with("turn "))
+        });
+        let (dir, journal) = journal_file("edge-moved-word");
+        let mut opts = hosted(10);
+        opts.policy.human_grace_s = 0;
+        opts.journal = Some(journal.clone());
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_word_settle(Duration::ZERO);
+            s.set_turn_end_timing(TurnEndTiming {
+                min_work: Duration::ZERO,
+                ..TurnEndTiming::default()
+            });
+        });
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        let read_torn = m.read_times.iter().any(|(i, _)| *i == 2);
+        assert!(
+            read_torn,
+            "word_edge read the torn frame: {:#?}",
+            m.requests
+        );
+        assert_eq!(
+            count(&m, "send") + count(&m, "turn"),
+            1,
+            "word_edge re-decides at the next look: {lines:#?}\n{:#?}",
+            m.requests
+        );
+        let events = records.iter().filter(|r| r.kind == "event").count();
+        assert_eq!(events, 1, "no duplicate point journaled: {records:#?}");
+    }
+
+    // 2. `reach_edge` waking an outage wait whose `Due` is an hour out (`far_rungs()`): its read
+    // hits a one-read frame of another point, and the next look resumes at once rather than
+    // waiting out the hour `Due`.
+    {
+        let t = Instant::now();
+        let down = Reach::Down { since: t };
+        let up = Reach::Up { since: t };
+        let wall = enotfound();
+        let torn = ended("a one-read torn frame");
+        let host = ReachHost::edged(&[down, down, up]);
+        let mut m = Mock::new(vec![busy_screen(), wall.clone(), torn, wall]);
+        m.stands.insert(1, Duration::from_millis(5));
+        m.stall_sleep = Some(Duration::from_millis(5));
+        m.vanish_after = Some(6);
+        m.exit_when = Some(|m| {
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("send ") || r.starts_with("turn "))
+        });
+        let (dir, journal) = journal_file("edge-moved-reach");
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(journal.clone()),
+            ..hosted(10)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            host.stamps_on(s);
+            s.setup.wait_step = Duration::from_millis(100);
+            s.set_turn_end_timing(far_rungs());
+        });
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        let read_torn = m.read_times.iter().any(|(i, _)| *i == 2);
+        assert!(
+            read_torn,
+            "reach_edge read the torn frame: {:#?}",
+            m.requests
+        );
+        assert_eq!(
+            count(&m, "send") + count(&m, "turn"),
+            1,
+            "reach_edge resumes at the next look despite hour Due: {lines:#?}\n{:#?}",
+            m.requests
+        );
+        let events = records.iter().filter(|r| r.kind == "event").count();
+        assert_eq!(events, 1, "no duplicate wall journaled: {records:#?}");
+    }
+}
+
 /// The journal's points (`EVENT idle`) over `screens` under agy, a person's key 2 s old at every
 /// read ([`points_under_a_person`]).
 fn agy_points(tag: &str, screens: Vec<Vec<String>>) -> Vec<String> {
     points_under_a_person(tag, "agy", screens)
 }
 
-/// A FOOTER READ CUT SHORT IS NO NEW POINT, nor its model's return: a read of agy's footer torn
-/// mid-repaint names `Gemini 4` of `Gemini 4 Argon · medium`, and the model weighs only at a limit
-/// wall, which this turn's end is not. NEGATIVE CONTROL: the same model swapped under the measured
-/// quota wall is a new point (`a_model_switched_under_a_limit_wall_is_a_new_point`).
+/// A FOOTER READ CUT SHORT IS NO NEW POINT, nor its model's return, at a turn's end or at a limit
+/// wall: a read of agy's footer torn mid-repaint (`Gemini 4               ` of
+/// `Gemini 4 Argon · medium`, or `Claude Opus                                ` of
+/// `Claude Opus 5.5 · high · 1 task(s) · /tasks`) has no ` · ` segment after it and stops short of
+/// the bottom rule's right edge, so [`aterm_phase::agy::footer_model`] refuses it (`None`), and a
+/// settled model switch at an ended turn moves no point either because the model weighs only at a
+/// limit wall. NEGATIVE CONTROL: a settled right-aligned model without effort or tasks at the
+/// measured quota wall still reads its model and journals a new point.
 #[test]
 fn a_footer_read_cut_short_is_no_new_point() {
     use aterm_phase::agy::fixtures as a;
     let end = screen(a::END_OF_TURN);
     let torn = agy_footer_swapped(&end, "Gemini 4 Argon · medium", "Gemini 4               ");
+    let switched_idle =
+        agy_footer_swapped(&end, "Gemini 4 Argon · medium", "Gemini 3.1 Pro · medium");
     assert_eq!(
         (
             aterm_phase::agy::footer_model(&end).as_deref(),
-            aterm_phase::agy::footer_model(&torn).as_deref()
+            aterm_phase::agy::footer_model(&torn).as_deref(),
+            aterm_phase::agy::footer_model(&switched_idle).as_deref(),
         ),
-        (Some("Gemini 4 Argon"), Some("Gemini 4"))
+        (Some("Gemini 4 Argon"), None, Some("Gemini 3.1 Pro"))
     );
     let points = agy_points(
         "footer-cut-short",
-        vec![screen(a::BUSY), end.clone(), torn, end],
+        vec![screen(a::BUSY), end.clone(), torn, end.clone()],
     );
     assert_eq!(points.len(), 1, "{points:#?}");
+    let idle_switch_points = agy_points(
+        "footer-switched-idle",
+        vec![screen(a::BUSY), end.clone(), switched_idle, end],
+    );
+    assert_eq!(idle_switch_points.len(), 1, "{idle_switch_points:#?}");
+
+    let wall = screen(a::lab::WALL_INDIVIDUAL_QUOTA);
+    let torn_wall = agy_footer_swapped(
+        &wall,
+        "Claude Opus 5.5 · high · 1 task(s) · /tasks",
+        "Claude Opus                                ",
+    );
+    let right_aligned_wall = agy_footer_swapped(
+        &wall,
+        "Claude Opus 5.5 · high · 1 task(s) · /tasks",
+        "                             Gemini 3.1 Pro",
+    );
+    assert_eq!(aterm_phase::agy::footer_model(&torn_wall), None);
+    assert_eq!(
+        aterm_phase::agy::footer_model(&right_aligned_wall).as_deref(),
+        Some("Gemini 3.1 Pro")
+    );
+    let wall_torn_points = agy_points(
+        "wall-footer-cut-short",
+        vec![screen(a::BUSY), wall.clone(), torn_wall, wall.clone()],
+    );
+    assert_eq!(wall_torn_points.len(), 1, "{wall_torn_points:#?}");
+    let wall_right_aligned_points = agy_points(
+        "wall-footer-right-aligned",
+        vec![screen(a::BUSY), wall, right_aligned_wall],
+    );
+    assert_eq!(
+        wall_right_aligned_points.len(),
+        2,
+        "{wall_right_aligned_points:#?}"
+    );
 }
 
 /// A MODEL SWITCHED UNDER A LIMIT WALL IS A NEW POINT (`/model` under the measured quota wall,

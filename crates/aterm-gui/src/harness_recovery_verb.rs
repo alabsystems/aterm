@@ -40,6 +40,7 @@ fn reply(progress: Option<&AccountProgress>) -> String {
     };
     let (phase, target, route) = match &progress.phase {
         ProgressPhase::Unknown => ("unknown", None, None),
+        ProgressPhase::Paused => ("paused", None, None),
         ProgressPhase::Watching => ("watching", None, None),
         ProgressPhase::Disabled => ("disabled", None, None),
         ProgressPhase::Limited => ("limited", None, None),

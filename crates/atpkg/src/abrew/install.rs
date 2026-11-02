@@ -26,6 +26,7 @@ fn preflight(
     f: &Formula,
     opts: &InstallOpts,
     machine: &Machine,
+    is_top: bool,
 ) -> Result<bool, InstallError> {
     let version = keg_version(f);
     if !super::valid_component(&f.name)
@@ -41,8 +42,13 @@ fn preflight(
     if let Some(inst) = prefix.installed_one(Kind::Formula, &f.name) {
         let older = version_cmp(&inst.version, &version) == std::cmp::Ordering::Less;
         same_keg_reinstall = opts.reinstall && inst.version == version;
+        // A dependency reaches the plan only when brew's
+        // expansion would pour it (missing or below the
+        // parent's bottle-tab minimum), so its replacement is
+        // admitted in every mode; the top's own replacement
+        // stays gated on upgrade/reinstall.
         let admitted_replacement = if older {
-            opts.upgrade || opts.reinstall
+            opts.upgrade || opts.reinstall || !is_top
         } else {
             opts.reinstall && inst.version == version
         };
@@ -173,12 +179,39 @@ pub fn plan(
     name: &str,
     opts: &InstallOpts,
 ) -> Result<Vec<Formula>, InstallError> {
+    // Brew's `Dependency#satisfied?` against the pouring
+    // parent's bottle tab: an installed dep is kept when it is
+    // at the latest version, pinned, or at/above the version
+    // the parent's bottle was built against; below that
+    // minimum it upgrades with the parent. No tab (unreadable
+    // manifest) keeps the installed dep.
+    let mut minimums: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    > = Default::default();
     dependency_plan(
         name,
         opts.ignore_dependencies,
         false,
         |n| catalog.formula(n).map_err(InstallError::from),
-        |n| prefix.installed_one(Kind::Formula, n).is_some(),
+        |parent: &Formula, dep: &Formula| {
+            let Some(inst) = prefix.installed_one(Kind::Formula, &dep.name) else {
+                return false;
+            };
+            if version_cmp(&inst.version, &keg_version(dep)) != std::cmp::Ordering::Less {
+                return true;
+            }
+            if prefix.is_pinned(&dep.name) {
+                return true;
+            }
+            let tab = minimums
+                .entry(parent.name.clone())
+                .or_insert_with(|| bottle_tab_minimums(prefix, parent));
+            match tab.get(&dep.name) {
+                Some(minimum) => version_cmp(&inst.version, minimum) != std::cmp::Ordering::Less,
+                None => true,
+            }
+        },
     )
 }
 
@@ -223,8 +256,30 @@ pub(super) fn dry_rows(
     opts: &InstallOpts,
 ) -> Result<(Option<DryRow>, Vec<DryRow>), InstallError> {
     let planned = plan(api, prefix, name, opts)?;
+    // A plain install of an already-current top has no
+    // installer in brew: warn and plan nothing, deps included.
+    // Brew decides this before any per-formula checks.
+    if !opts.force
+        && !opts.upgrade
+        && !opts.reinstall
+        && let Some(top_f) = planned.iter().find(|f| f.name == Formula::short_name(name))
+        && let Some(inst) = prefix.installed_one(Kind::Formula, &top_f.name)
+        && version_cmp(&inst.version, &keg_version(top_f)) != std::cmp::Ordering::Less
+    {
+        if !opts.quiet {
+            let version = inst.version.clone();
+            warn_already_installed(prefix, &inst, &version);
+        }
+        return Ok((None, Vec::new()));
+    }
     for f in &planned {
-        preflight(prefix, f, opts, Machine::this())?;
+        preflight(
+            prefix,
+            f,
+            opts,
+            Machine::this(),
+            f.name == Formula::short_name(name),
+        )?;
     }
     let row = |f: &Formula| -> Option<DryRow> {
         let new_version = keg_version(f);
@@ -276,7 +331,7 @@ pub(super) fn fetch_plan(api: &Api, name: &str) -> Result<Vec<Formula>, InstallE
         false,
         true,
         |n| api.formula(n).map_err(InstallError::from),
-        |_| false,
+        |_, _| false,
     )
 }
 
@@ -285,21 +340,22 @@ fn dependency_plan(
     ignore_dependencies: bool,
     include_build: bool,
     mut read: impl FnMut(&str) -> Result<Formula, InstallError>,
-    mut skip: impl FnMut(&str) -> bool,
+    mut satisfied: impl FnMut(&Formula, &Formula) -> bool,
 ) -> Result<Vec<Formula>, InstallError> {
     struct PlanState {
         out: Vec<Formula>,
         visiting: Vec<String>,
         seen: BTreeSet<String>,
+        pruned: BTreeSet<String>,
     }
     fn walk(
         name: &str,
+        parent: Option<&Formula>,
         ignore_dependencies: bool,
         include_build: bool,
         read: &mut impl FnMut(&str) -> Result<Formula, InstallError>,
-        skip: &mut impl FnMut(&str) -> bool,
+        satisfied: &mut impl FnMut(&Formula, &Formula) -> bool,
         state: &mut PlanState,
-        top: bool,
     ) -> Result<(), InstallError> {
         let name = name.strip_prefix("homebrew/core/").unwrap_or(name);
         if !super::valid_component(name) {
@@ -314,11 +370,7 @@ fn dependency_plan(
                 state.visiting.join(" -> ")
             )));
         }
-        if state.seen.contains(&short) {
-            return Ok(());
-        }
-        state.seen.insert(short.clone());
-        if !top && skip(&short) {
+        if state.seen.contains(&short) && !state.pruned.contains(&short) {
             return Ok(());
         }
         let f = read(&short)?;
@@ -327,23 +379,41 @@ fn dependency_plan(
                 "abrew: {short} is disabled upstream"
             )));
         }
+        // A dep another parent already kept can still be pulled
+        // in when this parent's bottle was built against a newer
+        // version than the installed one (brew's kept-dependency
+        // re-expansion).
+        if let Some(parent) = parent
+            && satisfied(parent, &f)
+        {
+            state.seen.insert(short.clone());
+            state.pruned.insert(short);
+            return Ok(());
+        }
+        state.pruned.remove(&short);
+        state.seen.insert(short.clone());
         if !ignore_dependencies {
             state.visiting.push(short.clone());
-            let deps = f.dependencies.iter().chain(
-                include_build
-                    .then_some(&f.build_dependencies)
-                    .into_iter()
-                    .flatten(),
-            );
-            for d in deps {
+            let deps: Vec<String> = f
+                .dependencies
+                .iter()
+                .chain(
+                    include_build
+                        .then_some(&f.build_dependencies)
+                        .into_iter()
+                        .flatten(),
+                )
+                .cloned()
+                .collect();
+            for d in &deps {
                 walk(
                     d,
+                    Some(&f),
                     ignore_dependencies,
                     include_build,
                     read,
-                    skip,
+                    satisfied,
                     state,
-                    false,
                 )?;
             }
             state.visiting.pop();
@@ -355,17 +425,40 @@ fn dependency_plan(
         out: Vec::new(),
         visiting: Vec::new(),
         seen: BTreeSet::new(),
+        pruned: BTreeSet::new(),
     };
     walk(
         name,
+        None,
         ignore_dependencies,
         include_build,
         &mut read,
-        &mut skip,
+        &mut satisfied,
         &mut state,
-        true,
     )?;
-    Ok(state.out)
+    // A dep first kept for one parent and later pulled in by
+    // another lands after the parent that kept it; restore
+    // deps-before-dependents order (stable for the common case,
+    // where the walk already produced it).
+    let mut out = state.out;
+    let names: BTreeSet<String> = out.iter().map(|f| f.name.clone()).collect();
+    let mut ordered: Vec<Formula> = Vec::with_capacity(out.len());
+    let mut emitted: BTreeSet<String> = BTreeSet::new();
+    while !out.is_empty() {
+        let Some(pos) = out.iter().position(|f| {
+            f.dependencies.iter().all(|d| {
+                let short = Formula::short_name(d);
+                !names.contains(short) || emitted.contains(short)
+            })
+        }) else {
+            break;
+        };
+        let f = out.remove(pos);
+        emitted.insert(f.name.clone());
+        ordered.push(f);
+    }
+    ordered.extend(out);
+    Ok(ordered)
 }
 
 /// Resolves and preflights `name`'s install plan without side effects beyond metadata caching.
@@ -390,10 +483,42 @@ pub(super) fn preflight_refusals(
 ) -> Vec<InstallError> {
     match plan(catalog, prefix, name, opts) {
         Err(walk) => vec![walk],
-        Ok(planned) => planned
-            .iter()
-            .filter_map(|f| preflight(prefix, f, opts, catalog.machine()).err())
-            .collect(),
+        Ok(planned) => {
+            // Brew has no installer for an already-current top
+            // outside upgrade/reinstall, so nothing in its plan
+            // needs gating (mirrors the early return in install).
+            let top_current = !opts.force
+                && !opts.upgrade
+                && !opts.reinstall
+                && !opts.as_dependency
+                && planned
+                    .iter()
+                    .find(|f| f.name == Formula::short_name(name))
+                    .is_some_and(|f| {
+                        prefix
+                            .installed_one(Kind::Formula, &f.name)
+                            .is_some_and(|inst| {
+                                version_cmp(&inst.version, &keg_version(f))
+                                    != std::cmp::Ordering::Less
+                            })
+                    });
+            if top_current {
+                return Vec::new();
+            }
+            planned
+                .iter()
+                .filter_map(|f| {
+                    preflight(
+                        prefix,
+                        f,
+                        opts,
+                        catalog.machine(),
+                        f.name == Formula::short_name(name),
+                    )
+                    .err()
+                })
+                .collect()
+        }
     }
 }
 
@@ -452,6 +577,57 @@ fn bottle_filename(f: &Formula, tag: &str) -> String {
     )
 }
 
+/// Brew's `check_install_sanity` pinned-dependency refusal: any
+/// pinned runtime dep in `top`'s closure that is not at its
+/// latest version blocks the install outright (brew checks
+/// `dep.satisfied?` with no bottle minimum here, so even a dep
+/// above the bottle-tab minimum counts). Brew fires this at
+/// real install time, never for a dry run.
+fn check_pinned_dependencies(
+    api: &Api,
+    prefix: &Prefix,
+    top: &Formula,
+) -> Result<(), InstallError> {
+    let mut seen: BTreeSet<String> = [top.name.clone()].into_iter().collect();
+    let mut bad: Vec<String> = Vec::new();
+    let mut stack: Vec<String> = top.dependencies.clone();
+    while let Some(declared) = stack.pop() {
+        let short = Formula::short_name(&declared).to_string();
+        if !seen.insert(short.clone()) {
+            continue;
+        }
+        let Some(df) = api
+            .formula(&short)
+            .ok()
+            .or_else(|| super::tap::lookup(prefix, &short))
+        else {
+            continue;
+        };
+        if prefix.is_pinned(&short) {
+            let satisfied = prefix
+                .installed_one(Kind::Formula, &short)
+                .is_some_and(|inst| {
+                    version_cmp(&inst.version, &keg_version(&df)) != std::cmp::Ordering::Less
+                });
+            if !satisfied {
+                bad.push(declared.clone());
+            }
+        }
+        stack.extend(df.dependencies.iter().cloned());
+    }
+    if bad.is_empty() {
+        return Ok(());
+    }
+    bad.sort();
+    bad.dedup();
+    Err(InstallError::Failed(format!(
+        "Error: {}: You must `brew unpin {}` as installing {} requires the latest version of pinned dependencies.",
+        specified_of(&top.full_name),
+        bad.join(" "),
+        top.full_name
+    )))
+}
+
 /// Installs formula `name` and its missing dependencies, returning the installed version.
 pub fn install(
     api: &Api,
@@ -460,14 +636,6 @@ pub fn install(
     opts: &InstallOpts,
 ) -> Result<String, InstallError> {
     let planned = plan(api, prefix, name, opts)?;
-    let link_states = planned
-        .iter()
-        .map(|f| preflight(prefix, f, opts, Machine::this()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let prior = prior_requests(prefix, planned.iter().map(|f| f.name.as_str()))?;
-    if !opts.dry_run {
-        prefix.ensure()?;
-    }
     // Brew narrates a plain install: the tap-action headline, the
     // dependency roll, and a headline per dependency. Upgrade and
     // reinstall have their own banners at the command layer, and an
@@ -484,6 +652,48 @@ pub fn install(
                     version_cmp(&inst.version, &keg_version(f)) != std::cmp::Ordering::Less
                 })
         });
+    // Brew has no installer for an already-current top outside
+    // upgrade/reinstall: it only warns (and marks the keg
+    // on-request for a named install), pouring no dependencies.
+    // Brew decides this when building its installer list, before
+    // any per-formula checks, so a planned dependency's own
+    // gating must not fire either.
+    if top_current
+        && !opts.upgrade
+        && !opts.reinstall
+        && !opts.as_dependency
+        && let Some(top_f) = top
+        && let Some(inst) = prefix.installed_one(Kind::Formula, &top_f.name)
+    {
+        if !opts.quiet {
+            warn_already_installed(prefix, &inst, &keg_version(top_f));
+        }
+        if !opts.dry_run {
+            prefix.ensure()?;
+            let _ = super::prefix::set_installed_on_request(
+                &prefix.keg(&inst.name, &inst.version),
+                true,
+            );
+            prefix.rebuild_state()?;
+        }
+        return Ok(inst.version);
+    }
+    let link_states = planned
+        .iter()
+        .map(|f| {
+            preflight(
+                prefix,
+                f,
+                opts,
+                Machine::this(),
+                f.name == Formula::short_name(name),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let prior = prior_requests(prefix, planned.iter().map(|f| f.name.as_str()))?;
+    if !opts.dry_run {
+        prefix.ensure()?;
+    }
     let narrate = !opts.quiet
         && !opts.dry_run
         && !opts.upgrade
@@ -507,6 +717,13 @@ pub fn install(
         .iter()
         .filter(|f| f.name != top_short && will_pour(f))
         .collect();
+    if !opts.dry_run
+        && !opts.ignore_dependencies
+        && let Some(top_f) = top
+        && will_pour(top_f)
+    {
+        check_pinned_dependencies(api, prefix, top_f)?;
+    }
     if narrate && let Some(top_f) = top {
         if !bottle_manifest_cached(prefix, top_f) {
             eprintln!("{}", super::tty::oh1("Downloading bottle manifests"));
@@ -529,7 +746,13 @@ pub fn install(
                 &[],
             );
             if opts.ask {
-                ask_to_proceed("installation")?;
+                ask_to_proceed(if opts.reinstall {
+                    "reinstallation"
+                } else if opts.upgrade {
+                    "upgrade"
+                } else {
+                    "installation"
+                })?;
             }
         }
         eprintln!(
@@ -2558,6 +2781,67 @@ pub(super) fn bottle_manifest_dest(prefix: &Prefix, f: &Formula) -> PathBuf {
 
 /// Whether a usable bottle manifest is already in the cache
 /// (brew only downloads — and only reports — the ones missing).
+/// The bottle tab's runtime-dependency minimums for `f`'s
+/// bottle on this machine: short name -> built-against
+/// `pkg_version`. Brew keeps an installed dep only when it is
+/// at the latest version or at/above this minimum. Empty when
+/// no tab can be read (callers then keep installed deps).
+pub(super) fn bottle_tab_minimums(
+    prefix: &Prefix,
+    f: &Formula,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
+        return out;
+    };
+    if !bottle_manifest_cached(prefix, f) {
+        let _ = fetch_bottle_manifest(prefix, f);
+    }
+    let Ok(bytes) =
+        crate::metadata_io::read_bounded_regular(&bottle_manifest_dest(prefix, f), 8 * 1024 * 1024)
+    else {
+        return out;
+    };
+    let Ok(index) = aterm_json::from_slice::<aterm_json::Value>(&bytes) else {
+        return out;
+    };
+    let Some(manifests) = index.get("manifests").and_then(aterm_json::Value::as_array) else {
+        return out;
+    };
+    let tab_text = manifests.iter().find_map(|m| {
+        let annotations = m.get("annotations")?;
+        let digest = annotations
+            .get("sh.brew.bottle.digest")
+            .and_then(aterm_json::Value::as_str)?;
+        (digest == bottle.sha256).then(|| {
+            annotations
+                .get("sh.brew.tab")
+                .and_then(aterm_json::Value::as_str)
+                .map(str::to_owned)
+        })?
+    });
+    let Some(tab_text) = tab_text else {
+        return out;
+    };
+    let Ok(tab) = aterm_json::from_slice::<aterm_json::Value>(tab_text.as_bytes()) else {
+        return out;
+    };
+    if let Some(deps) = tab
+        .get("runtime_dependencies")
+        .and_then(aterm_json::Value::as_array)
+    {
+        for dep in deps {
+            if let (Some(full), Some(pkg)) = (
+                dep.get("full_name").and_then(aterm_json::Value::as_str),
+                dep.get("pkg_version").and_then(aterm_json::Value::as_str),
+            ) {
+                out.insert(Formula::short_name(full).to_string(), pkg.to_string());
+            }
+        }
+    }
+    out
+}
+
 pub fn bottle_manifest_cached(prefix: &Prefix, f: &Formula) -> bool {
     if !super::valid_component(&f.name) || !super::valid_cask_version(&keg_version(f)) {
         return false;
@@ -2826,11 +3110,11 @@ mod tests {
                 install_reads.push(n.to_string());
                 read(n)
             },
-            |n| n == "dep",
+            |_, dep| dep.name == "dep",
         )
         .unwrap();
         assert_eq!(names(install), ["shared", "app"]);
-        assert_eq!(install_reads, ["app", "shared"]);
+        assert_eq!(install_reads, ["app", "dep", "shared"]);
         let mut fetch_reads = Vec::new();
         let fetch = dependency_plan(
             "homebrew/core/app",
@@ -2840,13 +3124,13 @@ mod tests {
                 fetch_reads.push(n.to_string());
                 read(n)
             },
-            |_| false,
+            |_, _| false,
         )
         .unwrap();
         assert_eq!(names(fetch), ["leaf", "shared", "dep", "tool", "app"]);
         assert_eq!(fetch_reads, ["app", "dep", "leaf", "shared", "tool"]);
         assert_eq!(
-            names(dependency_plan("app", true, false, read, |_| false).unwrap()),
+            names(dependency_plan("app", true, false, read, |_, _| false).unwrap()),
             ["app"]
         );
         assert!(
@@ -2855,7 +3139,7 @@ mod tests {
                 false,
                 false,
                 |_| panic!("qualified name must be refused before reading"),
-                |_| false
+                |_, _| false
             )
             .is_err()
         );
@@ -2867,10 +3151,10 @@ mod tests {
             })
         };
         assert!(
-            matches!(dependency_plan("app", false, false, cycle, |_| false), Err(InstallError::Failed(message)) if message.contains("dependency cycle"))
+            matches!(dependency_plan("app", false, false, cycle, |_, _| false), Err(InstallError::Failed(message)) if message.contains("dependency cycle"))
         );
         assert!(
-            matches!(dependency_plan("app", false, false, |_| Ok(Formula { disable: true, ..Formula::default() }), |_| false), Err(InstallError::Failed(message)) if message.contains("disabled"))
+            matches!(dependency_plan("app", false, false, |_| Ok(Formula { disable: true, ..Formula::default() }), |_, _| false), Err(InstallError::Failed(message)) if message.contains("disabled"))
         );
         assert_eq!(
             dependency_plan(
@@ -2878,7 +3162,7 @@ mod tests {
                 false,
                 false,
                 |_| Err(InstallError::Failed("captured read failure".into())),
-                |_| false
+                |_, _| false
             ),
             Err(InstallError::Failed("captured read failure".into()))
         );
@@ -2953,6 +3237,7 @@ mod tests {
                     ..InstallOpts::default()
                 },
                 Machine::this(),
+                true,
             ),
             Err(InstallError::Failed(_))
         ));
@@ -3357,6 +3642,332 @@ mod tests {
             aterm_json::to_vec(&value).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn already_current_top_pours_no_dependencies_like_brew() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        // demo installed current (as a dependency: not on
+        // request); its dep is not installed at all. Brew has no
+        // installer for a current top: it only warns and marks
+        // the keg on-request, pouring nothing.
+        let demo_keg = prefix.keg("demo", "1.0");
+        std::fs::create_dir_all(&demo_keg).unwrap();
+        prefix
+            .write_receipt(
+                &demo_keg,
+                &[
+                    ("installed_by", "abrew"),
+                    ("name", "demo"),
+                    ("version", "1.0"),
+                    ("installed_on_request", "false"),
+                ],
+            )
+            .unwrap();
+        cache_formula(
+            &prefix,
+            0,
+            "file:///nonexistent/demo.tar.gz",
+            "abc",
+            ":any_skip_relocation",
+            &["dep"],
+        );
+        let archive = tmp.path().join("dep.tar.gz");
+        std::fs::write(
+            &archive,
+            gzip_bytes(&tar_bytes(&[(
+                "dep/3/bin/dep",
+                b'0',
+                "",
+                b"#!/bin/sh\nprintf 'dep\\n'\n",
+                0o755,
+            )])),
+        )
+        .unwrap();
+        let dep_record = aterm_json::json!({
+            "name": "dep", "versions": { "stable": "3" },
+            "bottle": { "stable": { "files": { "all": {
+                "url": format!("file://{}", archive.display()),
+                "sha256": fetch::sha256_file(&archive).unwrap(),
+                "cellar": ":any_skip_relocation"
+            } } } }
+        });
+        std::fs::write(
+            prefix.cache().join("api/formula-dep.json"),
+            aterm_json::to_vec(&dep_record).unwrap(),
+        )
+        .unwrap();
+        let api = Api::new(prefix.clone());
+        assert_eq!(
+            install(&api, &prefix, "demo", &InstallOpts::default()).unwrap(),
+            "1.0"
+        );
+        assert!(
+            prefix.installed_one(Kind::Formula, "dep").is_none(),
+            "dep must not pour for an already-current top"
+        );
+        let receipt = std::fs::read_to_string(demo_keg.join("INSTALL_RECEIPT.json")).unwrap();
+        assert!(
+            receipt.contains("\"installed_on_request\": \"true\""),
+            "named install flips on-request: {receipt}"
+        );
+        // The dry plan likewise has no rows at all.
+        let (top, rows) = dry_rows(&api, &prefix, "demo", &InstallOpts::default()).unwrap();
+        assert!(
+            top.is_none() && rows.is_empty(),
+            "dry rows: {} row(s)",
+            rows.len()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fresh_install_upgrades_below_minimum_dep_like_brew() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        // dep installed at 2, below the 3 demo's bottle was
+        // built against. Brew's installer expansion (shared by
+        // install and upgrade) prunes only satisfied deps, so a
+        // fresh plain install of demo upgrades dep to 3.
+        let dep_keg = prefix.keg("dep", "2");
+        std::fs::create_dir_all(dep_keg.join("bin")).unwrap();
+        std::fs::write(dep_keg.join("bin/dep"), b"#!/bin/sh\nprintf 'dep2\\n'\n").unwrap();
+        prefix
+            .write_receipt(
+                &dep_keg,
+                &[
+                    ("installed_by", "abrew"),
+                    ("name", "dep"),
+                    ("version", "2"),
+                    ("installed_on_request", "false"),
+                ],
+            )
+            .unwrap();
+        let demo_archive = tmp.path().join("demo.tar.gz");
+        std::fs::write(
+            &demo_archive,
+            gzip_bytes(&tar_bytes(&[(
+                "demo/1.0/bin/demo",
+                b'0',
+                "",
+                b"#!/bin/sh\nprintf 'demo\\n'\n",
+                0o755,
+            )])),
+        )
+        .unwrap();
+        let demo_sha = fetch::sha256_file(&demo_archive).unwrap();
+        cache_formula(
+            &prefix,
+            0,
+            &format!("file://{}", demo_archive.display()),
+            &demo_sha,
+            ":any_skip_relocation",
+            &["dep"],
+        );
+        let dep_archive = tmp.path().join("dep.tar.gz");
+        std::fs::write(
+            &dep_archive,
+            gzip_bytes(&tar_bytes(&[(
+                "dep/3/bin/dep",
+                b'0',
+                "",
+                b"#!/bin/sh\nprintf 'dep\\n'\n",
+                0o755,
+            )])),
+        )
+        .unwrap();
+        let dep_record = aterm_json::json!({
+            "name": "dep", "versions": { "stable": "3" },
+            "bottle": { "stable": { "files": { "all": {
+                "url": format!("file://{}", dep_archive.display()),
+                "sha256": fetch::sha256_file(&dep_archive).unwrap(),
+                "cellar": ":any_skip_relocation"
+            } } } }
+        });
+        std::fs::write(
+            prefix.cache().join("api/formula-dep.json"),
+            aterm_json::to_vec(&dep_record).unwrap(),
+        )
+        .unwrap();
+        let api = Api::new(prefix.clone());
+        let demo = api.formula("demo").unwrap();
+        let tab = aterm_json::json!({
+            "runtime_dependencies": [{ "full_name": "dep", "pkg_version": "3" }]
+        });
+        let manifest = aterm_json::json!({
+            "manifests": [{ "annotations": {
+                "sh.brew.bottle.digest": demo_sha,
+                "sh.brew.tab": aterm_json::to_string(&tab).unwrap()
+            } }]
+        });
+        std::fs::write(
+            bottle_manifest_dest(&prefix, &demo),
+            aterm_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            install(&api, &prefix, "demo", &InstallOpts::default()).unwrap(),
+            "1.0"
+        );
+        assert_eq!(
+            prefix
+                .installed_one(Kind::Formula, "dep")
+                .map(|inst| inst.version)
+                .as_deref(),
+            Some("3"),
+            "fresh install must upgrade the below-minimum dep"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn already_current_top_below_minimum_dep_is_not_gated() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        // demo current; dep installed at 2, below the 3 its
+        // bottle was built against. Admission must not gate the
+        // dep replacement brew never attempts for a current top.
+        let demo_keg = prefix.keg("demo", "1.0");
+        std::fs::create_dir_all(&demo_keg).unwrap();
+        prefix
+            .write_receipt(
+                &demo_keg,
+                &[
+                    ("installed_by", "abrew"),
+                    ("name", "demo"),
+                    ("version", "1.0"),
+                    ("installed_on_request", "false"),
+                ],
+            )
+            .unwrap();
+        let dep_keg = prefix.keg("dep", "2");
+        std::fs::create_dir_all(&dep_keg).unwrap();
+        prefix
+            .write_receipt(
+                &dep_keg,
+                &[("installed_by", "abrew"), ("name", "dep"), ("version", "2")],
+            )
+            .unwrap();
+        cache_formula(
+            &prefix,
+            0,
+            "file:///nonexistent/demo.tar.gz",
+            "abc",
+            ":any_skip_relocation",
+            &["dep"],
+        );
+        let dep_record = aterm_json::json!({
+            "name": "dep", "versions": { "stable": "3" },
+            "bottle": { "stable": { "files": { "all": {
+                "url": "file:///nonexistent/dep.tar.gz", "sha256": "abc",
+                "cellar": ":any_skip_relocation"
+            } } } }
+        });
+        std::fs::write(
+            prefix.cache().join("api/formula-dep.json"),
+            aterm_json::to_vec(&dep_record).unwrap(),
+        )
+        .unwrap();
+        let api = Api::new(prefix.clone());
+        let demo = api.formula("demo").unwrap();
+        let tab = aterm_json::json!({
+            "runtime_dependencies": [{ "full_name": "dep", "pkg_version": "3" }]
+        });
+        let manifest = aterm_json::json!({
+            "manifests": [{ "annotations": {
+                "sh.brew.bottle.digest": "abc",
+                "sh.brew.tab": aterm_json::to_string(&tab).unwrap()
+            } }]
+        });
+        std::fs::write(
+            bottle_manifest_dest(&prefix, &demo),
+            aterm_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            preflight_plan(&api, &prefix, "demo", &InstallOpts::default()).is_ok(),
+            "current top must not gate its planned dep replacement"
+        );
+        assert_eq!(
+            install(&api, &prefix, "demo", &InstallOpts::default()).unwrap(),
+            "1.0"
+        );
+        assert_eq!(
+            prefix
+                .installed_one(Kind::Formula, "dep")
+                .map(|inst| inst.version)
+                .as_deref(),
+            Some("2"),
+            "below-minimum dep must not upgrade for a current top"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pinned_outdated_dependency_blocks_install_like_brew() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        // dep installed at 2 (latest 3) and pinned there.
+        let dep_keg = prefix.keg("dep", "2");
+        std::fs::create_dir_all(&dep_keg).unwrap();
+        prefix
+            .write_receipt(
+                &dep_keg,
+                &[("installed_by", "abrew"), ("name", "dep"), ("version", "2")],
+            )
+            .unwrap();
+        prefix.pin("dep").unwrap();
+        cache_formula(
+            &prefix,
+            0,
+            "file:///nonexistent/demo.tar.gz",
+            "abc",
+            ":any_skip_relocation",
+            &["dep"],
+        );
+        std::fs::write(
+            prefix.cache().join("api/formula-dep.json"),
+            br#"{"name":"dep","versions":{"stable":"3"}}"#,
+        )
+        .unwrap();
+        let api = Api::new(prefix.clone());
+        let err = install(&api, &prefix, "demo", &InstallOpts::default()).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "Error: demo: You must `brew unpin dep` as installing demo requires the latest version of pinned dependencies."
+        );
+        // Brew never sanity-errors a dry run, and
+        // --ignore-dependencies skips the check entirely (both
+        // then fail later for the missing bottle file, if at all).
+        let dry = install(
+            &api,
+            &prefix,
+            "demo",
+            &InstallOpts {
+                dry_run: true,
+                ..InstallOpts::default()
+            },
+        );
+        assert!(dry.is_ok(), "dry run: {dry:?}");
+        let ignoring = install(
+            &api,
+            &prefix,
+            "demo",
+            &InstallOpts {
+                ignore_dependencies: true,
+                ..InstallOpts::default()
+            },
+        );
+        assert!(
+            !format!("{ignoring:?}").contains("unpin"),
+            "ignore-dependencies: {ignoring:?}"
+        );
     }
 
     #[test]

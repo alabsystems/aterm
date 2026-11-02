@@ -1469,3 +1469,48 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
 
     running.stop();
 }
+
+/// A Mac in no fleet hears nobody: its census says so instead of the ratio's 100% default, and
+/// the JSON keeps the field as computed.
+#[test]
+fn a_census_that_heard_nobody_prints_none_heard_and_keeps_the_json_ratio() {
+    let alone = SwarmCensus::compute(&CensusInputs {
+        now_s: 1_793_300_000,
+        ..CensusInputs::default()
+    });
+    assert_eq!(alone.summary.distinct_heard_7d, 0);
+    let human = alone.render_human();
+    let head = human.lines().next().unwrap_or_default();
+    assert!(
+        head.contains("(0 heard 7d, none heard)") && !head.contains('%'),
+        "{head}"
+    );
+    assert_eq!(alone.summary.p2_ratio_bps, 10_000);
+    assert!(
+        alone.to_json().contains("\"p2_ratio_bps\":10000"),
+        "{}",
+        alone.to_json()
+    );
+    assert_eq!(
+        SwarmCensus::from_json(&alone.to_json())
+            .expect("roundtrip")
+            .summary
+            .p2_ratio_bps,
+        10_000
+    );
+
+    // Negative control: once anyone is heard, the same 10_000 is a real ratio and prints as one.
+    for (heard, bps, shown) in [
+        (1, 10_000, "(1 heard 7d, 100.0% joined)"),
+        (4, 5_000, "(4 heard 7d, 50.0% joined)"),
+    ] {
+        let mut heard_some = alone.clone();
+        heard_some.summary.distinct_heard_7d = heard;
+        heard_some.summary.p2_ratio_bps = bps;
+        let human = heard_some.render_human();
+        assert!(
+            human.contains(shown) && !human.contains("none heard"),
+            "{human}"
+        );
+    }
+}

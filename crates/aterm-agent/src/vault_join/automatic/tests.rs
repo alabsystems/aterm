@@ -55,10 +55,13 @@ struct Fake {
     place: Mutex<Option<Place>>,
     read_gate: Mutex<Option<Gate>>,
     post_gate: Mutex<Option<Gate>>,
+    fail_read: AtomicBool,
     fail_post: AtomicBool,
     posts: Sender<String>,
     waiting: Sender<Instant>,
     posted: AtomicUsize,
+    reads: AtomicUsize,
+    post_reads: Mutex<Vec<usize>>,
 }
 
 fn device(root: &std::path::Path, name: &str) -> Device {
@@ -69,10 +72,14 @@ fn device(root: &std::path::Path, name: &str) -> Device {
 
 impl Backend for Fake {
     fn read(&self) -> Result<Option<(Local, String)>> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         let place = self.place.lock_or_recover().clone();
         let gate = self.read_gate.lock_or_recover().take();
         if let Some(gate) = gate {
             gate.wait();
+        }
+        if self.fail_read.swap(false, Ordering::SeqCst) {
+            return Err(Error::new("membership temporarily unreadable"));
         }
         Ok(place.map(|place| {
             let local = Local::with(device(&self.root, "member"), TRUST, true, "member")
@@ -98,6 +105,9 @@ impl Backend for Fake {
                 return Ok(());
             }
             self.posted.fetch_add(1, Ordering::SeqCst);
+            self.post_reads
+                .lock_or_recover()
+                .push(self.reads.load(Ordering::SeqCst));
             self.posts.send(request.host.clone()).unwrap();
             if let Some(gate) = self.post_gate.lock_or_recover().take() {
                 gate.wait();
@@ -138,10 +148,13 @@ impl Fixture {
             place: Mutex::new(place),
             read_gate: Mutex::new(None),
             post_gate: Mutex::new(None),
+            fail_read: AtomicBool::new(false),
             fail_post: AtomicBool::new(false),
             posts,
             waiting,
             posted: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
+            post_reads: Mutex::new(Vec::new()),
         });
         let service = AutomaticJoins::with_backend(fake.clone()).unwrap();
         // This observes completion of the initial read and empty post, without a sleep.
@@ -251,6 +264,26 @@ fn a_slow_vault_does_not_hold_an_ask_connection_or_spawn_another_worker() {
 }
 
 #[test]
+fn each_waiting_machine_gets_a_fresh_policy_read_before_its_submission() {
+    let f = Fixture::home();
+    let (gate, entered, release) = Gate::pair();
+    *f.fake.read_gate.lock_or_recover() = Some(gate);
+    f.ask("first", false);
+    entered.recv_timeout(HANG).unwrap();
+    // Both asks are already queued when the worker's policy read finishes.
+    f.ask("second", false);
+    release.send(()).unwrap();
+    assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "first");
+    assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "second");
+    let reads = f.fake.post_reads.lock_or_recover();
+    assert_eq!(reads.len(), 2);
+    assert!(
+        reads[1] > reads[0],
+        "one policy read covered both posts: {reads:?}"
+    );
+}
+
+#[test]
 fn a_failed_post_retries_at_its_deadline_without_another_ask() {
     let f = Fixture::home();
     f.fake.fail_post.store(true, Ordering::SeqCst);
@@ -263,6 +296,40 @@ fn a_failed_post_retries_at_its_deadline_without_another_ask() {
     f.handle().shared.changed.notify_all();
     assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "retry");
     assert_eq!(f.fake.posted.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_failed_membership_read_retries_only_requests_that_are_still_live() {
+    for (elapsed, retry) in [(REFRESH_EVERY, true), (desk::STILL_ASKING, false)] {
+        let f = Fixture::home();
+        f.fake.fail_post.store(true, Ordering::SeqCst);
+        f.ask("retry-after-read", false);
+        assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "retry-after-read");
+        f.waits.recv_timeout(HANG).unwrap();
+
+        let desk = f.ready_on("home-a");
+        f.fake.fail_read.store(true, Ordering::SeqCst);
+        f.handle().refresh();
+        f.waits.recv_timeout(HANG).unwrap();
+        refused(&f.handle(), "192.168.1.40");
+        assert_eq!(desk.lock_or_recover().rows(f.fake.now()).len(), 1);
+        assert_eq!(f.fake.posted.load(Ordering::SeqCst), 1);
+
+        *f.fake.advance.lock_or_recover() += elapsed;
+        f.handle().shared.changed.notify_all();
+        f.waits.recv_timeout(HANG).unwrap();
+        assert!(Arc::ptr_eq(&desk, &f.ready_on("home-a")));
+        if retry {
+            assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "retry-after-read");
+            assert_eq!(f.fake.posted.load(Ordering::SeqCst), 2);
+        } else {
+            assert!(f.posts.try_recv().is_err(), "expired request was posted");
+            assert_eq!(f.fake.posted.load(Ordering::SeqCst), 1);
+            let desk = desk.lock_or_recover();
+            assert!(desk.rows(f.fake.now()).is_empty());
+            assert!(desk.next_automatic_request(f.fake.now()).is_none());
+        }
+    }
 }
 
 #[test]
@@ -375,6 +442,7 @@ fn stopping_refuses_new_connections_and_joins_the_in_flight_submission() {
     *f.fake.post_gate.lock_or_recover() = Some(gate);
     f.ask("last", false);
     entered.recv_timeout(HANG).unwrap();
+    f.ask("waiting", false);
     let service = f.service.take().unwrap();
     let (done, finished) = mpsc::channel();
     let stopping = std::thread::spawn(move || {

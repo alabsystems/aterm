@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-process Proton API transport. No Bridge, browser automation or helper app.
+//! Native Proton API operations and encryption, with an optional authenticated transport.
 
 use crate::{Folder, Mailbox, Message, Secret};
 use aterm_http::{Client, Method, ProxyMode, Trust};
@@ -10,11 +10,115 @@ use std::time::Duration;
 
 const API: &str = "https://mail.proton.me/api";
 
+/// An authenticated HTTP channel whose session is managed by its owner.
+/// Implementations must never replay a submitted write after an uncertain result.
+pub trait ApiTransport: Send {
+    fn request(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<ApiResponse, ApiError>;
+    fn renew(&mut self) -> Result<(), ApiError>;
+}
+
+/// A transport failure classified independently from its diagnostic text.
+#[derive(Debug)]
+pub struct ApiError {
+    pub kind: crate::proton_error::Kind,
+    pub message: String,
+}
+
+impl From<String> for ApiError {
+    fn from(message: String) -> Self {
+        Self {
+            kind: crate::proton_error::Kind::Network,
+            message,
+        }
+    }
+}
+impl From<&str> for ApiError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+pub struct ApiResponse {
+    pub status: u16,
+    pub retry_after: Option<String>,
+    pub body: Vec<u8>,
+}
+
+struct MessageCache {
+    entries: std::collections::VecDeque<Message>,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl Default for MessageCache {
+    fn default() -> Self {
+        Self {
+            entries: Default::default(),
+            bytes: 0,
+            max_entries: 32,
+            max_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+impl MessageCache {
+    fn weight(message: &Message) -> usize {
+        message.id.len()
+            + message.from.len()
+            + message.to.len()
+            + message.subject.len()
+            + message.date.len()
+            + message.text.len()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    fn get(&mut self, id: &str) -> Option<Message> {
+        let index = self.entries.iter().position(|entry| entry.id == id)?;
+        let message = self.entries.remove(index)?;
+        self.entries.push_front(message.clone());
+        Some(message)
+    }
+
+    fn insert(&mut self, message: Message) {
+        let weight = Self::weight(&message);
+        if weight > self.max_bytes || self.max_entries == 0 {
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.id == message.id)
+            && let Some(previous) = self.entries.remove(index)
+        {
+            self.bytes -= Self::weight(&previous);
+        }
+        while self.entries.len() >= self.max_entries || self.bytes + weight > self.max_bytes {
+            if let Some(old) = self.entries.pop_back() {
+                self.bytes -= Self::weight(&old);
+            } else {
+                break;
+            }
+        }
+        self.bytes += weight;
+        self.entries.push_front(message);
+    }
+}
+
 #[path = "proton_send.rs"]
 mod send;
+pub use send::PreparedMessage;
 
 pub struct Proton {
     client: Client,
+    transport: Option<std::cell::RefCell<Box<dyn ApiTransport>>>,
+    cache: MessageCache,
     uid: Secret,
     access: Secret,
     refresh_token: Secret,
@@ -33,6 +137,14 @@ pub struct Proton {
 }
 
 impl Proton {
+    /// Use an authenticated channel; callers must still check mailbox identity
+    /// and unlock its encryption keys before reading or sending.
+    pub fn with_transport(transport: Box<dyn ApiTransport>) -> Self {
+        let mut session = Self::empty();
+        session.transport = Some(std::cell::RefCell::new(transport));
+        session
+    }
+
     pub fn sign_in(username: &str, password: &Secret) -> Result<Self, String> {
         Self::sign_in_with_verifier(username, password, |_| {
             Err("Proton requires human verification".into())
@@ -56,6 +168,8 @@ impl Proton {
                 ProxyMode::Environment,
                 Duration::from_secs(30),
             ),
+            transport: None,
+            cache: MessageCache::default(),
             uid: Secret::new(String::new()),
             access: Secret::new(String::new()),
             refresh_token: Secret::new(String::new()),
@@ -152,6 +266,9 @@ impl Proton {
     }
 
     pub fn refresh_if_needed(&mut self) -> Result<bool, String> {
+        if self.transport.is_some() {
+            return Ok(false);
+        }
         let now = aterm_time::unix_secs().ok_or("Invalid system clock")?;
         let refreshed = now.saturating_add(60) >= self.expires;
         if refreshed {
@@ -172,6 +289,9 @@ impl Proton {
     }
 
     pub fn persist(&mut self, home: &std::path::Path, email: &str) -> Result<(), String> {
+        if self.transport.is_some() {
+            return Err("The authenticated transport owns this session".into());
+        }
         crate::session::save(home, email, &self.credentials())?;
         self.stored = Some((home.to_owned(), email.to_owned()));
         self.credentials_dirty = false;
@@ -179,6 +299,15 @@ impl Proton {
     }
 
     fn refresh(&mut self) -> Result<(), String> {
+        if let Some(transport) = &self.transport {
+            return transport.borrow_mut().renew().map_err(|error| {
+                let failure = self.fail(crate::proton_error::Failure::new(
+                    "/auth/v4/refresh",
+                    error.kind,
+                ));
+                format!("{failure}; {}", error.message)
+            });
+        }
         let mut nonce = [0; 32];
         aterm_uds::rand::fill(&mut nonce).map_err(|_| "Could not generate session nonce")?;
         let state: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -240,7 +369,7 @@ impl Proton {
         self.challenge.take();
         let first = operation(self);
         let mut renewal_pending = first.is_err()
-            && !self.access.expose().is_empty()
+            && (!self.access.expose().is_empty() || self.transport.is_some())
             && self.last_failure.borrow().as_ref().is_some_and(|failure| {
                 failure.kind == crate::proton_error::Kind::SessionExpired
                     && !matches!(
@@ -336,7 +465,7 @@ impl Proton {
     }
 
     pub fn sign_out_if_temporary(&self) -> Result<(), String> {
-        if self.stored.is_none() {
+        if self.stored.is_none() && self.transport.is_none() {
             self.sign_out()?;
         }
         Ok(())
@@ -344,8 +473,22 @@ impl Proton {
 
     /// Unlock account keys locally, then the address keys those account keys protect.
     pub fn unlock_mailbox(&mut self, password: &Secret) -> Result<(), String> {
-        let user = self.call(Method::Get, "/core/v4/users", None)?;
         let salts = self.call(Method::Get, "/core/v4/keys/salts", None)?;
+        self.unlock_mailbox_keys(password, Some(salts))
+    }
+
+    /// Resume with the derived key password of an already unlocked session.
+    /// This does not request password-only scopes from a refreshed session.
+    pub fn unlock_mailbox_with_key_password(&mut self, password: &Secret) -> Result<(), String> {
+        self.unlock_mailbox_keys(password, None)
+    }
+
+    fn unlock_mailbox_keys(
+        &mut self,
+        password: &Secret,
+        salts: Option<Value>,
+    ) -> Result<(), String> {
+        let user = self.call(Method::Get, "/core/v4/users", None)?;
         let addresses = self.call(Method::Get, "/core/v4/addresses", None)?;
         let mut user_keys = Vec::new();
         let mut legacy_passphrases = Vec::new();
@@ -355,10 +498,12 @@ impl Proton {
             .ok_or("Proton returned no account keys")?
         {
             let id = field(key, "ID")?;
-            let salt = salts["KeySalts"]
-                .as_array()
-                .and_then(|salts| salts.iter().find(|salt| salt["ID"].as_str() == Some(id)))
-                .and_then(|salt| salt["KeySalt"].as_str());
+            let salt = salts.as_ref().and_then(|salts| {
+                salts["KeySalts"]
+                    .as_array()
+                    .and_then(|salts| salts.iter().find(|salt| salt["ID"].as_str() == Some(id)))
+                    .and_then(|salt| salt["KeySalt"].as_str())
+            });
             let derived = match salt {
                 Some(salt) => crate::crypto::mailbox_password(
                     password.expose(),
@@ -434,6 +579,22 @@ impl Proton {
         // Revocation must remain available even when mailbox operations are paused.
         if !(path == "/auth/v4" && matches!(method, Method::Delete)) {
             self.ready()?;
+        }
+        if let Some(transport) = &self.transport {
+            self.last_failure.take();
+            let response = transport
+                .borrow_mut()
+                .request(method, path, body)
+                .map_err(|error| {
+                    let failure = self.fail(crate::proton_error::Failure::new(path, error.kind));
+                    format!("{failure}; {}", error.message)
+                })?;
+            return self.process_response(
+                path,
+                response.status,
+                response.retry_after.as_deref(),
+                &response.body,
+            );
         }
         let endpoint = format!("{API}{path}");
         let platform = if cfg!(target_os = "macos") {
@@ -512,7 +673,33 @@ impl Proton {
             }
             self.fail(failure)
         })?;
-        let code = parsed["Code"].as_u64().unwrap_or(0);
+        let mut code = parsed["Code"].as_u64().unwrap_or(0);
+        if (200..300).contains(&status)
+            && code == 1001
+            && matches!(
+                path,
+                "/mail/v4/messages/delete"
+                    | "/mail/v4/messages/read"
+                    | "/mail/v4/messages/unread"
+                    | "/mail/v4/messages/label"
+                    | "/mail/v4/messages/unlabel"
+            )
+            && let Some(responses) = parsed["Responses"]
+                .as_array()
+                .filter(|rows| !rows.is_empty())
+        {
+            if responses
+                .iter()
+                .all(|row| row["Response"]["Code"].as_u64() == Some(1000))
+            {
+                return Ok(parsed);
+            }
+            code = responses
+                .iter()
+                .filter_map(|row| row["Response"]["Code"].as_u64())
+                .find(|code| *code != 1000)
+                .unwrap_or(1001);
+        }
         if !(200..300).contains(&status) || code != 1000 {
             let failure = crate::proton_error::Failure::response(path, status, code, retry_after);
             let reason = self.fail(failure);
@@ -632,6 +819,7 @@ impl Mailbox for Proton {
             limit.min(100)
         );
         let value = self.call(Method::Get, &path, None)?;
+        self.cache.clear();
         value["Messages"]
             .as_array()
             .ok_or_else(|| "Proton returned no message list".to_string())?
@@ -640,7 +828,12 @@ impl Mailbox for Proton {
             .collect()
     }
 
-    fn read(&mut self, _folder: &str, id: &str) -> Result<Message, String> {
+    fn read(&mut self, folder: &str, id: &str) -> Result<Message, String> {
+        if folder != "1"
+            && let Some(message) = self.cache.get(id)
+        {
+            return Ok(message);
+        }
         let value = self.call(
             Method::Get,
             &format!("/mail/v4/messages/{}", crate::oauth::encode(id)),
@@ -657,6 +850,9 @@ impl Mailbox for Proton {
         } else {
             body.into()
         };
+        if folder != "1" {
+            self.cache.insert(message.clone());
+        }
         Ok(message)
     }
 
@@ -669,8 +865,9 @@ impl Mailbox for Proton {
                 "/mail/v4/messages/unread"
             },
             Some(json!({"IDs":[id]})),
-        )
-        .map(|_| ())
+        )?;
+        self.cache.clear();
+        Ok(())
     }
 }
 
@@ -704,6 +901,178 @@ fn message(value: &Value) -> Result<Message, String> {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    #[test]
+    fn bulk_success_requires_every_item_and_is_not_a_read_success() {
+        let ok = br#"{"Code":1001,"Responses":[{"ID":"a","Response":{"Code":1000}}]}"#;
+        assert!(
+            Proton::empty()
+                .process_response("/mail/v4/messages/delete", 200, None, ok)
+                .is_ok()
+        );
+        assert!(
+            Proton::empty()
+                .process_response("/mail/v4/messages", 200, None, ok)
+                .is_err()
+        );
+        for bad in [
+            br#"{"Code":1001,"Responses":[]}"#.as_slice(),
+            br#"{"Code":1001,"Responses":[{"Response":{"Code":1000}},{"Response":{"Code":2001}}]}"#,
+        ] {
+            assert!(
+                Proton::empty()
+                    .process_response("/mail/v4/messages/read", 200, None, bad)
+                    .is_err()
+            );
+        }
+    }
+
+    fn cached_message(id: &str, text: &str) -> Message {
+        Message {
+            id: id.into(),
+            from: String::new(),
+            to: String::new(),
+            subject: String::new(),
+            date: String::new(),
+            unread: false,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn message_cache_bounds_bytes_and_evicts_least_recently_read() {
+        let mut cache = MessageCache {
+            max_entries: 2,
+            max_bytes: 20,
+            ..Default::default()
+        };
+        cache.insert(cached_message("a", "one"));
+        cache.insert(cached_message("b", "two"));
+        assert!(cache.get("a").is_some());
+        cache.insert(cached_message("c", "three"));
+        assert!(cache.get("b").is_none());
+        assert!(cache.get("a").is_some());
+        cache.insert(cached_message("huge", &"x".repeat(21)));
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.bytes <= cache.max_bytes);
+        cache.insert(cached_message("a", "updated"));
+        assert_eq!(cache.get("a").unwrap().text, "updated");
+        cache.clear();
+        assert_eq!((cache.entries.len(), cache.bytes), (0, 0));
+    }
+
+    #[test]
+    fn cached_body_avoids_network_and_folder_refresh_invalidates_it() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ChannelState {
+            responses: [reply(200, r#"{"Code":1000,"Messages":[]}"#)].into(),
+            ..Default::default()
+        }));
+        let mut proton = Proton::with_transport(Box::new(Channel(state.clone())));
+        proton.cache.insert(cached_message("one", "cached body"));
+        assert_eq!(proton.read("0", "one").unwrap().text, "cached body");
+        assert_eq!(state.lock().unwrap().requests, 0);
+        proton.messages("0", 50).unwrap();
+        assert!(proton.cache.get("one").is_none());
+        assert_eq!(state.lock().unwrap().requests, 1);
+    }
+
+    #[derive(Default)]
+    struct ChannelState {
+        requests: usize,
+        renewals: usize,
+        responses: std::collections::VecDeque<Result<ApiResponse, ApiError>>,
+    }
+
+    struct Channel(std::sync::Arc<std::sync::Mutex<ChannelState>>);
+
+    impl ApiTransport for Channel {
+        fn request(
+            &mut self,
+            _: Method,
+            _: &str,
+            _: Option<Value>,
+        ) -> Result<ApiResponse, ApiError> {
+            let mut state = self.0.lock().unwrap();
+            state.requests += 1;
+            state
+                .responses
+                .pop_front()
+                .expect("unexpected repeated request")
+        }
+
+        fn renew(&mut self) -> Result<(), ApiError> {
+            self.0.lock().unwrap().renewals += 1;
+            Ok(())
+        }
+    }
+
+    fn reply(status: u16, body: &str) -> Result<ApiResponse, ApiError> {
+        Ok(ApiResponse {
+            status,
+            retry_after: None,
+            body: body.as_bytes().to_vec(),
+        })
+    }
+
+    #[test]
+    fn external_session_renews_once_without_rotating_browser_credentials() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ChannelState {
+            responses: [
+                reply(401, r#"{"Code":401}"#),
+                reply(200, r#"{"Code":1000,"Messages":[]}"#),
+            ]
+            .into(),
+            ..Default::default()
+        }));
+        let mut proton = Proton::with_transport(Box::new(Channel(state.clone())));
+        assert!(!proton.refresh_if_needed().unwrap());
+        assert!(
+            proton
+                .with_verification(|p| p.messages("0", 10), |_| panic!("not a human challenge"))
+                .unwrap()
+                .is_empty()
+        );
+        let state = state.lock().unwrap();
+        assert_eq!((state.requests, state.renewals), (2, 1));
+        assert!(
+            proton
+                .persist(std::path::Path::new("/unavailable"), "test@example.test")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejected_external_credentials_stop_background_retries() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ChannelState {
+            responses: [Err(ApiError {
+                kind: crate::proton_error::Kind::Credentials,
+                message: "credentials rejected".into(),
+            })]
+            .into(),
+            ..Default::default()
+        }));
+        let mut proton = Proton::with_transport(Box::new(Channel(state.clone())));
+        assert!(proton.messages("0", 10).is_err());
+        assert!(proton.messages("0", 10).is_err());
+        assert_eq!(state.lock().unwrap().requests, 1);
+        assert_eq!(
+            proton.last_failure().unwrap().kind,
+            crate::proton_error::Kind::Credentials
+        );
+    }
+
+    #[test]
+    fn uncertain_external_write_is_not_replayed_and_failed_channel_is_throttled() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ChannelState {
+            responses: [Err("disconnected".into())].into(),
+            ..Default::default()
+        }));
+        let mut proton = Proton::with_transport(Box::new(Channel(state.clone())));
+        assert!(proton.mark_read("0", "one", true).is_err());
+        assert!(proton.mark_read("0", "one", true).is_err());
+        let state = state.lock().unwrap();
+        assert_eq!((state.requests, state.renewals), (1, 0));
+    }
 
     #[test]
     fn revoked_access_token_renews_once_and_retries_only_the_read() {

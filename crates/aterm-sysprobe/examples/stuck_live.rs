@@ -484,5 +484,6 @@ fn job_proc(p: &ProcFacts) -> JobProc {
         version: aterm_sysprobe::procs::pid_version(p.pid).and_then(|v| u64::try_from(v).ok()),
         becomes: None,
         claims_ahead: None,
+        exec_version: None,
     }
 }

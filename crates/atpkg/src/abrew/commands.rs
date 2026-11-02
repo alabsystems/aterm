@@ -2826,19 +2826,51 @@ fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value
                 .iter()
                 .filter_map(|dep| {
                     let inst = prefix.installed_one(Kind::Formula, dep)?;
+                    // Brew's `Tab.formula_to_dep_hash` row, as far
+                    // as it is derivable at info time: version and
+                    // revision split from the installed pkg_version,
+                    // bottle_rebuild and compatibility from the
+                    // dep's current formula (bottle_rebuild omitted
+                    // when no bottle pours on this machine, like
+                    // brew's nil-compacted hash).
+                    let dep_f = api.formula(dep).ok().or_else(|| tap::lookup(prefix, dep));
+                    let (version, revision) = super::formula::split_revision(&inst.version);
                     let mut row = aterm_json::Map::new();
                     row.insert(
                         "full_name".to_string(),
                         aterm_json::Value::String(prefix.specified_name(&inst)),
                     );
+                    row.insert("version".to_string(), aterm_json::Value::String(version));
+                    row.insert(
+                        "revision".to_string(),
+                        aterm_json::Value::Number(revision.into()),
+                    );
+                    if let Some(df) = &dep_f
+                        && df
+                            .bottle_for(&super::machine::Machine::this().bottle_tags())
+                            .is_some()
+                    {
+                        row.insert(
+                            "bottle_rebuild".to_string(),
+                            aterm_json::Value::Number(df.bottle_rebuild.into()),
+                        );
+                    }
                     row.insert(
                         "pkg_version".to_string(),
                         aterm_json::Value::String(inst.version.clone()),
                     );
                     row.insert(
                         "declared_directly".to_string(),
-                        aterm_json::Value::Bool(f.dependencies.iter().any(|d| d == dep)),
+                        aterm_json::Value::Bool(
+                            f.dependencies.iter().any(|d| Formula::short_name(d) == dep),
+                        ),
                     );
+                    if let Some(compat) = dep_f.and_then(|df| df.compatibility_version) {
+                        row.insert(
+                            "compatibility_version".to_string(),
+                            aterm_json::Value::Number(compat.into()),
+                        );
+                    }
                     Some(aterm_json::Value::Object(row))
                 })
                 .collect()
@@ -3121,10 +3153,15 @@ fn info_json(
             match api.formula_value(n) {
                 Ok(v) => {
                     resolved.insert(Formula::short_name(n).to_string());
-                    formulae.push(v);
+                    let order = api
+                        .formula_value_bytes(n)
+                        .ok()
+                        .and_then(|bytes| parse_order(&bytes))
+                        .unwrap_or(Order::Leaf);
+                    formulae.push((v, order));
                 }
                 Err(_) if want_formula || installed => {
-                    return Err(format!("abrew: no formula {n}"));
+                    return Err(format!("Error: {}", formula_unavailable(api, n)));
                 }
                 Err(_) => {}
             }
@@ -3137,18 +3174,27 @@ fn info_json(
                 && !want_cask
                 && formulae
                     .iter()
-                    .any(|v| v.get("name").and_then(aterm_json::Value::as_str) == Some(short))
+                    .any(|(v, _)| v.get("name").and_then(aterm_json::Value::as_str) == Some(short))
             {
                 continue;
             }
             match api.cask_value(n) {
                 Ok(v) => {
                     resolved.insert(short.to_string());
-                    casks.push(v);
+                    let order = api
+                        .cask_value_bytes(n)
+                        .ok()
+                        .and_then(|bytes| parse_order(&bytes))
+                        .unwrap_or(Order::Leaf);
+                    casks.push((v, order));
                 }
                 Err(e) => {
                     if want_cask || installed {
-                        return Err(e);
+                        return Err(if e.contains("no such cask") {
+                            format!("Error: {}", cask_unavailable(short))
+                        } else {
+                            e
+                        });
                     }
                 }
             }
@@ -3157,25 +3203,474 @@ fn info_json(
     if !installed {
         for n in names {
             if !resolved.contains(Formula::short_name(n)) {
-                return Err(no_such(api, n, None));
+                return Err(format!(
+                    "Error: {}",
+                    if want_cask {
+                        cask_unavailable(Formula::short_name(n))
+                    } else {
+                        formula_unavailable(api, n)
+                    }
+                ));
             }
         }
     }
-    for v in &mut formulae {
+    for (v, _) in &mut formulae {
         enrich_formula_json(prefix, api, v);
     }
-    for v in &mut casks {
+    for (v, _) in &mut casks {
         enrich_cask_json(prefix, v);
     }
+    let ordered = |(v, order): (aterm_json::Value, Order)| JVal::Ordered(Box::new(v), order);
     let value = if v2 {
-        let mut map = aterm_json::Map::new();
-        map.insert("formulae".to_string(), aterm_json::Value::Array(formulae));
-        map.insert("casks".to_string(), aterm_json::Value::Array(casks));
-        aterm_json::Value::Object(map)
+        JVal::Obj(vec![
+            (
+                "formulae".to_string(),
+                JVal::Arr(formulae.into_iter().map(ordered).collect()),
+            ),
+            (
+                "casks".to_string(),
+                JVal::Arr(casks.into_iter().map(ordered).collect()),
+            ),
+        ])
     } else {
-        aterm_json::Value::Array(formulae.into_iter().chain(casks).collect())
+        JVal::Arr(formulae.into_iter().chain(casks).map(ordered).collect())
     };
-    aterm_json::to_string(&value).map_err(|e| format!("abrew: {e}"))
+    Ok(jpretty(&value))
+}
+
+/// A JSON value whose object fields keep brew's order. Leaf
+/// values stay `aterm_json::Value` (their inner key order is
+/// the map's alphabetical order); an `Ordered` leaf recovers
+/// its order from the API document that produced it.
+enum JVal {
+    Val(aterm_json::Value),
+    Obj(Vec<(String, JVal)>),
+    Arr(Vec<JVal>),
+    Ordered(Box<aterm_json::Value>, Order),
+}
+
+/// The key-order skeleton of a JSON document.
+enum Order {
+    Obj(Vec<(String, Order)>),
+    Arr(Vec<Order>),
+    Leaf,
+}
+
+/// Parse `bytes` for its key order only; `None` on any
+/// surprise, in which case emission falls back to the map's
+/// alphabetical order.
+fn parse_order(bytes: &[u8]) -> Option<Order> {
+    struct Cursor<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+    impl Cursor<'_> {
+        fn ws(&mut self) {
+            while self
+                .bytes
+                .get(self.pos)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                self.pos += 1;
+            }
+        }
+        fn peek(&mut self) -> Option<u8> {
+            self.ws();
+            self.bytes.get(self.pos).copied()
+        }
+        fn string(&mut self) -> Option<String> {
+            if self.peek()? != b'"' {
+                return None;
+            }
+            self.pos += 1;
+            let mut out = String::new();
+            loop {
+                let b = *self.bytes.get(self.pos)?;
+                self.pos += 1;
+                match b {
+                    b'"' => return Some(out),
+                    b'\\' => {
+                        let e = *self.bytes.get(self.pos)?;
+                        self.pos += 1;
+                        match e {
+                            b'"' => out.push('"'),
+                            b'\\' => out.push('\\'),
+                            b'/' => out.push('/'),
+                            b'b' => out.push('\u{0008}'),
+                            b'f' => out.push('\u{000c}'),
+                            b'n' => out.push('\n'),
+                            b'r' => out.push('\r'),
+                            b't' => out.push('\t'),
+                            b'u' => {
+                                let unit = self.hex4()?;
+                                if (0xd800..0xdc00).contains(&unit) {
+                                    if self.bytes.get(self.pos) != Some(&b'\\')
+                                        || self.bytes.get(self.pos + 1) != Some(&b'u')
+                                    {
+                                        return None;
+                                    }
+                                    self.pos += 2;
+                                    let low = self.hex4()?;
+                                    let c = 0x10000
+                                        + ((unit - 0xd800) << 10)
+                                        + low.checked_sub(0xdc00)?;
+                                    out.push(char::from_u32(c)?);
+                                } else {
+                                    out.push(char::from_u32(unit)?);
+                                }
+                            }
+                            _ => return None,
+                        }
+                    }
+                    _ => {
+                        // Re-decode one UTF-8 scalar from the raw bytes.
+                        let rest = &self.bytes[self.pos - 1..];
+                        let s = std::str::from_utf8(rest).ok()?;
+                        let c = s.chars().next()?;
+                        self.pos += c.len_utf8() - 1;
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        fn hex4(&mut self) -> Option<u32> {
+            let digits = self.bytes.get(self.pos..self.pos + 4)?;
+            let text = std::str::from_utf8(digits).ok()?;
+            let value = u32::from_str_radix(text, 16).ok()?;
+            self.pos += 4;
+            Some(value)
+        }
+        fn value(&mut self, depth: usize) -> Option<Order> {
+            if depth > 100 {
+                return None;
+            }
+            match self.peek()? {
+                b'{' => {
+                    self.pos += 1;
+                    let mut fields = Vec::new();
+                    if self.peek()? == b'}' {
+                        self.pos += 1;
+                        return Some(Order::Obj(fields));
+                    }
+                    loop {
+                        let key = self.string()?;
+                        if self.peek()? != b':' {
+                            return None;
+                        }
+                        self.pos += 1;
+                        let value = self.value(depth + 1)?;
+                        fields.push((key, value));
+                        match self.peek()? {
+                            b',' => self.pos += 1,
+                            b'}' => {
+                                self.pos += 1;
+                                return Some(Order::Obj(fields));
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                b'[' => {
+                    self.pos += 1;
+                    let mut items = Vec::new();
+                    if self.peek()? == b']' {
+                        self.pos += 1;
+                        return Some(Order::Arr(items));
+                    }
+                    loop {
+                        items.push(self.value(depth + 1)?);
+                        match self.peek()? {
+                            b',' => self.pos += 1,
+                            b']' => {
+                                self.pos += 1;
+                                return Some(Order::Arr(items));
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                b'"' => {
+                    self.string()?;
+                    Some(Order::Leaf)
+                }
+                _ => {
+                    while self.bytes.get(self.pos).is_some_and(|b| {
+                        !matches!(b, b',' | b']' | b'}') && !b.is_ascii_whitespace()
+                    }) {
+                        self.pos += 1;
+                    }
+                    Some(Order::Leaf)
+                }
+            }
+        }
+    }
+    let mut cursor = Cursor { bytes, pos: 0 };
+    let order = cursor.value(0)?;
+    cursor.ws();
+    (cursor.pos == bytes.len()).then_some(order)
+}
+
+const INSTALLED_ROW_ORDER: &[&str] = &[
+    "sbom",
+    "version",
+    "used_options",
+    "built_as_bottle",
+    "poured_from_bottle",
+    "time",
+    "runtime_dependencies",
+    "installed_on_request",
+];
+
+const RUNTIME_DEP_ORDER: &[&str] = &[
+    "full_name",
+    "version",
+    "revision",
+    "bottle_rebuild",
+    "pkg_version",
+    "declared_directly",
+    "compatibility_version",
+];
+
+fn const_order(key: &str) -> Option<&'static [&'static str]> {
+    match key {
+        "installed" => Some(INSTALLED_ROW_ORDER),
+        "runtime_dependencies" => Some(RUNTIME_DEP_ORDER),
+        _ => None,
+    }
+}
+
+/// Pretty-print `value` with object keys ordered by `guide`
+/// (the API document's own order), guide-less keys after.
+fn write_ordered(value: &aterm_json::Value, guide: &Order, indent: usize, out: &mut String) {
+    match (value, guide) {
+        (aterm_json::Value::Object(map), Order::Obj(fields)) if !map.is_empty() => {
+            out.push_str("{\n");
+            let mut first = true;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut emit =
+                |key: &str, child: &aterm_json::Value, child_guide: &Order, out: &mut String| {
+                    if !first {
+                        out.push_str(",\n");
+                    }
+                    first = false;
+                    out.push_str(&"  ".repeat(indent + 1));
+                    out.push_str(
+                        &aterm_json::to_string(&aterm_json::Value::String(key.to_string()))
+                            .unwrap_or_default(),
+                    );
+                    out.push_str(": ");
+                    write_ordered_child(key, child, child_guide, indent + 1, out);
+                };
+            for (key, child_guide) in fields {
+                if let Some(child) = map.get(key) {
+                    seen.insert(key.as_str());
+                    emit(key, child, child_guide, out);
+                }
+            }
+            for (key, child) in map {
+                if !seen.contains(key.as_str()) {
+                    emit(key, child, &Order::Leaf, out);
+                }
+            }
+            out.push('\n');
+            out.push_str(&"  ".repeat(indent));
+            out.push('}');
+        }
+        (aterm_json::Value::Array(items), Order::Arr(guides)) if !items.is_empty() => {
+            out.push_str("[\n");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                out.push_str(&"  ".repeat(indent + 1));
+                let guide = guides.get(i).unwrap_or(&Order::Leaf);
+                write_ordered(item, guide, indent + 1, out);
+            }
+            out.push('\n');
+            out.push_str(&"  ".repeat(indent));
+            out.push(']');
+        }
+        _ => write_json_value(value, indent, out),
+    }
+}
+
+/// A child under a key with a brew-constant row order gets a
+/// synthetic guide for its elements.
+fn write_ordered_child(
+    key: &str,
+    value: &aterm_json::Value,
+    guide: &Order,
+    indent: usize,
+    out: &mut String,
+) {
+    if let (aterm_json::Value::Array(items), Some(order)) = (value, const_order(key)) {
+        if items.is_empty() {
+            write_json_value(value, indent, out);
+            return;
+        }
+        let row = Order::Obj(
+            order
+                .iter()
+                .map(|k| ((*k).to_string(), Order::Leaf))
+                .collect(),
+        );
+        out.push_str("[\n");
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push_str(",\n");
+            }
+            out.push_str(&"  ".repeat(indent + 1));
+            write_ordered(item, &row, indent + 1, out);
+        }
+        out.push('\n');
+        out.push_str(&"  ".repeat(indent));
+        out.push(']');
+        return;
+    }
+    write_ordered(value, guide, indent, out);
+}
+
+impl From<aterm_json::Value> for JVal {
+    fn from(value: aterm_json::Value) -> Self {
+        JVal::Val(value)
+    }
+}
+
+fn jstr(s: impl Into<String>) -> JVal {
+    JVal::Val(aterm_json::Value::String(s.into()))
+}
+
+fn jbool(b: bool) -> JVal {
+    JVal::Val(aterm_json::Value::Bool(b))
+}
+
+fn jstrs(items: Vec<String>) -> JVal {
+    JVal::Arr(items.into_iter().map(jstr).collect())
+}
+
+fn write_json_value(value: &aterm_json::Value, indent: usize, out: &mut String) {
+    match value {
+        aterm_json::Value::Object(map) if !map.is_empty() => {
+            out.push_str("{\n");
+            for (i, (k, v)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                out.push_str(&"  ".repeat(indent + 1));
+                out.push_str(
+                    &aterm_json::to_string(&aterm_json::Value::String(k.clone()))
+                        .unwrap_or_default(),
+                );
+                out.push_str(": ");
+                write_json_value(v, indent + 1, out);
+            }
+            out.push('\n');
+            out.push_str(&"  ".repeat(indent));
+            out.push('}');
+        }
+        aterm_json::Value::Array(items) if !items.is_empty() => {
+            out.push_str("[\n");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(",\n");
+                }
+                out.push_str(&"  ".repeat(indent + 1));
+                write_json_value(item, indent + 1, out);
+            }
+            out.push('\n');
+            out.push_str(&"  ".repeat(indent));
+            out.push(']');
+        }
+        other => {
+            out.push_str(&aterm_json::to_string(other).unwrap_or_default());
+        }
+    }
+}
+
+/// Ruby `JSON.pretty_generate` shape (two-space indent);
+/// brew prints nearly every `--json` surface this way.
+fn jpretty(value: &JVal) -> String {
+    fn write(value: &JVal, indent: usize, out: &mut String) {
+        match value {
+            JVal::Obj(fields) if !fields.is_empty() => {
+                out.push_str("{\n");
+                for (i, (k, v)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(",\n");
+                    }
+                    out.push_str(&"  ".repeat(indent + 1));
+                    out.push_str(
+                        &aterm_json::to_string(&aterm_json::Value::String(k.clone()))
+                            .unwrap_or_default(),
+                    );
+                    out.push_str(": ");
+                    write(v, indent + 1, out);
+                }
+                out.push('\n');
+                out.push_str(&"  ".repeat(indent));
+                out.push('}');
+            }
+            JVal::Arr(items) if !items.is_empty() => {
+                out.push_str("[\n");
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(",\n");
+                    }
+                    out.push_str(&"  ".repeat(indent + 1));
+                    write(item, indent + 1, out);
+                }
+                out.push('\n');
+                out.push_str(&"  ".repeat(indent));
+                out.push(']');
+            }
+            JVal::Val(v) => write_json_value(v, indent, out),
+            JVal::Ordered(v, guide) => write_ordered(v, guide, indent, out),
+            JVal::Obj(_) => out.push_str("{}"),
+            JVal::Arr(_) => out.push_str("[]"),
+        }
+    }
+    let mut out = String::new();
+    write(value, 0, &mut out);
+    out
+}
+
+/// Compact one-line JSON (brew's bash fast path for
+/// `list --versions --json` pipes through `jq -c`).
+fn jcompact(value: &JVal) -> String {
+    fn write(value: &JVal, out: &mut String) {
+        match value {
+            JVal::Obj(fields) => {
+                out.push('{');
+                for (i, (k, v)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(
+                        &aterm_json::to_string(&aterm_json::Value::String(k.clone()))
+                            .unwrap_or_default(),
+                    );
+                    out.push(':');
+                    write(v, out);
+                }
+                out.push('}');
+            }
+            JVal::Arr(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(item, out);
+                }
+                out.push(']');
+            }
+            JVal::Val(v) => out.push_str(&aterm_json::to_string(v).unwrap_or_default()),
+            JVal::Ordered(v, _) => out.push_str(&aterm_json::to_string(v).unwrap_or_default()),
+        }
+    }
+    let mut out = String::new();
+    write(value, &mut out);
+    out
 }
 
 /// Read one unambiguous `--flag value` or `--flag=value` option.
@@ -3183,6 +3678,9 @@ pub(super) fn flag_value(rest: &[String], flag: &str) -> Result<Option<String>, 
     let mut found = None;
     let mut it = rest.iter();
     while let Some(s) = it.next() {
+        if s == "--" {
+            break;
+        }
         let value = if s == flag {
             it.next().map(String::as_str)
         } else if let Some(v) = s.strip_prefix(&format!("{flag}=")) {
@@ -3204,8 +3702,13 @@ pub(super) fn flag_value(rest: &[String], flag: &str) -> Result<Option<String>, 
 pub(super) fn operands_without_flag_values(rest: &[String], valued: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     let mut it = rest.iter();
+    let mut literal = false;
     while let Some(s) = it.next() {
-        if valued.contains(&s.as_str()) {
+        if literal {
+            out.push(s.clone());
+        } else if s == "--" {
+            literal = true;
+        } else if valued.contains(&s.as_str()) {
             let _ = it.next();
         } else if !s.starts_with('-') {
             out.push(s.clone());
@@ -5498,9 +6001,95 @@ pub(super) fn cmd_install(
     }
     let mut landed = false;
     let mut failures = blocked;
+    // Brew's `ask_formulae`: one preview and prompt for the whole
+    // formula batch (plain installs and upgrade-via-install
+    // together), only when dependency changes or outdated
+    // dependents would ride along. The preview is the install
+    // dry sections plus the dependents block, and the prompt
+    // action is "installation" even for the upgraded names.
+    let mut plain_opts = opts;
+    if opts.ask && !opts.dry_run {
+        let pouring: Vec<Formula> = names
+            .iter()
+            .filter_map(|name| {
+                if want_cask
+                    || (!want_formula
+                        && !upgrade_names.contains(name)
+                        && api.formula(name).is_err()
+                        && tap::lookup(prefix, name).is_none())
+                {
+                    return None;
+                }
+                let f = api
+                    .formula(name)
+                    .ok()
+                    .or_else(|| tap::lookup(prefix, name))?;
+                let pours = opts.force
+                    || prefix
+                        .installed_one(Kind::Formula, &f.name)
+                        .is_none_or(|inst| {
+                            version_cmp(&inst.version, &install::keg_version(&f)) == Ordering::Less
+                        });
+                pours.then_some(f)
+            })
+            .collect();
+        if !pouring.is_empty() {
+            let primary_names: std::collections::BTreeSet<String> =
+                pouring.iter().map(|f| f.name.clone()).collect();
+            let dependents = match dependent_rows(prefix, api, &pouring, &primary_names) {
+                Ok(rows) => rows,
+                Err(error) => return failed(&error),
+            };
+            let dep_exclude: std::collections::BTreeSet<String> = primary_names
+                .iter()
+                .cloned()
+                .chain(dependents.upgradeable.iter().map(|(f, _)| f.name.clone()))
+                .collect();
+            let (dep_installs, dep_upgrades) =
+                upgrade_dep_plan(prefix, api, &pouring, &dep_exclude);
+            if !dep_installs.is_empty()
+                || !dep_upgrades.is_empty()
+                || !dependents.upgradeable.is_empty()
+            {
+                let mut tops = Vec::new();
+                for name in &names {
+                    let short = Formula::short_name(name).to_string();
+                    if !primary_names.contains(&short) {
+                        continue;
+                    }
+                    let dry_opts;
+                    let name_opts = if upgrade_names.contains(name) {
+                        let mut upgraded = install_opts(rest);
+                        upgraded.upgrade = true;
+                        dry_opts = upgraded;
+                        &dry_opts
+                    } else {
+                        &opts
+                    };
+                    match install::dry_rows(api, prefix, name, name_opts) {
+                        Ok((top, deps)) => tops.push((short, top, deps)),
+                        Err(install::InstallError::Failed(msg)) => {
+                            eprintln!("{msg}");
+                            failures += 1;
+                        }
+                        Err(error) => return from_install(prefix, args, Err(error)),
+                    }
+                }
+                print_dry_sections(&tops, &[]);
+                present_and_upgrade_dependents(prefix, api, rest, &dependents, pouring.len(), true);
+                if let Err(e) = install::ask_to_proceed("installation") {
+                    return from_install(prefix, args, Err(e));
+                }
+            }
+        }
+        // The batch prompt above is the only formula prompt, as
+        // in brew; inner installs run unprompted from here.
+        plain_opts.ask = false;
+    }
     if !upgrade_names.is_empty() {
         let mut upgrade_opts = install_opts(rest);
         upgrade_opts.upgrade = true;
+        upgrade_opts.ask = false;
         if upgrade_formula_names(prefix, api, args, &upgrade_names, &upgrade_opts)
             == ExitCode::SUCCESS
         {
@@ -5530,10 +6119,36 @@ pub(super) fn cmd_install(
             }
         }
     }
+    // Plain formula primaries that will pour, for the dependents
+    // pass brew runs after the batch.
+    let plain_pouring: std::collections::BTreeSet<String> = plain_names
+        .iter()
+        .filter_map(|name| {
+            if want_cask
+                || (!want_formula
+                    && api.formula(name).is_err()
+                    && tap::lookup(prefix, name).is_none())
+            {
+                return None;
+            }
+            let f = api
+                .formula(name)
+                .ok()
+                .or_else(|| tap::lookup(prefix, name))?;
+            let pours = opts.force
+                || prefix
+                    .installed_one(Kind::Formula, &f.name)
+                    .is_none_or(|inst| {
+                        version_cmp(&inst.version, &install::keg_version(&f)) == Ordering::Less
+                    });
+            pours.then_some(f.name)
+        })
+        .collect();
+    let mut plain_landed: Vec<Formula> = Vec::new();
     for name in &plain_names {
         let result = if !want_cask && !want_formula {
             if api.formula(name).is_ok() {
-                install::install(api, prefix, name, &opts).map(|_| ())
+                install::install(api, prefix, name, &plain_opts).map(|_| ())
             } else {
                 match api.cask(name) {
                     Ok(c) => cask::install_with_deps(
@@ -5569,7 +6184,7 @@ pub(super) fn cmd_install(
                 Err(e) => return failed(&e),
             }
         } else {
-            match install::install(api, prefix, name, &opts).map(|_| ()) {
+            match install::install(api, prefix, name, &plain_opts).map(|_| ()) {
                 Err(install::InstallError::Failed(e)) if e.contains("no such") => {
                     if api.cask(name).is_ok() {
                         return failed(&format!(
@@ -5582,7 +6197,14 @@ pub(super) fn cmd_install(
             }
         };
         match result {
-            Ok(()) => landed = true,
+            Ok(()) => {
+                landed = true;
+                if plain_pouring.contains(Formula::short_name(name))
+                    && let Some(f) = api.formula(name).ok().or_else(|| tap::lookup(prefix, name))
+                {
+                    plain_landed.push(f);
+                }
+            }
             Err(install::InstallError::Aborted) => return ExitCode::from(1),
             Err(install::InstallError::Failed(msg)) => {
                 eprintln!("{msg}");
@@ -5598,6 +6220,29 @@ pub(super) fn cmd_install(
                 } else {
                     return from_install(prefix, args, Err(error));
                 }
+            }
+        }
+    }
+    // Outdated dependents of the plain formulae that landed
+    // upgrade after the batch, as in brew's upgrade_dependents
+    // (the upgrade-via-install batch above ran its own pass).
+    if !plain_landed.is_empty() {
+        let primary_names: std::collections::BTreeSet<String> =
+            plain_landed.iter().map(|f| f.name.clone()).collect();
+        match dependent_rows(prefix, api, &plain_landed, &primary_names) {
+            Ok(rows) => {
+                failures += present_and_upgrade_dependents(
+                    prefix,
+                    api,
+                    rest,
+                    &rows,
+                    plain_landed.len(),
+                    false,
+                );
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                failures += 1;
             }
         }
     }
@@ -6104,6 +6749,26 @@ fn tap_user_of(full_name: &str) -> &str {
     } else {
         "homebrew"
     }
+}
+
+/// The `user/repo` tap of a full package name (bare names and a
+/// bare tap string included): core when no tap is named.
+fn tap_of_full_name(full: &str) -> &str {
+    match full.matches('/').count() {
+        0 => "homebrew/core",
+        1 => full,
+        _ => full
+            .rsplit_once('/')
+            .map_or("homebrew/core", |(tap, _)| tap),
+    }
+}
+
+/// Brew's tap-migration allowance: the old tap's
+/// `tap_migrations` entry for `oldname` names the new formula's
+/// tap, so the move may proceed without `--force`.
+fn tap_migration_allows(prefix: &Prefix, old_full: &str, oldname: &str, new_full: &str) -> bool {
+    tap::migration_target_tap(prefix, tap_of_full_name(old_full), oldname)
+        .is_some_and(|target| target == tap_of_full_name(new_full))
 }
 
 /// Rewrite every symlink under `dir` whose target names
@@ -6681,7 +7346,9 @@ pub(super) fn cmd_migrate(
                     .installed_one(Kind::Formula, oldname)
                     .map(|inst| prefix.full_name(&inst))
                     .unwrap_or_else(|| "homebrew/core".to_string());
-                if tap_user_of(&old_tap) != tap_user_of(&f.full_name) {
+                if tap_user_of(&old_tap) != tap_user_of(&f.full_name)
+                    && !tap_migration_allows(prefix, &old_tap, oldname, &f.full_name)
+                {
                     let old_tap_name = old_tap
                         .rsplit_once('/')
                         .map_or(old_tap.as_str(), |(tap, _)| tap);
@@ -7070,7 +7737,7 @@ pub(super) fn cmd_reinstall(
     if names.is_empty() {
         return usage("reinstall needs at least one name");
     }
-    let opts = InstallOpts {
+    let mut opts = InstallOpts {
         force: true,
         reinstall: true,
         ..install_opts(rest)
@@ -7173,6 +7840,25 @@ pub(super) fn cmd_reinstall(
         Ok(rows) => rows,
         Err(error) => return failed(&error),
     };
+    // Ask mode: dependents preview + the single prompt first,
+    // as in upgrade; inner installs then run unprompted. The
+    // cask gate below prompts separately, as brew's ask_casks
+    // does, so capture the mode before suppressing it here.
+    let ask_wanted = opts.ask;
+    if opts.ask && !opts.dry_run && !dependents.upgradeable.is_empty() {
+        present_and_upgrade_dependents(
+            prefix,
+            api,
+            rest,
+            &dependents,
+            primary_formulae.len(),
+            true,
+        );
+        if let Err(e) = install::ask_to_proceed("reinstallation") {
+            return from_install(prefix, args, Err(e));
+        }
+        opts.ask = false;
+    }
     for formula in &primary_formulae {
         narrate_reinstall_tab(prefix, formula);
     }
@@ -7180,7 +7866,7 @@ pub(super) fn cmd_reinstall(
     narrate_fetch_heading(&heading_names);
     // Ask mode for casks: one batched preview and prompt before
     // the per-name loop, gated on would-install dependencies.
-    if opts.ask && !opts.dry_run {
+    if ask_wanted && !opts.dry_run {
         let mut rows: Vec<(String, Vec<String>)> = Vec::new();
         for name in &names {
             let short = Formula::short_name(name);
@@ -7337,44 +8023,27 @@ fn outdated_rows(
     Ok(out)
 }
 
-fn outdated_json_row(prefix: &Prefix, kind: Kind, name: &str, latest: &str) -> aterm_json::Value {
+fn outdated_json_row(prefix: &Prefix, kind: Kind, name: &str, latest: &str) -> JVal {
     let installed = prefix.installed_one(kind, name);
-    let versions: Vec<aterm_json::Value> = installed
+    let versions: Vec<String> = installed
         .as_ref()
-        .map(|i| {
-            i.versions
-                .iter()
-                .cloned()
-                .map(aterm_json::Value::String)
-                .collect()
-        })
+        .map(|i| i.versions.clone())
         .unwrap_or_default();
     let pinned_version = match kind {
         Kind::Formula => prefix.pinned_version(name),
         Kind::Cask => prefix.cask_pinned_version(name),
     };
     let pinned = pinned_version.is_some();
-    let mut map = aterm_json::Map::new();
-    map.insert(
-        "name".to_string(),
-        aterm_json::Value::String(name.to_string()),
-    );
-    map.insert(
-        "installed_versions".to_string(),
-        aterm_json::Value::Array(versions),
-    );
-    map.insert(
-        "current_version".to_string(),
-        aterm_json::Value::String(latest.to_string()),
-    );
-    map.insert("pinned".to_string(), aterm_json::Value::Bool(pinned));
-    map.insert(
-        "pinned_version".to_string(),
-        pinned_version
-            .map(aterm_json::Value::String)
-            .unwrap_or(aterm_json::Value::Null),
-    );
-    aterm_json::Value::Object(map)
+    JVal::Obj(vec![
+        ("name".to_string(), jstr(name)),
+        ("installed_versions".to_string(), jstrs(versions)),
+        ("current_version".to_string(), jstr(latest)),
+        ("pinned".to_string(), jbool(pinned)),
+        (
+            "pinned_version".to_string(),
+            pinned_version.map_or(JVal::Val(aterm_json::Value::Null), jstr),
+        ),
+    ])
 }
 
 const fn outdated_failed(any: bool, named: bool) -> bool {
@@ -7438,20 +8107,17 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
                 .map(|(name, _, latest)| outdated_json_row(prefix, kind, name, latest))
                 .collect::<Vec<_>>()
         };
-        let mut map = aterm_json::Map::new();
-        map.insert(
-            "formulae".to_string(),
-            aterm_json::Value::Array(rows_json(&collected[0], Kind::Formula)),
-        );
-        map.insert(
-            "casks".to_string(),
-            aterm_json::Value::Array(rows_json(&collected[1], Kind::Cask)),
-        );
-        let value = aterm_json::Value::Object(map);
-        match aterm_json::to_string(&value) {
-            Ok(text) => println!("{text}"),
-            Err(e) => return failed(&format!("abrew: {e}")),
-        }
+        let value = JVal::Obj(vec![
+            (
+                "formulae".to_string(),
+                JVal::Arr(rows_json(&collected[0], Kind::Formula)),
+            ),
+            (
+                "casks".to_string(),
+                JVal::Arr(rows_json(&collected[1], Kind::Cask)),
+            ),
+        ]);
+        println!("{}", jpretty(&value));
     } else {
         // Brew prints names alone unless verbose — a terminal or
         // --verbose, either overridden by --quiet; verbose groups
@@ -7584,10 +8250,20 @@ fn row_formulae(api: &Api, prefix: &Prefix, names: &[&str]) -> Vec<Formula> {
 fn version_change_lines(rows: &[(String, String, String, Option<String>)]) -> Vec<String> {
     let name_width = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
     let sep = if rows.len() == 1 { " " } else { "  " };
-    let old_width = rows.iter().map(|r| r.1.len()).max().unwrap_or(0);
+    let old_width = rows
+        .iter()
+        .map(|r| if r.1.is_empty() { r.2.len() } else { r.1.len() })
+        .max()
+        .unwrap_or(0);
     let versions: Vec<String> = rows
         .iter()
-        .map(|r| format!("{:old_width$} -> {}", r.1, r.2))
+        .map(|r| {
+            if r.1.is_empty() {
+                r.2.clone()
+            } else {
+                format!("{:old_width$} -> {}", r.1, r.2)
+            }
+        })
         .collect();
     let versions_width = versions.iter().map(|v| v.len()).max().unwrap_or(0);
     rows.iter()
@@ -7669,35 +8345,63 @@ pub(super) fn cmd_upgrade(
             Ok(rows) => rows,
             Err(error) => return failed(&error),
         };
-        if rows.is_empty() {
-            // Brew says nothing when there is nothing to do.
-            return ExitCode::SUCCESS;
-        }
         let (pinned, rows): (Vec<_>, Vec<_>) = rows
             .into_iter()
             .partition(|(name, _, _)| prefix.is_pinned(name));
+        // An unnamed upgrade covers casks too (unless --formula):
+        // one combined preview and prompt for both kinds.
+        let want_casks = !has_flag(rest, "--formula", "");
+        let (cask_pinned, cask_rows): (Vec<_>, Vec<_>) = if want_casks {
+            match outdated_rows(prefix, api, true, has_flag(rest, "--greedy", "")) {
+                Ok(all) => all
+                    .into_iter()
+                    .partition(|(name, _, _)| prefix.cask_is_pinned(name)),
+                Err(error) => return failed(&error),
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        if rows.is_empty() && pinned.is_empty() && cask_rows.is_empty() && cask_pinned.is_empty() {
+            // Brew says nothing when there is nothing to do.
+            return ExitCode::SUCCESS;
+        }
+        // Dependency changes of the planned upgrades come too;
+        // brew previews them before the upgrade table.
+        let (dep_install_rows, dep_upgrade_rows) = {
+            let planned_names: std::collections::BTreeSet<String> =
+                rows.iter().map(|(n, _, _)| n.clone()).collect();
+            let names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
+            upgrade_dep_plan(
+                prefix,
+                api,
+                &row_formulae(api, prefix, &names),
+                &planned_names,
+            )
+        };
         if !opts.quiet && !rows.is_empty() {
             let names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
             narrate_manifest_prelude(prefix, &row_formulae(api, prefix, &names));
         }
         // Brew's upgrade summary, shown for the dry run and as the
-        // ask-mode preview before a real run.
+        // ask-mode preview before a real run: dependency installs,
+        // then formulae and casks in one outdated table, then the
+        // pinned sections.
         let print_would = |rows: &[(String, String, String)],
-                           pinned: &[(String, String, String)]| {
-            if !rows.is_empty() {
+                           cask_rows: &[(String, String, String)],
+                           pinned: &[(String, String, String)],
+                           cask_pinned: &[(String, String, String)]| {
+            print_dep_sections(&dep_install_rows, &dep_upgrade_rows);
+            let total = rows.len() + cask_rows.len();
+            if total > 0 {
                 println!(
                     "{}",
                     super::tty::oh1(&format!(
                         "Would upgrade {} outdated {}",
-                        rows.len(),
-                        if rows.len() == 1 {
-                            "package"
-                        } else {
-                            "packages"
-                        }
+                        total,
+                        if total == 1 { "package" } else { "packages" }
                     ))
                 );
-                let changes: Vec<_> = rows
+                let mut changes: Vec<_> = rows
                     .iter()
                     .map(|(name, have, latest)| {
                         (
@@ -7708,44 +8412,50 @@ pub(super) fn cmd_upgrade(
                         )
                     })
                     .collect();
+                changes.extend(
+                    cask_rows
+                        .iter()
+                        .map(|(n, h, l)| (n.clone(), h.clone(), l.clone(), None)),
+                );
                 for line in version_change_lines(&changes) {
                     println!("{line}");
                 }
             }
-            if !pinned.is_empty() {
-                println!(
-                    "{}",
-                    super::tty::oh1(&format!(
-                        "{} Pinned {}",
-                        pinned.len(),
-                        if pinned.len() == 1 {
-                            "formula"
-                        } else {
-                            "formulae"
-                        }
-                    ))
-                );
-                let changes: Vec<_> = pinned
-                    .iter()
-                    .map(|(n, h, l)| (n.clone(), h.clone(), l.clone(), None))
-                    .collect();
-                for line in version_change_lines(&changes) {
-                    println!("{line}");
+            for (section, word, plural) in [
+                (pinned, "formula", "formulae"),
+                (cask_pinned, "cask", "casks"),
+            ] {
+                if !section.is_empty() {
+                    println!(
+                        "{}",
+                        super::tty::oh1(&format!(
+                            "{} Pinned {}",
+                            section.len(),
+                            if section.len() == 1 { word } else { plural }
+                        ))
+                    );
+                    let changes: Vec<_> = section
+                        .iter()
+                        .map(|(n, h, l)| (n.clone(), h.clone(), l.clone(), None))
+                        .collect();
+                    for line in version_change_lines(&changes) {
+                        println!("{line}");
+                    }
                 }
             }
         };
         if opts.dry_run {
-            print_would(&rows, &pinned);
+            print_would(&rows, &cask_rows, &pinned, &cask_pinned);
             return ExitCode::SUCCESS;
         }
         // Ask mode: the preview summary, the prompt, then the
-        // shared download heading before any pour.
+        // shared download heading before any pour. Pinned-only
+        // plans prompt for nothing (brew prompts only when
+        // something would change).
         let mut previewed_pinned = false;
-        if opts.ask {
-            if !rows.is_empty() {
-                print_would(&rows, &pinned);
-                previewed_pinned = !pinned.is_empty();
-            }
+        if opts.ask && (!rows.is_empty() || !cask_rows.is_empty()) {
+            print_would(&rows, &cask_rows, &pinned, &cask_pinned);
+            previewed_pinned = !pinned.is_empty();
             if let Err(e) = install::ask_to_proceed("upgrade") {
                 return from_install(prefix, args, Err(e));
             }
@@ -7786,7 +8496,7 @@ pub(super) fn cmd_upgrade(
                 }
                 Err(install::InstallError::Aborted) => return ExitCode::from(1),
                 Err(install::InstallError::Failed(error)) => {
-                    eprintln!("abrew: {error}");
+                    eprintln!("{error}");
                     failures += 1;
                 }
             }
@@ -7831,6 +8541,24 @@ pub(super) fn cmd_upgrade(
                 .collect();
             for line in version_change_lines(&changes) {
                 println!("{line}");
+            }
+        }
+        if want_casks {
+            // The combined prompt above covered casks too; their
+            // own ask gate stays silent here.
+            let mut cask_opts = opts;
+            cask_opts.ask = false;
+            let code = cmd_upgrade_casks(
+                prefix,
+                api,
+                args,
+                rest,
+                &cask_opts,
+                Vec::new(),
+                !upgraded.is_empty(),
+            );
+            if code != ExitCode::SUCCESS {
+                failures += 1;
             }
         }
         return if failures == 0 {
@@ -8038,6 +8766,122 @@ fn dependent_rows(
     Ok(out)
 }
 
+type ChangeRows = Vec<(String, String, String, Option<String>)>;
+
+/// Dependency changes a planned upgrade set pulls in, walking
+/// as the install plan does: a dep is kept (subtree pruned)
+/// when installed at the latest version, pinned, or at/above
+/// the pouring parent's bottle-tab minimum; otherwise it newly
+/// installs or upgrades and its subtree re-expands. `exclude`
+/// holds names accounted elsewhere (primaries, dependents);
+/// they still pour, so their subtrees are walked.
+fn upgrade_dep_plan(
+    prefix: &Prefix,
+    api: &Api,
+    planned: &[Formula],
+    exclude: &std::collections::BTreeSet<String>,
+) -> (ChangeRows, ChangeRows) {
+    struct Walk {
+        seen: std::collections::BTreeSet<String>,
+        minimums: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+        installs: ChangeRows,
+        upgrades: ChangeRows,
+    }
+    fn walk(
+        prefix: &Prefix,
+        api: &Api,
+        parent: &Formula,
+        exclude: &std::collections::BTreeSet<String>,
+        state: &mut Walk,
+    ) {
+        for dep in &parent.dependencies {
+            let short = Formula::short_name(dep).to_string();
+            if !state.seen.insert(short.clone()) {
+                continue;
+            }
+            let Some(df) = api
+                .formula(&short)
+                .ok()
+                .or_else(|| tap::lookup(prefix, &short))
+            else {
+                continue;
+            };
+            let latest = install::keg_version(&df);
+            // Brew's Dependency.expand is post-order: a pouring
+            // dep's own dependencies come before it, so rows are
+            // pushed only after the subtree has been walked.
+            // `change` is Some(true) for a new install,
+            // Some(false) for an upgrade, None when kept.
+            let change = match prefix.installed_one(Kind::Formula, &short) {
+                None => Some((true, String::new())),
+                Some(inst) if version_cmp(&inst.version, &latest) != Ordering::Less => None,
+                Some(_) if prefix.is_pinned(&short) => None,
+                Some(inst) => {
+                    let tab = state
+                        .minimums
+                        .entry(parent.name.clone())
+                        .or_insert_with(|| install::bottle_tab_minimums(prefix, parent));
+                    match tab.get(&short) {
+                        Some(minimum) if version_cmp(&inst.version, minimum) == Ordering::Less => {
+                            Some((false, inst.version))
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            if let Some((is_install, old)) = change {
+                walk(prefix, api, &df, exclude, state);
+                if !exclude.contains(&short) {
+                    let group = if is_install {
+                        &mut state.installs
+                    } else {
+                        &mut state.upgrades
+                    };
+                    group.push((short, old, latest, None));
+                }
+            }
+        }
+    }
+    let mut state = Walk {
+        seen: planned.iter().map(|f| f.name.clone()).collect(),
+        minimums: Default::default(),
+        installs: Vec::new(),
+        upgrades: Vec::new(),
+    };
+    for f in planned {
+        walk(prefix, api, f, exclude, &mut state);
+    }
+    (state.installs, state.upgrades)
+}
+
+/// Brew's `print_dry_run_dependency_summary`: one section per
+/// non-empty group, installs first.
+fn print_dep_sections(
+    install_rows: &[(String, String, String, Option<String>)],
+    upgrade_rows: &[(String, String, String, Option<String>)],
+) {
+    for (verb, rows) in [("install", install_rows), ("upgrade", upgrade_rows)] {
+        if rows.is_empty() {
+            continue;
+        }
+        println!(
+            "{}",
+            super::tty::ohai(&format!(
+                "Would {verb} {} {}:",
+                rows.len(),
+                if rows.len() == 1 {
+                    "dependency"
+                } else {
+                    "dependencies"
+                }
+            ))
+        );
+        for line in version_change_lines(rows) {
+            println!("{line}");
+        }
+    }
+}
+
 fn upgrade_formula_names(
     prefix: &Prefix,
     api: &Api,
@@ -8073,6 +8917,116 @@ fn upgrade_formula_names(
         Ok(rows) => rows,
         Err(error) => return failed(&error),
     };
+    // Dependency changes the planned upgrades pull in (brew's
+    // dry-run dependency summary), shown in dry runs and in the
+    // ask preview ahead of the requested/dependents sections.
+    let dep_exclude: std::collections::BTreeSet<String> = primary_names
+        .iter()
+        .cloned()
+        .chain(dependents.upgradeable.iter().map(|(f, _)| f.name.clone()))
+        .collect();
+    let (dep_install_rows, dep_upgrade_rows) =
+        upgrade_dep_plan(prefix, api, &planned, &dep_exclude);
+    // Ask mode (brew's upgrade summary preview): dependency
+    // sections, requested, dependents, pinned — one prompt when
+    // anything beyond the requested upgrades would change; the
+    // inner installs then run unprompted.
+    let mut effective = *opts;
+    if effective.ask
+        && !effective.dry_run
+        && (!dep_install_rows.is_empty()
+            || !dep_upgrade_rows.is_empty()
+            || !dependents.upgradeable.is_empty())
+    {
+        print_dep_sections(&dep_install_rows, &dep_upgrade_rows);
+        if !planned.is_empty() {
+            println!(
+                "{}",
+                super::tty::oh1(&format!(
+                    "Would upgrade {} requested outdated {}",
+                    planned.len(),
+                    if planned.len() == 1 {
+                        "package"
+                    } else {
+                        "packages"
+                    }
+                ))
+            );
+            let rows: Vec<(String, String, String, Option<String>)> = planned
+                .iter()
+                .map(|f| {
+                    (
+                        f.name.clone(),
+                        prefix
+                            .installed_one(Kind::Formula, &f.name)
+                            .map(|i| i.version)
+                            .unwrap_or_default(),
+                        install::keg_version(f),
+                        upgrade_bottle_size(prefix, api, &f.name),
+                    )
+                })
+                .collect();
+            for line in version_change_lines(&rows) {
+                println!("{line}");
+            }
+        }
+        if !dependents.upgradeable.is_empty() {
+            println!(
+                "{}",
+                super::tty::oh1(&format!(
+                    "Would upgrade {} {}",
+                    dependents.upgradeable.len(),
+                    if dependents.upgradeable.len() == 1 {
+                        "dependent"
+                    } else {
+                        "dependents"
+                    }
+                ))
+            );
+            let rows: Vec<(String, String, String, Option<String>)> = dependents
+                .upgradeable
+                .iter()
+                .map(|(f, have)| {
+                    (
+                        f.name.clone(),
+                        have.clone(),
+                        install::keg_version(f),
+                        upgrade_bottle_size(prefix, api, &f.name),
+                    )
+                })
+                .collect();
+            for line in version_change_lines(&rows) {
+                println!("{line}");
+            }
+        }
+        if !dependents.pinned.is_empty() {
+            println!(
+                "{}",
+                super::tty::oh1(&format!(
+                    "{} Pinned {}",
+                    dependents.pinned.len(),
+                    if dependents.pinned.len() == 1 {
+                        "formula"
+                    } else {
+                        "formulae"
+                    }
+                ))
+            );
+            let rows: Vec<(String, String, String, Option<String>)> = dependents
+                .pinned
+                .iter()
+                .map(|(n, h, l)| (n.clone(), h.clone(), l.clone(), None))
+                .collect();
+            for line in version_change_lines(&rows) {
+                println!("{line}");
+            }
+        }
+        if let Err(e) = install::ask_to_proceed("upgrade") {
+            return from_install(prefix, args, Err(e));
+        }
+        effective.ask = false;
+    }
+    let opts = &effective;
     let mut prelude: Vec<Formula> = planned.clone();
     prelude.extend(dependents.upgradeable.iter().map(|(f, _)| f.clone()));
     if !opts.quiet && !prelude.is_empty() {
@@ -8283,6 +9237,9 @@ fn upgrade_formula_names(
     }
     if !opts.dry_run && !dependents.upgradeable.is_empty() && !changes.is_empty() {
         failures += broken_linkage_dependents_pass(prefix, api);
+    }
+    if opts.dry_run {
+        print_dep_sections(&dep_install_rows, &dep_upgrade_rows);
     }
     // Brew's final summary: always for a dry run, otherwise once
     // at least two packages were upgraded (dependents included).
@@ -8536,7 +9493,7 @@ fn cmd_upgrade_casks(
             }
             Err(install::InstallError::Aborted) => return ExitCode::from(1),
             Err(install::InstallError::Failed(error)) => {
-                eprintln!("abrew: {error}");
+                eprintln!("{error}");
                 failures += 1;
             }
         }
@@ -8681,6 +9638,11 @@ pub(super) fn cmd_update(prefix: &Prefix, api: &Api) -> ExitCode {
             tap_failures += 1;
         }
     }
+    // Brew's update report relinks every tap's manpages and
+    // (setting permitting) completions.
+    for t in tap::list(prefix) {
+        tap::link_completions_and_manpages(prefix, &t);
+    }
     let staged = (api.index_rows_fresh(false), api.index_rows_fresh(true));
     if let (Ok(_), Ok(_)) = &staged {
         api.refresh_except(&["formula-index.json", "cask-index.json"]);
@@ -8722,7 +9684,9 @@ pub(super) fn cmd_update(prefix: &Prefix, api: &Api) -> ExitCode {
                     continue;
                 };
                 let old_tap = prefix.full_name(&inst);
-                if tap_user_of(&old_tap) != tap_user_of(&formula.full_name) {
+                if tap_user_of(&old_tap) != tap_user_of(&formula.full_name)
+                    && !tap_migration_allows(prefix, &old_tap, &inst.name, &formula.full_name)
+                {
                     let old_tap_name = old_tap
                         .rsplit_once('/')
                         .map_or(old_tap.as_str(), |(tap, _)| tap);
@@ -9639,34 +10603,47 @@ pub(super) fn cmd_link(
         return usage("link needs a formula name");
     }
     let dry_run = has_flag(rest, "--dry-run", "-n");
+    let force = has_flag(rest, "--force", "-f");
+    let overwrite = has_flag(rest, "--overwrite", "");
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
-    // Cask artifact linking is not native; refuse before any
-    // name is (un)linked when a named cask is installed.
-    if !want_formula {
-        for name in &names {
-            let token = super::api::canonical_cask_token(Formula::short_name(name));
-            if prefix.installed_one(Kind::Cask, token).is_some() {
-                return super::from_install(
-                    prefix,
-                    args,
-                    Err(install::InstallError::Unsupported(
-                        "cask artifact linking is not native".to_string(),
-                    )),
-                );
-            }
-        }
-    }
     for name in names {
         let short = Formula::short_name(&name);
-        if want_cask {
-            // An installed cask was refused above; what remains is
-            // brew's cask resolution failure.
-            let token = super::api::canonical_cask_token(short);
-            if package_definitively_unknown(prefix, api, token, false, true) {
-                return failed(&format!("Error: {}", cask_unavailable(token)));
+        let token = super::api::canonical_cask_token(short);
+        let as_cask = if want_cask {
+            true
+        } else if want_formula || prefix.installed_one(Kind::Formula, short).is_some() {
+            false
+        } else {
+            prefix.installed_one(Kind::Cask, token).is_some()
+        };
+        if as_cask {
+            let Some(inst) = prefix.installed_one(Kind::Cask, token) else {
+                if package_definitively_unknown(prefix, api, token, false, true) {
+                    return failed(&format!("Error: {}", cask_unavailable(token)));
+                }
+                return failed(&format!("Error: Cask '{token}' is not installed."));
+            };
+            let c = match api.cask(token) {
+                Ok(c) => c,
+                Err(e) if e.contains("no such") => {
+                    return failed(&format!("Error: {}", cask_unavailable(token)));
+                }
+                Err(e) => return failed(&e),
+            };
+            let items = match cask::linkable_artifacts(prefix, &c, &inst.version) {
+                Ok(items) => items,
+                Err(e) => return from_install(prefix, args, Err(e)),
+            };
+            let result = if link {
+                cask::link_cask(prefix, token, &items, force, overwrite, dry_run)
+            } else {
+                cask::unlink_cask(prefix, token, &items, dry_run)
+            };
+            if let Err(e) = result {
+                return from_install(prefix, args, Err(e));
             }
-            return failed(&format!("Error: Cask '{token}' is not installed."));
+            continue;
         }
         if !link {
             let inst = prefix.installed_one(Kind::Formula, short);
@@ -9919,59 +10896,46 @@ fn mode_string(meta: &std::fs::Metadata) -> String {
 }
 
 fn list_json(prefix: &Prefix, rest: &[String]) -> ExitCode {
-    let opt_str = |v: Option<String>| match v {
-        Some(s) => aterm_json::Value::String(s),
-        None => aterm_json::Value::Null,
-    };
+    let opt_str = |v: Option<String>| v.map_or_else(|| JVal::Val(aterm_json::Value::Null), jstr);
     let version_values = |i: &Installed| {
         let mut vs = i.versions.clone();
         vs.sort();
         vs.dedup();
-        vs.into_iter().map(aterm_json::Value::String).collect()
+        jstrs(vs)
     };
     let mut formulae = Vec::new();
     if !has_flag(rest, "--cask", "") {
         for i in prefix.installed(Kind::Formula) {
             let opt = prefix.optlinked_version(&i.name);
             let linked = linked_keg_version(prefix, &i);
-            let mut map = aterm_json::Map::new();
-            map.insert("name".into(), aterm_json::Value::String(i.name.clone()));
-            map.insert(
-                "versions".into(),
-                aterm_json::Value::Array(version_values(&i)),
-            );
-            map.insert("linked_version".into(), opt_str(linked));
-            map.insert("optlinked_version".into(), opt_str(opt));
-            map.insert(
-                "pinned_version".into(),
-                opt_str(prefix.pinned_version(&i.name)),
-            );
-            formulae.push(aterm_json::Value::Object(map));
+            formulae.push(JVal::Obj(vec![
+                ("name".into(), jstr(i.name.clone())),
+                ("versions".into(), version_values(&i)),
+                ("linked_version".into(), opt_str(linked)),
+                ("optlinked_version".into(), opt_str(opt)),
+                (
+                    "pinned_version".into(),
+                    opt_str(prefix.pinned_version(&i.name)),
+                ),
+            ]));
         }
     }
     let mut casks = Vec::new();
     if !has_flag(rest, "--formula", "") {
         for i in prefix.installed(Kind::Cask) {
-            let mut map = aterm_json::Map::new();
-            map.insert("token".into(), aterm_json::Value::String(i.name.clone()));
-            map.insert(
-                "versions".into(),
-                aterm_json::Value::Array(version_values(&i)),
-            );
-            map.insert("pinned_version".into(), aterm_json::Value::Null);
-            casks.push(aterm_json::Value::Object(map));
+            casks.push(JVal::Obj(vec![
+                ("token".into(), jstr(i.name.clone())),
+                ("versions".into(), version_values(&i)),
+                ("pinned_version".into(), JVal::Val(aterm_json::Value::Null)),
+            ]));
         }
     }
-    let mut root = aterm_json::Map::new();
-    root.insert("formulae".into(), aterm_json::Value::Array(formulae));
-    root.insert("casks".into(), aterm_json::Value::Array(casks));
-    match aterm_json::to_string(&aterm_json::Value::Object(root)) {
-        Ok(s) => {
-            println!("{s}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => failed(&format!("abrew: cannot encode list JSON: {e}")),
-    }
+    let root = JVal::Obj(vec![
+        ("formulae".into(), JVal::Arr(formulae)),
+        ("casks".into(), JVal::Arr(casks)),
+    ]);
+    println!("{}", jcompact(&root));
+    ExitCode::SUCCESS
 }
 
 fn multiple_version_lines(rows: &[Installed]) -> Vec<String> {
@@ -12200,7 +13164,139 @@ pub(super) fn cmd_log(prefix: &Prefix, rest: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `brew analytics [state]`: abrew records nothing, so the
+/// state is always brew's disabled form. `on`/`off` are refused
+/// at admission (there is no collection to toggle).
+pub(super) fn cmd_analytics() -> ExitCode {
+    println!("InfluxDB analytics are disabled.");
+    println!("Google Analytics were destroyed.");
+    ExitCode::SUCCESS
+}
+
+/// `brew developer [state|on|off]`: brew's developer-mode
+/// state machine over the prefix's own `devcmdrun` setting and
+/// the HOMEBREW_DEVELOPER/HOMEBREW_UPDATE_TO_TAG env gates.
+pub(super) fn cmd_developer(prefix: &Prefix, rest: &[String]) -> ExitCode {
+    let sub = operands(rest).first().cloned();
+    match sub.as_deref() {
+        None | Some("state") => {
+            let developer = super::env_set("HOMEBREW_DEVELOPER");
+            let devcmdrun = tap::setting_bool(prefix, "devcmdrun");
+            if developer {
+                println!("Developer mode is enabled because HOMEBREW_DEVELOPER is set.");
+            } else if devcmdrun {
+                println!(
+                    "Developer mode is enabled because a developer command or `brew developer on` was run."
+                );
+            } else {
+                println!("Developer mode is disabled.");
+            }
+            if developer || devcmdrun {
+                if super::env_set("HOMEBREW_UPDATE_TO_TAG") {
+                    println!(
+                        "However, `brew update` will update to the latest stable tag because HOMEBREW_UPDATE_TO_TAG is set."
+                    );
+                } else {
+                    println!(
+                        "`brew update` will update to the latest commit on the `main` branch."
+                    );
+                }
+            } else {
+                println!("`brew update` will update to the latest stable tag.");
+            }
+            ExitCode::SUCCESS
+        }
+        Some("on") => {
+            if let Err(e) = tap::set_setting_bool(prefix, "devcmdrun", true) {
+                return failed(&format!("Error: {e}"));
+            }
+            if super::env_set("HOMEBREW_UPDATE_TO_TAG") {
+                println!("To fully enable developer mode, you must unset HOMEBREW_UPDATE_TO_TAG.");
+            }
+            ExitCode::SUCCESS
+        }
+        Some("off") => {
+            if let Err(e) = tap::set_setting_bool(prefix, "devcmdrun", false) {
+                return failed(&format!("Error: {e}"));
+            }
+            if super::env_set("HOMEBREW_DEVELOPER") {
+                println!("To fully disable developer mode, you must unset HOMEBREW_DEVELOPER.");
+            }
+            ExitCode::SUCCESS
+        }
+        Some(other) => failed(&format!(
+            "Error: Invalid usage: unknown subcommand: `{other}`"
+        )),
+    }
+}
+
+/// `brew completions [state|link|unlink]`: whether tap shell
+/// completion files are linked into the prefix's completion
+/// directories (brew's destinations).
+pub(super) fn cmd_completions(prefix: &Prefix, rest: &[String]) -> ExitCode {
+    let sub = operands(rest).first().cloned();
+    match sub.as_deref() {
+        None | Some("state") => {
+            if tap::completions_linked(prefix) {
+                println!("Completions are linked.");
+            } else {
+                println!("Completions are not linked.");
+            }
+            ExitCode::SUCCESS
+        }
+        Some("link") => {
+            if let Err(e) = tap::set_completions_linked(prefix, true) {
+                return failed(&format!("Error: {e}"));
+            }
+            let mut conflicts = Vec::new();
+            for t in tap::list(prefix) {
+                for (shell, dst) in tap::completion_dirs(prefix) {
+                    conflicts.extend(tap::link_src_dst(
+                        &t.path.join("completions").join(shell),
+                        &dst,
+                    ));
+                }
+            }
+            if !conflicts.is_empty() {
+                eprintln!(
+                    "Error: Could not link:\n{}\n\nPlease delete these paths and run:\n  brew completions link",
+                    conflicts
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+            println!("Completions are now linked.");
+            ExitCode::SUCCESS
+        }
+        Some("unlink") => {
+            if let Err(e) = tap::set_completions_linked(prefix, false) {
+                return failed(&format!("Error: {e}"));
+            }
+            for t in tap::list(prefix) {
+                // Brew leaves official taps' completions linked.
+                if t.user == "homebrew" {
+                    continue;
+                }
+                tap::unlink_tap_completions(prefix, &t);
+            }
+            println!("Completions are no longer linked.");
+            ExitCode::SUCCESS
+        }
+        Some(other) => failed(&format!(
+            "Error: Invalid usage: unknown subcommand: `{other}`"
+        )),
+    }
+}
+
 pub(super) fn cmd_tap(prefix: &Prefix, rest: &[String]) -> ExitCode {
+    if has_flag(rest, "--repair", "") {
+        return match tap::repair(prefix) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => failed(&e),
+        };
+    }
     if has_flag(rest, "--list-official", "") {
         for t in [
             "homebrew/bundle",
@@ -12220,7 +13316,13 @@ pub(super) fn cmd_tap(prefix: &Prefix, rest: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let url = ops.get(1).map(String::as_str);
-    match tap::add(prefix, ops.first().map_or("", String::as_str), url) {
+    match tap::add(
+        prefix,
+        ops.first().map_or("", String::as_str),
+        url,
+        has_flag(rest, "--custom-remote", ""),
+        has_flag(rest, "--force", "-f"),
+    ) {
         Ok((t, newly)) => {
             if newly {
                 println!("Tapped {} ({})", t.name(), t.path.display());
@@ -12343,11 +13445,11 @@ pub(super) fn cmd_tap_info(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
                 })
                 .collect()
         };
-        let values: Vec<aterm_json::Value> = names
+        let values: Vec<JVal> = names
             .iter()
             .map(|name| tap_json_value(prefix, api, name, taps.iter().find(|t| t.name() == *name)))
             .collect();
-        println!("{}", aterm_json::Value::Array(values));
+        println!("{}", jpretty(&JVal::Arr(values)));
         return ExitCode::SUCCESS;
     }
     if has_flag(rest, "--installed", "") {
@@ -12429,12 +13531,7 @@ fn rb_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// Brew `Tap#to_hash` for `tap-info --json`. `private` is a
 /// GitHub API fact brew reports as public when unauthenticated;
 /// `trusted` follows brew's default (official taps trusted).
-fn tap_json_value(
-    prefix: &Prefix,
-    api: &Api,
-    name: &str,
-    installed: Option<&tap::Tap>,
-) -> aterm_json::Value {
+fn tap_json_value(prefix: &Prefix, api: &Api, name: &str, installed: Option<&tap::Tap>) -> JVal {
     let (user_raw, repo) =
         tap::parse_tap_name(name).unwrap_or_else(|| (name.to_string(), String::new()));
     let user = if user_raw.eq_ignore_ascii_case("homebrew") {
@@ -12470,81 +13567,70 @@ fn tap_json_value(
         ),
         None => (Vec::new(), Vec::new()),
     };
-    let strings = |items: Vec<String>| {
-        aterm_json::Value::Array(items.into_iter().map(aterm_json::Value::String).collect())
-    };
-    let mut map = aterm_json::Map::new();
-    map.insert(
-        "name".into(),
-        aterm_json::Value::String(format!("{user}/{repo}").to_lowercase()),
-    );
-    map.insert("user".into(), aterm_json::Value::String(user.clone()));
-    map.insert("repo".into(), aterm_json::Value::String(repo.clone()));
-    map.insert("repository".into(), aterm_json::Value::String(repo.clone()));
-    map.insert(
-        "path".into(),
-        aterm_json::Value::String(path.display().to_string()),
-    );
-    map.insert(
-        "installed".into(),
-        aterm_json::Value::Bool(installed.is_some()),
-    );
-    map.insert("official".into(), aterm_json::Value::Bool(official));
-    map.insert("trusted".into(), aterm_json::Value::Bool(official));
-    map.insert("formula_names".into(), strings(formula_names));
-    map.insert("cask_tokens".into(), strings(cask_tokens));
+    let mut fields: Vec<(String, JVal)> = vec![
+        ("name".into(), jstr(format!("{user}/{repo}").to_lowercase())),
+        ("user".into(), jstr(user.clone())),
+        ("repo".into(), jstr(repo.clone())),
+        ("repository".into(), jstr(repo.clone())),
+        ("path".into(), jstr(path.display().to_string())),
+        ("installed".into(), jbool(installed.is_some())),
+        ("official".into(), jbool(official)),
+        ("trusted".into(), jbool(official)),
+        ("formula_names".into(), jstrs(formula_names)),
+        ("cask_tokens".into(), jstrs(cask_tokens)),
+    ];
     if let Some(tap) = installed {
         let paths = |files: Vec<std::path::PathBuf>| {
-            strings(files.iter().map(|f| f.display().to_string()).collect())
+            jstrs(files.iter().map(|f| f.display().to_string()).collect())
         };
-        map.insert(
+        fields.push((
             "formula_files".into(),
             paths(rb_files(&tap.path.join("Formula"))),
-        );
-        map.insert(
+        ));
+        fields.push((
             "cask_files".into(),
             paths(rb_files(&tap.path.join("Casks"))),
-        );
-        map.insert(
+        ));
+        fields.push((
             "command_files".into(),
             paths(rb_files(&tap.path.join("cmd"))),
-        );
+        ));
         let default_remote = format!("https://github.com/{user}/homebrew-{repo}");
         let remote = tap_git(tap, &["config", "remote.origin.url"]);
-        map.insert(
+        fields.push((
             "remote".into(),
             remote
                 .clone()
-                .map_or(aterm_json::Value::Null, aterm_json::Value::String),
-        );
-        map.insert(
+                .map_or(JVal::Val(aterm_json::Value::Null), jstr),
+        ));
+        fields.push((
             "custom_remote".into(),
-            aterm_json::Value::Bool(remote.as_deref() != Some(default_remote.as_str())),
-        );
-        map.insert("private".into(), aterm_json::Value::Bool(false));
-        map.insert(
+            jbool(remote.as_deref() != Some(default_remote.as_str())),
+        ));
+        fields.push(("private".into(), jbool(false)));
+        fields.push((
             "HEAD".into(),
-            aterm_json::Value::String(
+            jstr(
                 tap_git(tap, &["rev-parse", "--verify", "--quiet", "HEAD"])
                     .unwrap_or_else(|| "(none)".to_string()),
             ),
-        );
-        map.insert(
+        ));
+        fields.push((
             "last_commit".into(),
-            aterm_json::Value::String(
+            jstr(
                 tap_git(tap, &["show", "-s", "--format=%cr", "HEAD"])
                     .unwrap_or_else(|| "never".to_string()),
             ),
-        );
-        map.insert(
+        ));
+        fields.push((
             "branch".into(),
-            aterm_json::Value::String(
+            jstr(
                 tap_git(tap, &["rev-parse", "--abbrev-ref", "HEAD"])
                     .unwrap_or_else(|| "(none)".to_string()),
             ),
-        );
+        ));
     }
-    aterm_json::Value::Object(map)
+    JVal::Obj(fields)
 }
 
 /// Brew's installed-tap block (cmd/tap-info.rb `print_tap_info` +
@@ -12734,7 +13820,7 @@ fn bundle_file(
                     println!("tap {n}: {}", if have { "present" } else { "missing" });
                     Ok(())
                 } else {
-                    match tap::add(prefix, n, None) {
+                    match tap::add(prefix, n, None, false, false) {
                         Ok(_) => {
                             landed = true;
                             Ok(())
@@ -13946,6 +15032,42 @@ mod tests {
     }
 
     #[test]
+    fn dep_plan_rows_follow_brew_expansion_order() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(temp.path());
+        prefix.ensure_api_cache().unwrap();
+        let api_dir = prefix.cache().join("api");
+        // demo -> alpha -> zeta, nothing installed. Brew's
+        // Dependency.expand is post-order (deps before their
+        // dependents), so the install group is [zeta, alpha],
+        // not alphabetical [alpha, zeta].
+        for (name, record) in [
+            (
+                "demo",
+                br#"{"name":"demo","versions":{"stable":"1"},"dependencies":["alpha"]}"#.as_slice(),
+            ),
+            (
+                "alpha",
+                br#"{"name":"alpha","versions":{"stable":"1"},"dependencies":["zeta"]}"#.as_slice(),
+            ),
+            (
+                "zeta",
+                br#"{"name":"zeta","versions":{"stable":"1"},"dependencies":[]}"#.as_slice(),
+            ),
+        ] {
+            std::fs::write(api_dir.join(format!("formula-{name}.json")), record).unwrap();
+        }
+        let api = Api::new(prefix.clone());
+        let planned = vec![api.formula("demo").unwrap()];
+        let exclude: std::collections::BTreeSet<String> =
+            ["demo".to_string()].into_iter().collect();
+        let (installs, upgrades) = upgrade_dep_plan(&prefix, &api, &planned, &exclude);
+        let names: Vec<&str> = installs.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(names, ["zeta", "alpha"]);
+        assert!(upgrades.is_empty());
+    }
+
+    #[test]
     fn info_json_enrichment_reports_installed_state() {
         let temp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(temp.path());
@@ -13958,7 +15080,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             api_dir.join("formula-dep.json"),
-            br#"{"name":"dep","versions":{"stable":"3"}}"#,
+            br#"{"name":"dep","versions":{"stable":"3"},"compatibility_version":1,"bottle":{"stable":{"rebuild":2,"files":{"all":{"url":"https://example.invalid/dep.bottle.tar.gz","sha256":"abc","cellar":":any"}}}}}"#,
         )
         .unwrap();
         let keg = prefix.keg("demo", "1");
@@ -13975,7 +15097,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        owned_keg(&prefix, "dep", "3");
+        owned_keg(&prefix, "dep", "3_1");
         let api = Api::new(prefix.clone());
         let mut record = aterm_json::json!({"name": "demo"});
         enrich_formula_json(&prefix, &api, &mut record);
@@ -14029,9 +15151,26 @@ mod tests {
             runtime[0].get("full_name").unwrap(),
             &aterm_json::json!("dep")
         );
+        // Brew's full dep-hash row: version/revision split from
+        // the installed pkg_version, rebuild + compatibility
+        // from the dep's formula.
+        assert_eq!(runtime[0].get("version").unwrap(), &aterm_json::json!("3"));
+        assert_eq!(runtime[0].get("revision").unwrap(), &aterm_json::json!(1));
+        assert_eq!(
+            runtime[0].get("bottle_rebuild").unwrap(),
+            &aterm_json::json!(2)
+        );
+        assert_eq!(
+            runtime[0].get("pkg_version").unwrap(),
+            &aterm_json::json!("3_1")
+        );
         assert_eq!(
             runtime[0].get("declared_directly").unwrap(),
             &aterm_json::json!(true)
+        );
+        assert_eq!(
+            runtime[0].get("compatibility_version").unwrap(),
+            &aterm_json::json!(1)
         );
         assert!(record.get("linked_keg").is_some_and(|v| v.is_null()));
         assert_eq!(record.get("pinned").unwrap(), &aterm_json::json!(false));
@@ -15066,5 +16205,80 @@ mod tests {
         let alias = dst.join("1.0/alias");
         assert!(alias.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&alias).unwrap(), "payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completions_link_state_unlink_round_trip() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let tap = p.taps_dir().join("someone/homebrew-tools/completions/zsh");
+        std::fs::create_dir_all(&tap).unwrap();
+        std::fs::create_dir_all(p.taps_dir().join("someone/homebrew-tools/.git")).unwrap();
+        std::fs::write(tap.join("_tool"), b"#compdef tool").unwrap();
+        let rest = |s: &str| vec![s.to_string()];
+        assert_eq!(cmd_completions(&p, &[]), ExitCode::SUCCESS);
+        assert!(!tap::completions_linked(&p));
+        assert_eq!(cmd_completions(&p, &rest("link")), ExitCode::SUCCESS);
+        assert!(tap::completions_linked(&p));
+        let linked = p.root.join("share/zsh/site-functions/_tool");
+        assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::canonicalize(&linked).unwrap(),
+            std::fs::canonicalize(tap.join("_tool")).unwrap()
+        );
+        assert_eq!(cmd_completions(&p, &rest("unlink")), ExitCode::SUCCESS);
+        assert!(!tap::completions_linked(&p));
+        assert!(linked.symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn json_pretty_matches_ruby_layout() {
+        let mut inner = aterm_json::Map::new();
+        inner.insert("b".into(), aterm_json::Value::Array(vec![]));
+        let mut root = aterm_json::Map::new();
+        root.insert("a".into(), aterm_json::Value::Object(inner));
+        root.insert(
+            "c".into(),
+            aterm_json::Value::Array(vec![
+                aterm_json::Value::Number(1u64.into()),
+                aterm_json::Value::String("x".into()),
+            ]),
+        );
+        assert_eq!(
+            jpretty(&JVal::Val(aterm_json::Value::Object(root))),
+            "{\n  \"a\": {\n    \"b\": []\n  },\n  \"c\": [\n    1,\n    \"x\"\n  ]\n}"
+        );
+        // Ordered objects keep insertion order in both layouts.
+        let ordered = JVal::Obj(vec![
+            ("formulae".into(), JVal::Arr(vec![])),
+            ("casks".into(), JVal::Arr(vec![])),
+        ]);
+        assert_eq!(
+            jpretty(&ordered),
+            "{\n  \"formulae\": [],\n  \"casks\": []\n}"
+        );
+        assert_eq!(jcompact(&ordered), "{\"formulae\":[],\"casks\":[]}");
+    }
+
+    #[test]
+    fn ordered_emission_follows_source_key_order() {
+        let source = br#"{"name":"jq","versions":{"stable":"1.8"},"installed":[],"analytics":{}}"#;
+        let guide = parse_order(source).expect("guide");
+        let value: aterm_json::Value = aterm_json::from_slice(
+            br#"{"analytics":1,"installed":[{"version":"1.7","sbom":null,"time":5}],"name":"jq","versions":{"stable":"1.8"},"zz_new":true}"#,
+        )
+        .unwrap();
+        let mut out = String::new();
+        write_ordered(&value, &guide, 0, &mut out);
+        // Source order first (guide-less keys last); the installed
+        // row takes brew's Tab order (sbom before version).
+        assert_eq!(
+            out,
+            "{\n  \"name\": \"jq\",\n  \"versions\": {\n    \"stable\": \"1.8\"\n  },\n  \"installed\": [\n    {\n      \"sbom\": null,\n      \"version\": \"1.7\",\n      \"time\": 5\n    }\n  ],\n  \"analytics\": 1,\n  \"zz_new\": true\n}"
+        );
+        assert!(parse_order(b"{\"a\":").is_none());
+        assert!(parse_order(br#"["x", {"k": null}]"#).is_some());
     }
 }

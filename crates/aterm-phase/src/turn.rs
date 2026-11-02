@@ -1321,6 +1321,11 @@ pub fn turn_history_stop(row: &str) -> bool {
     !row.is_empty() && !row.starts_with(char::is_whitespace) && !row.starts_with(['⏺', '●'])
 }
 
+fn is_monitor_event(row: &str) -> bool {
+    row.strip_prefix(['⏺', '●'])
+        .is_some_and(|rest| crate::text::trim_start(rest).starts_with("Monitor event:"))
+}
+
 fn turn_before(
     rows: &[String],
     read: impl Fn(&[(usize, &str)]) -> String,
@@ -1329,6 +1334,7 @@ fn turn_before(
     if !rows[head].starts_with(['⏺', '●']) {
         return None;
     }
+    let width = crate::question::screen_width(rows);
     let mut said: Vec<String> = Vec::new();
     let mut opened = false;
     let mut below = head;
@@ -1341,13 +1347,23 @@ fn turn_before(
             opened = true;
             break;
         }
-        if !is_tool_call(r) {
+        let own_row = is_tool_call(r)
+            || bare_call(rows, i, below)
+            || tool_group(rows, i, below, width)
+            || task_notice(rows, i, below)
+            || is_monitor_event(r)
+            || crate::phase::is_stop_hook_summary(r)
+            || crate::phase::vendor_paragraph(rows, i) == Some(i);
+        if !own_row {
             let last = (i..below)
                 .rev()
                 .find(|&k| !crate::text::trim(&rows[k]).is_empty())
                 .unwrap_or(i);
             if let Some((_, words)) = message_rows(rows, last).filter(|(h, _)| *h == i) {
-                said.push(read(&words));
+                let plain = crate::wrap::said_rows(&words);
+                if !is_idle_notice(&plain) && !is_hook_verdict(&plain) {
+                    said.push(read(&words));
+                }
             }
         }
         below = i;
@@ -2332,6 +2348,51 @@ mod tests {
             "  ? for shortcuts",
         );
         assert_eq!(turn_said_before(&cut), None);
+    }
+
+    #[test]
+    fn claudes_own_notice_rows_are_not_the_turns_earlier_words() {
+        for notice in [
+            &["⏺ Background command \"Build and tag the release\" completed (exit code 0)"][..],
+            &[
+                "⏺ Background command \"Build and tag the release\"",
+                "  completed (exit code 0) · 12s",
+            ],
+            &["⏺ Agent \"tag and release audit\" finished · 4s"],
+            &["⏺ Dynamic workflow \"deploy and tag\" completed · 5s"],
+            &["⏺ Monitor event: \"Build and tag the release\""],
+            &["⏺ Ran 2 stop hooks"],
+            &["⏺ Updated plan", "  ⎿  /tmp/plan.md"],
+            &["⏺ Ran agent · Build and tag the release (ctrl+o to expand)"],
+        ] {
+            let mut rows = vec!["✻ Worked for 2m 10s", ""];
+            rows.extend_from_slice(notice);
+            rows.extend([
+                "",
+                "⏺ NEEDS YOU: say \"go\" so I can rebuild the branch.",
+                "",
+            ]);
+            let drawn = framed(&rows, "  ? for shortcuts");
+            assert_eq!(turn_said_before(&drawn), None, "{notice:?}");
+            assert_eq!(turn_lines_before(&drawn, |_, _| false), None, "{notice:?}");
+            assert!(turn_whole(&drawn), "{notice:?}");
+        }
+        // Control: the agent's own earlier prose naming a background command or plan is still read.
+        let prose = framed(
+            &[
+                "❯ go on",
+                "",
+                "⏺ Background command \"Build and tag the release\" completed, so I'll tag next.",
+                "",
+                "⏺ NEEDS YOU: say \"go\" so I can rebuild the branch.",
+                "",
+            ],
+            "  ? for shortcuts",
+        );
+        assert_eq!(
+            turn_said_before(&prose).as_deref(),
+            Some("Background command \"Build and tag the release\" completed, so I'll tag next.")
+        );
     }
 
     #[test]

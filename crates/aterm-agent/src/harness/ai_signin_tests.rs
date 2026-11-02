@@ -691,6 +691,53 @@ warm = ["m1"]
         let _ = server_thread.join();
     }
 
+    /// A mail-code relay asks no steward while this Mac can read neither its roster nor its deny
+    /// list (its vault's `source.toml` other users may read, which every vault read refuses): no
+    /// steward can be told from a revoked Mac. Once the deny list reads (here: no vault
+    /// configured, a list that names no one), the issuer is asked.
+    ///
+    /// NEGATIVE CONTROL (2026-11-01): with `select_steward_relay_peers` reading an unreadable deny
+    /// list as one that names no one (`.unwrap_or_default()`, the shape before), this fails (`no
+    /// steward is asked while the deny list is unread`).
+    #[cfg(unix)]
+    #[test]
+    fn a_steward_relay_asks_no_one_while_the_deny_list_is_unread() {
+        use aterm_net::fleet_member::{Peer, Via};
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = aterm_secrets::client::Paths::for_home(home.path());
+        aterm_secrets::fsx::ensure_private_dir(&paths.dir).unwrap();
+        let source = paths.dir.join("source.toml");
+        std::fs::write(&source, b"name = \"team\"\n").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(aterm_secrets::client::swarm_denied_nodes(&paths).is_err());
+        let issuer = Peer {
+            node: Some("01010101010101010101010101010101".to_owned()),
+            key: None,
+            key_from: None,
+            host: "m1.local".to_owned(),
+            addr: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            port: 7101,
+            version: None,
+            seen_ms: Some(1_000),
+            via: Via::Issuer,
+            fleet: None,
+            signed: None,
+        };
+        let peers = vec![issuer];
+        let own = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(
+            select_steward_relay_peers(&peers, own, &[], Some(home.path())).is_empty(),
+            "no steward is asked while the deny list is unread"
+        );
+        std::fs::remove_file(&source).unwrap();
+        let asked: Vec<&str> = select_steward_relay_peers(&peers, own, &[], Some(home.path()))
+            .iter()
+            .map(|p| p.host.as_str())
+            .collect();
+        assert_eq!(asked, vec!["m1.local"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn select_steward_relay_peers_excludes_ordinary_members_and_orders_standbys_issuer() {
@@ -1235,4 +1282,44 @@ fn authorize_mail_code_rejects_forged_row_label_from_other_bound_member_and_hono
         .expect("node-m10 authorized by its own machine claim even when row.label is empty");
     assert_eq!(auth.label, "m10");
     assert_eq!(auth.recipient, m10_id.recipient());
+}
+#[test]
+fn credential_debug_redacts_account_bundle_and_route() {
+    let marker = "synthetic-private-signin-value";
+    let route = SealedRoute {
+        login: marker.into(),
+        webmail_url: Some(marker.into()),
+        imap_url: Some(marker.into()),
+        http_url: Some(marker.into()),
+        password: Some(marker.into()),
+        mailbox_password: Some(marker.into()),
+        totp_secret: Some(marker.into()),
+    };
+    let bundle = SealedAccountBundle {
+        password: Some(marker.into()),
+        mailbox_password: Some(marker.into()),
+        totp_secret: Some(marker.into()),
+        route: Some(route.clone()),
+    };
+    for output in [
+        format!("{route:?}"),
+        format!("{route:#?}"),
+        format!("{bundle:?}"),
+        format!("{bundle:#?}"),
+    ] {
+        assert!(!output.contains(marker));
+    }
+}
+
+#[test]
+fn credential_debug_redacts_mail_credential_before_encryption() {
+    let marker = "synthetic-private-mail-code";
+    let credential = SealedMailCredential {
+        kind: "otp".into(),
+        value: marker.into(),
+    };
+    for output in [format!("{credential:?}"), format!("{credential:#?}")] {
+        assert!(!output.contains(marker));
+        assert!(output.contains("SealedMailCredential"));
+    }
 }

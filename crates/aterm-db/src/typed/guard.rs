@@ -1,0 +1,291 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! What no ATT/1 cell may hold (design §3.4): a credential-shaped string, free text that names
+//! a secret (so a plain-word password cannot ride a note), a full phone number (it lives in the
+//! vault; a phone row keeps its last four digits), or an address outside a typed `email` cell
+//! (so every address is masked). A refusal names the rule and never quotes the
+//! value. Secret-named columns are refused at compile time ([`super::Collection::check`]).
+
+/// Why a value was refused: a rule, never the value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// A known token, key or seed shape.
+    CredentialShape,
+    /// Free text that names a secret.
+    SecretWord,
+    /// An address outside a typed `email` cell.
+    Address,
+    /// A control character.
+    Control,
+    /// Longer than the column allows.
+    Length,
+    /// A full phone number.
+    Phone,
+}
+
+impl Refusal {
+    /// The rule in words, with no part of the value.
+    pub const fn rule(self) -> &'static str {
+        match self {
+            Self::CredentialShape => "a credential-shaped value is never stored",
+            Self::SecretWord => "free text naming a secret is never stored; keep it in the vault",
+            Self::Address => "an address belongs in a typed email column",
+            Self::Control => "text holds no control characters",
+            Self::Length => "text is longer than its column allows",
+            Self::Phone => {
+                "a phone number lives in the vault; a phone row keeps its last four digits"
+            }
+        }
+    }
+}
+
+/// Token prefixes that mark a credential when they start a word.
+const PREFIXES: [&str; 16] = [
+    "github_pat_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "sk-ant-",
+    "sk-",
+    "xoxa-",
+    "xoxb-",
+    "xoxp-",
+    "xoxr-",
+    "xoxs-",
+    "AKIA",
+    "-----BEGIN",
+    "otpauth:",
+];
+
+/// Prefixes that mark a provider key only when a key's run of token characters follows (a
+/// Google API key, an xAI key, a Google OAuth access token), with the shortest such run, so a
+/// word such as `xai-web` stays.
+const KEYED: [(&str, usize); 3] = [("AIza", 30), ("xai-", 20), ("ya29.", 20)];
+
+/// A run of token characters this long reads as a key or secret.
+const LONG_RUN: usize = 40;
+
+/// The fewest characters of a base32 TOTP seed this guard refuses.
+const SEED_CHARS: usize = 16;
+
+/// Words that name a secret in free text, matched without case.
+const SECRET_WORDS: [&str; 16] = [
+    "password",
+    "passwd",
+    "passcode",
+    "passphrase",
+    "totp",
+    "otpauth",
+    "recovery code",
+    "backup code",
+    "private key",
+    "secret key",
+    "api key",
+    "api_key",
+    "apikey",
+    "2fa code",
+    "pw:",
+    "pwd:",
+];
+
+/// Whether a byte belongs to a token run.
+const fn token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-' | b'.')
+}
+
+/// Whether `text` carries a known credential shape: a token prefix at the start of a word, a
+/// provider key's prefix with its run, a base32 TOTP seed, or a long unbroken run of token
+/// characters.
+pub fn credential_shaped(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for (at, _) in text.char_indices() {
+        let boundary = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+        if !boundary {
+            continue;
+        }
+        let rest = &text[at..];
+        if PREFIXES.iter().any(|prefix| rest.starts_with(prefix)) {
+            return true;
+        }
+        if KEYED.iter().any(|(prefix, tail)| {
+            rest.strip_prefix(prefix)
+                .is_some_and(|after| after.bytes().take_while(|b| token_byte(*b)).count() >= *tail)
+        }) {
+            return true;
+        }
+    }
+    if base32_seed(text) {
+        return true;
+    }
+    let mut run = 0;
+    for b in bytes {
+        if b.is_ascii_alphanumeric() || b"+/=_-".contains(b) {
+            run += 1;
+            if run >= LONG_RUN {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// The fewest digits a phone number has.
+const PHONE_DIGITS: usize = 7;
+
+/// Whether `text` holds a phone number: a run of at least seven digits, standing apart from any
+/// word, that spaces, `-`, `.`, `(`, `)` and a leading `+` may separate. A leading calendar date
+/// (`2026-11-01`) is not counted, nor is a dotted IPv4 address.
+pub fn phone_shaped(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        let starts = matches!(bytes[at], b'0'..=b'9' | b'+' | b'(')
+            && (at == 0 || !bytes[at - 1].is_ascii_alphanumeric());
+        if !starts {
+            at += 1;
+            continue;
+        }
+        let mut groups: Vec<(usize, u8)> = Vec::new();
+        let mut digits = 0;
+        let mut separator = b' ';
+        let mut end = at;
+        let mut after_digit = at;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'0'..=b'9' => {
+                    digits += 1;
+                    after_digit = end + 1;
+                }
+                b @ (b' ' | b'-' | b'.' | b'(' | b')') => {
+                    if digits > 0 {
+                        groups.push((digits, separator));
+                        digits = 0;
+                    }
+                    separator = b;
+                }
+                b'+' if end == at => {}
+                _ => break,
+            }
+            end += 1;
+        }
+        if digits > 0 {
+            groups.push((digits, separator));
+        }
+        let apart = after_digit == bytes.len() || !bytes[after_digit].is_ascii_alphanumeric();
+        if apart && phone_groups(&groups) {
+            return true;
+        }
+        at = end.max(at + 1);
+    }
+    false
+}
+
+/// Whether one run's digit groups (each with the separator before it) read as a phone number.
+fn phone_groups(groups: &[(usize, u8)]) -> bool {
+    let dated = matches!(
+        groups,
+        [(4, _), (1 | 2, b'-' | b'.'), (1 | 2, b'-' | b'.'), ..]
+    );
+    let rest = if dated { &groups[3..] } else { groups };
+    let ipv4 = rest.len() == 4
+        && rest.iter().all(|(n, _)| *n <= 3)
+        && rest[1..].iter().all(|(_, separator)| *separator == b'.');
+    !ipv4 && rest.iter().map(|(n, _)| n).sum::<usize>() >= PHONE_DIGITS
+}
+
+/// Whether `word` is base32 in one case (`A`–`Z` or `a`–`z`, and `2`–`7`).
+fn base32(word: &str) -> bool {
+    let upper = word
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b));
+    let lower = word
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b));
+    !word.is_empty() && (upper || lower)
+}
+
+/// Whether `text` holds a base32 TOTP seed: one word of at least 16 base32 characters, or at
+/// least four space-separated groups of four (`JBSW Y3DP EHPK 3PXP`), holding a digit `2`–`7`
+/// (so plain words in capitals stay) and a letter past `f` (so a hex digest stays).
+fn base32_seed(text: &str) -> bool {
+    let digit = |word: &str| {
+        word.bytes().any(|b| (b'2'..=b'7').contains(&b))
+            && word.bytes().any(|b| b.to_ascii_lowercase() > b'f')
+    };
+    let words = text.split(|c: char| !c.is_ascii_alphanumeric());
+    if words
+        .into_iter()
+        .any(|word| word.len() >= SEED_CHARS && base32(word) && digit(word))
+    {
+        return true;
+    }
+    let groups: Vec<&str> = text.split(' ').collect();
+    groups.windows(SEED_CHARS / 4).any(|run| {
+        run.iter().all(|group| group.len() == 4 && base32(group))
+            && (run
+                .iter()
+                .all(|g| g.bytes().all(|b| !b.is_ascii_lowercase()))
+                || run
+                    .iter()
+                    .all(|g| g.bytes().all(|b| !b.is_ascii_uppercase())))
+            && run.iter().any(|group| digit(group))
+    })
+}
+
+/// Whether free text names a secret.
+pub fn names_secret(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    SECRET_WORDS.iter().any(|word| lower.contains(word))
+}
+
+/// Whether `text` is never shown, not even in a local review on the owner's own Mac: it is shaped
+/// like a credential or names a secret.
+pub fn withheld(text: &str) -> bool {
+    credential_shaped(text) || names_secret(text)
+}
+
+/// Check one free-text value of at most `max` bytes.
+///
+/// # Errors
+/// The rule it breaks; the value is never quoted.
+pub fn text(value: &str, max: usize) -> Result<(), Refusal> {
+    if value.len() > max {
+        return Err(Refusal::Length);
+    }
+    if value.chars().any(char::is_control) {
+        return Err(Refusal::Control);
+    }
+    if value.contains('@') {
+        return Err(Refusal::Address);
+    }
+    if credential_shaped(value) {
+        return Err(Refusal::CredentialShape);
+    }
+    if names_secret(value) {
+        return Err(Refusal::SecretWord);
+    }
+    if phone_shaped(value) {
+        return Err(Refusal::Phone);
+    }
+    Ok(())
+}
+
+/// Check a string a typed column holds other than free text (an enum word, a label, a URL):
+/// it may not carry a credential shape either.
+///
+/// # Errors
+/// The rule it breaks; the value is never quoted.
+pub fn word(value: &str) -> Result<(), Refusal> {
+    if value.chars().any(char::is_control) {
+        return Err(Refusal::Control);
+    }
+    if credential_shaped(value) {
+        return Err(Refusal::CredentialShape);
+    }
+    Ok(())
+}

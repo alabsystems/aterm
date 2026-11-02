@@ -288,6 +288,9 @@ impl TimerDrive {
             held: false,
             holds: Vec::new(),
             theme: None,
+            claim_ended: false,
+            not_claim_worker: false,
+            claim_worker: None,
         }
     }
 

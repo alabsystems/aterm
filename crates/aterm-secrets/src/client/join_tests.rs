@@ -438,7 +438,7 @@ fn a_vault_approved_only_by_code_records_every_asking_mac_until_it_is_in() {
     approver_pass(&admin, &|_| {}, &mut approver);
     assert_eq!(asking(&admin), []);
     assert!(
-        requests_for(&config(&admin).expect("config").expect("one"), None)
+        requests_for(&admin, &config(&admin).expect("config").expect("one"), None)
             .expect("listed")
             .iter()
             .any(|request| request.recipient == key),
@@ -578,7 +578,7 @@ fn a_mac_let_go_is_no_mac_asking_to_join_until_it_asks_again() {
 
         let opened = admin_open(&admin).expect("admin opens");
         admin_revoke(&admin, &opened, "mb", false).expect("revoked");
-        let queued = requests_for(&config(&admin).expect("config").expect("one"), None)
+        let queued = requests_for(&admin, &config(&admin).expect("config").expect("one"), None)
             .expect("listed")
             .into_iter()
             .find(|request| request.recipient == key)
@@ -683,7 +683,7 @@ fn a_fresh_approver_shows_no_mac_let_go_from_an_open_vault_until_it_asks_again()
         std::slice::from_ref(&key),
         "CONTROL: the open vault names the key it let go"
     );
-    let queued = requests_for(&config(&admin).expect("config").expect("one"), None)
+    let queued = requests_for(&admin, &config(&admin).expect("config").expect("one"), None)
         .expect("listed")
         .into_iter()
         .find(|request| request.recipient == key)
@@ -806,7 +806,7 @@ fn an_approver_away_while_a_mac_came_and_went_shows_no_ghost() {
     let opened = admin_open(&admin).expect("admin opens");
     admin_revoke(&admin, &opened, "mb", false).expect("revoked");
     assert!(
-        requests_for(&config(&admin).expect("config").expect("one"), None)
+        requests_for(&admin, &config(&admin).expect("config").expect("one"), None)
             .expect("listed")
             .iter()
             .any(|request| request.recipient == key),
@@ -1003,7 +1003,7 @@ fn a_mac_let_go_that_proves_the_renewed_password_is_let_in_within_the_hour() {
     assert!(!member(&admin), "held as the request it had standing");
     assert_eq!(asking(&admin), [], "and not shown");
 
-    let queued = requests_for(&config(&admin).expect("config").expect("one"), None)
+    let queued = requests_for(&admin, &config(&admin).expect("config").expect("one"), None)
         .expect("listed")
         .into_iter()
         .find(|request| request.recipient == key)
@@ -1131,7 +1131,7 @@ fn a_mac_let_in_by_code_while_the_approver_was_away_is_no_ghost_once_let_go() {
     assert_eq!(asking(&admin), [], "CONTROL: the Mac let go asked nothing");
 
     // It asks again an hour on, and is shown: its key is on a `code-only` line the approver knew.
-    let queued = requests_for(&config(&admin).expect("config").expect("one"), None)
+    let queued = requests_for(&admin, &config(&admin).expect("config").expect("one"), None)
         .expect("listed")
         .into_iter()
         .find(|request| request.recipient == key)
@@ -1288,7 +1288,7 @@ fn shown_on_a_line_it_knew(
     approver_pass(&admin, &|_| {}, &mut approver);
     assert_eq!(asking(&admin), [], "CONTROL: the Mac let go asked nothing");
 
-    let queued = requests_for(&config(&admin).expect("config").expect("one"), None)
+    let queued = requests_for(&admin, &config(&admin).expect("config").expect("one"), None)
         .expect("listed")
         .into_iter()
         .find(|request| request.recipient == key)
@@ -2852,6 +2852,7 @@ fn deaf() -> Hearing<'static> {
         routes: false,
         ask: &ask_nobody,
         hold: &hold_nothing,
+        away: &|| false,
     }
 }
 
@@ -2931,6 +2932,7 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
                     routes: false,
                     ask: &ask,
                     hold: &hold_nothing,
+                    away: &|| false,
                 },
             )
         });
@@ -3120,6 +3122,7 @@ fn swarm_off_asks_no_alab_member_from_a_waiting_subscriber() {
                     routes: false,
                     ask: &ask,
                     hold: &hold,
+                    away: &|| false,
                 },
             )
         });
@@ -3365,6 +3368,7 @@ fn a_failing_subscriber_ends_its_nap_on_a_browse_add() {
                     routes: false,
                     ask: &ask_nobody,
                     hold: &hold_nothing,
+                    away: &|| false,
                 },
             )
         });
@@ -3435,6 +3439,7 @@ fn a_pass_healthy_after_errors_starts_a_runner() {
                     routes: false,
                     ask: &ask_nobody,
                     hold: &hold_nothing,
+                    away: &|| false,
                 },
             )
         });
@@ -3533,6 +3538,7 @@ fn a_server_that_vanishes_and_returns_at_a_new_address_is_applied() {
                     routes: false,
                     ask: &ask_nobody,
                     hold: &hold_nothing,
+                    away: &|| false,
                 },
             )
         });

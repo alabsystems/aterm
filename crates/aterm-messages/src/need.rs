@@ -444,9 +444,7 @@ impl Fingerprint {
         let subject = if subject.chars().count() <= room {
             subject
         } else {
-            let hash = subject.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-            });
+            let hash = aterm_hash::fnv1a_64(subject.as_bytes());
             if room >= 5 {
                 let keep = (room - 5).min(12);
                 let head: String = subject.chars().take(keep).collect();

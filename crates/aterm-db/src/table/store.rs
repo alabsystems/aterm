@@ -57,8 +57,8 @@ pub(crate) fn with_replay_observer<T>(
     read()
 }
 
-const MAX_RECORDS: usize = 8192;
-const MAX_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_RECORDS: usize = 8192;
+pub(crate) const MAX_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CONFLICTS: usize = aterm_secrets::commons::constraints::MAX_BINDINGS;
 const DISCARDED_OVERHEAD: usize = 5 + 32 + 4;
 const JOURNAL_RECORDS: usize = MAX_RECORDS * 2 + MAX_CONFLICTS;
@@ -101,8 +101,8 @@ impl Capacity {
 fn charge(subject: &str, wire: usize) -> usize {
     wire.saturating_add(8 + subject.len() + aterm_journal::APPEND_OVERHEAD)
 }
-const WRITER_RECORDS: usize = 4096;
-const WRITER_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const WRITER_RECORDS: usize = 4096;
+pub(crate) const WRITER_BYTES: usize = 8 * 1024 * 1024;
 const SUBJECT: &str = "commons/table/1";
 const CONFLICT_SUBJECT: &str = "commons/table-conflict/1";
 const ANCHOR_LEN: usize = 5 + super::SCOPE_LEN + 48 + 16;
@@ -1333,6 +1333,43 @@ impl Store {
             .map(|record| record.header().id)
             .collect::<Vec<_>>();
         self.commit_from(session, payload, &retained, BTreeSet::new())
+    }
+
+    /// Append `payload` on this writer's own chain: its one causal dependency is its own previous
+    /// record (the `commit_liability` shape), checked against the catalog projection, so this
+    /// writer's withheld or forked history still refuses the append. A peer's head never becomes
+    /// a parent, so no merge record is spent and one writer's append-only rows never wait on
+    /// another's (docs/DESIGN-alab-lab-model-2026-11-01.md §3.9, the journal ring's appends).
+    ///
+    /// # Errors
+    /// As `commit_catalog`, except that a wide frontier never refuses the append.
+    pub(crate) fn commit_own(&mut self, session: &Session<'_>, payload: &[u8]) -> Result<Receipt> {
+        let projection = self.catalog_projection(session)?;
+        self.commit_from(session, payload, &projection.ordered, BTreeSet::new())
+    }
+
+    /// The records and wire bytes this replica retains, in all and authored by `actor`: withheld
+    /// and excluded records count too, since they hold storage, so a share never resets when a
+    /// projection hides a writer's records.
+    ///
+    /// # Errors
+    /// Table custody changed under this handle.
+    pub(crate) fn retained_use(
+        &self,
+        session: &Session<'_>,
+        actor: Actor,
+    ) -> Result<crate::catalog::ring::Used> {
+        self.check(session)?;
+        let mut used = crate::catalog::ring::Used::default();
+        for stored in self.records.values() {
+            used.records += 1;
+            used.bytes = used.bytes.saturating_add(stored.wire.len());
+            if stored.header.actor == actor {
+                used.writer_records += 1;
+                used.writer_bytes = used.writer_bytes.saturating_add(stored.wire.len());
+            }
+        }
+        Ok(used)
     }
 
     fn previous(&self, retained: &[Digest]) -> Option<&Header> {

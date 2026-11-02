@@ -34,7 +34,7 @@ fn a_vault_join_counts_the_fleets_key_only_for_the_current_code_and_a_driver() {
             (now, Some(now)),
             true,
             (None, &[], None),
-            (&[], None, 0)
+            (Some(&[]), None, 0)
         )
         .is_err(),
         "a channel with no node proof"
@@ -45,7 +45,7 @@ fn a_vault_join_counts_the_fleets_key_only_for_the_current_code_and_a_driver() {
         (now, Some(now)),
         true,
         (None, &[], None),
-        (&[], None, 0),
+        (Some(&[]), None, 0),
     )
     .unwrap();
     assert_eq!(
@@ -67,7 +67,7 @@ fn a_vault_join_counts_the_fleets_key_only_for_the_current_code_and_a_driver() {
             (old, Some(now)),
             true,
             (None, &[], None),
-            (&[], None, 0)
+            (Some(&[]), None, 0)
         )
         .unwrap()
         .fleet,
@@ -79,7 +79,7 @@ fn a_vault_join_counts_the_fleets_key_only_for_the_current_code_and_a_driver() {
             (now, None),
             true,
             (None, &[], None),
-            (&[], None, 0)
+            (Some(&[]), None, 0)
         )
         .unwrap()
         .fleet,
@@ -91,7 +91,7 @@ fn a_vault_join_counts_the_fleets_key_only_for_the_current_code_and_a_driver() {
             (now, Some(now)),
             false,
             (None, &[], None),
-            (&[], None, 0)
+            (Some(&[]), None, 0)
         )
         .unwrap()
         .fleet,
@@ -107,7 +107,7 @@ fn a_vault_join_counts_the_fleets_key_only_for_the_current_code_and_a_driver() {
             (now, Some(now)),
             true,
             (Some(removed), &[], Some(&log)),
-            (&[], None, 0)
+            (Some(&[]), None, 0)
         )
         .unwrap()
         .book
@@ -121,7 +121,7 @@ fn a_vault_join_counts_the_fleets_key_only_for_the_current_code_and_a_driver() {
         (now, Some(now)),
         true,
         (Some(seated), &[], Some(&log_seated)),
-        (&[], None, 0),
+        (Some(&[]), None, 0),
     )
     .unwrap();
     assert!(
@@ -134,7 +134,7 @@ fn a_vault_join_counts_the_fleets_key_only_for_the_current_code_and_a_driver() {
             (now, Some(now)),
             true,
             (Some(p.key), &[], Some(&log_seated)),
-            (&[], None, 0),
+            (Some(&[]), None, 0),
         )
         .unwrap()
         .book
@@ -147,7 +147,7 @@ fn a_vault_join_counts_the_fleets_key_only_for_the_current_code_and_a_driver() {
             (now, Some(now)),
             true,
             (Some(removed), std::slice::from_ref(&p.node), Some(&log)),
-            (&[], None, 0)
+            (Some(&[]), None, 0)
         )
         .is_err(),
         "a node on the deny rows"
@@ -384,7 +384,7 @@ impl Member {
                     (mark, Some(vault)),
                     true,
                     (None, &[], None),
-                    (&[], from, 0),
+                    (Some(&[]), from, 0),
                 );
                 let (desk, paths, seen) = (Arc::clone(&desk), paths.clone(), Arc::clone(&seen));
                 served.answer(move |stream| {
@@ -403,7 +403,7 @@ impl Member {
                                 &judged,
                                 Some(&desk),
                                 &paths,
-                                &decide,
+                                (&decide, &|_| None),
                             ));
                         }
                         Err(why) => drop(aterm_secrets::members::refuse(stream, &why)),
@@ -546,4 +546,12 @@ fn a_vault_join_over_the_fleets_channel_reaches_the_desk_only_as_the_channel_pro
         "node -: the listener says why: {said:?}"
     );
     assert!(member.seen().is_empty(), "node -: no desk");
+}
+
+/// A fleet book that could not be read lets no seat move; one read and empty has no older member.
+/// NEGATIVE CONTROL: an unread book taken as an empty list: `moved_seats_read` is true and this fails.
+#[test]
+fn an_unread_book_lets_no_seat_move() {
+    assert_eq!(book_word_read(None, &[7; 32], None, 1), Book::default());
+    assert!(book_word_read(Some(&[]), &[7; 32], None, 1).moved_seats_read);
 }

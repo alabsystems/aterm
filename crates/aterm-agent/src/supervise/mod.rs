@@ -35,7 +35,7 @@ pub use facts::{Fact, FactsReading, HeldCall, HeldReading};
 pub use journal::{Journal, read_journal};
 pub use ledger::{
     ANCHOR_REMOVED, Format as LedgerFormat, LedgerHost, LedgerOpts, gather, parse_since,
-    parse_since_local, render as render_ledger,
+    parse_since_local, render as render_ledger, render_local as render_ledger_local,
 };
 pub use phase::{
     Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, survey_open,

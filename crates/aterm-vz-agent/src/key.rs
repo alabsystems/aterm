@@ -53,7 +53,7 @@ pub fn parse(bytes: &[u8]) -> Option<Key> {
 /// Whether two keys are the same, in time that does not depend on where they differ.
 #[must_use]
 pub fn same(a: &Key, b: &Key) -> bool {
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    aterm_digest::ct_eq(a, b)
 }
 
 /// The key the disk (or device) at `path` holds: `Ok(None)` where it is not a key disk.

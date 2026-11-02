@@ -517,7 +517,7 @@ pub fn serve_until(
     running.store(false, Ordering::Release);
     let _ = outbound.join();
     let error = stopped.lock().unwrap_or_else(|p| p.into_inner()).take();
-    error.map_or(Ok(()), |reason| Err(Error(reason)))
+    error.map_or(Ok(()), |reason| Err(Error::new(&reason)))
 }
 
 #[cfg(test)]

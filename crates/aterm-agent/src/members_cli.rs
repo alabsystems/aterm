@@ -55,6 +55,23 @@ const DIAL_WITHIN: Duration = Duration::from_secs(5);
 /// The port a member's fleet listener serves when `--at` names none.
 const FLEET_PORT: u16 = 7100;
 
+/// This Mac's network place in the words every reporter uses (`network: …`); none off Unix or
+/// with no state directory.
+fn network_header() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let state = aterm_types::dirs::state_dir()?;
+        Some(aterm_netplace::words::header(
+            &aterm_netplace::read(&state),
+            &aterm_netplace::words::Words::now(),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// `aterm members …`: `argv[1..]` in, exit code out.
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     let args: Vec<String> = argv
@@ -67,6 +84,11 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("requests") if args.len() == 1 => {
+            // The requests a member hears are the ones on its network: where this Mac is says
+            // why none come from a phone hotspot. On stderr, so the reply stays the wire's.
+            if let Some(header) = network_header() {
+                eprintln!("{header}");
+            }
             aterm_ctl::main_entry(vec!["members".into(), "requests".into()])
         }
         Some("allow" | "ignore") if args.len() == 2 && valid_window_target(&args[1]) => {
@@ -455,6 +477,8 @@ enum Follows {
     Absent,
     /// It does not run: why.
     Failed(String),
+    /// The first fetch has not configured a vault; the durable intent is retained.
+    Bootstrapping(Box<Self>, String),
 }
 
 impl Follows {
@@ -504,6 +528,7 @@ impl Follows {
                 "this Mac's vault subscriber does not run ({why}), so it follows no vault change: \
                  {ON}"
             )),
+            Self::Bootstrapping(follows, _) => follows.fix(),
         }
     }
 }
@@ -666,14 +691,18 @@ fn join_tried(
             return Tried::Ended(2);
         }
     };
-    match join::run_phrase(
+    let ran = join::run_phrase(
         &me.paths,
         dial,
         &joining,
         &heard,
         &phrase,
         args.member.as_deref(),
-    ) {
+        &mut |line| {
+            let _ = writeln!(err, "aterm members join: {line}");
+        },
+    );
+    match ran {
         Ok(joined) => {
             // The bundle set this Mac up for the vault; only its subscriber follows it from here.
             let follows = (reach.follow)(&me.paths.home);
@@ -697,7 +726,7 @@ fn join_tried(
 /// a Pending state and a queued request. Nothing is asked of a person: no password, and no
 /// signer but the ALab vault's own, which this build pins.
 fn join_alab_vault(paths: &Paths) -> aterm_secrets::Result<()> {
-    client::join(
+    client::join_if_unchanged(
         paths,
         &client::JoinOptions {
             source: String::new(),
@@ -710,6 +739,7 @@ fn join_alab_vault(paths: &Paths) -> aterm_secrets::Result<()> {
             requested: &|| {},
             say: &|_| {},
         },
+        None,
     )
     .map(drop)
 }
@@ -719,14 +749,22 @@ fn join_alab_vault(paths: &Paths) -> aterm_secrets::Result<()> {
 /// While this Mac waits on the ALab vault, that subscriber asks ALab's members again, after 1,
 /// 2, 4 and 8 minutes and then every 15 (`aterm_secrets::client::ask_members_if_due`), so a
 /// member that was asleep, away or restarting its window when this asked shows the row too.
-/// `Err` says why no vault is set up.
+/// Before the first fetch, a separate durable intent lets the subscriber retry setup even if
+/// no source was authenticated yet. That intent is never membership. `Err` says why setup
+/// could not be made retryable.
 fn wait_at_vault(paths: &Paths, reach: &Reach<'_>) -> Result<Follows, String> {
     let unset = || !matches!(client::config(paths), Ok(Some(_)));
-    if unset()
-        && let Err(error) = (reach.join_vault)(paths)
-        && unset()
-    {
-        return Err(error.to_string());
+    if unset() {
+        client::prepare_alab_join_retry(paths).map_err(|error| error.to_string())?;
+        if unset()
+            && let Err(error) = (reach.join_vault)(paths)
+            && unset()
+        {
+            return Ok(Follows::Bootstrapping(
+                Box::new((reach.follow)(&paths.home)),
+                error.to_string(),
+            ));
+        }
     }
     Ok((reach.follow)(&paths.home))
 }
@@ -749,6 +787,14 @@ fn said_no_wait(
         Err(why) => Some(Some(why)),
     };
     match (heard, waits) {
+        (_, Ok(Follows::Bootstrapping(follows, why))) => {
+            let next = if *follows == Follows::Runs {
+                "this Mac's vault subscriber retries setup automatically"
+            } else {
+                "setup is saved here for the vault subscriber"
+            };
+            let _ = writeln!(out, "ALab vault setup has not finished ({why}); {next}");
+        }
         (None, _) => {
             let _ = writeln!(out, "{}", join::LET_IN);
         }
@@ -1426,6 +1472,61 @@ mod tests {
             2,
             "each run makes sure it follows"
         );
+    }
+
+    /// A first fetch failure must leave a subscriber able to retry, without claiming membership.
+    #[test]
+    fn a_first_vault_fetch_failure_keeps_headless_bootstrap_running() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths::for_home(root.path());
+        let followed = std::sync::atomic::AtomicBool::new(false);
+        let follow = |_: &Path| {
+            followed.store(true, std::sync::atomic::Ordering::Relaxed);
+            Follows::Runs
+        };
+        let reach = Reach {
+            browse: &|| Ok(Vec::new()),
+            dial: &|_| panic!("no member dial"),
+            join_vault: &|_| Err(aterm_secrets::Error::new("first fetch unavailable")),
+            follow: &follow,
+        };
+        let waiting = wait_at_vault(&paths, &reach);
+        assert!(waiting.is_ok());
+        assert!(followed.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(client::config(&paths).unwrap().is_none());
+        assert_eq!(
+            client::status(&paths).unwrap().membership,
+            client::Membership::Unconfigured
+        );
+        assert!(!paths.home.join(".secrets").exists());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(said_no_wait(Ok(&[]), &[], waiting, &mut out, &mut err), 0);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("retries setup automatically"), "{out}");
+        assert!(
+            !out.contains(join::LET_IN),
+            "no membership or queued vault request yet: {out}"
+        );
+    }
+
+    #[test]
+    fn a_headless_bootstrap_keeps_sharing_off_before_fetch_or_follow() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(root.path());
+        std::fs::create_dir_all(root.path().join(".config/aterm")).unwrap();
+        std::fs::write(
+            root.path().join(".config/aterm/aterm.toml"),
+            "[swarm]\nenabled = false\n",
+        )
+        .unwrap();
+        let reach = Reach {
+            browse: &|| panic!("no browse"),
+            dial: &|_| panic!("no dial"),
+            join_vault: &|_| panic!("sharing off: no fetch"),
+            follow: &|_| panic!("sharing off: no follower"),
+        };
+        assert!(wait_at_vault(&paths, &reach).is_err());
+        assert!(client::config(&paths).unwrap().is_none());
     }
 
     /// install.sh's windowless `members join --no-wait` sets the Mac up at the ALab vault (its

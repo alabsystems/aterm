@@ -6,7 +6,6 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-#[cfg(test)]
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
@@ -31,6 +30,9 @@ mod urgency_replay_tests;
 #[cfg(test)]
 #[path = "temporal_urgency_tests.rs"]
 mod urgency_tests;
+#[cfg(test)]
+#[path = "temporal_writer_tests.rs"]
+mod writer_tests;
 pub(crate) use urgency::Demand as RecordingDemand;
 
 /// Keep recording fresh while an actual rewind consumer owns it.
@@ -361,12 +363,14 @@ fn writer() -> Result<&'static Sender<Queued>, String> {
                 },
                 move || {
                     let _gone = WriterGone;
-                    let mut role = urgency::WriterRole::new(urgency::global().clone());
+                    let demands = urgency::global().clone();
+                    demands.adopt_writer(std::thread::current());
+                    let mut role = urgency::WriterRole::new(demands.clone());
                     role.poll();
-                    let mut next = rx.recv().ok();
-                    while let Some(first) = next {
-                        let mut cur = Some(first);
-                        while let Some(queued) = cur {
+                    serve(
+                        &mut WriterChannel(rx),
+                        || demands.is_urgent(),
+                        |queued| {
                             role.poll();
                             let Queued {
                                 mut completion,
@@ -383,22 +387,8 @@ fn writer() -> Result<&'static Sender<Queued>, String> {
                             completion.route.state.pool.relieve();
                             drop(completion);
                             role.poll();
-                            cur = rx.try_recv().ok();
-                        }
-                        if pool().relief_due() {
-                            match rx.recv_timeout(std::time::Duration::from_millis(20)) {
-                                Ok(more) => {
-                                    next = Some(more);
-                                    continue;
-                                }
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                    pool().relieve_allocator_if_due();
-                                }
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                            }
-                        }
-                        next = rx.recv().ok();
-                    }
+                        },
+                    );
                 },
             )
             .map(|_| tx)
@@ -406,6 +396,68 @@ fn writer() -> Result<&'static Sender<Queued>, String> {
         })
         .as_ref()
         .map_err(Clone::clone)
+}
+
+/// How long the shared writer naps once it has emptied its queue ([`serve`]). A writer waiting on
+/// its channel is woken by every send, so a reader streaming output wakes it once per slice, each
+/// wake a context switch on the cores the reader and its PTY drain run on; napping off the channel
+/// instead, it takes the slices that queued meanwhile as one batch. A new demand ends a nap at once
+/// ([`urgency::Demands::acquire`]), so a drain, a view or a queue that reaches its pressure mark
+/// never waits on one.
+const WRITER_BATCH_NAP: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Where the shared writer takes its messages from ([`serve`]).
+trait Inbox<Q> {
+    /// The next message, waiting on the channel, where a send wakes the writer; `None` once every sender is gone.
+    fn wait(&mut self) -> Option<Q>;
+    /// A message already queued, without waiting.
+    fn take(&mut self) -> Option<Q>;
+    /// Wait up to [`WRITER_BATCH_NAP`] off the channel, where a send does not wake the writer.
+    fn nap(&mut self);
+}
+
+/// Write every message `inbox` brings, in the order queued. Once its queue is empty the writer naps
+/// and takes what queued meanwhile, unless `urgent()`; it waits on the channel only when a nap
+/// brought nothing, or while a demand is live.
+fn serve<Q>(inbox: &mut impl Inbox<Q>, urgent: impl Fn() -> bool, mut write: impl FnMut(Q)) {
+    while let Some(first) = inbox.wait() {
+        let mut next = Some(first);
+        while let Some(queued) = next {
+            write(queued);
+            next = inbox.take();
+            if next.is_none() && !urgent() {
+                inbox.nap();
+                next = inbox.take();
+            }
+        }
+    }
+}
+
+/// The shared writer's channel, whose wait first gives an idle writer the allocator relief it owes
+/// once it has freed enough ([`RewindPool::relieve_allocator_if_due`]).
+struct WriterChannel(Receiver<Queued>);
+
+impl Inbox<Queued> for WriterChannel {
+    fn wait(&mut self) -> Option<Queued> {
+        if pool().relief_due() {
+            match self.0.recv_timeout(std::time::Duration::from_millis(20)) {
+                Ok(more) => return Some(more),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    pool().relieve_allocator_if_due();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+        self.0.recv().ok()
+    }
+
+    fn take(&mut self) -> Option<Queued> {
+        self.0.try_recv().ok()
+    }
+
+    fn nap(&mut self) {
+        std::thread::park_timeout(WRITER_BATCH_NAP);
+    }
 }
 
 /// A queue whose messages a test takes from the returned end instead of the shared writer.
@@ -1723,6 +1775,24 @@ impl TemporalRecorder {
         Ticks(u64::try_from(micros).unwrap_or(u64::MAX))
     }
 
+    /// The tick a new event takes: [`Self::now`], or one past the newest event's when the clock
+    /// reads no later than it, so no two events share a tick. A writer recording a batch, as it does
+    /// after a nap ([`WRITER_BATCH_NAP`]) or when it drains a backlog, can record several slices
+    /// in one microsecond; on one tick they would be one Rewind state ([`Self::rewind_instants`]),
+    /// so the states between them would be lost to a view. A frozen test clock stamps every event
+    /// at its tick (`freeze_now_for_test`).
+    fn stamp(&self) -> Ticks {
+        let now = self.now();
+        #[cfg(test)]
+        if self.frozen_now.is_some() {
+            return now;
+        }
+        match self.log.newest_live() {
+            Some(newest) if newest.ts >= now => Ticks(newest.ts.0.saturating_add(1)),
+            _ => now,
+        }
+    }
+
     /// The sleep-counting clock the timeline runs on, in nanoseconds (`std::time::Instant` stops while macOS sleeps).
     fn clock_ns(&self) -> Option<u64> {
         let ns = aterm_uds::process::continuous_ns();
@@ -1757,7 +1827,7 @@ impl TemporalRecorder {
     }
 
     fn record(&mut self, op: Op) -> Option<Rekey> {
-        let ts = self.now();
+        let ts = self.stamp();
         self.append(op, ts);
         self.due()
     }
@@ -1774,7 +1844,7 @@ impl TemporalRecorder {
         if self.keyframes.is_empty() || self.chain_diverged {
             return None;
         }
-        let ts = self.now();
+        let ts = self.stamp();
         let id = WitnessId(self.next_witness);
         self.next_witness += 1;
         let seq = self.append(Op::Witness(id), ts);
@@ -1970,7 +2040,7 @@ impl TemporalRecorder {
         coalesceable: bool,
         config: Option<Arc<TerminalConfig>>,
     ) {
-        let ts = self.now();
+        let ts = self.stamp();
         let id = KeyframeId(self.next_keyframe);
         self.next_keyframe += 1;
         let seq = self.append(Op::Keyframe(id), ts);
@@ -5855,7 +5925,42 @@ mod tests {
         assert!(r.spine_watermark().keyframe_wanted());
     }
 
-    /// A witness and the slice after it on one tick, as when the writer drains a backlog: a replay to that tick folds the slice, so only the next witness covers it.
+    /// Slices recorded while the clock reads no later than the newest event, as a writer recording
+    /// a batch within one microsecond sees it, each take the tick past the one before and stay
+    /// their own Rewind state.
+    #[test]
+    fn slices_recorded_within_one_microsecond_keep_their_own_ticks_and_states() {
+        let mut live = Terminal::new(6, 30);
+        let mut r = seeded(&live);
+        let put = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8]| {
+            live.process_at(bytes, clock(0));
+            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(0))));
+        };
+        let ahead = Ticks(r.now().0 + 60_000_000);
+        r.freeze_now_for_test(Some(ahead));
+        put(&mut live, &mut r, b"one");
+        r.freeze_now_for_test(None);
+        let states = r.rewind_instants().len();
+        put(&mut live, &mut r, b"\r\ntwo");
+        put(&mut live, &mut r, b"\r\nthree");
+        let ticks: Vec<Ticks> = r.log.live().map(|e| e.ts).collect();
+        assert!(
+            ticks.windows(2).all(|pair| pair[0] < pair[1]),
+            "every event has its own tick: {ticks:?}"
+        );
+        assert_eq!(
+            r.latest_tick(),
+            Ticks(ahead.0 + 2),
+            "the clock read behind the newest event, so each slice took the tick past it"
+        );
+        assert_eq!(
+            r.rewind_instants().len(),
+            states + 2,
+            "each slice is its own state"
+        );
+    }
+
+    /// A witness and the slice after it on one tick, as a frozen clock stamps them (the writer's own stamps never share one, [`TemporalRecorder::stamp`]): a replay to that tick folds the slice, so only the next witness covers it.
     #[test]
     fn a_slice_on_its_witness_tick_is_covered_by_the_next_witness() {
         for poisoned in [false, true] {

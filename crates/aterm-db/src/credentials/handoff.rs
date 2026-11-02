@@ -128,7 +128,7 @@ impl Round<'_> {
         self.check()?;
         let now = now_ms();
         let facts = facts(&self.logical_paths()?, now)?;
-        crate::documents::application::observe_store(
+        crate::documents::application::observe_store_if_declared(
             self.paths,
             descriptor,
             |session, store, scope| {
@@ -167,6 +167,7 @@ impl Round<'_> {
                 Ok(offers.first().map(|(offer, request)| (*request, *offer)))
             },
         )
+        .map(Option::flatten)
     }
 }
 

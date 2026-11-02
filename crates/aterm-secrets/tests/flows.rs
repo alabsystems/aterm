@@ -855,8 +855,16 @@ fn the_install_lane_returns_within_its_bound_and_leaves_a_pending_request() {
         let phrase = Phrase::parse(&words).expect("three words");
         let (heard, _) = join::ask_all(&dial, &joining, &ats);
         assert_eq!(heard[0].answer, desk::Answer::Allowed);
-        let joined = join::run_phrase(&machine, &dial, &joining, &heard, &phrase, None)
-            .expect("the phrase let it in");
+        let joined = join::run_phrase(
+            &machine,
+            &dial,
+            &joining,
+            &heard,
+            &phrase,
+            None,
+            &mut |_| {},
+        )
+        .expect("the phrase let it in");
         assert_eq!((joined.member.as_str(), joined.name.as_str()), ("ma", "mb"));
         assert!(
             matches!(joined.admission, join::Admission::Asked(Ok(_))),
@@ -886,6 +894,388 @@ fn the_install_lane_returns_within_its_bound_and_leaves_a_pending_request() {
         client::status(&machine).expect("status").membership,
         Membership::In { .. }
     ));
+}
+
+/// A member whose vault state a pass holds (a sync, a converge) when the new Mac types the
+/// phrase answers busy before its run touches the phrase: the phrase stays live and the row
+/// stays allowed, and the new Mac asks that member again by itself and gets in once the pass
+/// ends, with the one Allow and the one phrase.
+///
+/// NEGATIVE CONTROL: leave the state to the handover (no `take_handover_hold` before
+/// `Desk::begin` in `desk::run`): the run takes the phrase, the handover finds the state held,
+/// and the phrase burns (`left: Some(Burned)`, `right: Some(Live)`).
+#[test]
+fn a_member_busy_with_a_vault_pass_keeps_the_phrase_and_lets_the_new_mac_in_once_it_ends() {
+    const HANG: Duration = Duration::from_secs(60);
+    let lab = Lab::changing("busy");
+    let admin = lab.home("ma");
+    let token = synthetic("gh");
+    write_private(&admin.home.join(".secrets").join("gh_access_token"), &token);
+    client::create(
+        &admin,
+        &lab.url,
+        Some(&admin.home.join(".secrets")),
+        Some("ma"),
+    )
+    .expect("create");
+    let member = Mutex::new(desk::Desk::new(
+        desk::Local::of(&admin)
+            .expect("member state")
+            .expect("a Commons member"),
+    ));
+    let machine = lab.home("mb");
+    client::machine_identity(&machine).expect("identity");
+    let device = Device::open(&machine)
+        .expect("device")
+        .expect("an identity");
+    let joining = joiner::Joining {
+        device: &device,
+        node: [7; 32],
+        name: "mb".into(),
+        model: "Mac15,3".into(),
+    };
+    let bundle = |handing: &desk::Handing<'_>| client::hand_over(&admin, handing);
+    let (ended, ends) = std::sync::mpsc::channel::<Result<bool, String>>();
+    std::thread::scope(|scope| {
+        let dial = |_: &str| -> aterm_secrets::Result<Box<dyn join::Stream>> {
+            let (ours, theirs) = UnixStream::pair()?;
+            for end in [&ours, &theirs] {
+                end.set_read_timeout(Some(HANG))?;
+            }
+            let (member, bundle, ended) = (&member, &bundle, ended.clone());
+            scope.spawn(move || {
+                let mut ours = ours;
+                let served = desk::serve(member, &mut ours, [10, 0, 0, 9].into(), bundle);
+                let _ = ended.send(
+                    served
+                        .map(|let_in| let_in.is_some())
+                        .map_err(|e| e.to_string()),
+                );
+            });
+            Ok(Box::new(theirs))
+        };
+        let ats = ["ma".to_owned()];
+        let (heard, missed) = join::ask_all(&dial, &joining, &ats);
+        assert_eq!(heard.len(), 1, "{missed:?}");
+        ends.recv_timeout(HANG)
+            .expect("the ask ended")
+            .expect("asked");
+        let (pid, words) = {
+            let mut desk = member.lock().unwrap();
+            let now = aterm_time::Instant::now();
+            let row = desk.rows(now)[0].id;
+            let phrase = desk.allow(row, now).expect("Allow");
+            (phrase, desk.words(phrase, now).expect("live").join(" "))
+        };
+        let phrase = Phrase::parse(&words).expect("three words");
+        let (heard, _) = join::ask_all(&dial, &joining, &ats);
+        assert_eq!(heard[0].answer, desk::Answer::Allowed);
+        ends.recv_timeout(HANG)
+            .expect("the ask ended")
+            .expect("asked");
+
+        // A vault pass on the member holds its state as the phrase is typed.
+        let pass = client::take_handover_hold(&admin)
+            .expect("the state lock")
+            .expect("no pass holds it yet");
+        // The pass ends once the member answered the first run; what the member held then.
+        let desk_ref = &member;
+        let seen = scope.spawn(move || {
+            let first = ends.recv_timeout(HANG).expect("the first run ended");
+            let held = {
+                let desk = desk_ref.lock().unwrap();
+                (
+                    desk.phrase_state(pid),
+                    desk.rows(aterm_time::Instant::now())[0].state,
+                )
+            };
+            drop(pass);
+            (first, held)
+        });
+        let joined = join::run_phrase(
+            &machine,
+            &dial,
+            &joining,
+            &heard,
+            &phrase,
+            None,
+            &mut |_| {},
+        );
+        let (first, (phrase_state, row_state)) = seen.join().expect("the pass");
+        assert!(first.is_err(), "the busy member let nobody in: {first:?}");
+        assert_eq!(
+            phrase_state,
+            Some(aterm_secrets::members::PhraseState::Live),
+            "the busy member never touched the phrase"
+        );
+        assert_eq!(row_state, desk::RowState::Allowed(pid));
+        let joined = joined.expect("the phrase let it in once the pass ended");
+        assert_eq!((joined.member.as_str(), joined.name.as_str()), ("ma", "mb"));
+        assert_eq!(
+            read(&machine, "gh_access_token").as_deref(),
+            Some(token.as_str())
+        );
+        assert_eq!(
+            member.lock().unwrap().rows(aterm_time::Instant::now())[0].state,
+            desk::RowState::Closed
+        );
+    });
+}
+
+/// A member that stays busy names how long the phrase has left (`left=`): the new Mac says once
+/// that the member is busy and stops asking once the phrase can no longer live, where before it
+/// asked for the phrase's whole lifetime counted from when it started; the member never touched
+/// the phrase, and its row stays allowed.
+///
+/// NEGATIVE CONTROL: ignore the member's `left=` in `join::run_phrase` (no `until.min`): the new
+/// Mac asks on past the phrase's end, "the new Mac stopped asking once the phrase could no
+/// longer live" (the hold is let go at the hang detector, and the run that follows fails); so
+/// does a member that names the phrase's whole lifetime (`left = ALLOW_LIFETIME` in
+/// `desk::run`).
+#[test]
+fn a_member_busy_until_the_phrase_lapses_is_asked_again_only_while_it_lives() {
+    const HANG: Duration = Duration::from_secs(60);
+    let lab = Lab::changing("lapse");
+    let admin = lab.home("ma");
+    write_private(
+        &admin.home.join(".secrets").join("gh_access_token"),
+        &synthetic("gh"),
+    );
+    client::create(
+        &admin,
+        &lab.url,
+        Some(&admin.home.join(".secrets")),
+        Some("ma"),
+    )
+    .expect("create");
+    let member = Mutex::new(desk::Desk::new(
+        desk::Local::of(&admin)
+            .expect("member state")
+            .expect("a Commons member"),
+    ));
+    let machine = lab.home("mb");
+    client::machine_identity(&machine).expect("identity");
+    let device = Device::open(&machine)
+        .expect("device")
+        .expect("an identity");
+    let joining = joiner::Joining {
+        device: &device,
+        node: [7; 32],
+        name: "mb".into(),
+        model: "Mac15,3".into(),
+    };
+    let bundle = |handing: &desk::Handing<'_>| client::hand_over(&admin, handing);
+    std::thread::scope(|scope| {
+        let dial = |_: &str| -> aterm_secrets::Result<Box<dyn join::Stream>> {
+            let (ours, theirs) = UnixStream::pair()?;
+            for end in [&ours, &theirs] {
+                end.set_read_timeout(Some(HANG))?;
+            }
+            let (member, bundle) = (&member, &bundle);
+            scope.spawn(move || {
+                let mut ours = ours;
+                let _ = desk::serve(member, &mut ours, [10, 0, 0, 9].into(), bundle);
+            });
+            Ok(Box::new(theirs))
+        };
+        let ats = ["ma".to_owned()];
+        let (heard, missed) = join::ask_all(&dial, &joining, &ats);
+        assert_eq!(heard.len(), 1, "{missed:?}");
+        // The person pressed Allow long enough ago that the phrase has four seconds left.
+        let (pid, words) = {
+            let mut desk = member.lock().unwrap();
+            let now = aterm_time::Instant::now();
+            let row = desk.rows(now)[0].id;
+            let then = now - (aterm_secrets::pake::ALLOW_LIFETIME - Duration::from_secs(4));
+            let phrase = desk.allow(row, then).expect("Allow");
+            (phrase, desk.words(phrase, now).expect("live").join(" "))
+        };
+        let phrase = Phrase::parse(&words).expect("three words");
+        let (heard, _) = join::ask_all(&dial, &joining, &ats);
+        assert_eq!(heard[0].answer, desk::Answer::Allowed);
+
+        // A vault pass holds the member's state past the phrase's end.
+        let pass = client::take_handover_hold(&admin)
+            .expect("the state lock")
+            .expect("no pass holds it yet");
+        let (returned, wait) = std::sync::mpsc::channel::<()>();
+        let holder = scope.spawn(move || {
+            let hung = wait.recv_timeout(HANG).is_err();
+            drop(pass);
+            hung
+        });
+        let mut said = Vec::new();
+        let joined = join::run_phrase(
+            &machine,
+            &dial,
+            &joining,
+            &heard,
+            &phrase,
+            None,
+            &mut |line| said.push(line.to_owned()),
+        );
+        let _ = returned.send(());
+        assert!(
+            !holder.join().expect("the pass"),
+            "the new Mac stopped asking once the phrase could no longer live"
+        );
+        match joined {
+            Err(join::PhraseFailed::Unsent(error)) => {
+                assert_eq!(
+                    error.kind(),
+                    aterm_secrets::ErrorKind::MemberBusy,
+                    "{error}"
+                );
+            }
+            other => panic!(
+                "the busy member let nobody in and touched no phrase: {:?}",
+                other.map(|joined| joined.name)
+            ),
+        }
+        assert_eq!(said.len(), 1, "one line on the first busy answer: {said:?}");
+        let desk = member.lock().unwrap();
+        assert_eq!(
+            desk.phrase_state(pid),
+            Some(aterm_secrets::members::PhraseState::Live),
+            "the busy member never touched the phrase"
+        );
+        assert_eq!(
+            desk.rows(aterm_time::Instant::now())[0].state,
+            desk::RowState::Allowed(pid)
+        );
+    });
+}
+
+/// A bundle the new Mac's write would refuse goes unacknowledged: here the new Mac made a vault
+/// of its own after it asked, so its write refuses the member's bundle ("already in a vault"),
+/// it sends no `ack`, and the member's row stays allowed, its phrase spent, so a person's Allow
+/// again works at once; nothing of the member's vault reaches the new Mac.
+///
+/// NEGATIVE CONTROL: acknowledge before the check (`accepts(&bundle)?` moved after the `ack`
+/// line in `joiner::run_noting_send`): "a bundle the new Mac refused is sent, not acknowledged:
+/// Some(Acknowledged)".
+#[test]
+fn a_bundle_the_new_mac_would_refuse_goes_unacknowledged_and_the_row_stays_allowed() {
+    const HANG: Duration = Duration::from_secs(60);
+    let lab = Lab::changing("refused");
+    let admin = lab.home("ma");
+    write_private(
+        &admin.home.join(".secrets").join("gh_access_token"),
+        &synthetic("gh"),
+    );
+    client::create(
+        &admin,
+        &lab.url,
+        Some(&admin.home.join(".secrets")),
+        Some("ma"),
+    )
+    .expect("create");
+    let member = Mutex::new(desk::Desk::new(
+        desk::Local::of(&admin)
+            .expect("member state")
+            .expect("a Commons member"),
+    ));
+    let machine = lab.home("mb");
+    client::machine_identity(&machine).expect("identity");
+    let device = Device::open(&machine)
+        .expect("device")
+        .expect("an identity");
+    let joining = joiner::Joining {
+        device: &device,
+        node: [7; 32],
+        name: "mb".into(),
+        model: "Mac15,3".into(),
+    };
+    let bundle = |handing: &desk::Handing<'_>| client::hand_over(&admin, handing);
+    let (ended, ends) = std::sync::mpsc::channel::<Result<Option<desk::Delivered>, String>>();
+    let own = Lab::changing("own");
+    std::thread::scope(|scope| {
+        let dial = |_: &str| -> aterm_secrets::Result<Box<dyn join::Stream>> {
+            let (ours, theirs) = UnixStream::pair()?;
+            for end in [&ours, &theirs] {
+                end.set_read_timeout(Some(HANG))?;
+            }
+            let (member, bundle, ended) = (&member, &bundle, ended.clone());
+            scope.spawn(move || {
+                let mut ours = ours;
+                let served = desk::serve(member, &mut ours, [10, 0, 0, 9].into(), bundle);
+                let _ = ended.send(
+                    served
+                        .map(|let_in| let_in.map(|let_in| let_in.delivered))
+                        .map_err(|e| e.to_string()),
+                );
+            });
+            Ok(Box::new(theirs))
+        };
+        let ats = ["ma".to_owned()];
+        let (heard, missed) = join::ask_all(&dial, &joining, &ats);
+        assert_eq!(heard.len(), 1, "{missed:?}");
+        ends.recv_timeout(HANG)
+            .expect("the ask ended")
+            .expect("asked");
+        let (pid, words) = {
+            let mut desk = member.lock().unwrap();
+            let now = aterm_time::Instant::now();
+            let row = desk.rows(now)[0].id;
+            let phrase = desk.allow(row, now).expect("Allow");
+            (phrase, desk.words(phrase, now).expect("live").join(" "))
+        };
+        let phrase = Phrase::parse(&words).expect("three words");
+        let (heard, _) = join::ask_all(&dial, &joining, &ats);
+        assert_eq!(heard[0].answer, desk::Answer::Allowed);
+        ends.recv_timeout(HANG)
+            .expect("the ask ended")
+            .expect("asked");
+
+        // Before the phrase is typed, the new Mac makes a vault of its own.
+        write_private(
+            &machine.home.join(".secrets").join("own_token"),
+            &synthetic("own"),
+        );
+        client::create(
+            &machine,
+            &own.url,
+            Some(&machine.home.join(".secrets")),
+            Some("mb"),
+        )
+        .expect("create its own vault");
+
+        let joined = join::run_phrase(
+            &machine,
+            &dial,
+            &joining,
+            &heard,
+            &phrase,
+            None,
+            &mut |_| {},
+        );
+        let delivered = ends
+            .recv_timeout(HANG)
+            .expect("the run ended")
+            .expect("the run sent its bundle");
+        let refused = joined
+            .map(|joined| joined.name)
+            .expect_err("the new Mac refused the bundle");
+        assert!(refused.sent(), "the phrase went: {refused}");
+        assert!(
+            refused.to_string().contains("already in a vault"),
+            "{refused}"
+        );
+        assert!(
+            matches!(delivered, Some(desk::Delivered::Unacknowledged(_))),
+            "a bundle the new Mac refused is sent, not acknowledged: {delivered:?}"
+        );
+        assert_eq!(
+            member.lock().unwrap().rows(aterm_time::Instant::now())[0].state,
+            desk::RowState::Allowed(pid),
+            "the row stays allowed, so Allow again works at once"
+        );
+        assert_eq!(
+            read(&machine, "gh_access_token"),
+            None,
+            "nothing of the member's vault reached the new Mac"
+        );
+    });
 }
 
 /// What the approver judged of `admin`'s queue: the names it let in.

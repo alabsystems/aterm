@@ -918,16 +918,23 @@ pub fn run(
         let _ = writeln!(err, "shared renewal requires an existing local row");
         return ExitCode::from(1);
     };
-    let opener = opener_link(&store, host);
     let browser = if host.under_ssh() {
-        RenewBrowser::Remote { opener }
+        RenewBrowser::Remote {
+            opener: opener_link(&store, host).ok(),
+        }
     } else {
-        match (row.browser.as_ref(), opener) {
-            (Some(profile), Some(opener)) => RenewBrowser::Profile {
-                opener,
-                profile: profile.clone(),
+        match row.browser.as_ref() {
+            Some(profile) => match opener_link(&store, host) {
+                Ok(opener) => RenewBrowser::Profile {
+                    opener,
+                    profile: profile.clone(),
+                },
+                Err(error) => {
+                    let _ = writeln!(err, "shared renewal: {error}; nothing was run");
+                    return ExitCode::from(1);
+                }
             },
-            _ => RenewBrowser::Default,
+            None => RenewBrowser::Default,
         }
     };
     let policy = accounts::RenewalPolicy {

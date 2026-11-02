@@ -9,8 +9,8 @@ use std::collections::VecDeque;
 use super::{
     Class, Consumer, InputGate, JobKind, MU_FLOOR_MS, MU_PRIOR_MS, MuFrom, NEVER_RETURNS_MS,
     NO_PROGRESS_CPU_NS_PER_MIN, OWN_MIN, OWN_RING, PHI_QUIET_LEAVE_MILLI, PHI_QUIET_MILLI,
-    PHI_STUCK_MILLI, RUNNING_WINDOW_MS, Standing, Stop, Verdict, Wait, WaitName, Zombies, median,
-    phi_milli,
+    PHI_STUCK_MILLI, RUNNING_WINDOW_MS, Standing, Stop, TierB, Verdict, Wait, WaitName, Zombies,
+    median, phi_milli,
 };
 use crate::jobs::GateWord;
 
@@ -145,6 +145,8 @@ pub struct Evidence {
     pub wait: Wait,
     /// A Tier B naming holding this episode, and how it counts.
     pub named: Option<Standing>,
+    /// The kind of that same current-episode Tier B naming.
+    pub named_kind: Option<TierB>,
 }
 
 /// The context one step reads beyond the evidence.
@@ -420,6 +422,7 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         .last_progress_ms
         .is_some_and(|l| at.saturating_sub(l) <= RUNNING_WINDOW_MS);
     let tty_wait = holds_fg && matches!(ev.wait.name, WaitName::TtyRaw | WaitName::TtyPassword);
+    let named_lock = ev.named_kind == Some(TierB::Lock) && ev.named.is_some();
     let class = if published {
         Class::UnreadInput
     } else if running {
@@ -436,7 +439,7 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         Class::Thrashing
     } else if t.busy.on {
         Class::BusySilent
-    } else if t.polling.on && !tty_wait {
+    } else if t.polling.on && !tty_wait && !named_lock {
         Class::Polling
     } else if ev.zombies.is_some() && !ev.zombie_parent_waits {
         // A parent that reaps late waits legitimately all the same, by its own wait (xargs reaps

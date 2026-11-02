@@ -245,7 +245,6 @@ impl App {
     }
 
     /// Whether an exception under `key` is currently open or pending ripening.
-    #[cfg(test)]
     pub(crate) fn owes_exception(&self, key: &str) -> bool {
         self.ripening.iter().any(|claim| claim.key == key)
             || self
@@ -807,7 +806,6 @@ impl App {
             HostNote::DiskWorker { task, folder } => self.start_disk_worker(task, &folder),
             HostNote::DiskWorkerExpired { sid } => self.disk_worker_expired(&sid),
             HostNote::CreditClaim { sid, offer } => self.start_credit_claim(&sid, offer),
-            HostNote::CreditClaimExpired { sid } => self.credit_claim_expired(&sid),
             HostNote::ProgramCheckStuck { workers, limit } => {
                 self.post_message(message_reporters::program_check_stuck(workers, limit));
             }
@@ -824,7 +822,10 @@ impl App {
                 );
             }
             HostNote::ServiceMemory { told, admin } => self.service_memory(&told, admin),
-            HostNote::DiskLooked => self.vitals_disk_looked(Instant::now()),
+            HostNote::DiskLooked => {
+                self.vitals_disk_looked(Instant::now());
+                self.end_claim_workers(Instant::now());
+            }
             HostNote::DiskSettingsRead => {
                 self.host_noted.remove(DISK_CLEANUP_OFF_NOTED);
                 self.except_clear(message_reporters::DISK_SETTINGS_KEY);

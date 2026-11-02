@@ -566,66 +566,18 @@ pub fn cmd_enter(args: &[String]) -> Res {
     Ok(Door::new(&run)?.ctl_inherit(&["key", "enter"])?)
 }
 
-fn standing(door: &Door<'_>, text: &str) -> Option<bool> {
-    let r = door.ctl(&["text"]).ok()?;
-    if r.code != 0 {
-        return None;
-    }
-    Some(crate::screen::composer_row(door.run().agent(), &r.stdout).as_deref() == Some(text))
-}
-
-/// Type `text` and press Enter once `text` stands in the composer.
+/// Type `text` into the lab's composer once it stands empty, and press Enter once `text` stands
+/// in it ([`crate::composer_turn::turn`]); whether the composer took it, the why on stderr where
+/// it did not.
 /// # Errors
 /// A door rule refused it, or the run was interrupted.
 pub fn turn(door: &Door<'_>, text: &str) -> Result<bool, Fail> {
-    use std::time::Duration;
-    let tag = door.run().tag.clone();
-    if door.ctl(&["send", text])?.code != 0 {
-        return Ok(false);
+    let (tag, agent) = (&door.run().tag, door.run().agent());
+    let turned = crate::composer_turn::turn(&crate::composer_turn::Target::lab(door, agent), text)?;
+    if let Some(why) = turned.why(agent, text) {
+        eprintln!("aterm-lab: turn: {why}, in lab '{tag}' ({LAB} text {tag})");
     }
-    crate::stop::sleep(Duration::from_millis(300))?;
-    let mut stood = false;
-    for _ in 0..20 {
-        if standing(door, text) == Some(true) {
-            stood = true;
-            break;
-        }
-        crate::stop::sleep(Duration::from_millis(250))?;
-    }
-    if !stood {
-        eprintln!(
-            "aterm-lab: turn: '{text}' does not stand in the composer of lab '{tag}' ({LAB} text {tag}): Enter not pressed"
-        );
-        return Ok(false);
-    }
-    for attempt in 1..=2 {
-        if door.ctl(&["key", "enter"])?.code != 0 {
-            return Ok(false);
-        }
-        let mut now = Some(true);
-        for _ in 0..20 {
-            crate::stop::sleep(Duration::from_millis(250))?;
-            now = standing(door, text);
-            if now == Some(false) {
-                return Ok(true);
-            }
-        }
-        if now.is_none() {
-            eprintln!(
-                "aterm-lab: turn: the screen of lab '{tag}' could not be read after Enter: '{text}' is not known to be sent"
-            );
-            return Ok(false);
-        }
-        if attempt == 1 {
-            eprintln!(
-                "aterm-lab: turn: '{text}' still stands in the composer of lab '{tag}' 5 s after Enter: Enter again"
-            );
-        }
-    }
-    eprintln!(
-        "aterm-lab: turn: '{text}' still stands in the composer of lab '{tag}' after two Enters ({LAB} text {tag})"
-    );
-    Ok(false)
+    Ok(turned == crate::composer_turn::Turned::Taken)
 }
 
 /// `turn [tag] TEXT` (one row): exit 1 unless the composer took the prompt.

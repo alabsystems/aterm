@@ -42,6 +42,7 @@ fn memory_entry_evidence(at_ms: u64, dt_ms: u64, wait: Wait) -> step::Evidence {
         zombie_parent_waits: false,
         wait,
         named: None,
+        named_kind: None,
     }
 }
 
@@ -168,6 +169,78 @@ fn a_legitimate_memory_wait_clears_a_stuck_episode_on_its_first_tick() {
     ev.wait = Wait::bare(WaitName::Memory, Standing::Legit, 1, "front");
     assert_immediate_memory(&step::classify_tick(&mut track, &ev, &cx));
     assert!(!track.episode_open());
+}
+
+#[test]
+fn an_episode_lock_naming_overrides_polling_without_resetting_its_evidence() {
+    let mut cx = memory_entry_context();
+    cx.consumer = Consumer::Agent;
+    cx.kind = JobKind::AgentCall;
+    let mut track = step::Track::new(0);
+    let mut ev = memory_entry_evidence(
+        0,
+        2000,
+        Wait::bare(WaitName::Unnamed, Standing::Capped, 1, "front"),
+    );
+    ev.calls = Some(80);
+    for at in (2000..=28 * 60_000).step_by(2000) {
+        ev.at_ms = at;
+        let _ = step::classify_tick(&mut track, &ev, &cx);
+    }
+    ev.at_ms += 2000;
+    let polling = step::classify_tick(&mut track, &ev, &cx);
+    assert_eq!(polling.class, Class::Polling);
+    assert_eq!(polling.verdict, Verdict::Stuck);
+
+    for (kind, standing) in [
+        (None, Some(Standing::Legit)),
+        (Some(TierB::Timer), Some(Standing::Legit)),
+        (Some(TierB::Lock), None),
+    ] {
+        let mut control = track.clone();
+        let mut evidence = ev.clone();
+        evidence.at_ms += 2000;
+        evidence.named_kind = kind;
+        evidence.named = standing;
+        let out = step::classify_tick(&mut control, &evidence, &cx);
+        assert_eq!(out.class, Class::Polling, "{kind:?}, {standing:?}");
+        assert_eq!(out.verdict, Verdict::Stuck);
+    }
+
+    let mut unknown = track.clone();
+    let mut evidence = ev.clone();
+    evidence.at_ms += 2000;
+    evidence.named_kind = Some(TierB::Lock);
+    evidence.named = Some(Standing::Capable);
+    let out = step::classify_tick(&mut unknown, &evidence, &cx);
+    assert_eq!(out.class, Class::Waiting);
+    assert_eq!(out.verdict, Verdict::Stuck);
+
+    ev.named_kind = Some(TierB::Lock);
+    ev.named = Some(Standing::Legit);
+    ev.at_ms += 2000;
+    let first = step::classify_tick(&mut track, &ev, &cx);
+    assert_eq!(first.class, Class::Waiting);
+    assert_eq!(
+        first.verdict,
+        Verdict::Stuck,
+        "existing two-tick hysteresis"
+    );
+    ev.at_ms += 2000;
+    let confirmed = step::classify_tick(&mut track, &ev, &cx);
+    assert_eq!(confirmed.class, Class::Waiting);
+    assert_eq!(confirmed.verdict, Verdict::Fine);
+    assert_eq!(confirmed.phi_milli, Some(0));
+    assert!(!confirmed.no_progress);
+
+    ev.named_kind = None;
+    ev.named = None;
+    ev.at_ms += 2000;
+    assert_eq!(
+        step::classify_tick(&mut track, &ev, &cx).class,
+        Class::Polling,
+        "the rate band was retained while the lock naming counted"
+    );
 }
 
 /// The first whole second at which `quiet` reaches φ × 1000 = `phi` for μ.

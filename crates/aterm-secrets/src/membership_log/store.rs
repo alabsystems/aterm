@@ -56,6 +56,123 @@ pub fn decode_records(bytes: &[u8]) -> Result<Vec<Record>> {
     Ok(out)
 }
 
+/// One record frame of a stream, as [`frames`] reads it: its id (the SHA-256 of its bytes, which
+/// is [`Record::id`] for a record this build reads), the parents its bytes name, and where it
+/// sits in the stream.
+#[cfg(unix)]
+pub(crate) struct Frame {
+    pub(crate) id: RecordId,
+    pub(crate) parents: Vec<RecordId>,
+    pub(crate) range: std::ops::Range<usize>,
+}
+
+/// Every record frame of `bytes`, under [`decode_records`]'s bounds, read without judging a
+/// frame's kind and without verifying anything ([`Record::frame_prefix`]): a stream holding a
+/// record of a kind only a newer build writes still names each of its records. It is for naming
+/// ids back to the server that sent them (`untaken`), never for trusting them. One walk, two
+/// judgments: [`decode_records`] refuses an unknown kind ([`Record::wire_len_prefix`]), and
+/// [`frame_ids`] is this with that check.
+///
+/// # Errors
+/// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than [`MAX_RECORDS`] frames, or holds one
+/// this layout cannot frame (truncated, oversized, another layout version).
+#[cfg(unix)]
+pub(crate) fn frames(bytes: &[u8]) -> Result<Vec<Frame>> {
+    if bytes.len() > MAX_RECORDS_STREAM {
+        return Err(Error::new("membership record stream is too large"));
+    }
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        if out.len() >= MAX_RECORDS {
+            return Err(Error::new("membership record stream exceeds record bound"));
+        }
+        let (len, parents) = Record::frame_prefix(&bytes[at..])?;
+        let end = at
+            .checked_add(len)
+            .filter(|end| *end <= bytes.len() && len <= MAX_RECORD)
+            .ok_or_else(|| Error::new("membership record is truncated"))?;
+        out.push(Frame {
+            id: aterm_digest::Sha256::digest(&bytes[at..end]),
+            parents,
+            range: at..end,
+        });
+        at = end;
+    }
+    Ok(out)
+}
+
+/// [`frames`] that refuses a frame of a kind this build does not know, as [`decode_records`]
+/// does ([`Record::wire_len_prefix`]): one walk, the other judgment. A vault server names a
+/// records POST's ids with it before taking any lock, and verifies only the frames its store
+/// does not hold already (`server::post_records`, `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1
+/// F23, rule 4.1). Nothing is verified: a frame's id is the SHA-256 of its bytes, which is
+/// [`Record::id`] once it verifies, so a held id's frame is byte for byte a record verified
+/// already.
+///
+/// # Errors
+/// As [`frames`], or a frame is of a kind this build does not know.
+#[cfg(unix)]
+pub(crate) fn frame_ids(bytes: &[u8]) -> Result<Vec<Frame>> {
+    let frames = frames(bytes)?;
+    for frame in &frames {
+        Record::wire_len_prefix(&bytes[frame.range.clone()])?;
+    }
+    Ok(frames)
+}
+
+/// The frames of `bytes` (read into `frames`, [`frames`]) that this build reads
+/// ([`Record::decode`]) and that descend from no frame of `bytes` it cannot read, in stream order:
+/// what a pull still offers its store of a stream [`decode_records`] refuses as a whole. A server
+/// of a newer build sends a record of a kind this build does not know beside records it reads
+/// (its ancestors, its siblings), and refusing the whole stream kept those from every server
+/// that holds it. A frame that descends from one this build cannot read is left out: it could
+/// only wait, on a parent that never lands. Each frame is checked on its own, as
+/// [`Store::recovering`] reads a records file.
+#[cfg(unix)]
+pub(crate) fn readable_part(bytes: &[u8], frames: &[Frame]) -> Vec<u8> {
+    let at: BTreeMap<RecordId, usize> = frames
+        .iter()
+        .enumerate()
+        .map(|(i, frame)| (frame.id, i))
+        .collect();
+    let mut children: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, frame) in frames.iter().enumerate() {
+        for parent in &frame.parents {
+            if let Some(&j) = at.get(parent)
+                && j != i
+            {
+                children.entry(j).or_default().push(i);
+            }
+        }
+    }
+    let mut unread: Vec<bool> = frames
+        .iter()
+        .map(|frame| {
+            bytes
+                .get(frame.range.clone())
+                .is_none_or(|wire| Record::decode(wire).is_err())
+        })
+        .collect();
+    let mut stack: Vec<usize> = (0..unread.len()).filter(|&i| unread[i]).collect();
+    while let Some(j) = stack.pop() {
+        for &i in children.get(&j).into_iter().flatten() {
+            if !unread[i] {
+                unread[i] = true;
+                stack.push(i);
+            }
+        }
+    }
+    frames
+        .iter()
+        .zip(&unread)
+        .filter(|(_, unread)| !**unread)
+        .filter_map(|(frame, _)| bytes.get(frame.range.clone()))
+        .flatten()
+        .copied()
+        .collect()
+}
+
 /// `records`, each after every genesis and parent among them, ties by id. A record that will
 /// wait in the store (a parent neither among them nor `held`, or one that waits itself) also
 /// comes after every `Admit` of its signer among them, so the store meets a seat before the
@@ -249,7 +366,7 @@ fn make_room(log: &mut Log) {
     while log.order.len() + log.waiting.len() > MAX_RECORDS
         || log.total_bytes() > MAX_RECORDS_STREAM
     {
-        if log.waiting.pop_last().is_none() {
+        if !log.drop_last_waiting() {
             return;
         }
     }
@@ -405,9 +522,7 @@ impl Store {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(log) = &self.log {
-            for record in &log.order {
-                out.extend_from_slice(record.bytes());
-            }
+            out = self.encode_held();
             for record in causal(log.waiting.values(), |id| log.held.contains_key(id)) {
                 out.extend_from_slice(record.bytes());
             }
@@ -417,6 +532,31 @@ impl Store {
             }
         }
         out
+    }
+
+    /// The bytes of the log's records, each after its parents ([`Store::encode`]'s first part):
+    /// what a vault server's records file holds (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23,
+    /// rule 1). Empty for a store with no genesis. A record waiting on a parent is held in memory
+    /// only: a server serves complete records alone ([`Store::missing`]), the complete part of a
+    /// log only grows, so the file changes only by an append of what the log holds past it, and
+    /// it stays within what every reader takes.
+    #[must_use]
+    pub fn encode_held(&self) -> Vec<u8> {
+        self.encode_held_from(0)
+    }
+
+    /// [`Store::encode_held`] past the log's first `from` records: what goes on the end of a
+    /// records file that holds those, already in causal order.
+    #[must_use]
+    pub fn encode_held_from(&self, from: usize) -> Vec<u8> {
+        self.log
+            .as_ref()
+            .and_then(|log| log.order.get(from..))
+            .unwrap_or_default()
+            .iter()
+            .flat_map(Record::bytes)
+            .copied()
+            .collect()
     }
 
     /// Whether the store holds no records.
@@ -450,10 +590,24 @@ impl Store {
     }
 
     /// Whether `id` is held with every parent (not waiting on one).
-    fn holds(&self, id: &RecordId) -> bool {
+    pub(crate) fn holds(&self, id: &RecordId) -> bool {
         self.log
             .as_ref()
             .is_some_and(|log| log.held.contains_key(id))
+    }
+
+    /// The record `id` when it is held but not complete: waiting on a parent, or held before a
+    /// genesis. A store at its bound may let it go for another record ([`make_room`]), so a
+    /// caller that offers it again with its parent (`server::post_records`) still lands it.
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only the unix vault server offers records again")
+    )]
+    pub(crate) fn uncomplete(&self, id: &RecordId) -> Option<&Record> {
+        match &self.log {
+            Some(log) => log.waiting.get(id),
+            None => self.unrooted.get(id),
+        }
     }
 
     /// Exact signed wire bytes of `id` when held.
@@ -720,7 +874,16 @@ impl Store {
     /// `bytes` fails [`decode_records`], or no record entered the store and [`Store::insert`]
     /// refused one.
     pub fn ingest(&mut self, bytes: &[u8]) -> Result<usize> {
-        let records = decode_records(bytes)?;
+        self.ingest_records(decode_records(bytes)?)
+    }
+
+    /// [`Store::ingest`] of `records` already decoded and verified ([`Record::decode`]): each is
+    /// inserted after any genesis, seat and parent among them, and a record [`Store::insert`]
+    /// refuses is skipped. Returns how many new records entered the store.
+    ///
+    /// # Errors
+    /// No record entered the store and [`Store::insert`] refused one.
+    pub fn ingest_records(&mut self, records: Vec<Record>) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -803,6 +966,119 @@ mod tests {
                 "the copy holds the record's bytes again"
             );
         }
+    }
+
+    /// `log`'s running byte counters, against the sums they replace.
+    fn assert_counters(log: &Log, after: &str) {
+        let held: usize = log.order.iter().map(|r| r.bytes().len()).sum();
+        let waiting: usize = log.waiting.values().map(|r| r.bytes().len()).sum();
+        assert_eq!(log.held_bytes(), held, "held bytes after {after}");
+        assert_eq!(log.waiting_bytes(), waiting, "waiting bytes after {after}");
+    }
+
+    /// `Log`'s byte counters (`held_bytes`, `waiting_bytes`) match the sums they replaced after
+    /// each insert (complete and waiting), each landing, and each record a store at its bound
+    /// lets go (`make_room`). The sums walked every record on each insert, and a store at its
+    /// bound walked them again for each record it let go (F23, rule 6).
+    /// NEGATIVE CONTROL: a `drop_last_waiting` that does not lower `waiting_bytes` (so
+    /// `make_room` leaves the counter high) fails "waiting bytes after make_room".
+    #[test]
+    fn log_byte_counters_match_their_sums() {
+        let (w1, inc1, m1, e1) = entrant(1, "m1");
+        let (_, _, _, e2) = entrant(2, "m2");
+        // A founder's key: only a seated signer's record waits for its parents.
+        let (w_junk, inc_junk, _, e_junk) = entrant(9, "m9");
+        let genesis = Record::found(&[9; 32], vec![e1, e_junk], 1_000).expect("genesis");
+        let waiting = |i: usize| {
+            let mut parent = [0x77; 32];
+            parent[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            super::super::Draft {
+                network: *genesis.id(),
+                sequence: 1,
+                previous: None,
+                parents: vec![parent],
+                authored_ms: 2_000 + i as u64,
+                body: Body::Name {
+                    name: format!("w{i}"),
+                },
+            }
+            .sign(&w_junk, inc_junk)
+            .expect("signed")
+        };
+        let mut log = Log::new(genesis.clone()).expect("log");
+        log.require_seats();
+        assert_counters(&log, "the genesis");
+        let admit = log
+            .draft(
+                &m1,
+                1_001,
+                Body::Admit {
+                    entrant: e2,
+                    evidence: Evidence::Phrase,
+                },
+            )
+            .sign(&w1, inc1)
+            .expect("admit");
+        let mut grown = log.clone();
+        grown.insert(admit.clone()).expect("admit");
+        let child = grown
+            .draft(
+                &m1,
+                1_002,
+                Body::Name {
+                    name: "child".to_owned(),
+                },
+            )
+            .sign(&w1, inc1)
+            .expect("child");
+        assert_eq!(
+            log.insert(child).expect("child"),
+            super::super::Inserted::Waiting
+        );
+        assert_counters(&log, "a waiting insert");
+        assert_eq!(
+            log.insert(waiting(0)).expect("waits"),
+            super::super::Inserted::Waiting
+        );
+        assert_counters(&log, "a second waiting insert");
+        assert_eq!(
+            log.insert(admit).expect("admit"),
+            super::super::Inserted::Held
+        );
+        assert_eq!(log.waiting.len(), 1, "the child landed");
+        assert_counters(&log, "a landing");
+
+        let mut store = Store::with_compiled(Some(*genesis.id()));
+        store.insert(genesis.clone()).expect("genesis");
+        for i in 0..MAX_RECORDS - 1 {
+            store.insert(waiting(i)).expect("room to wait");
+        }
+        assert_counters(store.log().expect("log"), "filling the store");
+        let admit = store
+            .log()
+            .expect("log")
+            .draft(
+                &m1,
+                1_001,
+                Body::Admit {
+                    entrant: entrant(3, "m3").3,
+                    evidence: Evidence::Phrase,
+                },
+            )
+            .sign(&w1, inc1)
+            .expect("admit");
+        assert!(
+            store
+                .insert(admit)
+                .expect("a complete record takes a waiting one's place")
+        );
+        let log = store.log().expect("log");
+        assert_eq!(
+            log.order.len() + log.waiting.len(),
+            MAX_RECORDS,
+            "make_room let one go"
+        );
+        assert_counters(log, "make_room");
     }
 
     #[test]
@@ -1772,5 +2048,137 @@ mod tests {
             assert_eq!(reloaded.inventory(), store.inventory(), "{how}");
             assert_eq!(shown(reloaded), shown(&store), "{how}");
         }
+    }
+
+    /// A founder's genesis, its `Name` `n0`, and two more `Name`s after `n0` (siblings, each
+    /// with `n0` as its parent), with the founder's writer seed and incarnation.
+    #[cfg(unix)]
+    fn founder_with_siblings() -> (Record, Record, Record, Record, [u8; 32], [u8; 16]) {
+        let (writer, incarnation, founder, entrant) = entrant(1, "m1");
+        let genesis = Record::found(&[9; 32], vec![entrant], 1_000).expect("genesis");
+        let mut log = Log::new(genesis.clone()).expect("log");
+        let name = |log: &Log, name: &str| {
+            log.draft(
+                &founder,
+                2_000,
+                Body::Name {
+                    name: name.to_owned(),
+                },
+            )
+            .sign(&writer, incarnation)
+            .expect("signed")
+        };
+        let n0 = name(&log, "n0");
+        log.insert(n0.clone()).expect("held");
+        let x = name(&log, "x");
+        let n1 = name(&log, "n1");
+        (genesis, n0, x, n1, writer, incarnation)
+    }
+
+    /// A kind code no build writes yet: a test's stand-in for a newer build's record.
+    #[cfg(unix)]
+    const NEWER_KIND: u8 = 0xee;
+
+    /// A stream holding a record of a kind this build does not know still splits into its
+    /// records' ids and parents (`frames`), which a pull names back to the server that sent it
+    /// (`untaken`), while `decode_records` and `Record::wire_len_prefix` still refuse it: the
+    /// layout frames every kind alike.
+    /// NEGATIVE CONTROL: framing through the kind check (`Record::frame_prefix` calling
+    /// `Kind::from_code`) makes `frames` refuse the stream ("frames a kind this build does not
+    /// know: Error(\"membership record of an unknown kind\", Other)").
+    /// NEGATIVE CONTROL: dropping the kind check from `Record::wire_len_prefix` fails "the
+    /// length prefix still refuses an unknown kind".
+    #[cfg(unix)]
+    #[test]
+    fn a_frame_of_a_kind_this_build_does_not_know_still_frames() {
+        let (genesis, n0, x, n1, _, _) = founder_with_siblings();
+        let unread = crate::membership_log::with_kind_code(&x, NEWER_KIND);
+        let mut stream = n0.bytes().to_vec();
+        stream.extend_from_slice(&unread);
+        stream.extend_from_slice(n1.bytes());
+
+        let framed = match frames(&stream) {
+            Ok(framed) => framed,
+            Err(e) => panic!("frames a kind this build does not know: {e:?}"),
+        };
+        let ids: Vec<RecordId> = framed.iter().map(|frame| frame.id).collect();
+        assert_eq!(
+            ids,
+            vec![*n0.id(), aterm_digest::Sha256::digest(&unread), *n1.id()]
+        );
+        let parents: Vec<&[RecordId]> = framed
+            .iter()
+            .map(|frame| frame.parents.as_slice())
+            .collect();
+        assert_eq!(
+            parents,
+            vec![
+                std::slice::from_ref(genesis.id()),
+                std::slice::from_ref(n0.id()),
+                std::slice::from_ref(n0.id())
+            ]
+        );
+        assert_eq!(stream.get(framed[1].range.clone()), Some(unread.as_slice()));
+        assert!(
+            decode_records(&stream).is_err(),
+            "the stream is refused whole"
+        );
+        assert!(
+            Record::wire_len_prefix(&unread).is_err(),
+            "the length prefix still refuses an unknown kind"
+        );
+        assert_eq!(
+            Record::wire_len_prefix(n0.bytes()).ok(),
+            Some(n0.bytes().len())
+        );
+    }
+
+    /// What a pull offers its store of a stream that does not decode as a whole: every record
+    /// this build reads (an ancestor and a sibling of the unreadable one) but none that descends
+    /// from it, which could only wait on a parent that never lands.
+    /// NEGATIVE CONTROL: leaving out only the frames that fail `Record::decode` (no descent)
+    /// keeps the child of the unreadable record ("left: [\"n0\", \"y\", \"n1\"], right:
+    /// [\"n0\", \"n1\"]").
+    #[cfg(unix)]
+    #[test]
+    fn the_readable_part_of_a_stream_leaves_out_what_descends_from_a_record_this_build_cannot_read()
+    {
+        let (genesis, n0, x, n1, writer, incarnation) = founder_with_siblings();
+        let unread = crate::membership_log::with_kind_code(&x, NEWER_KIND);
+        let unread_id = aterm_digest::Sha256::digest(&unread);
+        let y = super::super::Draft {
+            network: *genesis.id(),
+            sequence: 3,
+            previous: Some(unread_id),
+            parents: vec![unread_id],
+            authored_ms: 3_000,
+            body: Body::Name {
+                name: "y".to_owned(),
+            },
+        }
+        .sign(&writer, incarnation)
+        .expect("signed");
+        let mut stream = n0.bytes().to_vec();
+        stream.extend_from_slice(&unread);
+        stream.extend_from_slice(y.bytes());
+        stream.extend_from_slice(n1.bytes());
+
+        let framed = frames(&stream).expect("framed");
+        let part = readable_part(&stream, &framed);
+        let names = |bytes: &[u8]| -> Vec<String> {
+            decode_records(bytes)
+                .expect("the readable part decodes")
+                .iter()
+                .map(|record| match record.body() {
+                    Body::Name { name } => name.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        };
+        assert_eq!(names(&part), vec!["n0".to_owned(), "n1".to_owned()]);
+        assert_eq!(
+            readable_part(n0.bytes(), &frames(n0.bytes()).expect("framed")),
+            n0.bytes()
+        );
     }
 }

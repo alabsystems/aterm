@@ -182,6 +182,17 @@ fn rss_bytes(pid: u32) -> Result<u64, CouldNotRun> {
         .map_err(|_| CouldNotRun::Refused(format!("ps named no resident size for {pid}")))
 }
 
+/// CPU accounting is diagnostic and never substitutes for the throughput verdict.
+#[cfg(target_os = "macos")]
+fn cpu_ns(pid: u32) -> Option<u64> {
+    super::usage(pid).ok().map(|usage| usage.cpu_ns)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cpu_ns(_: u32) -> Option<u64> {
+    None
+}
+
 /// The median of `v` (the lower of the middle two).
 #[must_use]
 pub fn median(v: &[u64]) -> u64 {
@@ -239,12 +250,33 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
             min_milli,
         } => {
             let (mut off, mut on) = (Vec::new(), Vec::new());
-            for _ in 0..pairs {
-                for record in [false, true, true, false] {
+            for pair in 0..pairs {
+                for (arm, record) in [false, true, true, false].into_iter().enumerate() {
                     let take = Take::launch(rig, record, budget)?;
                     let out = take.home.join("drain.us");
+                    let before = cpu_ns(take.inst.pid());
+                    let started = std::time::Instant::now();
                     take.start_drain(rig, None, bytes, &out)?;
                     let us = take.drained_us(&out)?;
+                    let sample_wall_us = started.elapsed().as_micros();
+                    let used = before
+                        .zip(cpu_ns(take.inst.pid()))
+                        .and_then(|(before, after)| after.checked_sub(before));
+                    // Diagnostics bracket the command and report polling as well as the drain.
+                    // The verdict still uses only the producer's original drain measurement.
+                    let status = take.inst.ctl.ok(&["temporal", "status"])?;
+                    eprintln!(
+                        "measure-sample: {}",
+                        aterm_json::json!({
+                            "schema": 1, "measurement": "recording-throughput", "pair": pair,
+                            "arm": arm, "recording": record, "drain_us": us,
+                            "sample_wall_us": sample_wall_us, "sample_cpu_ns": used,
+                            "dropped_input": field(&status, "dropped_input"),
+                            "writer_in_flight": field(&status, "writer_in_flight"),
+                            "writer_queued_bytes": field(&status, "writer_queued_bytes"),
+                            "pool_used": field(&status, "pool_used"),
+                        })
+                    );
                     if record { &mut on } else { &mut off }.push(us);
                 }
             }

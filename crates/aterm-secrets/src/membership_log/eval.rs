@@ -18,6 +18,25 @@
 //! signer has an effective `Remove` whose cutoff does not reach it, concurrent or later, unless an
 //! effective `Admit` of the signer that follows that `Remove` (a restoring one) is in its past.
 //!
+//! **Keyed epochs** (F21). These change no record's counting; they answer a second question,
+//! whether a counting record can be opened. On a removed Mac's side of a split
+//! the members still count it, so one of them can write under an `Epoch` it minted past its
+//! cutoff, and once the `Remove` (or a quorum) arrives that epoch stops counting. A counting `Put`
+//! or `Delete` is a *dependent* of the `Epoch` it names when that epoch does not count yet its
+//! signer was a member where it signed it (the epoch is authorized with nothing void, or under the
+//! quorums that take effect), the epoch lies in the write's past, the write's signer is another
+//! writer (the first 32 bytes of the actor, so a new incarnation of the epoch's signer is the same
+//! writer), and the write was signed in good faith: no `Remove` of the epoch's signer that stands
+//! under those quorums (authorized there and not void) lies in the write's past and cuts the epoch
+//! there (its cutoff does not reach the epoch, and no `Admit` of that signer, authorized either
+//! way, lies between it and the epoch). A `Remove` a quorum voided removes nobody, so after F16's
+//! Undo the Macs the voided member removed write in good faith under each other's epochs. An epoch
+//! with a dependent is *keyed*. Its key opens for reading through counting `Wrap`s and through
+//! the non-counting `Wrap`s of it that lie in a dependent's past, but it carries no authority: it
+//! is never newest, winning or handed on. The writer clause reads only the write's own past and
+//! the good-faith clause the `Remove`s there, so after a heal no Mac that holds a `Remove` that
+//! stands can sign a new dependent.
+//!
 //! **Who is in.** A Mac is in when the genesis binds it or an effective `Admit` lets it in, and
 //! every effective `Remove` of it lies in that entry's causal past: a `Remove` beats a concurrent
 //! `Admit`, and an `Admit` that follows a `Remove` restores the Mac. A founder the genesis lists
@@ -292,12 +311,15 @@ pub(super) fn authorization_passes(records: &[Record]) -> usize {
     memo.len()
 }
 
-/// Which held records count for non-membership payloads (`Epoch`, `Wrap`, `Put`, `Delete`), and
-/// strict causal precedence among them.
+/// Which held records count for non-membership payloads (`Epoch`, `Wrap`, `Put`, `Delete`),
+/// strict causal precedence among them, and the keyed epochs (the module's "Keyed epochs").
 #[derive(Debug)]
 pub(super) struct Effective {
     counts: Vec<bool>,
     past: Vec<Bits>,
+    keyed: Vec<bool>,
+    dependents: BTreeMap<usize, Vec<usize>>,
+    usable_wrap: Vec<bool>,
 }
 
 impl Effective {
@@ -309,6 +331,24 @@ impl Effective {
     /// Whether record `a` lies in record `b`'s strict causal past.
     pub(super) fn before(&self, a: usize, b: usize) -> bool {
         self.past[b].get(a)
+    }
+
+    /// Whether record `index` is a keyed `Epoch`: it does not count, yet a counting `Put` or
+    /// `Delete` depends on it (F21 rule 1).
+    pub(super) fn keyed(&self, index: usize) -> bool {
+        self.keyed.get(index).copied().unwrap_or(false)
+    }
+
+    /// The dependents of the keyed epoch at `epoch`, in record order; empty for any other record.
+    pub(super) fn dependents(&self, epoch: usize) -> &[usize] {
+        self.dependents.get(&epoch).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether the `Wrap` at `index` may open its epoch: it counts, or it is a non-counting
+    /// `Wrap` of a keyed epoch that lies in the past of one of that epoch's dependents (F21
+    /// rule 2).
+    pub(super) fn opens_wrap(&self, index: usize) -> bool {
+        self.counts(index) || self.usable_wrap.get(index).copied().unwrap_or(false)
     }
 }
 
@@ -448,6 +488,17 @@ struct Effects {
     out: BTreeSet<MemberId>,
 }
 
+/// How each record stands, for F21's rule 1: authorized with nothing void (`plain`), authorized
+/// under the quorums that take effect (`authorized`), and void under them (`void`); and those
+/// quorums (`accepted`, indexes into `candidates`), for judging a write by what its own past holds.
+struct Authority<'a> {
+    plain: &'a [bool],
+    authorized: &'a [bool],
+    void: &'a [bool],
+    candidates: &'a [Candidate],
+    accepted: &'a [usize],
+}
+
 /// One quorum `Remove` the log holds: the `Remove`s that name one member and one cutoff.
 struct Candidate {
     member: MemberId,
@@ -488,6 +539,8 @@ struct Standing {
 
 struct Graph<'a> {
     records: &'a [Record],
+    /// Each held record's index, by id.
+    at: BTreeMap<&'a RecordId, usize>,
     /// `past[i]` holds every record in record `i`'s strict causal past.
     past: Vec<Bits>,
     /// Each `Remove`'s cutoff, by record index.
@@ -592,6 +645,7 @@ impl<'a> Graph<'a> {
 
         Self {
             records,
+            at,
             past,
             cutoffs,
             actors,
@@ -1716,6 +1770,8 @@ impl<'a> Graph<'a> {
         let accepted = self.accepted(&candidates, &mut memo, &mut scratch);
         let effects = self.effects(&candidates, &accepted);
         let authorized = self.authorized(&effects.void, &mut memo, &mut scratch);
+        // `accepted` already filled the memo's empty-void key, so this is a memo hit.
+        let plain = self.authorized(&vec![false; self.records.len()], &mut memo, &mut scratch);
         let all = |_: usize| true;
         let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
         let mut counts = vec![false; self.records.len()];
@@ -1727,10 +1783,177 @@ impl<'a> Graph<'a> {
                 && authorized[i]
                 && !self.cut(i, &standing.removes, &standing.admits);
         }
+        let dependents = self.dependents(
+            &counts,
+            &Authority {
+                plain: &plain,
+                authorized: &authorized,
+                void: &effects.void,
+                candidates: &candidates,
+                accepted: &accepted,
+            },
+            &mut memo,
+            &mut scratch,
+        );
+        let mut keyed = vec![false; self.records.len()];
+        for &epoch in dependents.keys() {
+            keyed[epoch] = true;
+        }
+        let usable_wrap = self.usable_wraps(&counts, &dependents);
         Effective {
             counts,
             past: self.past,
+            keyed,
+            dependents,
+            usable_wrap,
         }
+    }
+
+    /// F21's rule 1: the dependents of each keyed epoch, by epoch index, given which records
+    /// `counts` and how each stands (`auth`). One pass over the counting `Put`s and `Delete`s; in
+    /// the steady state none names a non-counting epoch.
+    ///
+    /// Good faith is judged by what the write's own past holds: a `Remove` that stands only under
+    /// a quorum whose shares that past does not yet hold (an Undo's lone share, signed by a Mac the
+    /// epoch's signer removed) was no removal where the write was signed, so it trips nothing.
+    /// The view of a past without every quorum is computed only for a write some standing
+    /// `Remove` would otherwise trip, once per set of quorums that past holds.
+    fn dependents(
+        &self,
+        counts: &[bool],
+        auth: &Authority<'_>,
+        memo: &mut Memo,
+        scratch: &mut AuthScratch,
+    ) -> BTreeMap<usize, Vec<usize>> {
+        let mut dependents: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        // Each set of quorums some write's past holds: the records void and authorized there.
+        let mut views: BTreeMap<Vec<usize>, (Vec<bool>, Vec<bool>)> = BTreeMap::new();
+        let mut voters: BTreeMap<usize, Option<BTreeSet<MemberId>>> = BTreeMap::new();
+        for (d, record) in self.records.iter().enumerate().skip(1) {
+            let (Body::Put { epoch, .. } | Body::Delete { epoch, .. }) = record.body() else {
+                continue;
+            };
+            if !counts[d] {
+                continue;
+            }
+            let Some(&e) = self.at.get(epoch) else {
+                continue;
+            };
+            let mut held: Option<Vec<usize>> = None;
+            let mut stands_at_d = |r: usize| {
+                let held = held.get_or_insert_with(|| {
+                    auth.accepted
+                        .iter()
+                        .copied()
+                        .filter(|&q| {
+                            let cand = &auth.candidates[q];
+                            let at_cutoff = voters.entry(cand.cutoff).or_insert_with(|| {
+                                let no_void = vec![false; self.records.len()];
+                                self.members_at_cutoff(cand.cutoff, &no_void, auth.plain, scratch)
+                            });
+                            let seen = Candidate {
+                                member: cand.member,
+                                cutoff: cand.cutoff,
+                                shares: cand
+                                    .shares
+                                    .iter()
+                                    .copied()
+                                    .filter(|&share| self.before(share, d))
+                                    .collect(),
+                            };
+                            let no_void = vec![false; self.records.len()];
+                            self.weigh_with_members(&seen, at_cutoff.as_ref(), &no_void)
+                                .holds()
+                        })
+                        .collect()
+                });
+                if held.len() == auth.accepted.len() {
+                    return true;
+                }
+                let (void, authorized) = views.entry(held.clone()).or_insert_with(|| {
+                    let void = self.effects(auth.candidates, held).void;
+                    let authorized = self.authorized(&void, memo, scratch);
+                    (void, authorized)
+                });
+                authorized[r] && !void[r]
+            };
+            if self.depends(d, e, counts, auth, &mut stands_at_d) {
+                dependents.entry(e).or_default().push(d);
+            }
+        }
+        dependents
+    }
+
+    /// Whether the counting `Put` or `Delete` `d` depends on `e`, the epoch it names: `e` is an
+    /// `Epoch` in `d`'s past that does not count yet whose signer was a member where it signed it
+    /// (authorized with nothing void, or under the quorums that take effect), `d`'s signer is
+    /// another writer, seated in `d`'s past by the genesis or by an `Admit` that counts (a Mac a
+    /// removed Mac let in past its cutoff adds no dependent, though its records may count where
+    /// their past leaves its admitter's removal out), and no `Remove` of `e`'s signer that stands under those quorums
+    /// (authorized there and not void) and in `d`'s own past (`stands_at_d`) lies in `d`'s past
+    /// and cuts `e` there: its cutoff does not reach `e`, and no `Admit` of the signer authorized
+    /// either way lies between it and `e`. A `Remove` a quorum voided (F16's Undo) therefore cuts
+    /// nothing, as it removes nobody, and neither does an Undo's share the quorum had not yet
+    /// made a removal where `d` was signed.
+    fn depends(
+        &self,
+        d: usize,
+        e: usize,
+        counts: &[bool],
+        auth: &Authority<'_>,
+        stands_at_d: &mut dyn FnMut(usize) -> bool,
+    ) -> bool {
+        let member_signed = |i: usize| auth.plain[i] || auth.authorized[i];
+        if counts[e]
+            || !member_signed(e)
+            || !matches!(self.records[e].body(), Body::Epoch { .. })
+            || !self.before(e, d)
+            || self.signer(d)[..32] == self.signer(e)[..32]
+        {
+            return false;
+        }
+        let writer = self.signer_actor[d];
+        if !self.is_founder[writer]
+            && !self.admits_of[writer]
+                .iter()
+                .any(|&a| counts[a] && self.before(a, d))
+        {
+            return false;
+        }
+        let signer = self.signer_actor[e];
+        !self.removes_of[signer].iter().any(|&(r, cutoff)| {
+            auth.authorized[r]
+                && !auth.void[r]
+                && self.before(r, d)
+                && !self.upto(e, cutoff)
+                && !self.admits_of[signer]
+                    .iter()
+                    .any(|&a| member_signed(a) && self.before(r, a) && self.before(a, e))
+                && stands_at_d(r)
+        })
+    }
+
+    /// F21's rule 2: the non-counting `Wrap`s of a keyed epoch that lie in the past of one of its
+    /// `dependents`, which a reader may open.
+    fn usable_wraps(&self, counts: &[bool], dependents: &BTreeMap<usize, Vec<usize>>) -> Vec<bool> {
+        let mut usable = vec![false; self.records.len()];
+        if dependents.is_empty() {
+            return usable;
+        }
+        for (w, slot) in usable.iter_mut().enumerate().skip(1) {
+            if counts[w] {
+                continue;
+            }
+            let Body::Wrap { epoch, .. } = self.records[w].body() else {
+                continue;
+            };
+            *slot = self
+                .at
+                .get(epoch)
+                .and_then(|e| dependents.get(e))
+                .is_some_and(|ds| ds.iter().any(|&d| self.before(w, d)));
+        }
+        usable
     }
 
     fn historical_seat_entry(self, binding: &Binding) -> Option<RecordId> {

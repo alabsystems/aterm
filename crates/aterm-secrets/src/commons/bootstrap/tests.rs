@@ -1463,6 +1463,73 @@ fn an_established_journal_missing_a_published_witness_takes_the_writer_to_ingest
 }
 
 #[test]
+fn vault_revalidation_retains_busy_and_changed_kinds_without_trusting_error_words() {
+    use std::time::{Duration, Instant};
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    client::create(
+        &paths,
+        home.path().join("team.vault").to_str().unwrap(),
+        None,
+        Some("m1"),
+    )
+    .unwrap();
+    let bootstrap = Bootstrap::cached(&paths).unwrap().unwrap();
+    let check = |error: Error, kind| {
+        assert_eq!(error.kind(), kind, "{error}");
+        assert!(is_transient_vault_revalidation(&error));
+        let copied_words = Error::new(format!("local context: {error}"));
+        assert!(
+            !is_transient_vault_revalidation(&copied_words),
+            "only a typed source observation can request a retry"
+        );
+    };
+    let held =
+        aterm_uds::private_file::PrivateLock::take(&paths.dir, ".lock", Duration::ZERO, "held")
+            .unwrap();
+    for error in [
+        bootstrap.revalidate_custody().err().unwrap(),
+        bootstrap.local_source_read().err().unwrap(),
+        Bootstrap::required_until(&paths, Instant::now())
+            .err()
+            .unwrap(),
+        Bootstrap::required_with_journal_until(&paths, Instant::now())
+            .err()
+            .unwrap(),
+        Bootstrap::established_with_journal_until(&paths, Instant::now())
+            .err()
+            .unwrap(),
+    ] {
+        check(error, crate::ErrorKind::VaultBusy);
+    }
+    drop(held);
+    bootstrap.revalidate_custody().unwrap();
+    assert!(bootstrap.local_source_read().is_ok());
+
+    let admin = client::admin_open(&paths).unwrap();
+    client::admin_publish(&paths, &admin, &admin.doc).unwrap();
+    check(
+        bootstrap.revalidate_custody().err().unwrap(),
+        crate::ErrorKind::VaultChanged,
+    );
+    check(
+        bootstrap.local_source_read().err().unwrap(),
+        crate::ErrorKind::VaultChanged,
+    );
+    let current = Bootstrap::cached(&paths).unwrap().unwrap();
+    current.revalidate_custody().unwrap();
+
+    std::fs::rename(
+        paths.dir.join(".lock"),
+        paths.dir.join("retained-state-lock"),
+    )
+    .unwrap();
+    let missing = current.local_source_read().err().unwrap();
+    assert_eq!(missing.kind(), crate::ErrorKind::Other);
+    assert!(!is_transient_vault_revalidation(&missing));
+}
+
+#[test]
 fn bounded_bootstrap_retries_transient_vault_lock_after_releasing_custody() {
     use std::{cell::Cell, rc::Rc, time::Instant};
 

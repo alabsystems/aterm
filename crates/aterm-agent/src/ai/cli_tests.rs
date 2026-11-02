@@ -705,13 +705,13 @@ fn login_kimi_renews_its_pool_or_runs_its_own_login_for_a_person() {
 
 /// UNDER AN AGENT, WITH NO TERMINAL, THE DOCTOR MAKES ATERM'S OWN FIXES AND HOLDS ONLY A
 /// PERSON'S (owner ruling R-13: no human user): it installs a CLI that is not installed (`aterm
-/// pkg install muse`) and renews a pool row with an email (`aterm harness accounts renew
+/// pkg install claude`) and renews a pool row with an email (`aterm harness accounts renew
 /// kimi-one --cli kimi`), starts no CLI's own sign-in (codex has no roster), and says what only
 /// a person can give on one `NEEDS YOU:` line. CONTROL: `--read-only` runs nothing.
 #[test]
 fn the_doctor_makes_aterms_own_fixes_under_an_agent_and_holds_only_a_persons() {
     let b = machine(&["codex", "kimi"]);
-    let config = "[ai]\npreferred = \"codex\"\n[ai.claude]\nuse = false\n[ai.agy]\nuse = false\n\
+    let config = "[ai]\npreferred = \"codex\"\n[ai.agy]\nuse = false\n[ai.muse]\nuse = false\n\
                   [ai.grok]\nuse = false\n";
     std::fs::write(
         b.dir.path().join("accounts-kimi.toml"),
@@ -728,7 +728,7 @@ fn the_doctor_makes_aterms_own_fixes_under_an_agent_and_holds_only_a_persons() {
     let h = state::health(&look(&env).rows);
     assert_eq!(
         (h.by_aterm.clone(), h.by_person.clone()),
-        (vec!["muse", "kimi"], vec!["codex"]),
+        (vec!["claude", "kimi"], vec!["codex"]),
         "{out}"
     );
 
@@ -741,7 +741,7 @@ fn the_doctor_makes_aterms_own_fixes_under_an_agent_and_holds_only_a_persons() {
         .collect();
     let args = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
     assert!(
-        calls.contains(&("aterm".to_string(), args(&["pkg", "install", "muse"])))
+        calls.contains(&("aterm".to_string(), args(&["pkg", "install", "claude"])))
             && calls.contains(&(
                 "aterm".to_string(),
                 args(&["harness", "accounts", "renew", "kimi-one", "--cli", "kimi"])
@@ -1060,7 +1060,7 @@ fn codex_default_only(held: &str) -> Box3 {
     let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/old"), false);
     std::fs::write(
         b.pkg.agents_dir().join("codex"),
-        format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
+        crate::harness::codex_alab::twin_text(&exe),
     )
     .expect("launcher");
     std::fs::create_dir_all(b.home.join(".codex")).expect("default home");

@@ -103,9 +103,10 @@ CFLAGS_x86_64_apple_darwin = "-mmacosx-version-min=10.12"
 # The release cutter (crates/aterm-release). No `-q`, so a failing run is never silent.
 ship = "run --profile gate -p aterm-release --"
 # Every check, alone or in any combination, and the perf lanes
-# (crates/aterm-verify): `targo --unverified verify --help`. Dev profile, the
-# caller's target dir.
-verify = "run -q -p aterm-verify --"
+# (crates/aterm-verify): `targo --unverified verify --help`. Share the test
+# profile's dependency units, retaining debug assertions without a second
+# compile for dev-profile debug information. The caller's target dir is kept.
+verify = "run -q --profile test -p aterm-verify --"
 # The real-Claude lab (crates/aterm-lab): `targo --unverified lab help`. Dev
 # profile, the caller's target dir; the aterm it tests is the one beside it.
 lab = "run -q -p aterm-lab --"

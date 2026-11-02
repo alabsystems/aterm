@@ -1,0 +1,537 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! The residency tier against the real log: with a budget that keeps only the newest
+//! record decoded, every record read back from its frame equals the record written —
+//! through the single-append path and the batch path, sealed at rest or not, across a
+//! reopen, and across a retention cut that moves every kept frame.
+
+use std::sync::Arc;
+
+use astream_wire::Offset;
+
+use crate::brecord::BrokerRecord;
+use crate::store::{BrokerLog, Durability};
+
+fn body(i: u64) -> Vec<u8> {
+    // Bodies of varying length, so a wrong frame boundary cannot decode by luck.
+    let n = 1 + (i as usize * 37) % 300;
+    (0..n)
+        .map(|k| (i as u8).wrapping_mul(31).wrapping_add(k as u8))
+        .collect()
+}
+
+fn subject(i: u64) -> String {
+    format!("/f/tier/s{}", i % 7)
+}
+
+fn check_all(log: &BrokerLog, from: u64, to: u64) {
+    let got: Vec<Arc<BrokerRecord>> = log.read_from(Offset(from));
+    assert_eq!(
+        got.len() as u64,
+        to - from,
+        "every retained record reads back"
+    );
+    for (k, rec) in got.iter().enumerate() {
+        let i = from + k as u64;
+        assert_eq!(rec.seq, Offset(i));
+        assert_eq!(rec.subject, subject(i));
+        assert_eq!(rec.body, body(i));
+    }
+}
+
+#[test]
+fn cold_records_read_back_exactly_through_single_appends_and_reopen() {
+    let root = crate::test_scratch::Scratch::new("tier-single");
+    let path = root.path().join("log");
+    {
+        let mut log = BrokerLog::open_with(&path, Durability::Relaxed).unwrap();
+        log.set_resident_budget(0);
+        for i in 0..200u64 {
+            log.publish(1, i, subject(i), body(i)).unwrap();
+        }
+        let (resident, _, retained) = log.residency();
+        assert_eq!((resident, retained), (1, 200));
+        check_all(&log, 0, 200);
+        check_all(&log, 150, 200);
+    }
+    let mut log = BrokerLog::open_with(&path, Durability::Relaxed).unwrap();
+    log.set_resident_budget(0);
+    check_all(&log, 0, 200);
+    // Appends after a reopen land at positions after the recovered prefix.
+    for i in 200..230u64 {
+        log.publish(1, i, subject(i), body(i)).unwrap();
+    }
+    check_all(&log, 0, 230);
+}
+
+#[test]
+fn cold_records_read_back_exactly_through_the_batch_path() {
+    let root = crate::test_scratch::Scratch::new("tier-batch");
+    let path = root.path().join("log");
+    let mut log = BrokerLog::open_with(&path, Durability::Relaxed).unwrap();
+    log.set_resident_budget(1);
+    let mut i = 0u64;
+    for batch in 1..=12u64 {
+        for _ in 0..batch {
+            log.stage_publish(2, i, subject(i), body(i)).unwrap();
+            i += 1;
+        }
+        log.commit_batch().unwrap();
+    }
+    check_all(&log, 0, i);
+}
+
+#[cfg(feature = "at-rest")]
+#[test]
+fn cold_records_read_back_exactly_when_sealed_at_rest() {
+    const KEY: [u8; 32] = [0x5a; 32];
+    let root = crate::test_scratch::Scratch::new("tier-sealed");
+    let path = root.path().join("log");
+    {
+        let mut log = BrokerLog::open_encrypted(&path, KEY).unwrap();
+        log.set_resident_budget(0);
+        for i in 0..64u64 {
+            log.publish(3, i, subject(i), body(i)).unwrap();
+        }
+        check_all(&log, 0, 64);
+    }
+    let mut log = BrokerLog::open_encrypted(&path, KEY).unwrap();
+    log.set_resident_budget(0);
+    check_all(&log, 0, 64);
+}
+
+#[cfg(feature = "retention")]
+#[test]
+fn cold_records_read_back_exactly_after_a_retention_cut() {
+    let root = crate::test_scratch::Scratch::new("tier-retain");
+    let path = root.path().join("log");
+    let mut log = BrokerLog::open_with(&path, Durability::Strict).unwrap();
+    log.set_resident_budget(0);
+    for i in 0..120u64 {
+        log.publish(4, i, subject(i), body(i)).unwrap();
+    }
+    log.retain_before(Offset(50)).unwrap();
+    check_all(&log, 50, 120);
+    for i in 120..140u64 {
+        log.publish(4, i, subject(i), body(i)).unwrap();
+    }
+    check_all(&log, 50, 140);
+    drop(log);
+    let mut log = BrokerLog::open_with(&path, Durability::Strict).unwrap();
+    log.set_resident_budget(0);
+    check_all(&log, 50, 140);
+}
+
+#[test]
+fn a_bounded_log_answers_last_and_fetch_like_an_unbounded_one() {
+    let root = crate::test_scratch::Scratch::new("tier-parity");
+    let (a, b) = (root.path().join("a"), root.path().join("b"));
+    let mut bounded = BrokerLog::open_with(&a, Durability::Relaxed).unwrap();
+    let mut full = BrokerLog::open_with(&b, Durability::Relaxed).unwrap();
+    bounded.set_resident_budget(0);
+    for i in 0..90u64 {
+        bounded.publish(5, i, subject(i), body(i)).unwrap();
+        full.publish(5, i, subject(i), body(i)).unwrap();
+    }
+    let filter = astream_wire::Filter::new("/f/tier/>").unwrap();
+    let head = bounded.stats().head.0;
+    for from in [0u64, 13, 44, 89] {
+        let (pa, na) = bounded.fetch(from, &filter, 10, 100, head);
+        let (pb, nb) = full.fetch(from, &filter, 10, 100, head);
+        assert_eq!(na, nb);
+        assert_eq!(pa, pb);
+    }
+    assert_eq!(bounded.read_from(Offset(0)), full.read_from(Offset(0)));
+}
+
+#[cfg(unix)]
+#[test]
+fn summary_filters_keep_fetch_stats_and_subscribe_from_reading_cold_non_matches() {
+    let root = crate::test_scratch::Scratch::new("tier-summary-filter");
+    let path = root.path().join("log");
+    let sock = root.path().join("sock");
+    let mut opts = crate::OpenOptions::new(Durability::Relaxed);
+    opts.resident_budget = Some(0);
+    let broker = crate::Broker::open_opts(&path, opts, || Ok(crate::Prepared::Nothing)).unwrap();
+    let mut handle = broker.serve(&sock).unwrap();
+    let mut cli = crate::Client::connect(&sock).unwrap();
+    let needle = "/f/tier/needle";
+    let needle_offsets = [17u64, 130, 289, 391];
+    for i in 0..400u64 {
+        let subj = if needle_offsets.contains(&i) {
+            needle.to_string()
+        } else {
+            format!("/f/tier/noise/{}", i % 6)
+        };
+        let (off, deduped) = cli.publish(1, i + 1, &subj, &body(i)).unwrap();
+        assert_eq!((off, deduped), (i, false));
+    }
+    // Append one hidden consumer-group commit at offset 400 so offset 391 is cold too.
+    assert_eq!(cli.commit("/f/tier/grp", 10).unwrap(), 400);
+    let (resident, _, retained) = broker.residency();
+    assert_eq!((resident, retained), (1, 401));
+
+    // 1) `Broker::stats` and wire `Client::stats` read summaries alone (0 cold reads).
+    broker.reset_cold_reads();
+    let st = broker.stats();
+    assert_eq!(st.log.head, Offset(401));
+    assert_eq!(st.visible_head, 401);
+    let wire_st = cli.stats("/f/tier/>").unwrap();
+    assert_eq!(wire_st.head, 401);
+    assert_eq!(
+        wire_st.faces.iter().map(|f| f.records).sum::<u64>(),
+        400,
+        "all 400 non-hidden records counted by face"
+    );
+    assert_eq!(
+        broker.cold_reads(),
+        0,
+        "Broker::stats and wire Stats must decode zero cold frames"
+    );
+
+    // 2) `Fetch` on a narrow filter decodes only the 4 matching cold records.
+    broker.reset_cold_reads();
+    let (records, (next, head)) = cli.fetch(0, needle, 10).unwrap();
+    assert_eq!((next, head), (401, 401));
+    let got_offs: Vec<u64> = records.iter().map(|(o, _, _)| *o).collect();
+    assert_eq!(got_offs, needle_offsets);
+    for (o, s, b) in &records {
+        assert_eq!(s, needle);
+        assert_eq!(b, &body(*o));
+    }
+    assert_eq!(
+        broker.cold_reads(),
+        needle_offsets.len() as u64,
+        "Fetch decoded only matching cold frames"
+    );
+
+    // 3) Multi-chunk `Subscribe` (`401 > TAIL_CHUNK = 256`) decodes only the 4 matching
+    //    cold records and emits its caught-up mark only after reaching the head (401).
+    broker.reset_cold_reads();
+    let mut sub_cli = crate::Client::connect(&sock).unwrap();
+    assert!(sub_cli.idle_marks().unwrap());
+    let mut sub = sub_cli.subscribe(0, needle).unwrap();
+    let mut delivered = Vec::new();
+    let caught_up_next = loop {
+        match sub.recv_event().unwrap().expect("open subscription") {
+            crate::Event::Delivery {
+                offset,
+                subject: s,
+                body: b,
+            } => {
+                assert_eq!(s, needle);
+                assert_eq!(b, body(offset));
+                delivered.push(offset);
+            }
+            crate::Event::Mark { next, head, .. } => {
+                assert_eq!(
+                    delivered, needle_offsets,
+                    "caught-up mark must not fire before scanning all chunks to head"
+                );
+                assert_eq!(head, 401);
+                break next;
+            }
+            crate::Event::Gap(g) => panic!("unexpected gap: {g:?}"),
+        }
+    };
+    assert_eq!(caught_up_next, 401);
+    assert_eq!(
+        broker.cold_reads(),
+        needle_offsets.len() as u64,
+        "Subscribe decoded only matching cold frames across chunks"
+    );
+    drop(sub);
+
+    // NC: a broad filter matching every non-hidden cold record DOES perform cold reads.
+    broker.reset_cold_reads();
+    let (broad_records, _) = cli.fetch(0, "/f/tier/>", 10).unwrap();
+    assert_eq!(broad_records.len(), 10);
+    assert_eq!(broker.cold_reads(), 10);
+
+    drop(cli);
+    handle.shutdown();
+}
+
+#[cfg(feature = "retention")]
+fn assert_rule_retention_parity(at_rest: Option<[u8; 32]>) {
+    let tag = if at_rest.is_some() {
+        "tier-rules-sealed"
+    } else {
+        "tier-rules-plain"
+    };
+    let root = crate::test_scratch::Scratch::new(tag);
+    let (a, b) = (root.path().join("bounded"), root.path().join("full"));
+    let open = |p: &std::path::Path, budget: Option<usize>| -> BrokerLog {
+        let mut opts = crate::OpenOptions::new(Durability::Strict);
+        opts.resident_budget = budget;
+        #[cfg(feature = "at-rest")]
+        if let Some(k) = at_rest {
+            opts.at_rest_key = Some(k);
+        }
+        #[cfg(not(feature = "at-rest"))]
+        let _ = at_rest;
+        BrokerLog::open_opts(p, opts, || Ok(crate::Prepared::Nothing)).unwrap()
+    };
+
+    let mut bounded = open(&a, Some(0));
+    let mut full = open(&b, None);
+
+    let rules_of = || {
+        crate::Retention::new(
+            vec![
+                crate::Rule::prefix("/f/F/pub/*/*/ev")
+                    .unwrap()
+                    .max_bytes(450),
+                crate::Rule::hold("/f/F/in/>")
+                    .unwrap()
+                    .max_age(std::time::Duration::from_secs(86_400))
+                    .until_read("/f/{2}/cur/{4}/node/inbox")
+                    .unwrap(),
+                crate::Rule::hold("/f/F/pub/*/*/presence")
+                    .unwrap()
+                    .last_only(),
+            ],
+            crate::Rule::default_hold(),
+        )
+        .unwrap()
+    };
+    bounded.set_retention(rules_of()).unwrap();
+    full.set_retention(rules_of()).unwrap();
+
+    let push_both =
+        |bounded: &mut BrokerLog, full: &mut BrokerLog, seq: u64, s: &str, n: usize| -> Offset {
+            let payload = vec![(seq as u8).wrapping_add(11); n];
+            let (ob, fb) = bounded
+                .publish(9, seq + 1, s.to_string(), payload.clone())
+                .unwrap();
+            let (of, ff) = full.publish(9, seq + 1, s.to_string(), payload).unwrap();
+            assert_eq!((ob, fb), (of, ff));
+            ob
+        };
+
+    // Under the prefix byte cap (`cut == base`): planning + tick read 0 cold frames.
+    push_both(&mut bounded, &mut full, 0, "/f/F/pub/n1/s1/presence", 24);
+    let n1_mail = push_both(&mut bounded, &mut full, 1, "/f/F/in/n1/from/a", 24);
+    push_both(&mut bounded, &mut full, 2, "/f/F/pub/n1/s1/ev", 64);
+    bounded.reset_cold_reads();
+    let t_b = bounded.retain_by_rules(1_000).unwrap();
+    let t_f = full.retain_by_rules(1_000).unwrap();
+    assert_eq!((t_b.base, t_b.carried), (0, 0));
+    assert_eq!(t_b.base, t_f.base);
+    assert_eq!(
+        bounded.cold_reads(),
+        0,
+        "tick with cut == base must read 0 cold frames"
+    );
+
+    // Commit n1's mail as read, add unread n2 mail, supersede presence, and push EV past
+    // 450 bytes so the cut advances above them.
+    bounded
+        .commit("/f/F/cur/n1/node/inbox".to_string(), n1_mail.0)
+        .unwrap();
+    full.commit("/f/F/cur/n1/node/inbox".to_string(), n1_mail.0)
+        .unwrap();
+    let n2_mail = push_both(&mut bounded, &mut full, 3, "/f/F/in/n2/from/a", 32);
+    push_both(&mut bounded, &mut full, 4, "/f/F/pub/n1/s1/presence", 28);
+    for seq in 5..12u64 {
+        push_both(&mut bounded, &mut full, seq, "/f/F/pub/n1/s1/ev", 90);
+    }
+    let tb1 = bounded.retain_by_rules(2_000).unwrap();
+    let tf1 = full.retain_by_rules(2_000).unwrap();
+    assert!(tb1.base > 5, "cut advanced into EV burst: {}", tb1.base);
+    assert_eq!(
+        (tb1.base, tb1.carried, tb1.released),
+        (tf1.base, tf1.carried, tf1.released)
+    );
+    assert_eq!(
+        tb1.carried, 1,
+        "Keep::All carried unread n2 mail into <log>.held (presence carried in <log>.state)"
+    );
+    let pres_f = astream_wire::Filter::new("/f/F/pub/*/*/presence").unwrap();
+    let hb = bounded.stats().head.0;
+    let hf = full.stats().head.0;
+    let _ = bounded.publish_last_visible(hb).unwrap();
+    let _ = full.publish_last_visible(hf).unwrap();
+    let mut vb = bounded.last_view_at(hb).unwrap();
+    let mut vf = full.last_view_at(hf).unwrap();
+    let crate::LastStep::Page(lb, None) =
+        bounded.last_matching(&pres_f, "", 16, 64, &mut vb).unwrap()
+    else {
+        panic!("expected single LastStep::Page from bounded");
+    };
+    let crate::LastStep::Page(lf, None) = full.last_matching(&pres_f, "", 16, 64, &mut vf).unwrap()
+    else {
+        panic!("expected single LastStep::Page from full");
+    };
+    assert_eq!(lb.len(), 1, "latest presence carried below cut");
+    assert_eq!(lb, lf);
+
+    // Second tick after n2 reads its mail + another EV burst.
+    bounded
+        .commit("/f/F/cur/n2/node/inbox".to_string(), n2_mail.0)
+        .unwrap();
+    full.commit("/f/F/cur/n2/node/inbox".to_string(), n2_mail.0)
+        .unwrap();
+    for seq in 12..18u64 {
+        push_both(&mut bounded, &mut full, seq, "/f/F/pub/n1/s1/ev", 90);
+    }
+    let tb2 = bounded.retain_by_rules(3_000).unwrap();
+    let tf2 = full.retain_by_rules(3_000).unwrap();
+    assert_eq!(
+        (tb2.base, tb2.carried, tb2.released),
+        (tf2.base, tf2.carried, tf2.released)
+    );
+    assert_eq!(tb2.released, 1, "read n2 mail released from <log>.held");
+
+    for pat in [
+        "/f/F/>",
+        "/f/F/in/>",
+        "/f/F/pub/*/*/presence",
+        "/f/F/pub/*/*/ev",
+    ] {
+        let f = astream_wire::Filter::new(pat).unwrap();
+        assert_eq!(bounded.oldest(&f), full.oldest(&f), "oldest({pat})");
+        let head = bounded.stats().head.0;
+        assert_eq!(
+            bounded.fetch(0, &f, 64, 1024, head),
+            full.fetch(0, &f, 64, 1024, head),
+            "fetch({pat})"
+        );
+    }
+    assert_eq!(bounded.read_from(Offset(0)), full.read_from(Offset(0)));
+
+    drop(bounded);
+    drop(full);
+    let reopened = open(&a, Some(0));
+    let reopened_full = open(&b, None);
+    let all = astream_wire::Filter::new("/f/F/>").unwrap();
+    let head = reopened.stats().head.0;
+    assert_eq!(reopened.base(), reopened_full.base());
+    assert_eq!(
+        reopened.fetch(0, &all, 64, 1024, head),
+        reopened_full.fetch(0, &all, 64, 1024, head)
+    );
+    assert_eq!(
+        reopened.read_from(Offset(0)),
+        reopened_full.read_from(Offset(0))
+    );
+}
+
+#[cfg(feature = "retention")]
+#[test]
+fn rule_retention_on_zero_resident_budget_matches_unbounded_and_reads_only_carried_records() {
+    assert_rule_retention_parity(None);
+    #[cfg(feature = "at-rest")]
+    assert_rule_retention_parity(Some([0x3c; 32]));
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_cold_record_stops_fetch_and_refuses_subscribe_and_fork_without_spinning() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let root = crate::test_scratch::Scratch::new("tier-unreadable");
+    let path = root.path().join("log");
+    let sock = root.path().join("sock");
+    let mut opts = crate::OpenOptions::new(Durability::Strict);
+    opts.resident_budget = Some(0);
+    let broker = crate::Broker::open_opts(&path, opts, || Ok(crate::Prepared::Nothing)).unwrap();
+    let mut handle = broker.serve(&sock).unwrap();
+    let mut cli = crate::Client::connect(&sock).unwrap();
+
+    // Offsets 0, 1, 3, 4, 5 match `/f/match`; offset 2 is `/f/other` (non-matching cold).
+    let subjects = [
+        "/f/match", "/f/match", "/f/other", "/f/match", "/f/match", "/f/match",
+    ];
+    for (i, s) in subjects.iter().enumerate() {
+        let payload = vec![b'a' + i as u8; 48];
+        cli.publish(7, i as u64, s, &payload).unwrap();
+    }
+    assert_eq!(broker.residency(), (1, broker.residency().1, 6));
+
+    // Locate offset 3's frame start.
+    let frame3_at = broker
+        .shared_log_frame_at_for_test(3)
+        .expect("frame 3 recorded");
+
+    // Positive control before corruption: `ForkSubscribe` at cold non-matching offset 2
+    // replaces `/f/other` with `/f/match` and delivers [0, 1, 2, 3, 4, 5].
+    {
+        let mut fork = crate::Client::connect(&sock)
+            .unwrap()
+            .fork_subscribe(2, "/f/match", b"swapped", "/f/match")
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some((off, _s, b)) = fork.recv().unwrap() {
+            seen.push((off, b));
+        }
+        let offs: Vec<u64> = seen.iter().map(|(o, _)| *o).collect();
+        assert_eq!(offs, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(seen[2].1, b"swapped");
+    }
+
+    // Corrupt cold frame 3's payload bytes in place on disk after open.
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(frame3_at + 16)).unwrap();
+        f.write_all(&[0xff, 0x00, 0xaa, 0x55]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // 1) `Fetch` delivers [0, 1] and stops with `next == 3` (never skips damaged 3 to 4, 5).
+    let (records, (next, _head)) = cli.fetch(0, "/f/match", 10).unwrap();
+    let fetch_offs: Vec<u64> = records.iter().map(|(o, _, _)| *o).collect();
+    assert_eq!(fetch_offs, vec![0, 1]);
+    assert_eq!(next, 3, "Fetch must stop before unreadable cold offset 3");
+
+    // 2) `Subscribe` delivers [0, 1], emits NO false caught-up mark, and returns an
+    //    explicit refusal naming offset 3 rather than spinning.
+    let mut sub_cli = crate::Client::connect(&sock).unwrap();
+    assert!(sub_cli.idle_marks().unwrap());
+    let mut sub = sub_cli.subscribe(0, "/f/match").unwrap();
+    let mut sub_offs = Vec::new();
+    let sub_err = loop {
+        match sub.recv_event() {
+            Ok(Some(crate::Event::Delivery { offset, .. })) => sub_offs.push(offset),
+            Ok(Some(crate::Event::Mark { next, head, .. })) => {
+                panic!("premature caught-up mark ({next}/{head}) before unreadable cold frame")
+            }
+            Ok(Some(crate::Event::Gap(g))) => panic!("unexpected gap: {g:?}"),
+            Ok(None) => panic!("unexpected clean EOF without refusal"),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(sub_offs, vec![0, 1]);
+    let msg = sub_err.to_string();
+    assert!(
+        msg.contains("cold record at offset 3"),
+        "expected refusal naming cold offset 3, got: {msg:?}"
+    );
+    drop(sub);
+
+    // 3) `ForkSubscribe` delivers [0, 1] and refuses at offset 3 instead of closing its
+    //    snapshot with a Mark as if [0, 1] were the whole log.
+    let mut fork = crate::Client::connect(&sock)
+        .unwrap()
+        .fork_subscribe(5, "/f/match", b"alt", "/f/match")
+        .unwrap();
+    let mut fork_offs = Vec::new();
+    let fork_err = loop {
+        match fork.recv() {
+            Ok(Some((off, _, _))) => fork_offs.push(off),
+            Ok(None) => panic!("ForkSubscribe silently truncated snapshot at unreadable frame"),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(fork_offs, vec![0, 1]);
+    assert!(
+        fork_err.to_string().contains("cold record at offset 3"),
+        "expected ForkSubscribe refusal naming offset 3, got: {fork_err:?}"
+    );
+    drop(fork);
+    drop(cli);
+
+    // 4) Shutdown joins cleanly with zero stuck/spinning tail threads.
+    handle.shutdown();
+}

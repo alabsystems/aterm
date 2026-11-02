@@ -37,6 +37,10 @@ fn accepted() -> Reading {
     })
 }
 
+/// Unix only, where `codex_app_login::shared::snapshot` reads owner-private `auth.json` bytes;
+/// off Unix `shared_codex_refuses_verification_where_private_evidence_is_unavailable` holds
+/// the refusal.
+#[cfg(unix)]
 #[test]
 fn shared_codex_accepts_provider_verified_access_email_without_an_id_token() {
     let temp = aterm_tempfile::tempdir().unwrap();
@@ -128,6 +132,10 @@ fn shared_codex_refuses_disagreeing_account_or_user_despite_access_email() {
     }
 }
 
+/// Unix only, where `codex_app_login::shared::snapshot` reads owner-private `auth.json` bytes;
+/// off Unix `shared_codex_refuses_verification_where_private_evidence_is_unavailable` holds
+/// the refusal.
+#[cfg(unix)]
 #[test]
 fn shared_codex_does_not_take_subscription_from_an_unverified_id_token() {
     let temp = aterm_tempfile::tempdir().unwrap();
@@ -186,6 +194,10 @@ fn shared_codex_does_not_take_subscription_from_an_unverified_id_token() {
     }
 }
 
+/// Unix only, where `codex_app_login::shared::snapshot` reads owner-private `auth.json` bytes;
+/// off Unix `shared_codex_refuses_verification_where_private_evidence_is_unavailable` holds
+/// the refusal.
+#[cfg(unix)]
 #[test]
 fn shared_codex_proof_requires_provider_acceptance_and_exact_private_snapshot() {
     let temp = aterm_tempfile::tempdir().unwrap();
@@ -261,6 +273,10 @@ fn shared_codex_rejects_wrong_identity_or_issuer_before_any_provider_request() {
     }
 }
 
+/// Unix only, where `codex_app_login::shared::snapshot` reads owner-private `auth.json` bytes;
+/// off Unix `shared_codex_refuses_verification_where_private_evidence_is_unavailable` holds
+/// the refusal.
+#[cfg(unix)]
 #[test]
 fn shared_codex_does_not_attribute_a_concurrent_or_refreshed_file_to_prior_request() {
     let temp = aterm_tempfile::tempdir().unwrap();
@@ -279,6 +295,34 @@ fn shared_codex_does_not_attribute_a_concurrent_or_refreshed_file_to_prior_reque
             .principal(),
         principal("account-1", "user-2").unwrap()
     );
+}
+
+/// Off Unix `codex_app_login::shared::snapshot` refuses staged `auth.json` verification before
+/// making any provider request, while portable token identity rules still reject invalid claims.
+#[cfg(not(unix))]
+#[test]
+fn shared_codex_refuses_verification_where_private_evidence_is_unavailable() {
+    let temp = aterm_tempfile::tempdir().unwrap();
+    let valid = document(EMAIL, "user-1");
+    assert_eq!(
+        identity(&aterm_json::to_vec(&valid).unwrap(), EMAIL)
+            .unwrap()
+            .0,
+        EMAIL
+    );
+    assert!(identity(&aterm_json::to_vec(&valid).unwrap(), "other@example.test").is_err());
+    write(temp.path(), &valid);
+    let err = match verify_with(temp.path(), EMAIL, || {
+        panic!("no provider request off Unix")
+    }) {
+        Ok(_) => panic!("expected off-Unix refusal"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        "private shared-login evidence is unavailable on this platform"
+    );
+    assert_eq!(local_principal(temp.path(), EMAIL), None);
 }
 
 #[test]

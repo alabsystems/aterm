@@ -13,7 +13,7 @@ const STORE: &str =
     "/Users//u/Library/Application Support/aterm/pkg/store/muse/2001004010006427002/bin/muse";
 
 #[test]
-fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
+fn a_relaunch_carries_the_provider_and_its_launch_policy_and_drops_what_the_session_keeps() {
     let launch = argv(&[
         STORE,
         "--base-url",
@@ -49,7 +49,18 @@ fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
             "http://127.0.0.1:60955",
             "-c",
             "provider_retry.max_attempts=3",
+            "--yolo",
+            "--approval-mode",
+            "never",
+            "--sandbox-network",
+            "allow",
+            "--disable-sandbox",
+            "--disable-approval",
+            "--approval-judge",
+            "auto",
             "--trust-workspace",
+            "--permission-profile",
+            "p1",
             "--provider=meta",
             "--contributor-mode",
             "off",
@@ -549,4 +560,80 @@ fn a_session_id_is_a_uuid() {
     assert!(is_session_uuid("0badbeef-0000-4000-8000-000000000000"));
     assert!(!is_session_uuid("my-session-name"));
     assert!(!is_session_uuid(&format!("{S1}0")));
+}
+
+#[test]
+fn launch_endpoint_guards_mtls_auth_and_custom_ca_env_vars() {
+    assert_eq!(
+        launch_endpoint(
+            &argv(&[
+                STORE,
+                "--base-url",
+                "https://muse.internal/v1",
+                "-c",
+                "endpoint_transport.auth=\"bearer\"",
+            ]),
+            &[],
+        ),
+        LaunchEndpoint::BaseUrl {
+            url: "https://muse.internal/v1".to_string(),
+            source: "Muse Code's --base-url",
+        },
+        "bearer transport auth stays probeable"
+    );
+    assert_eq!(
+        launch_endpoint(
+            &argv(&[
+                STORE,
+                "-c",
+                "endpoint_transport={\"base_url\":\"https://muse.internal/v1\",\"auth\":{\"type\":\"bearer\"}}",
+            ]),
+            &[],
+        ),
+        LaunchEndpoint::BaseUrl {
+            url: "https://muse.internal/v1".to_string(),
+            source: "Muse Code's -c endpoint_transport.base_url",
+        },
+        "typed bearer object stays probeable"
+    );
+
+    for mtls in [
+        "endpoint_transport.auth={\"client_cert\":\"/etc/tls/c.pem\",\"client_key\":\"/etc/tls/k.pem\"}",
+        "endpoint_transport={\"base_url\":\"https://muse.internal/v1\",\"auth\":{\"client_cert\":\"/etc/tls/c.pem\"}}",
+        "endpoint_transport.auth.client_cert=\"/etc/tls/c.pem\"",
+        "endpoint_transport.auth=mtls",
+    ] {
+        let got = launch_endpoint(
+            &argv(&[STORE, "--base-url", "https://muse.internal/v1", "-c", mtls]),
+            &[],
+        );
+        assert!(
+            matches!(got, LaunchEndpoint::Gap(ref why) if why.contains("endpoint_transport.auth")),
+            "expected mTLS gap for {mtls}, got {got:?}"
+        );
+    }
+
+    for ca_var in ["TBH_CA_CERTIFICATE", "SSL_CERT_FILE", "SSL_CERT_DIR"] {
+        let env = vec![format!("{ca_var}=/etc/ssl/corp-ca.pem")];
+        let https_got = launch_endpoint(
+            &argv(&[STORE, "--base-url", "https://muse.internal/v1"]),
+            &env,
+        );
+        assert!(
+            matches!(https_got, LaunchEndpoint::Gap(ref why) if why.contains(ca_var)),
+            "expected custom CA gap for {ca_var}, got {https_got:?}"
+        );
+        let http_got = launch_endpoint(
+            &argv(&[STORE, "--base-url", "http://127.0.0.1:18080/v1"]),
+            &env,
+        );
+        assert_eq!(
+            http_got,
+            LaunchEndpoint::BaseUrl {
+                url: "http://127.0.0.1:18080/v1".to_string(),
+                source: "Muse Code's --base-url",
+            },
+            "plain http lab stub stays probeable even when {ca_var} is set in env"
+        );
+    }
 }

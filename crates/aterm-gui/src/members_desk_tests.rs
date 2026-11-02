@@ -395,6 +395,54 @@ fn a_join_files_info_entries_and_puts_nothing_on_screen() {
     );
 }
 
+/// An update carrying 0.147's standing join alerts retires them on the first poll,
+/// including requests no longer in its snapshot. Current requests remain
+/// available as Info entries, and unrelated messages stay live.
+#[test]
+fn a_desk_poll_retires_carried_join_alerts() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let (desk, request) = heard(root.path(), true);
+    let mut app = app_with(desk);
+    for key in [
+        "members.ask.1",
+        "members.ask.99",
+        "secrets.asking.ABCD",
+        "unrelated.warning",
+    ] {
+        app.post_unsynced(
+            Message::new(tags::PRIVACY, Severity::Warn, "An existing warning")
+                .key(key)
+                .now(Ask::standing(
+                    StandingWhy::OnlyYou(Reason::new("a person must act")),
+                    Then::step("Review the request"),
+                )),
+            wall_stamp_now(),
+        );
+    }
+    assert!(app.messages.live_by_key("members.ask.1").is_some());
+    app.follow_member_requests();
+    assert!(app.messages.live_by_key("members.ask.1").is_none());
+    assert!(app.messages.live_by_key("members.ask.99").is_none());
+    assert!(app.messages.live_by_key("secrets.asking.ABCD").is_none());
+    assert!(app.messages.live_by_key("unrelated.warning").is_some());
+    assert_eq!(entry_of(&app, request).severity, Severity::Info);
+}
+
+#[test]
+fn polling_without_a_desk_retires_carried_join_alerts() {
+    let mut app = App::headless_for_test();
+    app.members.slot = Box::leak(Box::new(Mutex::new(None)));
+    app.members.set_approver(Vec::new());
+    app.post_unsynced(
+        Message::new(tags::PRIVACY, Severity::Warn, "Old join request").key("members.ask.99"),
+        wall_stamp_now(),
+    );
+    assert!(app.messages.live_by_key("members.ask.99").is_some());
+    app.follow_member_requests();
+    assert!(app.messages.live_by_key("members.ask.99").is_none());
+    assert!(join_keys(&app).is_empty());
+}
+
 /// A phrase whose sheet did not open is burned at once, Allow's and invite's alike: nobody saw
 /// it, so it gives up its place in the book and no run can use it, and the row asks again
 /// rather than tell the asking Mac to wait for a phrase no person can read.

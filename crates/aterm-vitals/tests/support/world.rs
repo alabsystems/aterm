@@ -626,6 +626,7 @@ impl World {
             blocked_fd: p.blocked_fd.filter(|_| want_fds && !zombie && !p.refused),
             start_wait: (p.held && !zombie).then_some(p.wait),
             version: (self.versions && !zombie).then_some(p.exec),
+            exec_version: (self.versions && !zombie).then_some(p.exec),
         }
     }
 

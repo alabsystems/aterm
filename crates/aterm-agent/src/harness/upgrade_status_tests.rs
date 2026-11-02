@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::harness::upgrade::Version;
 use crate::supervise::ScratchDir;
 use std::path::PathBuf;
 
@@ -174,6 +175,27 @@ fn only_an_upgrade_that_will_not_move_on_its_own_is_stalled() {
             "{a:?} {b:?}"
         );
     }
+    let muse_row = Row {
+        session: "muse-s-1".to_string(),
+        tab: TAB.to_string(),
+        agent: upgrade::Agent::Muse,
+        from: "1.4.10-R6427.1".to_string(),
+        to: "1.4.10-R6500.1".to_string(),
+        phase: Phase::Failed("signal-refused".to_string()),
+        ..Row::default()
+    };
+    assert!(
+        muse_row.standing(&[holder("muse-s-1", "1.4.10-R6427.1", Some(TAB))], true),
+        "a live Muse holder on an older revision under the same core stands behind the target"
+    );
+    assert!(
+        !muse_row.standing(&[holder("muse-s-1", "1.4.10-R6500.1", Some(TAB))], true),
+        "CONTROL: a live Muse holder already on the target revision is no longer behind"
+    );
+    assert!(
+        !muse_row.standing(&[holder("muse-s-1", "1.4.10-R6500.2", Some(TAB))], true),
+        "CONTROL: a live Muse holder on a newer revision is not behind"
+    );
     let deferred = Row {
         request: Request::DeferUntil(NOW + 60),
         ..old.clone()

@@ -9,8 +9,8 @@ use std::path::Path;
 use aterm_json::{Map, Value};
 
 use super::{
-    LiveTab, Opts, Phase, Report, Request, STALE_S, St, Version, alive, connect, conversation_live,
-    ledger, load, now_s, process_group, roster_aside, save, session_files, started_s, state_dir,
+    LiveTab, Opts, Phase, Report, Request, STALE_S, St, alive, connect, conversation_live, ledger,
+    load, now_s, process_group, roster_aside, save, session_files, started_s, state_dir,
     sweep_lock, tab_is_live, unique_tab_for_group, upgrade,
 };
 use crate::harness::relaunch::{TAB_TAKEN, overtakable, overtaken, overtaken_line};
@@ -1268,8 +1268,7 @@ impl Row {
     }
 
     fn behind_holders<'a>(&'a self, holders: &'a [Holder]) -> impl Iterator<Item = &'a Holder> {
-        let to = Version::parse(&self.to);
-        let same_build = to.is_some() && Version::parse(&self.from) == to;
+        let same_build = upgrade::same_build(self.agent, &self.from, &self.to);
         holders.iter().filter(move |h| {
             h.session == self.session
                 && (self.held_back
@@ -1280,8 +1279,9 @@ impl Row {
                         .proc_start
                         .split_whitespace()
                         .eq(h.proc_start.split_whitespace()))
-                && to.as_ref().is_some_and(|to| {
-                    Version::parse(&h.version).is_some_and(|v| v < *to || (same_build && v == *to))
+                && upgrade::build_order(self.agent, &h.version, &self.to).is_some_and(|ord| {
+                    ord == std::cmp::Ordering::Less
+                        || (same_build && ord == std::cmp::Ordering::Equal)
                 })
         })
     }

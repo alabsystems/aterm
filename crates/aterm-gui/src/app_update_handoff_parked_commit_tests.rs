@@ -1003,7 +1003,11 @@ fn the_outgoing_commit_writes_the_persons_stamps_at_its_write() {
             .lines()
             .map(|line| line.split_once(' ').expect("a stamp row"))
             .collect();
-        assert_eq!(rows.len(), 2, "one gesture and one typing row: {body:?}");
+        assert_eq!(
+            rows.len(),
+            if typed { 3 } else { 2 },
+            "one gesture and one typing row, and a typing's awake row: {body:?}"
+        );
         let age = rows
             .iter()
             .find_map(|&(id, age)| (id == "0").then_some(age))
@@ -1028,6 +1032,17 @@ fn the_outgoing_commit_writes_the_persons_stamps_at_its_write() {
             );
         } else {
             assert_eq!(typing_age, "-", "no typing was carried: {body:?}");
+        }
+        let awake = rows
+            .iter()
+            .find_map(|&(id, age)| (id == "a0").then_some(age));
+        if typed {
+            assert!(
+                awake.is_some_and(|age| age.parse::<u64>().is_ok_and(|ms| ms >= 30_000)),
+                "the typing's awake age: {body:?}"
+            );
+        } else {
+            assert_eq!(awake, None, "no typing, no awake row: {body:?}");
         }
         assert!(!path.exists(), "the Commit returned: taken back");
     }

@@ -97,13 +97,24 @@ fn copy_wait_left_at(
     (!left.is_zero()).then_some(left)
 }
 
+/// The words a wait ends COULD NOT RUN with when its child `pid` is held at macOS's program check past `waited`, its hang detector: `held` is [`crate::process::at_program_check`]'s answer, asked before the child is killed. `None` unless it is held, so any other silence stays the waiter's own failure. It stands outside the test seams below because a bench built with debug assertions off ends a wait this way too.
+#[must_use]
+pub fn held_words(pid: u32, waited: Duration, held: Option<bool>) -> Option<String> {
+    (held == Some(true)).then(|| {
+        format!(
+            "macOS's program check held this test's program (pid {pid}) past its {waited:?} \
+             hang detector; nothing was verified"
+        )
+    })
+}
+
 #[cfg(any(test, debug_assertions))]
 mod silent;
 #[cfg(all(unix, test))]
 pub(crate) use silent::std_ends_within;
 #[cfg(any(test, debug_assertions))]
 pub use silent::{
-    CODESIGN_HANG, ECHO_HANG, KeptUntilRan, ad_hoc_copy, held_words, require_disk_image_service,
+    CODESIGN_HANG, ECHO_HANG, KeptUntilRan, ad_hoc_copy, require_disk_image_service,
     require_trust_service, sign_ad_hoc, stand_in, trust_service_silent,
 };
 #[cfg(all(unix, any(test, debug_assertions)))]

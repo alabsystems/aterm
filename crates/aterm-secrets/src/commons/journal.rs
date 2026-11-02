@@ -31,7 +31,20 @@ const MAX_BYTES: usize = 128 * 1024 * 1024;
 // Leave room to join a generation's many data heads in batches of at most 64.
 // This is recovery headroom, not an unbounded-growth or rollover guarantee.
 const RECOVERY_NODES: usize = MAX_NODES.div_ceil(astream_wire::sync::MAX_PARENTS - 1);
-const MAX_RECOVERY_BYTES: usize = 4 + 16 + 32 + 2 + 64 * 32 + 32 + 8 + 2 + 4 + 64 + 256;
+const MAX_RECOVERY_BYTES: usize = 4
+    + 16
+    + 32
+    + 2
+    + astream_wire::sync::MAX_PARENTS * size_of::<Digest>()
+    + 32
+    + 8
+    + 2
+    + 4
+    + 64
+    + 256;
+// A pin bump that moves `MAX_PARENTS` or the digest moves every journal's recovery reserve, and
+// breaks the build here so the bump says what happens to a full journal written at the old one.
+const _: () = assert!(MAX_RECOVERY_BYTES == 2_468);
 const RECOVERY_BYTES: usize = RECOVERY_NODES * MAX_RECOVERY_BYTES;
 const SUBJECT: &str = "commons/control/1";
 const NAME: &str = "control";

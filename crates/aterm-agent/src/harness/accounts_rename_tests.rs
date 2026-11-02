@@ -45,6 +45,8 @@ pub(crate) fn seed_reference(state: &mut State, logins: &mut Logins, label: &str
             state.pending_pin = PinRequest::new(label, "a".repeat(32));
         }
         7 => {
+            // A running session's usage tap also marks this Mac's use of the account.
+            state.claimed_at.insert(label.into(), NOW);
             state.sessions.insert(
                 format!("session-{label}"),
                 SessionRow {

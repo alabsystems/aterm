@@ -858,8 +858,8 @@ impl<S: Read + Write> Client<S> {
     }
 
     /// Whether the latest `Hello` answer announced [`Request::Stats`]
-    /// (`REQUIREMENTS` R5): this broker serves attach-gated operational fleet statistics
-    /// over the wire ([`stats`](Self::stats)).
+    /// (`REQUIREMENTS` R5): this broker serves operational fleet statistics over the wire
+    /// ([`stats`](Self::stats)).
     pub const fn supports_stats(&self) -> bool {
         self.ext.supports_stats()
     }
@@ -1794,7 +1794,7 @@ impl<S: Read + Write> Client<S> {
         Ok(())
     }
 
-    /// Query attach-gated operational fleet statistics for `filter` (`REQUIREMENTS` R5).
+    /// Query operational fleet statistics for `filter` (`REQUIREMENTS` R5).
     /// Requires a read grant covering `/f/<F>/>` (or root `/>`) on a guarded broker;
     /// never returns record bodies.
     pub fn stats(&mut self, filter: &str) -> io::Result<WireStats> {

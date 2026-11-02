@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 7, "0.7");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 8, "0.8");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,9 +200,13 @@ impl fmt::Display for Busy {
 }
 
 /// The busy signal on the screen, read from the live zone when the composer frame is there.
+/// With no frame it is read from the whole screen, but for a `/login` dialog drawn in the
+/// composer's place, from the dialog and the row said above it
+/// ([`crate::login::dialog_live_from`]).
 pub fn busy_signal(rows: &[String]) -> Option<Busy> {
     let Some(frame) = composer_frame(rows) else {
-        return rows
+        let from = crate::login::dialog_live_from(rows).unwrap_or(0);
+        return rows[from..]
             .iter()
             .find_map(|r| busy_reason(r))
             .map(|rule| Busy::hard(Zone::Screen, rule));
@@ -1931,7 +1935,7 @@ fn last_said_before(rows: &[String], end: usize, width: Option<usize>) -> Option
 }
 
 /// The vendor's own `⏺` paragraph that row `i` is a row of, as its bullet row.
-fn vendor_paragraph(rows: &[String], i: usize) -> Option<usize> {
+pub(crate) fn vendor_paragraph(rows: &[String], i: usize) -> Option<usize> {
     const NOTICES: &[&str] = &[crate::anchor!("notice.auto_mode")];
     let mut open = i;
     while !rows[open].starts_with(['⏺', '●']) {
@@ -2408,7 +2412,7 @@ pub fn owner_above_rows(rows: &[String], i: usize) -> bool {
 }
 
 /// Whether `row` is Claude Code's stop-hook summary.
-fn is_stop_hook_summary(row: &str) -> bool {
+pub(crate) fn is_stop_hook_summary(row: &str) -> bool {
     let Some(rest) = row
         .strip_prefix(['⏺', '●'])
         .map(crate::text::trim_start)

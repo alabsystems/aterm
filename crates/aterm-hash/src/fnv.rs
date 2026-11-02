@@ -23,11 +23,12 @@ pub const fn fnv1a_64_extend(hash: u64, bytes: &[u8]) -> u64 {
     astream_wire::hash::fnv1a_64_update(hash, bytes)
 }
 
-/// One fold step: `(hash ^ word) * FNV64_PRIME`, wrapping.
+/// One fold step, `(hash ^ word) * FNV64_PRIME` wrapping: astream-wire's step, on its
+/// Clean-origin multiply.
 #[inline]
 #[must_use]
 pub const fn fnv_mix_u64(hash: u64, word: u64) -> u64 {
-    (hash ^ word).wrapping_mul(FNV64_PRIME)
+    astream_wire::hash::fnv1a_64_mix_u64(hash, word)
 }
 
 /// The FNV-1a/128 offset basis: the 128-bit hash of no bytes.
@@ -265,8 +266,8 @@ mod tests {
         );
     }
 
-    /// The byte loop and the word fold `fnv1a_64_mix_u64` are astream-wire's;
-    /// [`fnv_mix_u64`] is this file's copy of that fold.
+    /// The byte loop and the word step are astream-wire's, so the step is held here to the
+    /// formula written out, and the loop to a fold of the step.
     #[test]
     fn the_word_fold_agrees_with_astreams_byte_loop() {
         let fold = |prime: u64, bytes: &[u8]| {
@@ -304,7 +305,7 @@ mod tests {
             for word in words {
                 assert_eq!(
                     fnv_mix_u64(h, word),
-                    astream_wire::hash::fnv1a_64_mix_u64(h, word),
+                    (h ^ word).wrapping_mul(FNV64_PRIME),
                     "{h:#x} {word:#x}"
                 );
             }
@@ -315,7 +316,7 @@ mod tests {
         let word = 0x0102_0304_0506_0708;
         assert_ne!(
             (FNV64_OFFSET ^ word).wrapping_mul(off_by_one_bit),
-            astream_wire::hash::fnv1a_64_mix_u64(FNV64_OFFSET, word)
+            fnv_mix_u64(FNV64_OFFSET, word)
         );
     }
 

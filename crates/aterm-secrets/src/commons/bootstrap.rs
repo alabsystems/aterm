@@ -800,9 +800,10 @@ pub fn writer_here(paths: &Paths) -> bool {
 }
 
 fn is_transient_vault_revalidation(error: &Error) -> bool {
-    let text = error.to_string();
-    text.contains("Commons vault became unavailable while acquiring custody (vault-busy)")
-        || text.contains("Commons vault source or applied version changed while acquiring custody")
+    matches!(
+        error.kind(),
+        crate::ErrorKind::VaultBusy | crate::ErrorKind::VaultChanged
+    )
 }
 
 impl Bootstrap {
@@ -903,11 +904,7 @@ impl Bootstrap {
     pub fn required(paths: &Paths) -> Result<Self> {
         match Self::observe(paths)? {
             Availability::Available(bootstrap) => Ok(*bootstrap),
-            Availability::Unavailable(reason) => Err(Error::new(format!(
-                "Commons unavailable ({}): {}",
-                reason.code(),
-                reason.explanation()
-            ))),
+            Availability::Unavailable(reason) => Err(reason.failure("Commons unavailable")),
         }
     }
 
@@ -916,11 +913,7 @@ impl Bootstrap {
     pub fn required_until(paths: &Paths, deadline: std::time::Instant) -> Result<Self> {
         match Self::observe_until(paths, deadline)? {
             Availability::Available(bootstrap) => Ok(*bootstrap),
-            Availability::Unavailable(reason) => Err(Error::new(format!(
-                "Commons unavailable ({}): {}",
-                reason.code(),
-                reason.explanation()
-            ))),
+            Availability::Unavailable(reason) => Err(reason.failure("Commons unavailable")),
         }
     }
 
@@ -955,11 +948,9 @@ impl Bootstrap {
                         Err(error) => Err(error),
                     }
                 }
-                super::Observation::Unavailable(reason) => Err(Error::new(format!(
-                    "Commons unavailable ({}): {}",
-                    reason.code(),
-                    reason.explanation()
-                ))),
+                super::Observation::Unavailable(reason) => {
+                    Err(reason.failure("Commons unavailable"))
+                }
             };
         }
     }
@@ -981,10 +972,8 @@ impl Bootstrap {
         loop {
             let snapshot = match super::observe_until(paths, deadline)? {
                 super::Observation::Visible(snapshot) => snapshot,
-                super::Observation::Unavailable(_) => {
-                    return Err(Error::new(
-                        "existing Commons vault observation is unavailable",
-                    ));
+                super::Observation::Unavailable(reason) => {
+                    return Err(reason.failure("existing Commons vault observation is unavailable"));
                 }
             };
             match Self::open_snapshot_with_journal(
@@ -1442,15 +1431,14 @@ impl Bootstrap {
         let current = match super::observe(paths)? {
             super::Observation::Visible(current) => current,
             super::Observation::Unavailable(reason) => {
-                return Err(Error::new(format!(
-                    "Commons vault became unavailable while acquiring custody ({}): {}",
-                    reason.code(),
-                    reason.explanation()
-                )));
+                return Err(
+                    reason.failure("Commons vault became unavailable while acquiring custody")
+                );
             }
         };
         if !snapshot.same_observation(&current) {
-            return Err(Error::new(
+            return Err(Error::of_kind(
+                crate::ErrorKind::VaultChanged,
                 "Commons vault source or applied version changed while acquiring custody",
             ));
         }

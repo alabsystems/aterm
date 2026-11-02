@@ -2119,7 +2119,9 @@ fn a_parker_that_cannot_go_on_closes_what_it_holds_and_the_lanes_serve_on() {
     let mut idle = rig.idle().expect("admitted");
     rig.settle("both parked", |c, _| c.parked == 2 && c.rpc == 0);
     rig.lanes.inject_parker_panics(usize::MAX);
-    claimed.send("ping\n");
+    // Wakes the parker. Under load it may have woken and stopped first, and hung this up: the
+    // write then fails, and the EOF below is what is judged either way.
+    let _ = claimed.stream.write_all(b"ping\n");
     assert_eq!(
         line_within(&mut claimed, SETTLE).as_deref(),
         Some("<EOF>"),

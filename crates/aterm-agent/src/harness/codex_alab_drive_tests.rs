@@ -669,11 +669,7 @@ impl Rig {
     fn twin_to_build(&self, marked: bool) {
         let exe = crate::harness::codex_alab::lay_package(&self.dir.join("store/codex/1"), marked);
         std::fs::create_dir_all(self.twin.parent().expect("the twin's folder")).expect("agents");
-        std::fs::write(
-            &self.twin,
-            format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
-        )
-        .expect("launcher");
+        std::fs::write(&self.twin, crate::harness::codex_alab::twin_text(&exe)).expect("launcher");
     }
 
     fn asked(&self) -> Vec<String> {
@@ -1208,6 +1204,42 @@ fn a_codex_alab_run_names_its_lock_or_its_resumed_thread() {
     assert_eq!(resumed.session.as_deref(), Some(T1));
     let plain = read(&rig.kernel, &["codex"]).expect("a run");
     assert_eq!(plain.session, None, "nothing names a thread");
+    assert_eq!(plain.version, None, "no package metadata yet");
+    let pkg = exe.parent().expect("bin").parent().expect("pkg");
+    std::fs::create_dir_all(pkg.join("bin")).expect("pkg bin");
+    std::fs::write(&exe, b"codex").expect("exe file");
+    std::fs::write(
+        pkg.join("codex-package.json"),
+        r#"{"layoutVersion":1,"version":"0.164.0","entrypoint":"bin/codex"}"#,
+    )
+    .expect("vendor pkg");
+    assert_eq!(
+        read(&rig.kernel, &["codex"]).expect("vendor run").version,
+        Some("0.164.0".to_string()),
+        "vendor package version"
+    );
+    std::fs::write(
+        pkg.join("codex-package.json"),
+        r#"{"layoutVersion":1,"version":"0.1.0-dev.13764+codex.0.164.0.g4b3a367a0","entrypoint":"bin/codex"}"#,
+    )
+    .expect("compound pkg");
+    std::fs::write(
+        pkg.join("alab-build.json"),
+        r#"{"client_version":"0.164.0-dev.13764+g4b3a367a0"}"#,
+    )
+    .expect("alab build");
+    assert_eq!(
+        read(&rig.kernel, &["codex"]).expect("compound run").version,
+        Some("0.1.0-dev.13764+codex.0.164.0.g4b3a367a0".to_string()),
+        "compound codex-alab product version"
+    );
+    std::fs::write(pkg.join("alab-build.json"), r#"{"version":"0.0.0"}"#)
+        .expect("corrupt alab build");
+    assert_eq!(
+        read(&rig.kernel, &["codex"]).expect("corrupt run").version,
+        None,
+        "fail closed when alab-build.json is invalid"
+    );
     let two = Crashed {
         files: vec![lock(T1), lock(T2)],
         ..rig.kernel.clone_world()

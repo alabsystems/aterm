@@ -503,8 +503,9 @@ KEY USAGE
   aterm agents remove        remove the block, aterm's skills and its hooks
   aterm agents primer        print the block
 
-  An aterm window runs `aterm agents install` itself, at startup and on new sessions
-  (at most once a minute), unless `agents_auto_prime = false` is set in `aterm.toml`.
+  An aterm window brings every detected agent up to date itself, at startup and on
+  new sessions (at most once a minute), and so does each `aterm init` run from the
+  installed aterm.app, unless `agents_auto_prime = false` is set in `aterm.toml`.
   Text outside the markers is never touched. A skill file without the marker is
   reported `foreign` and left alone: delete the marker line to fork a skill."#,
         ),
@@ -1793,6 +1794,13 @@ FOR AN AGENT
     or more), or it is backgrounded before the operator answers.
   * Cancel on the sheet, not Esc in the agent, stops a pending sudo.
   * `-A` is not needed, and it skips Touch ID.
+  * The sheet attaches only while the session shows in its window's active
+    tab: from a background tab (a spawned worker's), while another sheet is
+    open, or soon after a cancel, sudo is refused at once with no sheet, and
+    aterm never switches tabs to show one.
+  * `sudo -n` never prompts, so it raises no sheet: it runs only where sudo
+    needs no password (a cached credential, a NOPASSWD rule) and fails at once
+    elsewhere.
   * A sandboxed shell call cannot reach `sudo` at all; an `Operation not
     permitted` there is the sandbox, not privacy consent (`aterm ctl privacy`).
   * `tmux` and `screen` sessions are refused.
@@ -2671,7 +2679,7 @@ CUT — from a clean clone of the dev repo on main, never the shared checkout
       withdraws a claimed, unpublished cut (the claim commit stays).
 
   aterm ship --help          every flag and exit code, recovery included
-  docs/RELEASING.md          the runbook, including a cut that stops half-way
+  aterm help ship           this release and recovery runbook
 "#;
 
 /// `aterm help update`.
@@ -2895,7 +2903,8 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
   aterm ctl --host any spawn agent=<claude|codex> [model=<m>] [cwd=<abs-path>] - < task
                              one survey of every member picks the Mac: of those that let
                              this Mac drive them and have an enrolled, unwalled account of
-                             that program, the least used week, then five hours, then the
+                             that program, one read working before an unseen one, then the
+                             least used week, then five hours, then the
                              fewest busy sessions, then by host. It says on stderr which
                              (`--host any: chose <host> (<addr>): …`), prints `OK <sid>` as
                              `--host <that Mac>` does, and refuses with counts where none can.

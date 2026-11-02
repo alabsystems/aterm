@@ -1415,6 +1415,55 @@ fn open_dir_at(d: RawFd, name: &CString) -> io::Result<RawFd> {
     Ok(fd)
 }
 
+/// Make the directory at absolute `path` and each one missing above it without following
+/// symlinks: a link at any part of it, or a `..`, refuses it.
+pub fn scratch_dirs(path: &std::path::Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("scratch_dirs: {} is not an absolute path", path.display()),
+        ));
+    }
+    let root = c"/";
+    // SAFETY: a valid C string; the descriptor is owned below.
+    let d = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if d < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut dir = own_fd(d);
+    for comp in path.components() {
+        let c = match comp {
+            Component::Normal(c) => c,
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("scratch_dirs: {} climbs with ..", path.display()),
+                ));
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => continue,
+        };
+        let n = open_dir_at(dir.as_raw_fd(), &cname(c)?).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "not making {}: {}: {e} (a link in its path?)",
+                    path.display(),
+                    c.to_string_lossy()
+                ),
+            )
+        })?;
+        dir = own_fd(n);
+    }
+    Ok(())
+}
+
 /// Atomically stage and rename `src` to absolute `path` with `mode` without following symlinks.
 pub fn put(path: &std::path::Path, mode: u32, src: &PutSrc<'_>) -> io::Result<()> {
     put_with_nonce(path, mode, src, || {
@@ -2784,6 +2833,29 @@ mod tests {
             .is_err()
         );
         assert!(put(Path::new("relative/x"), 0o600, &PutSrc::Bytes(b"")).is_err());
+    }
+
+    /// A folder made through no link: each missing part made, an existing one kept. NEGATIVE
+    /// CONTROL: a link on the way refuses it, and nothing is made where the link points.
+    #[test]
+    fn scratch_dirs_makes_each_part_and_follows_no_link() {
+        let d = dir("dirs");
+        let made = d.0.join("a/b/c");
+        scratch_dirs(&made).unwrap();
+        assert!(std::fs::symlink_metadata(&made).unwrap().is_dir());
+        scratch_dirs(&made).unwrap();
+        let elsewhere = d.0.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, d.0.join("via")).unwrap();
+        assert!(std::fs::create_dir_all(d.0.join("via/probe")).is_ok());
+        assert!(elsewhere.join("probe").is_dir(), "a plain mkdir follows it");
+        std::fs::remove_dir(elsewhere.join("probe")).unwrap();
+        assert!(scratch_dirs(&d.0.join("via/x")).is_err());
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+        std::os::unix::fs::symlink(&elsewhere, d.0.join("a/b/last")).unwrap();
+        assert!(scratch_dirs(&d.0.join("a/b/last")).is_err());
+        assert!(scratch_dirs(&d.0.join("a/../a/b")).is_err());
+        assert!(scratch_dirs(Path::new("relative/x")).is_err());
     }
 
     use std::path::Path;

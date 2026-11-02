@@ -25,6 +25,13 @@ path = "src/main.rs"
 name = "aterm-lab-guest"
 path = "src/guest/main.rs"
 
+# The stand-in vendor agent of `lab harness-proof` (src/standin/main.rs): the lab builds it and
+# lays two copies into its scratch atpkg store as two builds of the vendor a harness runs, so no
+# vendor byte, account or server is involved. Dev-only as the lab is.
+[[bin]]
+name = "aterm-lab-standin"
+path = "src/standin/main.rs"
+
 [dependencies]
 # The in-process control connection (`RelayClient`): the frame stream
 # (`subscribe`) and `await match` waits ride one authenticated socket instead of

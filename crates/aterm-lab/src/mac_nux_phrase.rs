@@ -3,8 +3,7 @@
 
 //! `lab mac nux`'s `vault-phrase` row: the owner's acceptance test ("a new LAN Mac downloads
 //! aterm, joins with one keyphrase approval from any existing member, and GitHub, publishing and
-//! AI accounts work") as one command, in one guest, on its loopback alone
-//! (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10).
+//! AI accounts work") as one command, in one guest (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10).
 //!
 //! Three identities share the guest, each a scratch `$HOME` under the lane's folder (as
 //! `vault-local` gives its admin one of its own):
@@ -20,39 +19,75 @@
 //!   it syncs until In, and it enrols in the vault's Commons with the seed (the guest helper's
 //!   `enrol`: the control exchange the Commons runtime runs over the LAN, run over loopback in
 //!   one process, as `lab swarm partition` runs it). Then the guest helper's `member` runs F10's
-//!   members desk on its custody behind an `ask`-only listener on `127.0.0.1`, presses Allow for
-//!   the first Mac that asks and writes the phrase to its record ([`read_desk`]). The shipped
-//!   member shows a phrase only in its own sheet (§3.3.5) and the lane reads no window, so the
-//!   phrase is read there, as `lab swarm partition` presses Allow in its own process.
-//! - The joiner is the build's own CLI: `aterm members join --no-wait --at <the member>`
-//!   (install.sh's windowless ask), then `aterm members join --at <the member>` on a terminal
-//!   with the phrase typed at its prompt ([`super::DRIVE`]'s `$NUX_PHRASE`), then its own
-//!   subscriber (`aterm secrets watch`), as a joined Mac's agent runs it. It dials the member at
-//!   its loopback address where a new Mac browses the LAN for members
-//!   (`discover::browse_members`): a browse from the guest would reach the members this Mac's
-//!   LAN advertises, so the row never runs one.
+//!   members desk on its custody behind an `ask`-only listener at the guest's own address on
+//!   tart's network ([`lan_address`]), registered under the run's lab members service as the
+//!   node job registers a member's fleet port, presses Allow for the first Mac that asks and
+//!   writes the phrase to its record ([`read_desk`]). The shipped member shows a phrase only in
+//!   its own sheet (§3.3.5) and the lane reads no window, so the phrase is read there, as `lab
+//!   swarm partition` presses Allow in its own process.
+//! - The joiner is the build's own CLI: `aterm members join --no-wait` (install.sh's windowless
+//!   ask), then `aterm members join` on a terminal with the phrase typed at its prompt
+//!   ([`super::DRIVE`]'s `$NUX_PHRASE`), then its own subscriber (`aterm secrets watch`), as a
+//!   joined Mac's agent runs it. It is named no member (`--at`): each run finds the member as a
+//!   new Mac does, by `discover::browse_members` (`dns-sd -B`, `parse_browse_members_of`, `dns-sd
+//!   -L` of each instance, `parse_reached`), and asks it over the guest's network at the address
+//!   that resolve gives.
+//!
+//! Isolation, which is why the browse runs on a lab service. This Mac is a live ALab member, and
+//! mDNSResponder announces its own registrations (its members desk's `_alab._tcp`, its vault's
+//! `_alab-vault._tcp`) on tart's bridge while a guest runs, so a guest that browsed `_alab._tcp`
+//! could hear this Mac's desk and ask it, putting a real Allow row on its owner's screen. The
+//! joiner instead runs with `ATERM_LAB_MEMBER_SERVICE` naming `_alab-lab-<six random base-36
+//! digits>._tcp`, made for the run ([`lab_service_of`]): `browse_members` then browses that type
+//! and no other, takes no value that is not a lab service (it fails the browse rather than fall
+//! back to `_alab._tcp`), and no ALab Mac registers or browses it, so whatever else the bridge
+//! carries, no live member is in the joiner's browse and no live aterm process hears the
+//! member's advert. Every one of the joiner's commands carries the variable ([`as_joiner`]), and
+//! the row runs none of them on an app whose executable does not name it ([`names_knob`]), so a
+//! build without the knob, which would browse `_alab._tcp`, never runs here. Choosing the type
+//! rather than a network: the guest's mDNS reaches this Mac's bridge whatever it registers, and
+//! a firewall in the guest that blocked it would make this Mac's live desk the fallback of any
+//! rule that failed to load; a type nobody else uses needs no rule to hold. The member's advert
+//! of the lab type does reach this Mac's mDNSResponder over the bridge (the row shows it, `lab
+//! adverts this Mac heard`), where no aterm process browses that type.
 //!
 //! The row times the ask to the member's row, to the phrase shown and typed, to each synthetic
 //! file in the joiner's `~/.secrets` (compared with the seed's in the guest, never printed) and to
-//! `aterm members status` reading In, then reads its isolation while every server still runs:
-//! each aterm listener's address, and the `_alab-vault._tcp` and `_alab._tcp` adverts heard in
-//! the guest and, from a guest, on this Mac, each placed by where its host resolves
-//! ([`super::advert`]): this Mac's own registrations, which mDNSResponder also announces on
-//! tart's bridge, are named in the row and never fail it. [`verdict`] fails the row on a phrase
-//! that came from any Mac but the member, a file missing or not the seed's, a joiner that never
-//! reads In, a listener beyond loopback, an advert that is not this Mac's own, or a browse whose
-//! transcript shows it never looked.
+//! `aterm members status` reading In. Before the joiner runs it waits until the guest's own
+//! browse of the lab service hears the member's instance resolving to the guest, and refuses to
+//! go on when it hears any other. While every server still runs it reads where the member heard
+//! each ask from, each aterm listener's address, the guest's registrations, and the
+//! `_alab-vault._tcp` and `_alab._tcp` adverts heard in the guest and, from a guest, on this
+//! Mac, each placed by where its host resolves ([`super::advert`]): this Mac's own
+//! registrations, which mDNSResponder also announces on tart's bridge, are named in the row and
+//! never fail it. [`verdict`] fails the row on a phrase that came from any Mac but the member, a
+//! file missing or not the seed's, a joiner that never reads In, a browse the row cannot show
+//! found the member and nothing else ([`browse_verdict`]: the member asked over loopback, or the
+//! guest's browse heard no member or another one), or anything that reached beyond the guest
+//! ([`isolation_verdict`]: an ask from an address that is not the guest's, a listener beyond
+//! loopback but the member's, a registration but the member's lab one, a real-service advert
+//! that is not this Mac's own, or a browse whose transcript shows it never looked).
+//!
+//! The member's Commons enrolment stays the guest helper's in-process exchange over loopback
+//! (the row's `enrolled by the runtime` cell says NOT MEASURED). The Commons runtime finds its
+//! peers by beacons to one multicast group and port (`aterm_db::runtime`'s transport), which a
+//! runtime on the guest's network would send onto tart's bridge, where this Mac's live runtime
+//! listens; the only other port it takes is a debug build's, loopback alone by design
+//! (`ATERM_DEBUG_COMMONS_LOOPBACK_PORT`, which refuses any LAN attachment) and absent from the
+//! release-shaped app the row runs. Running it over the guest's network needs a lab port the
+//! runtime keeps apart from the live one on the LAN, in `aterm-db`'s transport.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use aterm_secrets::discover::MEMBER_SERVICE;
+use aterm_secrets::discover::{LAB_MEMBER_SERVICE_ENV, MEMBER_SERVICE};
 
-use super::advert::Split;
+use super::advert::{self, Split, Whose};
 use super::{
     ALAB_SERVICE, GUEST_HELPER, GUEST_NUX, Guest, LOCAL_VAULT, LOCAL_VAULT_PORT, Row, Value,
-    drive_cells_within, guest_heard, host_guests, or_missing, secs_to_ms, squeeze,
+    browse_adds, drive_cells_within, guest_browse, guest_dns_sd, guest_heard, host_guests,
+    or_missing, secs_to_ms, squeeze,
 };
 use crate::mac::{POLL, STEP};
 use crate::{Fail, stop};
@@ -135,6 +170,83 @@ fn as_home(aterm: &str, home: &str) -> String {
     format!("/usr/bin/env HOME={home} {aterm}")
 }
 
+/// `aterm`'s command line as the joiner: `$HOME` set to `home` and [`LAB_MEMBER_SERVICE_ENV`] to
+/// the run's lab members service, so every browse for members it makes (its ask, its join, its
+/// subscriber's asks while it waits) looks for the lab's member alone.
+fn as_joiner(aterm: &str, home: &str, service: &str) -> String {
+    format!("/usr/bin/env HOME={home} {LAB_MEMBER_SERVICE_ENV}={service} {aterm}")
+}
+
+/// The run's lab members service, from six random bytes: `_alab-lab-<six base-36 digits>._tcp`
+/// (`aterm_secrets::discover::lab_service`), a type no ALab Mac registers or browses.
+#[must_use]
+pub fn lab_service_of(bytes: [u8; 6]) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let nonce: String = bytes
+        .iter()
+        .map(|b| char::from(DIGITS[usize::from(*b) % DIGITS.len()]))
+        .collect();
+    format!("_alab-lab-{nonce}._tcp")
+}
+
+/// A fresh lab members service for this run ([`lab_service_of`] of this Mac's random bytes).
+///
+/// # Errors
+/// This Mac gave no random bytes.
+fn fresh_lab_service() -> Result<String, Fail> {
+    let mut bytes = [0u8; 6];
+    aterm_uds::rand::fill(&mut bytes).map_err(|e| Fail::die(format!("random bytes: {e}")))?;
+    Ok(lab_service_of(bytes))
+}
+
+/// The guest command that says whether the app's executable `aterm` names
+/// [`LAB_MEMBER_SERVICE_ENV`] (`named`, else `absent`). A build without the knob would browse the
+/// live fleet's `_alab._tcp` whatever the variable says, so the joiner never runs on one.
+fn names_knob(aterm: &str) -> String {
+    format!(
+        "/usr/bin/grep -q -a -F {LAB_MEMBER_SERVICE_ENV} '{aterm}' && echo named || echo absent"
+    )
+}
+
+/// The guest command that prints its interfaces (`ifconfig`), for [`inet_addresses`].
+const GUEST_ADDRESSES: &str = "/sbin/ifconfig -a 2>/dev/null || true";
+
+/// Every address `ifconfig`'s `inet` and `inet6` lines name, each once (an IPv6 scope such as
+/// `%en0` dropped).
+#[must_use]
+pub fn inet_addresses(ifconfig: &str) -> Vec<IpAddr> {
+    let mut found: Vec<IpAddr> = Vec::new();
+    for line in ifconfig.lines() {
+        let mut words = line.split_whitespace();
+        if !matches!(words.next(), Some("inet" | "inet6")) {
+            continue;
+        }
+        let Some(address) = words
+            .next()
+            .and_then(|w| w.split('%').next())
+            .and_then(|w| w.parse::<IpAddr>().ok())
+        else {
+            continue;
+        };
+        if !found.contains(&address) {
+            found.push(address);
+        }
+    }
+    found
+}
+
+/// The guest's address on tart's network, where the member listens and its advert resolves: the
+/// first IPv4 address of `addresses` that is not loopback, link-local or unspecified.
+#[must_use]
+pub fn lan_address(addresses: &[IpAddr]) -> Option<Ipv4Addr> {
+    addresses.iter().find_map(|address| match address {
+        IpAddr::V4(v4) if !(v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()) => {
+            Some(*v4)
+        }
+        _ => None,
+    })
+}
+
 /// The guest command that starts the seed's vault server on 127.0.0.1, advertising nothing, in
 /// the background (its log `seed/serve.log`).
 fn serve(aterm: &str, seed: &str) -> String {
@@ -164,13 +276,11 @@ fn create(aterm: &str, seed: &str) -> String {
     )
 }
 
-/// The guest command that starts `home`'s vault subscriber (an admin's: its approver), as a
-/// Mac's agent runs it, in the background (its log `home/watch.log`).
-fn watch(aterm: &str, home: &str) -> String {
-    format!(
-        "({} secrets watch </dev/null >{home}/watch.log 2>&1 &)",
-        as_home(aterm, home)
-    )
+/// The guest command that starts the vault subscriber of the identity `me` runs as ([`as_home`],
+/// [`as_joiner`]), whose home is `home`, as a Mac's agent runs it, in the background (its log
+/// `home/watch.log`): the seed's is its approver.
+fn watch(me: &str, home: &str) -> String {
+    format!("({me} secrets watch </dev/null >{home}/watch.log 2>&1 &)")
 }
 
 /// The guest command that asks to join the seed's vault as `member`, named [`MEMBER_NAME`],
@@ -247,11 +357,12 @@ pub fn signer_of(created: &str) -> Option<&str> {
         .filter(|signer| !signer.is_empty())
 }
 
-/// The guest command that starts the guest helper's `member` on `home`'s custody, listening on
-/// 127.0.0.1 alone, in the background (its record `record`, its errors `home/member.err`).
-fn desk(helper: &str, home: &str, record: &str) -> String {
+/// The guest command that starts the guest helper's `member` on `home`'s custody, listening at
+/// `listen` (the guest's own address, [`MEMBER_PORT`]) and registered there under the lab members
+/// service `service`, in the background (its record `record`, its errors `home/member.err`).
+fn desk(helper: &str, home: &str, listen: &str, record: &str, service: &str) -> String {
     format!(
-        "(/usr/bin/env HOME={home} {helper} member {home} 127.0.0.1:{MEMBER_PORT} {record} \
+        "(/usr/bin/env HOME={home} {helper} member {home} {listen} {record} --advertise {service} \
          </dev/null >/dev/null 2>{home}/member.err &)"
     )
 }
@@ -291,15 +402,22 @@ struct Homes {
     joiner: String,
 }
 
+/// Where the member serves the joiner: its listen address (the guest's own, [`MEMBER_PORT`]) and
+/// the run's lab members service it is registered under.
+struct Lab {
+    listen: String,
+    service: String,
+}
+
 /// The seed and the member, ready: the seed's homes, server (answering within [`HANG`]), vault
 /// and approver; the member asked, approved by the seed, In (within [`HANG`]) and enrolled in the
-/// seed's Commons; and the member's desk serving (within [`HANG`]). Each step is its own guest
-/// command, so a failure names the step and its output or log; the member's steps are timed in
-/// `row`.
+/// seed's Commons; and the member's desk serving at `lab`'s address under its service (within
+/// [`HANG`]). Each step is its own guest command, so a failure names the step and its output or
+/// log; the member's steps are timed in `row`.
 ///
 /// # Errors
 /// A step failed, or a wait's detector fired: the row cannot go on.
-fn setup(g: &Guest, h: &Homes, record: &str, row: &mut Row) -> Result<Desk, Fail> {
+fn setup(g: &Guest, h: &Homes, record: &str, lab: &Lab, row: &mut Row) -> Result<Desk, Fail> {
     let helper = format!("{GUEST_NUX}/{GUEST_HELPER}");
     let Homes { seed, member, .. } = h;
     g.sh(&homes(h, record), STEP)?;
@@ -366,8 +484,11 @@ fn setup(g: &Guest, h: &Homes, record: &str, row: &mut Row) -> Result<Desk, Fail
         Value::Ms(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
     );
 
-    g.sh(&watch(&g.aterm, seed), STEP)?;
-    g.sh(&desk(&helper, member, record), STEP)?;
+    g.sh(&watch(&as_home(&g.aterm, seed), seed), STEP)?;
+    g.sh(
+        &desk(&helper, member, &lab.listen, record, &lab.service),
+        STEP,
+    )?;
     let read = within_hang(|| {
         let at = read_desk(&g.read(record)?);
         Ok((at.serving.is_some() || at.refused.is_some()).then_some(at))
@@ -435,12 +556,14 @@ pub fn registrations(pgrep: &str) -> Vec<String> {
         .collect()
 }
 
-/// One Mac the member heard ask: when, the name it asks as, its join code.
+/// One Mac the member heard ask: when, the name it asks as, its join code, and the address it
+/// asked from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Heard {
     pub at: u64,
     pub name: String,
     pub code: String,
+    pub from: Option<String>,
 }
 
 /// The phrase the member showed: when, for which Mac, and its words (never in a `Debug` or a
@@ -465,6 +588,8 @@ impl std::fmt::Debug for Presented {
 /// `src/guest/member.rs`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Desk {
+    /// The instance and service its ask port was registered under.
+    pub advertised: Option<(String, String)>,
     /// When it began to serve, at which address, as which member.
     pub serving: Option<(u64, String, String)>,
     /// Why it could not serve.
@@ -472,12 +597,37 @@ pub struct Desk {
     pub heard: Vec<Heard>,
     pub presented: Vec<Presented>,
     pub allow_failed: Option<String>,
-    /// When a run sent its bundle, and to which Mac.
+    /// When a run's bundle reached the new Mac (it acknowledged it), and which Mac.
     pub let_in: Option<(u64, String)>,
+    /// A run whose bundle the new Mac never acknowledged: when, to which Mac, and why.
+    pub unacknowledged: Option<(u64, String, String)>,
     /// The request it posted with its `Allowed`: when it was taken, or why not.
     pub posted: Option<Result<u64, String>>,
+    /// The address of each exchange that let no Mac in.
+    pub asked: Vec<String>,
     /// The exchanges that ended in an error.
     pub ended: Vec<String>,
+}
+
+impl Desk {
+    /// Every address it heard an ask from (its `heard`, `asked` and `ask-ended` lines), each
+    /// once, in the order recorded by kind.
+    #[must_use]
+    pub fn sources(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let all = self
+            .heard
+            .iter()
+            .filter_map(|h| h.from.as_deref())
+            .chain(self.asked.iter().map(String::as_str))
+            .chain(self.ended.iter().filter_map(|e| field(e, "from")));
+        for from in all {
+            if !out.iter().any(|o| o == from) {
+                out.push(from.to_owned());
+            }
+        }
+        out
+    }
 }
 
 /// The value of `key=` among `rest`'s words.
@@ -501,6 +651,13 @@ pub fn read_desk(text: &str) -> Desk {
         };
         let rest = parts.next().unwrap_or("").trim();
         match kind {
+            "advertised" => {
+                if let (Some(instance), Some(service)) =
+                    (field(rest, "instance"), field(rest, "service"))
+                {
+                    seed.advertised = Some((instance.to_owned(), service.to_owned()));
+                }
+            }
             "member" => {
                 if let (Some(listen), Some(name)) = (field(rest, "listen"), field(rest, "name")) {
                     seed.serving = Some((at, listen.to_owned(), name.to_owned()));
@@ -513,7 +670,13 @@ pub fn read_desk(text: &str) -> Desk {
                         at,
                         name: name.to_owned(),
                         code: code.to_owned(),
+                        from: field(rest, "from").map(str::to_owned),
                     });
+                }
+            }
+            "asked" => {
+                if let Some(from) = field(rest, "from") {
+                    seed.asked.push(from.to_owned());
                 }
             }
             "phrase" => {
@@ -533,6 +696,16 @@ pub fn read_desk(text: &str) -> Desk {
             "let-in" => {
                 if let Some(name) = field(rest, "name") {
                     seed.let_in = Some((at, name.to_owned()));
+                }
+            }
+            "sent-unacknowledged" => {
+                if let Some(name) = field(rest, "name") {
+                    let why = rest
+                        .split_whitespace()
+                        .skip(1)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    seed.unacknowledged = Some((at, name.to_owned(), why));
                 }
             }
             "posted" => {
@@ -721,6 +894,75 @@ fn port_of(addr: &str) -> Option<u16> {
         .and_then(|(_, port)| port.parse().ok())
 }
 
+/// One advert of the run's lab members service the guest heard: its instance, and where it
+/// resolved when that was not to the guest's own addresses alone (`None`: the guest's own).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabAdvert {
+    pub instance: String,
+    pub elsewhere: Option<String>,
+}
+
+/// The adverts of the lab members service `service` the guest heard ([`guest_browse`]), each
+/// placed against the guest's own addresses `guest` ([`advert::place`], resolved in the guest on
+/// the interface it came over): the member's resolves to the guest, anything else does not.
+/// `Err` says why its browse shows none, where it did not run.
+fn guest_lab(
+    g: &Guest,
+    service: &str,
+    guest: &[IpAddr],
+) -> Result<Result<Vec<LabAdvert>, String>, Fail> {
+    let heard = match browse_adds(&guest_browse(g, service)?) {
+        Ok(heard) => heard,
+        Err(why) => return Ok(Err(why)),
+    };
+    let out = format!("{GUEST_NUX}/resolved{service}.txt");
+    let placed = advert::place(&heard, service, guest, &mut guest_dns_sd(g, &out))?;
+    Ok(Ok(placed
+        .into_iter()
+        .map(|(heard, whose)| LabAdvert {
+            instance: heard.instance,
+            elsewhere: match whose {
+                Whose::ThisMac => None,
+                Whose::Another(at) => Some(at),
+            },
+        })
+        .collect()))
+}
+
+/// The lab adverts for a cell: `alab-1a2b3c4d (the guest's own)`, each, or "none".
+fn lab_text(adverts: &[LabAdvert]) -> String {
+    if adverts.is_empty() {
+        return "none".to_owned();
+    }
+    adverts
+        .iter()
+        .map(|a| match &a.elsewhere {
+            None => format!("{} (the guest's own)", a.instance),
+            Some(at) => format!("{} ({at})", a.instance),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The lab adverts that are not the guest's own (none when the browse did not run).
+fn not_the_guests(adverts: &Result<Vec<LabAdvert>, String>) -> Vec<LabAdvert> {
+    adverts
+        .as_ref()
+        .map(|adverts| {
+            adverts
+                .iter()
+                .filter(|a| a.elsewhere.is_some())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a `dns-sd` registration line ([`registrations`]) names `service` among its words.
+fn registers(line: &str, service: &str) -> bool {
+    line.split_whitespace().any(|word| word == service)
+}
+
 /// What a `vault-phrase` run saw, for [`verdict`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Saw {
@@ -730,6 +972,21 @@ pub struct Saw {
     pub files: Vec<Arrived>,
     /// Where the joiner stood last.
     pub standing: Standing,
+    /// The run's lab members service (the joiner's `ATERM_LAB_MEMBER_SERVICE`).
+    pub service: String,
+    /// The guest's own addresses ([`inet_addresses`]).
+    pub guest: Vec<IpAddr>,
+    /// Where the member listened for the joiner: [`MEMBER_PORT`] at the guest's [`lan_address`].
+    pub member_at: String,
+    /// The instance the member's record says it registered under [`Self::service`].
+    pub advertised: Option<String>,
+    /// Each advert of [`Self::service`] the guest heard right before the joiner first browsed
+    /// ([`guest_lab`]; why its browse shows none, where it did not run).
+    pub lab_adverts: Result<Vec<LabAdvert>, String>,
+    /// The address the member heard the Mac it showed the phrase for ask from.
+    pub joiner_from: Option<String>,
+    /// Every address the member heard an ask from ([`Desk::sources`]).
+    pub asks_from: Vec<String>,
     /// Every aterm listener's address in the guest ([`listen_addresses`]).
     pub listening: Vec<String>,
     /// The Bonjour registrations guest processes held ([`registrations`]).
@@ -744,11 +1001,9 @@ pub struct Saw {
 
 /// Why the run fails the acceptance test, each reason once: none for a pass. It passes only when
 /// the phrase came from [`MEMBER_NAME`] (a member that is no admin, never the seed), every
-/// [`CREDENTIALS`] file is in the joiner's `~/.secrets` with the seed's value, the joiner
-/// reads In, both of the seed's ports were read listening and every aterm listener is on
-/// loopback, no guest process held a Bonjour registration, and every [`SERVICES`] browse ran and
-/// heard no advert but this Mac's own, in the guest (its own or one from beyond it: the row is not
-/// alone on its loopback) or from a guest on this Mac.
+/// [`CREDENTIALS`] file is in the joiner's `~/.secrets` with the seed's value, the joiner reads
+/// In, the joiner's own browse found the member and nothing else ([`browse_verdict`]), and
+/// nothing reached beyond the guest ([`isolation_verdict`]).
 #[must_use]
 pub fn verdict(saw: &Saw) -> Vec<String> {
     let mut why = Vec::new();
@@ -775,6 +1030,85 @@ pub fn verdict(saw: &Saw) -> Vec<String> {
     if saw.standing != Standing::In {
         why.push(format!("the joiner stayed {}, never In", saw.standing));
     }
+    why.extend(browse_verdict(saw));
+    why.extend(isolation_verdict(saw));
+    why
+}
+
+/// Why the row cannot show that the joiner's own `browse_members` found the member and nothing
+/// else, each reason once: none when it can. The joiner is named no member, and the member
+/// listens at the guest's address on tart's network alone, so an ask it heard from a guest
+/// address beyond loopback came by the address the joiner's browse resolved. The member must have
+/// registered under the run's lab service, and the guest's own browse of that service (the same
+/// mDNSResponder the joiner's browse asks, just before it first browsed) must have heard the
+/// member's instance resolving to the guest; another advert it heard fails
+/// [`isolation_verdict`].
+#[must_use]
+pub fn browse_verdict(saw: &Saw) -> Vec<String> {
+    let mut why = Vec::new();
+    let service = &saw.service;
+    match (&saw.advertised, &saw.lab_adverts) {
+        (None, _) => why.push(format!(
+            "the member's record names no {service} registration, so no browse could find it"
+        )),
+        (Some(_), Err(unread)) => why.push(format!(
+            "the guest's browse of {service} did not run ({unread}), so what the joiner's browse \
+             could find is unproven"
+        )),
+        (Some(instance), Ok(adverts)) => {
+            if !adverts
+                .iter()
+                .any(|a| &a.instance == instance && a.elsewhere.is_none())
+            {
+                why.push(format!(
+                    "the guest's browse of {service} never heard the member's {instance} \
+                     resolving to the guest (it heard {})",
+                    lab_text(adverts)
+                ));
+            }
+        }
+    }
+    match saw.joiner_from.as_deref() {
+        None => why.push("the member heard the joiner ask from no address".to_owned()),
+        Some(from) => match from.parse::<IpAddr>() {
+            Ok(ip) if ip.is_loopback() => why.push(format!(
+                "the joiner asked over loopback ({from}), not at the address its browse resolved"
+            )),
+            Ok(_) => {}
+            Err(_) => why.push(format!(
+                "the member heard the joiner ask from {from}, no address"
+            )),
+        },
+    }
+    why
+}
+
+/// Why the run reached beyond its guest, each reason once: none when it did not. Every ask the
+/// member heard came from one of the guest's own addresses; both of the seed's ports were read
+/// listening and every aterm listener is on loopback but the member's, at the guest's own
+/// address; the guest's one registration is the member's of the run's lab service; the guest's
+/// browse of that service heard no advert that is not the guest's own; and every [`SERVICES`]
+/// browse ran and heard no advert but this Mac's own, in the guest (something in it or beyond it
+/// advertising the live fleet's service) or from a guest on this Mac.
+#[must_use]
+pub fn isolation_verdict(saw: &Saw) -> Vec<String> {
+    let mut why = Vec::new();
+    let strangers: Vec<&str> = saw
+        .asks_from
+        .iter()
+        .filter(|from| {
+            !from
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| saw.guest.contains(&ip))
+        })
+        .map(String::as_str)
+        .collect();
+    if !strangers.is_empty() {
+        why.push(format!(
+            "the member heard an ask from {}, not one of the guest's own addresses",
+            strangers.join(", ")
+        ));
+    }
     for port in [LOCAL_VAULT_PORT, MEMBER_PORT] {
         if !saw.listening.iter().any(|a| port_of(a) == Some(port)) {
             why.push(format!(
@@ -785,7 +1119,7 @@ pub fn verdict(saw: &Saw) -> Vec<String> {
     let beyond: Vec<&str> = saw
         .listening
         .iter()
-        .filter(|a| !on_loopback(a))
+        .filter(|a| !on_loopback(a) && **a != saw.member_at)
         .map(String::as_str)
         .collect();
     if !beyond.is_empty() {
@@ -794,18 +1128,34 @@ pub fn verdict(saw: &Saw) -> Vec<String> {
             beyond.join(", ")
         ));
     }
-    if !saw.registrations.is_empty() {
+    let others: Vec<&str> = saw
+        .registrations
+        .iter()
+        .filter(|r| !registers(r, &saw.service))
+        .map(String::as_str)
+        .collect();
+    if !others.is_empty() {
         why.push(format!(
             "a guest process registered a Bonjour service: {}",
-            saw.registrations.join("; ")
+            others.join("; ")
+        ));
+    }
+    let elsewhere = not_the_guests(&saw.lab_adverts);
+    if !elsewhere.is_empty() {
+        why.push(format!(
+            "the guest heard {} {} advert(s) not its own ({}): the joiner's browse could have \
+             asked them",
+            elsewhere.len(),
+            saw.service,
+            lab_text(&elsewhere)
         ));
     }
     for service in SERVICES {
         match saw.guest_adverts.iter().find(|(s, _)| s == service) {
             Some((_, Ok(heard))) if heard.others.is_empty() => {}
             Some((_, Ok(heard))) => why.push(format!(
-                "the guest heard {} {service} advert(s) not this Mac's ({}): the row is not \
-                 alone on its loopback",
+                "the guest heard {} {service} advert(s) not this Mac's ({}): something in the \
+                 guest or beyond it advertises the live fleet's service",
                 heard.others.len(),
                 heard.others.join(", ")
             )),
@@ -833,6 +1183,15 @@ pub fn verdict(saw: &Saw) -> Vec<String> {
         }
     }
     why
+}
+
+/// A verdict's reasons as a cell: `pass: <what passed>`, or each reason.
+fn verdict_cell(failed: &[String], passed: impl FnOnce() -> String) -> Value {
+    if failed.is_empty() {
+        Value::Text(format!("pass: {}", passed()))
+    } else {
+        Value::Text(format!("FAILED: {}", failed.join("; ")))
+    }
 }
 
 /// `text`, then this Mac's own adverts in `heard` in brackets, where it heard any.
@@ -883,6 +1242,50 @@ fn await_phrase(g: &Guest, record: &str) -> Result<Result<Desk, String>, Fail> {
     }))
 }
 
+/// The joiner's ask, as install.sh's windowless lanes run it, `me` its command line
+/// ([`as_joiner`]): named no member, so it browses for one.
+fn ask_cmd(me: &str) -> String {
+    format!("{me} members join --no-wait")
+}
+
+/// The joiner's join, the phrase typed at its prompt, `me` its command line ([`as_joiner`]):
+/// named no member, so it browses for one.
+fn join_cmd(me: &str) -> String {
+    format!("{me} members join")
+}
+
+/// The guest's browse of the lab members service `service` read again until it hears the
+/// member's `instance` resolving to the guest (the [`HANG`] detector), so the joiner's browse,
+/// which listens 1.5 s, finds a registration that is up: what it heard last, or why it heard
+/// nothing (its browse did not run, or the detector fired first).
+///
+/// # Errors
+/// The guest could not be read, or the run was stopped.
+fn await_lab(
+    g: &Guest,
+    service: &str,
+    instance: &str,
+    guest: &[IpAddr],
+) -> Result<Result<Vec<LabAdvert>, String>, Fail> {
+    let mut last = Err("no browse ran".to_owned());
+    let heard = within_hang(|| {
+        last = guest_lab(g, service, guest)?;
+        Ok(last
+            .as_ref()
+            .is_ok_and(|adverts| {
+                adverts
+                    .iter()
+                    .any(|a| a.instance == instance && a.elsewhere.is_none())
+            })
+            .then_some(()))
+    })?;
+    Ok(match (heard, last) {
+        (Some(()), last) => last,
+        (None, Ok(adverts)) => Ok(adverts),
+        (None, Err(why)) => Err(format!("{why} ({} s on)", HANG.as_secs())),
+    })
+}
+
 /// `vault-phrase` (the module docs).
 pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), Fail> {
     let h = Homes {
@@ -893,16 +1296,80 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
     let (seed_home, member_home, joiner) = (&h.seed, &h.member, &h.joiner);
     let record = format!("{GUEST_NUX}/{DESK_RECORD}");
     let helper = format!("{GUEST_NUX}/{GUEST_HELPER}");
-    setup(g, &h, &record, row)?;
-    let me = as_home(&g.aterm, joiner);
-    let at = format!("127.0.0.1:{MEMBER_PORT}");
+
+    // The run's lab members service, and an app that takes it: one that does not would browse
+    // the live fleet's `_alab._tcp`, so the row stops before anything of the joiner's runs.
+    let service = fresh_lab_service()?;
+    let named = g.run(&names_knob(&g.aterm), STEP)?;
+    row.cell(
+        "lab members service",
+        Value::Text(format!(
+            "{service} (the joiner's {LAB_MEMBER_SERVICE_ENV}; the app {})",
+            if named.trim() == "named" {
+                "names it"
+            } else {
+                "does not name it"
+            }
+        )),
+    );
+    if named.trim() != "named" {
+        return Err(crate::mac::not_run(format!(
+            "the app's executable names no {LAB_MEMBER_SERVICE_ENV}, so its browse would look for \
+             the live fleet's {MEMBER_SERVICE} members: the row ran none of the joiner's commands"
+        )));
+    }
+    let guest = inet_addresses(&g.run(GUEST_ADDRESSES, STEP)?);
+    let Some(lan) = lan_address(&guest) else {
+        return Err(Fail::die(format!(
+            "the guest has no address on tart's network for the member to listen at (its \
+             addresses: {})",
+            guest
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    };
+    let lab = Lab {
+        listen: format!("{lan}:{MEMBER_PORT}"),
+        service,
+    };
+    let service = lab.service.as_str();
+    let served = setup(g, &h, &record, &lab, row)?;
+    let me = as_joiner(&g.aterm, joiner, service);
+
+    // The member's registration, heard in the guest before the joiner browses, and nothing else
+    // of the lab's type: anything else is not the guest's, and the joiner's browse would ask it.
+    let Some((instance, _)) = served.advertised.clone() else {
+        return Err(Fail::die(format!(
+            "the member's desk serves but its record names no registration: {}",
+            tail_of(g, &format!("{member_home}/member.advert"))?
+        )));
+    };
+    row.cell(
+        "member advertised",
+        Value::Text(format!("{instance} under {service} at {}", lab.listen)),
+    );
+    let lab_adverts = await_lab(g, service, &instance, &guest)?;
+    row.cell(
+        "lab adverts heard in the guest",
+        Value::Text(match &lab_adverts {
+            Ok(adverts) => lab_text(adverts),
+            Err(why) => format!("unread ({why})"),
+        }),
+    );
+    let elsewhere = not_the_guests(&lab_adverts);
+    if !elsewhere.is_empty() {
+        row.fail(format!(
+            "the guest heard {service} adverts not its own ({}): the row ran none of the \
+             joiner's commands",
+            lab_text(&elsewhere)
+        ));
+        return Ok(());
+    }
 
     // The ask, as install.sh's windowless lanes run it.
-    let (ask, ask_out) = g.notty_within(
-        "phrase-ask",
-        &format!("{me} members join --no-wait --at {at}"),
-        HANG,
-    )?;
+    let (ask, ask_out) = g.notty_within("phrase-ask", &ask_cmd(&me), HANG)?;
     drive_cells_within(row, "ask: ", &ask, HANG);
     row.cell(
         "ask: said",
@@ -960,7 +1427,7 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
     let (join, join_out) = g.drive_within(
         "phrase-join",
         &format!("NUX_PHRASE={}", crate::util::shell_quote(&shown.words)),
-        &format!("{me} members join --at {at}"),
+        &join_cmd(&me),
         HANG,
     )?;
     drive_cells_within(row, "join: ", &join, HANG);
@@ -1024,7 +1491,7 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
     );
 
     // The joiner's own subscriber, as its agent runs it, until it reads In.
-    g.sh(&watch(&g.aterm, joiner), STEP)?;
+    g.sh(&watch(&me, joiner), STEP)?;
     let mut last = after;
     let read_in = within_hang(|| {
         let (standing, at) = read_status(&g.run(&status_now(&me), STEP)?);
@@ -1051,11 +1518,17 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
     let desk = read_desk(&g.read(&record)?);
     row.cell(
         "member: let in",
-        or_missing(
-            since(desk.let_in.as_ref().map(|l| l.0), asked),
-            Value::Ms,
-            "no run sent its bundle",
-        ),
+        match (&desk.let_in, &desk.unacknowledged) {
+            (None, Some((_, _, why))) => Value::Missing(format!(
+                "a run sent its bundle and the new Mac never acknowledged it: {}",
+                squeeze(why, 100)
+            )),
+            (let_in, _) => or_missing(
+                since(let_in.as_ref().map(|l| l.0), asked),
+                Value::Ms,
+                "no run sent its bundle",
+            ),
+        },
     );
     row.cell(
         "member: posted the Allow",
@@ -1082,6 +1555,16 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
     }
 
     // Isolation, read while every server and the joiner's subscriber still run.
+    let asks_from = desk.sources();
+    row.cell(
+        "member heard asks from",
+        Value::Text(if asks_from.is_empty() {
+            "none".into()
+        } else {
+            asks_from.join(", ")
+        }),
+    );
+    let joiner_from = heard.and_then(|h| h.from.clone());
     let listening = listen_addresses(&g.run(LISTENERS, STEP)?);
     row.cell(
         "aterm listeners",
@@ -1102,16 +1585,26 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
     );
     // Each browse by the guest helper, which stops its own `dns-sd` alone: a subscriber's
     // standing browse runs beside it.
-    let mut guest = Vec::new();
+    let mut in_guest = Vec::new();
     let mut host = Vec::new();
-    for service in SERVICES {
-        guest.push((service.to_owned(), guest_heard(g, service)?));
-        host.push((service.to_owned(), host_guests(run, service)?));
+    for real in SERVICES {
+        in_guest.push((real.to_owned(), guest_heard(g, real)?));
+        host.push((real.to_owned(), host_guests(run, real)?));
     }
+    // What this Mac heard of the member's lab advert over tart's bridge: no aterm here browses
+    // that type, so it reaches no process of the live fleet; named, never judged.
+    row.cell(
+        "lab adverts this Mac heard",
+        Value::Text(match host_guests(run, service)? {
+            Ok(heard) if heard.others.is_empty() => with_own("none".to_owned(), &heard),
+            Ok(heard) => with_own(heard.others.join(", "), &heard),
+            Err(why) => format!("unread ({why})"),
+        }),
+    );
     row.cell(
         "adverts heard in the guest",
         Value::Text(
-            guest
+            in_guest
                 .iter()
                 .map(|(s, heard)| match heard {
                     Ok(heard) => with_own(format!("{s} {}", heard.others.len()), heard),
@@ -1135,26 +1628,70 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
         ),
     );
 
-    let heard_own = guest
+    let heard_own = in_guest
         .iter()
         .chain(&host)
         .any(|(_, heard)| heard.as_ref().is_ok_and(|h| !h.this_macs.is_empty()));
-    let failed = verdict(&Saw {
+    let saw = Saw {
         allowed_by,
         files,
         standing,
+        service: service.to_owned(),
+        guest,
+        member_at: lab.listen.clone(),
+        advertised: Some(instance),
+        lab_adverts,
+        joiner_from,
+        asks_from,
         listening,
         registrations,
-        guest_adverts: guest,
+        guest_adverts: in_guest,
         host_adverts: host,
-    });
+    };
+    row.cell(
+        "browse heard the member",
+        verdict_cell(&browse_verdict(&saw), || {
+            format!(
+                "the joiner, named no member, asked {} at {} from {}, found by browse_members of \
+                 {service}; the guest's browse heard {}",
+                saw.allowed_by.as_deref().unwrap_or(MEMBER_NAME),
+                saw.member_at,
+                saw.joiner_from.as_deref().unwrap_or("?"),
+                saw.lab_adverts
+                    .as_ref()
+                    .map_or_else(Clone::clone, |a| lab_text(a))
+            )
+        }),
+    );
+    row.cell(
+        "enrolled by the runtime",
+        Value::Missing(
+            "open: the member enrols through the guest helper's in-process exchange over \
+             loopback; a Commons runtime on the guest's network would beacon on the live \
+             fleet's group and port (module docs)"
+                .into(),
+        ),
+    );
+    row.cell(
+        "isolation",
+        verdict_cell(&isolation_verdict(&saw), || {
+            format!(
+                "every ask from the guest ({}), every listener on loopback but the member's {}, \
+                 the one registration the member's {service}, no {} advert{}",
+                saw.asks_from.join(", "),
+                saw.member_at,
+                SERVICES.join(" or "),
+                if heard_own { " but this Mac's own" } else { "" },
+            )
+        }),
+    );
+    let failed = verdict(&saw);
     if failed.is_empty() {
         row.cell(
             "acceptance",
             Value::Text(format!(
-                "pass: allowed by {MEMBER_NAME}, {n} of {n} files the seed's, In, loopback only, \
-                 no advert{}",
-                if heard_own { " but this Mac's own" } else { "" },
+                "pass: found by its browse of {service}, allowed by {MEMBER_NAME}, {n} of {n} \
+                 files the seed's, In, nothing beyond the guest",
                 n = CREDENTIALS.len()
             )),
         );
@@ -1168,8 +1705,13 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
 mod tests {
     use super::*;
 
-    /// A run that met the acceptance test: every file the seed's, In, its two ports on loopback,
-    /// no advert anywhere.
+    /// The run's lab members service in these tests.
+    const LAB: &str = "_alab-lab-k3x9q2._tcp";
+
+    /// A run that met the acceptance test: every file the seed's, In, the joiner's browse found
+    /// the member's lab advert alone and asked it at the guest's own address, the seed's port on
+    /// loopback and the member's at that address, the member's lab registration the guest's one,
+    /// no advert of a real service anywhere.
     fn passing() -> Saw {
         Saw {
             allowed_by: Some(MEMBER_NAME.into()),
@@ -1182,8 +1724,24 @@ mod tests {
                 })
                 .collect(),
             standing: Standing::In,
-            listening: vec!["127.0.0.1:7485".into(), "127.0.0.1:7486".into()],
-            registrations: Vec::new(),
+            service: LAB.into(),
+            guest: ["127.0.0.1", "::1", "fe80::1", "192.168.64.5"]
+                .iter()
+                .map(|a| a.parse().unwrap())
+                .collect(),
+            member_at: "192.168.64.5:7486".into(),
+            advertised: Some("alab-1a2b3c4d".into()),
+            lab_adverts: Ok(vec![LabAdvert {
+                instance: "alab-1a2b3c4d".into(),
+                elsewhere: None,
+            }]),
+            joiner_from: Some("192.168.64.5".into()),
+            asks_from: vec!["192.168.64.5".into()],
+            listening: vec!["127.0.0.1:7485".into(), "192.168.64.5:7486".into()],
+            registrations: vec![format!(
+                "900 /usr/bin/dns-sd -R alab-1a2b3c4d {LAB} local 7486 v=1 role=member \
+                 fleet=7486 window=1"
+            )],
             guest_adverts: SERVICES
                 .iter()
                 .map(|s| ((*s).to_owned(), Ok(Split::default())))
@@ -1415,6 +1973,23 @@ mod tests {
             ["a guest process registered a Bonjour service: \
                  812 dns-sd -P nuxlab _alab-vault._tcp local 7485"]
         );
+        // The member's registration of the run's lab service is the one the row expects; one of
+        // the live fleet's service, or of another lab's, beside it still fails. NEGATIVE CONTROL
+        // (2026-10-29): `registers` taking any `_alab-lab-` registration fails here at another
+        // lab's: `left: []`.
+        for beside in [
+            "813 dns-sd -R nuxlab _alab._tcp local 7100",
+            "814 dns-sd -R alab-00000000 _alab-lab-zzzzzz._tcp local 7486",
+        ] {
+            let mut saw = passing();
+            saw.registrations.push(beside.into());
+            assert_eq!(
+                verdict(&saw),
+                [format!(
+                    "a guest process registered a Bonjour service: {beside}"
+                )]
+            );
+        }
     }
 
     #[test]
@@ -1431,6 +2006,18 @@ mod tests {
             verdict(&saw),
             ["an aterm process listened beyond loopback: 192.168.64.5:7100"]
         );
+        // Only the member's port at the guest's own address listens beyond loopback: the same
+        // port on every interface, or at another address, does not pass for it. NEGATIVE CONTROL
+        // (2026-10-29): `isolation_verdict` passing any listener on the member's port fails here
+        // at `*:7486`: `left: []`.
+        for wide in ["*:7486", "192.168.64.9:7486"] {
+            let mut saw = passing();
+            saw.listening.push(wide.into());
+            assert_eq!(
+                verdict(&saw),
+                [format!("an aterm process listened beyond loopback: {wide}")]
+            );
+        }
         // A run that read no listener on a seed port has not shown where it listened.
         let mut saw = passing();
         saw.listening = vec!["127.0.0.1:7485".into()];
@@ -1445,27 +2032,63 @@ mod tests {
 
     /// The member's desk record as the guest helper writes it (`src/guest/member.rs`'s module
     /// docs).
-    const RECORD: &str = "member 1000 listen=127.0.0.1:7486 name=nux-member\n\
-                          heard 1250 id=1 name=admins-virtual-machine code=K7Q2-9F3A from=127.0.0.1\n\
-                          asked 1251 from=127.0.0.1\n\
+    const RECORD: &str = "advertised 990 instance=alab-1a2b3c4d service=_alab-lab-k3x9q2._tcp port=7486\n\
+                          member 1000 listen=192.168.64.5:7486 name=nux-member\n\
+                          heard 1250 id=1 name=admins-virtual-machine code=K7Q2-9F3A from=192.168.64.5\n\
+                          asked 1251 from=192.168.64.5\n\
                           phrase 1300 id=1 name=admins-virtual-machine maple river ocean\n\
                           let-in 4100 name=admins-virtual-machine\n\
                           posted 4180 ok\n";
+
+    /// A run whose bundle the new Mac never acknowledged (`src/guest/member.rs`'s
+    /// `sent-unacknowledged`) is read as sent, with why, never as a Mac let in.
+    ///
+    /// NEGATIVE CONTROL: drop `read_desk`'s `sent-unacknowledged` arm: `left: None`, `right:
+    /// Some((4100, "admins-virtual-machine", "the other Mac closed the join exchange"))`.
+    #[test]
+    fn a_run_the_new_mac_never_acknowledged_is_read_as_no_mac_let_in() {
+        let seed = read_desk(
+            "sent-unacknowledged 4100 name=admins-virtual-machine the other Mac closed the join \
+             exchange\nposted 4180 ok\n",
+        );
+        assert_eq!(seed.let_in, None);
+        assert_eq!(
+            seed.unacknowledged,
+            Some((
+                4100,
+                "admins-virtual-machine".into(),
+                "the other Mac closed the join exchange".into()
+            ))
+        );
+    }
 
     #[test]
     fn the_phrase_reader_types_only_the_one_phrase_shown_for_the_mac_that_asked() {
         let seed = read_desk(RECORD);
         assert_eq!(
+            seed.advertised,
+            Some(("alab-1a2b3c4d".into(), "_alab-lab-k3x9q2._tcp".into()))
+        );
+        assert_eq!(
             seed.serving,
-            Some((1000, "127.0.0.1:7486".into(), "nux-member".into()))
+            Some((1000, "192.168.64.5:7486".into(), "nux-member".into()))
         );
         assert_eq!(
             seed.heard,
             [Heard {
                 at: 1250,
                 name: "admins-virtual-machine".into(),
-                code: "K7Q2-9F3A".into()
+                code: "K7Q2-9F3A".into(),
+                from: Some("192.168.64.5".into()),
             }]
+        );
+        assert_eq!(seed.asked, ["192.168.64.5"]);
+        // Every address an ask came from, each once, an ended exchange's included.
+        let more =
+            format!("{RECORD}ask-ended 4200 from=192.168.64.1 eof\nasked 4300 from=10.0.0.7\n");
+        assert_eq!(
+            read_desk(&more).sources(),
+            ["192.168.64.5", "10.0.0.7", "192.168.64.1"]
         );
         assert_eq!(seed.let_in, Some((4100, "admins-virtual-machine".into())));
         assert_eq!(seed.posted, Some(Ok(4180)));
@@ -1633,11 +2256,11 @@ mod tests {
         assert!(s.needs_app() && !s.grows_disk() && s.not_run().is_none());
     }
 
-    /// The seed's server and the member's desk listen on 127.0.0.1 and name no mDNS service, the
-    /// joiner dials the member there (so it browses for no member), and the driver types the
-    /// phrase at the prompt `aterm members join` prints.
+    /// The seed's server listens on 127.0.0.1 and names no mDNS service, the member's desk
+    /// listens at the guest's own address registered under the run's lab service, and the
+    /// driver types the phrase at the prompt `aterm members join` prints.
     #[test]
-    fn the_servers_listen_on_loopback_and_the_joiner_dials_the_member_there() {
+    fn the_seed_serves_on_loopback_and_the_member_at_the_guests_address() {
         let serve = serve("/A/aterm", "/n/seed");
         assert!(
             serve.starts_with("(/usr/bin/env HOME=/n/seed /A/aterm secrets serve "),
@@ -1652,9 +2275,12 @@ mod tests {
         };
         assert_eq!(after("--listen"), Some("127.0.0.1:7485"), "{serve}");
         assert!(words.contains(&"--no-advertise"), "{serve}");
-        let member = desk("/n/helper", "/n/member", "/n/rec");
+        let member = desk("/n/helper", "/n/member", "192.168.64.5:7486", "/n/rec", LAB);
         assert!(
-            member.contains("HOME=/n/member /n/helper member /n/member 127.0.0.1:7486 /n/rec"),
+            member.contains(
+                "HOME=/n/member /n/helper member /n/member 192.168.64.5:7486 /n/rec \
+                 --advertise _alab-lab-k3x9q2._tcp "
+            ),
             "{member}"
         );
         let create = create("/A/aterm", "/n/seed");
@@ -1713,5 +2339,219 @@ mod tests {
         let at = |needle: &str| drive.find(needle).unwrap();
         assert!(at("$phrase }") < at("[Pp]assword"), "{drive}");
         assert!(drive.contains("set phrase $env(NUX_PHRASE)"), "{drive}");
+    }
+
+    /// Every command of the joiner's (its ask, its join, its subscriber, its status) runs with
+    /// `ATERM_LAB_MEMBER_SERVICE` naming the run's lab service and is named no member, so each
+    /// finds the member by its own browse of that service, never of `_alab._tcp`; the seed's
+    /// commands carry neither.
+    ///
+    /// NEGATIVE CONTROL (2026-10-29): `as_joiner` without its `ATERM_LAB_MEMBER_SERVICE=` word
+    /// (the joiner then browses the live fleet's `_alab._tcp`) fails here at the ask.
+    #[test]
+    fn every_command_of_the_joiners_browses_the_runs_lab_service_alone() {
+        let me = as_joiner("/A/aterm", "/n/joiner", LAB);
+        let ask = ask_cmd(&me);
+        let join = join_cmd(&me);
+        let watching = watch(&me, "/n/joiner");
+        let status = status_now(&me);
+        for cmd in [&ask, &join, &watching, &status] {
+            let words: Vec<&str> = cmd.split_whitespace().collect();
+            assert!(
+                words.contains(&"ATERM_LAB_MEMBER_SERVICE=_alab-lab-k3x9q2._tcp")
+                    && words.contains(&"HOME=/n/joiner"),
+                "{cmd}"
+            );
+            assert!(!words.contains(&"--at"), "{cmd}");
+        }
+        assert!(ask.ends_with(" members join --no-wait"), "{ask}");
+        assert!(join.ends_with(" members join"), "{join}");
+        assert_eq!(
+            watching,
+            "(/usr/bin/env HOME=/n/joiner ATERM_LAB_MEMBER_SERVICE=_alab-lab-k3x9q2._tcp \
+             /A/aterm secrets watch </dev/null >/n/joiner/watch.log 2>&1 &)"
+        );
+        let seed = watch(&as_home("/A/aterm", "/n/seed"), "/n/seed");
+        assert!(!seed.contains(LAB_MEMBER_SERVICE_ENV), "{seed}");
+        assert_eq!(
+            names_knob("/g/aterm.app/Contents/MacOS/aterm"),
+            "/usr/bin/grep -q -a -F ATERM_LAB_MEMBER_SERVICE \
+             '/g/aterm.app/Contents/MacOS/aterm' && echo named || echo absent"
+        );
+    }
+
+    /// The run's lab service is one `browse_members` takes, never the live fleet's, and each
+    /// run's differs with its random bytes.
+    ///
+    /// NEGATIVE CONTROL (2026-10-29): `lab_service_of` with a seventh character after its nonce
+    /// (`_alab-lab-000000x._tcp`, past DNS-SD's 15) fails here at its first `lab_service`
+    /// assertion.
+    #[test]
+    fn the_runs_lab_service_is_a_lab_one() {
+        for bytes in [[0u8; 6], [255; 6], [35, 36, 71, 72, 200, 9]] {
+            let service = lab_service_of(bytes);
+            assert!(aterm_secrets::discover::lab_service(&service), "{service}");
+            assert_eq!(
+                aterm_secrets::discover::member_service(Some(std::ffi::OsStr::new(&service)))
+                    .unwrap(),
+                service
+            );
+            assert_ne!(service, MEMBER_SERVICE);
+        }
+        assert_eq!(
+            lab_service_of([0, 1, 10, 35, 36, 255]),
+            "_alab-lab-01az03._tcp"
+        );
+        assert_ne!(lab_service_of([1; 6]), lab_service_of([2; 6]));
+    }
+
+    /// The guest's addresses as `ifconfig -a` prints them on a tart guest, and the one the member
+    /// listens at: its IPv4 address on tart's network, never loopback or link-local.
+    ///
+    /// NEGATIVE CONTROL (2026-10-29): `lan_address` without its link-local filter fails here:
+    /// `left: Some(169.254.20.7)`, `right: Some(192.168.64.5)`.
+    #[test]
+    fn the_member_listens_at_the_guests_address_on_tarts_network() {
+        let ifconfig = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\
+            \toptions=1203<RXCSUM,TXCSUM,TXSTATUS,SW_TIMESTAMP>\n\
+            \tinet 127.0.0.1 netmask 0xff000000\n\
+            \tinet6 ::1 prefixlen 128 \n\
+            \tinet6 fe80::1%lo0 prefixlen 64 scopeid 0x1 \n\
+            en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+            \tether 7a:21:9c:40:11:02\n\
+            \tinet6 fe80::1c2f:8ad3:6b1e:2a41%en0 prefixlen 64 secured scopeid 0x6 \n\
+            \tinet 169.254.20.7 netmask 0xffff0000 broadcast 169.254.255.255\n\
+            \tinet 192.168.64.5 netmask 0xffffff00 broadcast 192.168.64.255\n\
+            \tinet 192.168.64.5 netmask 0xffffff00 broadcast 192.168.64.255\n";
+        let addresses = inet_addresses(ifconfig);
+        let expected: Vec<IpAddr> = [
+            "127.0.0.1",
+            "::1",
+            "fe80::1",
+            "fe80::1c2f:8ad3:6b1e:2a41",
+            "169.254.20.7",
+            "192.168.64.5",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        assert_eq!(addresses, expected);
+        assert_eq!(
+            lan_address(&addresses),
+            Some(Ipv4Addr::new(192, 168, 64, 5))
+        );
+        assert_eq!(
+            lan_address(&addresses[..5]),
+            None,
+            "loopback and link-local are not it"
+        );
+        assert!(inet_addresses("").is_empty());
+    }
+
+    /// The joiner's browse is proven to have found the member only when the member registered
+    /// under the run's lab service, the guest's browse heard that instance resolving to the guest,
+    /// and the member heard the joiner ask from a guest address beyond loopback.
+    ///
+    /// NEGATIVE CONTROL (2026-10-29): `browse_verdict` with its `Ok(ip) if ip.is_loopback()` arm
+    /// removed (an ask over loopback passes for one the browse resolved) fails here:
+    /// `left: []`.
+    #[test]
+    fn a_run_whose_joiner_did_not_find_the_member_by_its_browse_fails() {
+        assert_eq!(browse_verdict(&passing()), Vec::<String>::new());
+        // The joiner dialed the member at loopback (as `--at 127.0.0.1:7486` would).
+        let mut saw = passing();
+        saw.joiner_from = Some("127.0.0.1".into());
+        saw.asks_from = vec!["127.0.0.1".into()];
+        assert_eq!(
+            verdict(&saw),
+            ["the joiner asked over loopback (127.0.0.1), not at the address its browse resolved"]
+        );
+        let mut saw = passing();
+        saw.joiner_from = None;
+        assert_eq!(
+            verdict(&saw),
+            ["the member heard the joiner ask from no address"]
+        );
+        // The member registered nothing, or its browse never heard the member's instance.
+        let mut saw = passing();
+        saw.advertised = None;
+        assert_eq!(
+            verdict(&saw),
+            [format!(
+                "the member's record names no {LAB} registration, so no browse could find it"
+            )]
+        );
+        let mut saw = passing();
+        saw.lab_adverts = Ok(Vec::new());
+        assert_eq!(
+            verdict(&saw),
+            [format!(
+                "the guest's browse of {LAB} never heard the member's alab-1a2b3c4d resolving \
+                 to the guest (it heard none)"
+            )]
+        );
+        let mut saw = passing();
+        saw.lab_adverts = Err("dns-sd failed: DNSService call failed -65563".into());
+        assert_eq!(
+            verdict(&saw),
+            [format!(
+                "the guest's browse of {LAB} did not run (dns-sd failed: DNSService call failed \
+                 -65563), so what the joiner's browse could find is unproven"
+            )]
+        );
+        // The member's instance heard resolving elsewhere is not the member the joiner found.
+        let mut saw = passing();
+        saw.lab_adverts = Ok(vec![LabAdvert {
+            instance: "alab-1a2b3c4d".into(),
+            elsewhere: Some("admins-virtual-machine.local 192.168.64.1".into()),
+        }]);
+        assert_eq!(verdict(&saw).len(), 2, "{:?}", verdict(&saw));
+        assert_eq!(browse_verdict(&saw).len(), 1, "{:?}", browse_verdict(&saw));
+    }
+
+    /// Anything that reached beyond the guest fails the row: an ask the member heard from an
+    /// address that is not the guest's (this Mac's end of tart's bridge, another Mac), or an
+    /// advert of the lab service the guest heard that is not its own.
+    ///
+    /// NEGATIVE CONTROL (2026-10-29): `isolation_verdict` without its check of `asks_from`
+    /// against the guest's addresses (an ask from this Mac's bridge address passes) fails here:
+    /// `left: []`.
+    #[test]
+    fn a_run_that_reached_beyond_the_guest_fails() {
+        assert_eq!(isolation_verdict(&passing()), Vec::<String>::new());
+        for stranger in ["192.168.64.1", "192.168.1.242", "fe80::9", "no-address"] {
+            let mut saw = passing();
+            saw.asks_from.push(stranger.into());
+            assert_eq!(
+                verdict(&saw),
+                [format!(
+                    "the member heard an ask from {stranger}, not one of the guest's own addresses"
+                )]
+            );
+        }
+        // The joiner's own ask from a stranger fails as isolation, not as a browse that missed.
+        let mut saw = passing();
+        saw.joiner_from = Some("192.168.64.1".into());
+        saw.asks_from = vec!["192.168.64.1".into()];
+        assert_eq!(browse_verdict(&saw), Vec::<String>::new());
+        assert_eq!(
+            isolation_verdict(&saw).len(),
+            1,
+            "{:?}",
+            isolation_verdict(&saw)
+        );
+        // A lab advert beside the member's that resolved elsewhere is one the joiner could ask.
+        let mut saw = passing();
+        saw.lab_adverts.as_mut().unwrap().push(LabAdvert {
+            instance: "alab-99999999".into(),
+            elsewhere: Some("m22.local 192.168.1.242".into()),
+        });
+        assert_eq!(
+            verdict(&saw),
+            [format!(
+                "the guest heard 1 {LAB} advert(s) not its own (alab-99999999 (m22.local \
+                 192.168.1.242)): the joiner's browse could have asked them"
+            )]
+        );
     }
 }

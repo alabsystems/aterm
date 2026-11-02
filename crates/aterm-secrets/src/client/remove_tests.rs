@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::client::log_entries_tests::{
-    TwoMacs, hand, join_host, member_key, two_macs, two_macs_with,
+    TwoMacs, copy_private_tree, hand, join_host, member_key, two_macs, two_macs_with,
 };
 use crate::commons::bootstrap::Bootstrap;
 use crate::membership_log::encode_records;
@@ -38,11 +38,23 @@ fn asker(
 /// `m7` lets in a Mac asking under `name` by the log, and posts the records so `m22` can pull
 /// them. Returns the Mac's home, actor and age recipient.
 fn let_in(macs: &TwoMacs, dir: &str, name: &str) -> (Paths, MemberId, Recipient) {
-    let (paths, request, allowed) = asker(macs.root.path(), &macs.m7, dir, name);
-    let (bundle, logged) = hand(&macs.m7, &request, &allowed, true);
-    assert!(logged, "CONTROL: m7 hands the log path");
-    write_from_log_bundle(&paths, &bundle).expect("the Mac writes from the log");
+    let admitted = let_in_by(macs, &macs.m7, dir, name);
     post_records_to_servers(&macs.m7).expect("m7 posts the admission");
+    admitted
+}
+
+/// `member` lets in a Mac asking under `name` by the log, keeping the records to itself. Returns
+/// the Mac's home, actor and age recipient.
+fn let_in_by(
+    macs: &TwoMacs,
+    member: &Paths,
+    dir: &str,
+    name: &str,
+) -> (Paths, MemberId, Recipient) {
+    let (paths, request, allowed) = asker(macs.root.path(), member, dir, name);
+    let (bundle, logged) = hand(member, &request, &allowed, true);
+    assert!(logged, "CONTROL: the member hands the log path");
+    write_from_log_bundle(&paths, &bundle).expect("the Mac writes from the log");
     (
         paths,
         request.binding().actor(),
@@ -435,6 +447,7 @@ fn a_removed_mac_asking_again_shows_as_removed_not_new() {
         allowed,
         reads_log: true,
         restore,
+        held: None,
     };
     let error = hand_over(m7, &handing(&request, &allowed, false))
         .err()
@@ -784,6 +797,7 @@ fn a_mac_allowed_again_after_the_stewards_deny_rows_is_back_in_the_roster() {
             allowed: &allowed40,
             reads_log: true,
             restore: true,
+            held: None,
         },
     )
     .expect("m7 restores m40");
@@ -841,6 +855,7 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
             allowed: &allowed40,
             reads_log: true,
             restore: false,
+            held: None,
         },
     )
     .expect("m7 admits m40 with node_key [0x40; 32]");
@@ -930,6 +945,7 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
             allowed: &allowed40_v2,
             reads_log: true,
             restore: true,
+            held: None,
         },
     )
     .expect("m7 restores m40 under new device key");
@@ -1354,6 +1370,7 @@ fn a_removed_mac_asking_again_with_fresh_secrets_key_and_same_node_key_is_restor
             allowed: &allowed40,
             reads_log: true,
             restore: false,
+            held: None,
         },
     )
     .expect("m7 admits m40 with node_key");
@@ -1431,6 +1448,7 @@ fn a_removed_mac_asking_again_with_fresh_secrets_key_and_same_node_key_is_restor
             allowed: &allowed_fresh,
             reads_log: true,
             restore: true,
+            held: None,
         },
     )
     .expect("m7 restores m40 under fresh secrets identity and same node_key");
@@ -1914,4 +1932,1015 @@ fn removed_labels_overlay_and_local_label_resolution_enforce_node_and_recipient_
         "log-removed Mac must not resolve a swarm label from state.toml, source.toml, or hostnames"
     );
     macs.server.stop();
+}
+
+/// F21's split (the design's tests 4 to 6): m22 = A (the admin), m7 = Y, m40 = R, m42 and m44
+/// other members, and m41 = X, whom m22 lets in on side 1 during the split; with `w`, also m43 =
+/// W, whom m7 lets in on side 2 and who puts `w-entry` under m40's epoch.
+pub(super) struct KeyedSplit {
+    pub(super) macs: TwoMacs,
+    pub(super) m40: Paths,
+    pub(super) m41: Paths,
+    pub(super) m43: Option<Paths>,
+    pub(super) rec40: Recipient,
+    pub(super) rec44: Recipient,
+    /// The `[everyone]` epoch m40 minted on side 2 past its cutoff, under which m7 put
+    /// `shared` = v2.
+    pub(super) epoch: RecordId,
+    /// m22's text before the split: `shared` = v1 and `other` = o1.
+    pub(super) doc: Document,
+}
+
+/// Build [`KeyedSplit`] up to the heal. Side 1 (m22, m41): m22 removes m40 and m42 and lets in
+/// m41. Side 2 (m40, m7): m40, not yet told, removes m42, which mints its epoch `E` wrapped to m22,
+/// m7, m40 and m44; m7 pulls those records and puts `shared` = v2 under `E`, the one newest
+/// `[everyone]` epoch it holds. A removal concurrent with its signer's own still holds (F16), so
+/// m22 removes m42 too: after the heal no newest epoch is wrapped to a removed Mac, F16's
+/// coverage rule has nothing to do, and only F21's reseal is due.
+pub(super) fn keyed_split(w: bool) -> KeyedSplit {
+    let macs = two_macs(&[
+        (Audience::Everyone, "shared", b"v1".as_slice()),
+        (Audience::Everyone, "other", b"o1".as_slice()),
+    ]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let (m40, actor40, rec40) = let_in(&macs, "m40", "m40");
+    let (_m42, _, rec42) = let_in(&macs, "m42", "m42");
+    let (_m44, _, rec44) = let_in(&macs, "m44", "m44");
+    sync_records(m22, None).expect("m22 pulls the admissions");
+    sync_records(&m40, None).expect("m40 pulls the admissions");
+    let doc = admin_open(m22).expect("m22 opens the vault").doc.clone();
+
+    // Side 1.
+    remove_member(m22, &join_code(&rec40), false).expect("m22 removes m40");
+    remove_member(m22, &join_code(&rec42), false).expect("m22 removes m42");
+    let (m41, _, _) = let_in_by(&macs, m22, "m41", "m41");
+
+    // Side 2.
+    remove_member(&m40, &join_code(&rec42), false).expect("m40, not yet told, removes m42");
+    save_records(m7, &load_records(&m40).unwrap().encode()).expect("m7 pulls m40's records");
+    let epoch = test_put_everyone(m7, "shared", b"v2").expect("m7 puts shared = v2");
+    assert_eq!(
+        log_of(m7).get(&epoch).map(|r| *r.actor()),
+        Some(actor40),
+        "CONTROL: m40 minted the epoch m7 wrote under"
+    );
+    let m43 = w.then(|| {
+        let (m43, _, _) = let_in_by(&macs, m7, "m43", "m43");
+        test_put_everyone(&m43, "w-entry", b"w1").expect("m43 puts w-entry");
+        save_records(m7, &load_records(&m43).unwrap().encode()).expect("m7 pulls m43's put");
+        m43
+    });
+    KeyedSplit {
+        macs,
+        m40,
+        m41,
+        m43,
+        rec40,
+        rec44,
+        epoch,
+        doc,
+    }
+}
+
+impl KeyedSplit {
+    /// Every Mac here, the removed one included.
+    pub(super) fn all(&self) -> Vec<&Paths> {
+        let mut all = vec![&self.macs.m22, &self.macs.m7, &self.m40, &self.m41];
+        all.extend(self.m43.as_ref());
+        all
+    }
+
+    /// The heal: every Mac takes every other's records.
+    pub(super) fn heal(&self) {
+        let wires: Vec<Vec<u8>> = self
+            .all()
+            .into_iter()
+            .map(|paths| load_records(paths).unwrap().encode())
+            .collect();
+        for paths in self.all() {
+            for wire in &wires {
+                save_records(paths, wire).expect("the heal keeps every record");
+            }
+        }
+    }
+
+    /// What `paths` reads of the `[everyone]` entry `name` from its log.
+    pub(super) fn read(paths: &Paths, name: &str) -> Option<Vec<u8>> {
+        let id = read_identity(paths).unwrap().unwrap();
+        log_of(paths)
+            .open_audience_entries(&id)
+            .unwrap()
+            .unwrap()
+            .by_audience
+            .get(&Audience::Everyone)
+            .and_then(|entries| entries.get(name))
+            .map(|entry| entry.value.as_slice().to_vec())
+    }
+
+    /// Whether a reseal or the coverage rule is due on `paths` ([`Log::rotation_due`]).
+    pub(super) fn due(paths: &Paths) -> bool {
+        let id = read_identity(paths).unwrap().unwrap();
+        log_of(paths).rotation_due(&id.recipient(), &active(paths))
+    }
+
+    /// Whether `paths` hides an epoch it cannot open.
+    pub(super) fn hidden(paths: &Paths) -> bool {
+        let id = read_identity(paths).unwrap().unwrap();
+        log_of(paths)
+            .open_audience_entries(&id)
+            .unwrap()
+            .unwrap()
+            .hidden_epochs
+    }
+}
+
+/// F21 rule 7 (the design's test 5): after the heal, m41, which holds no key of m40's epoch,
+/// removes m44 (`rotate_after_removal`) and publishes its text with `other` dropped (a fresh
+/// `[everyone]` epoch: `draft_document_diff`'s fresh-epoch branch). Neither re-puts what m41
+/// reads of `shared` (v1) with m7's v2 in its past, so m22 and m7 still read v2 and m41 still
+/// waits for a holder, which its status says (rule 7's waiting line). Then m7's vault pass
+/// reseals, m41 reads v2 too and nothing waits, and m7 records what m40 could read while it was
+/// out (rule 8): `shared`.
+///
+/// NEGATIVE CONTROL (each restored with cp from a backup plus touch, and confirmed with cmp):
+/// - `rotate_after_removal` reseals every entry while hidden (`let whole = true;`): fails
+///   "m22 reads shared" with left `Some([118, 49])`, right `Some([118, 50])`.
+/// - the fresh-epoch branch re-puts every entry while hidden (`let whole = true;`): fails the
+///   same assert, left `Some([118, 49])`, right `Some([118, 50])`.
+/// - `reseal_audience` re-puts no winner (`if false && whole && …`): E is covered but carries
+///   nothing, and the test fails "m41 reads shared after the reseal", left `Some([118, 49])`,
+///   right `Some([118, 50])`.
+/// - `reseal_waits` names nothing (`if true || keyed.covered …`): fails "m41's status says
+///   writes wait for a holder".
+/// - `tend_epochs_at` records nothing after a reseal (`if false && !uncovered.is_empty() …`):
+///   fails "m7's reseal records what m40 could read".
+#[test]
+fn a_mac_that_cannot_open_a_keyed_epoch_never_reseals_over_it() {
+    let split = keyed_split(false);
+    split.heal();
+    let (m22, m7, m41) = (&split.macs.m22, &split.macs.m7, &split.m41);
+    for paths in [m22, m7] {
+        assert_eq!(
+            KeyedSplit::read(paths, "shared"),
+            Some(b"v2".to_vec()),
+            "CONTROL: a holder reads m7's write after the heal"
+        );
+    }
+    assert!(
+        log_of(m22)
+            .keyed_epochs()
+            .iter()
+            .any(|k| k.epoch == split.epoch && !k.covered),
+        "CONTROL: E is keyed and uncovered"
+    );
+    assert!(KeyedSplit::hidden(m41), "CONTROL: m41 holds no key of E");
+    assert_eq!(KeyedSplit::read(m41, "shared"), Some(b"v1".to_vec()));
+
+    remove_member(m41, &join_code(&split.rec44), false).expect("m41 removes m44");
+    let mut doc = split.doc.clone();
+    assert!(doc.unset_entry(&Audience::Everyone, "other").unwrap());
+    let cfg = config(m41).unwrap().expect("m41's config");
+    let drafted = log_entries::draft_document_diff(
+        m41,
+        &cfg,
+        &cfg.signer.expect("m41 pins the vault's signer"),
+        &[],
+        &read_identity(m41).unwrap().unwrap(),
+        &doc,
+        log_entries::Base::default(),
+    )
+    .unwrap()
+    .expect("m41 writes the log");
+    save_records(m41, &encode_records(&drafted.records)).unwrap();
+    split.heal();
+
+    for (who, paths) in [("m22", m22), ("m7", m7)] {
+        assert_eq!(
+            KeyedSplit::read(paths, "shared"),
+            Some(b"v2".to_vec()),
+            "{who} reads shared"
+        );
+        assert_eq!(
+            KeyedSplit::read(paths, "other"),
+            None,
+            "{who} reads m41's drop"
+        );
+    }
+    assert!(
+        KeyedSplit::hidden(m41),
+        "m41 still waits for a holder's reseal"
+    );
+    assert!(
+        !reseal_waits(m41).unwrap().is_empty(),
+        "m41's status says writes wait for a holder"
+    );
+    assert!(reseal_waits(m7).unwrap().is_empty(), "m7 opens E");
+
+    // m7's vault pass reseals, and m41 reads m7's write.
+    let t0 = aterm_time::unix_millis().unwrap_or(0);
+    assert!(
+        !tend_epochs_at(m7, t0).unwrap().is_empty(),
+        "m7 reseals at first sight"
+    );
+    split.heal();
+    for (who, paths) in [("m22", m22), ("m7", m7), ("m41", m41)] {
+        assert_eq!(
+            KeyedSplit::read(paths, "shared"),
+            Some(b"v2".to_vec()),
+            "{who} reads shared after the reseal"
+        );
+        assert_eq!(
+            KeyedSplit::read(paths, "other"),
+            None,
+            "{who} keeps m41's drop"
+        );
+        assert!(
+            !KeyedSplit::hidden(paths),
+            "{who} hides nothing after the reseal"
+        );
+        assert!(
+            reseal_waits(paths).unwrap().is_empty(),
+            "nothing waits on {who}"
+        );
+    }
+    // Rule 8: the resealer records what m40 could read while out.
+    let lines = read_after_cutoff_lines(m7).unwrap();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("m40 ") && line.contains("[everyone] shared")),
+        "m7's reseal records what m40 could read: {lines:?}"
+    );
+
+    split.macs.server.stop();
+}
+
+/// F21 rule 5 (the design's test 4): m7 also deletes `other` under m40's epoch E during the split.
+/// After the heal, m7 and m22 read m7's split-time writes (`shared` = v2, `other` gone), a holder's
+/// overlay writes v2 into its text while m41's, holding no key of E, leaves its text alone, and a
+/// reseal is due on the holders but not on m41. The vault pass's tender on m7, ranked first as the
+/// signer of E's dependents, attests E and mints one higher `[everyone]` epoch with m7's writes in
+/// its past, wrapped to every member but m40, carrying v2 and issuing the `Delete` again; m22 waits
+/// its rank's step and, once m7's records reach it, finds E covered and signs nothing. Then nothing
+/// is due or hidden anywhere and m41 reads v2 and no `other`.
+///
+/// NEGATIVE CONTROLS (each restored with cp from a backup plus touch, and confirmed with cmp):
+/// - `reseal_audience` signs no attestation (its loop over `attest` takes none): E stays uncovered,
+///   so m22, past its step, reseals, and the test fails "m22, past its step, signs nothing".
+/// - `reseal_audience` issues no `Delete` of a keyed `Delete` winner (its loop over
+///   `keyed_deletes` takes none): fails "m41 reads no other", left `Some([111, 49])`, right
+///   `None`.
+#[test]
+fn the_vault_pass_after_the_heal_reseals_an_epoch_kept_readable() {
+    let split = keyed_split(false);
+    let (m22, m7, m41) = (&split.macs.m22, &split.macs.m7, &split.m41);
+    {
+        let (b7, a7, i7) = member_key(m7);
+        let log7 = log_of(m7);
+        let id7 = read_identity(m7).unwrap().unwrap();
+        let opened = log7.open_audience_entries(&id7).unwrap().unwrap();
+        let key: [u8; 32] = *opened.unwrapped_keys[&split.epoch];
+        let delete = b7
+            .device()
+            .with_seed(|seed| {
+                log7.draft_delete(
+                    &a7,
+                    aterm_time::unix_millis().unwrap_or(0),
+                    split.epoch,
+                    &key,
+                    "other",
+                )
+                .unwrap()
+                .sign(seed, i7)
+            })
+            .unwrap();
+        save_records(m7, &encode_records(&[delete])).unwrap();
+    }
+    split.heal();
+    for paths in [m22, m7] {
+        assert_eq!(KeyedSplit::read(paths, "shared"), Some(b"v2".to_vec()));
+        assert_eq!(KeyedSplit::read(paths, "other"), None);
+    }
+    assert!(KeyedSplit::hidden(m41), "m41 holds no key of E");
+    assert_eq!(KeyedSplit::read(m41, "shared"), Some(b"v1".to_vec()));
+    assert_eq!(KeyedSplit::read(m41, "other"), Some(b"o1".to_vec()));
+    let mut text = split.doc.clone();
+    text.set_entry(&Audience::Everyone, "shared", b"local")
+        .unwrap();
+    let overlaid = |paths: &Paths| {
+        let mut doc = text.clone();
+        log_entries::overlay_log_onto_document(
+            &log_of(paths),
+            &read_identity(paths).unwrap().unwrap(),
+            &mut doc,
+            None,
+        )
+        .unwrap();
+        doc.entries()
+            .into_iter()
+            .find(|e| e.audience == Audience::Everyone && e.name == "shared")
+            .map(|e| e.value.as_slice().to_vec())
+    };
+    assert_eq!(
+        overlaid(m7),
+        Some(b"v2".to_vec()),
+        "a holder's overlay writes v2"
+    );
+    assert_eq!(
+        overlaid(m41),
+        Some(b"local".to_vec()),
+        "m41's overlay leaves its text alone"
+    );
+    assert!(
+        KeyedSplit::due(m7) && KeyedSplit::due(m22),
+        "a reseal is due on E's holders"
+    );
+    assert!(
+        !KeyedSplit::due(m41),
+        "m41 holds no key of E and is not due"
+    );
+
+    let t0 = aterm_time::unix_millis().unwrap_or(0);
+    let signed = tend_epochs_at(m7, t0).unwrap();
+    assert!(
+        tend_epochs_at(m22, t0).unwrap().is_empty(),
+        "m22 waits its rank's step"
+    );
+    let reseal = signed
+        .iter()
+        .find(|r| {
+            matches!(
+                r.body(),
+                Body::Epoch {
+                    audience: EpochAudience::Everyone,
+                    ..
+                }
+            )
+        })
+        .map(|r| *r.id())
+        .expect("m7, ranked first, reseals [everyone] at first sight");
+    assert!(
+        !epochs_wrapped_to(&log_of(m7), &split.rec40).contains(&reseal),
+        "no Wrap hands m40 the reseal's epoch"
+    );
+    split.heal();
+    // m7's reseal changed the newest epochs, so m22 first sees the new rank key at `later`, and
+    // 40 steps on it is past any rank m22 could hold.
+    let later = t0 + 40 * log_entries::GAP_STEP_MS;
+    for at in [later, later + 40 * log_entries::GAP_STEP_MS] {
+        assert!(
+            tend_epochs_at(m22, at).unwrap().is_empty(),
+            "m22, past its step, signs nothing"
+        );
+    }
+    assert!(
+        log_of(m22).keyed_epochs().iter().all(|k| k.covered),
+        "m22 finds E covered"
+    );
+    for (who, paths) in [("m22", m22), ("m7", m7), ("m41", m41)] {
+        assert!(!KeyedSplit::due(paths), "nothing is due on {who}");
+        assert!(!KeyedSplit::hidden(paths), "{who} hides nothing");
+        assert_eq!(
+            KeyedSplit::read(paths, "shared"),
+            Some(b"v2".to_vec()),
+            "{who} reads v2"
+        );
+    }
+    assert_eq!(KeyedSplit::read(m41, "other"), None, "m41 reads no other");
+    assert_eq!(
+        overlaid(m41),
+        Some(b"v2".to_vec()),
+        "m41's overlay writes v2"
+    );
+
+    split.macs.server.stop();
+}
+
+/// F21 rule 5 runs only on the vault pass's ranked tender: the Commons repair
+/// (`reconcile_commons_log`, which every Commons exchange runs, unranked) leaves an audience with
+/// an uncovered keyed epoch alone. After the heal m7, which holds E and every newest epoch,
+/// signs no attestation of E on its Commons repair and E stays uncovered; its tender then
+/// reseals at first sight (rank 0, as the signer of E's dependent) and records what m40 could
+/// read while out (rule 8), which only the tender writes.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): the reseal
+/// back on the Commons repair (`reconcile_due` counting rule 5 on every path, and
+/// `coalesce_concurrent_commons_epochs` resealing without `reseal`): fails "the Commons repair
+/// leaves E to the ranked tender".
+#[test]
+fn only_the_ranked_tender_reseals_a_keyed_epoch() {
+    let split = keyed_split(false);
+    split.heal();
+    let m7 = &split.macs.m7;
+    assert!(KeyedSplit::due(m7), "CONTROL: a reseal is due on m7");
+    let minted = log_entries::reconcile_commons_log(m7, true).unwrap();
+    assert!(
+        !minted.iter().any(|r| matches!(
+            r.body(),
+            Body::Wrap { epoch, .. } if *epoch == split.epoch
+        )) && log_of(m7).keyed_epochs().iter().any(|k| !k.covered),
+        "the Commons repair leaves E to the ranked tender"
+    );
+    let t0 = aterm_time::unix_millis().unwrap_or(0);
+    assert!(
+        !tend_epochs_at(m7, t0).unwrap().is_empty(),
+        "m7's tender reseals at first sight"
+    );
+    assert!(log_of(m7).keyed_epochs().iter().all(|k| k.covered));
+    assert!(
+        !read_after_cutoff_lines(m7).unwrap().is_empty(),
+        "the tender records what m40 could read"
+    );
+    split.macs.server.stop();
+}
+
+/// F21 rule 5's ranks: where only the reseal is due (no newest epoch is wrapped to a removed Mac
+/// and none is concurrent), the Macs ranked are E's holders, the signer of its dependent first.
+/// m41, which holds the newest `[everyone]` epoch but no key of E, takes no rank: it could not
+/// reseal, and each rank ahead of the first holder delays the reseal by one step.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): ranking every
+/// holder of a newest epoch whatever is due (`tend_ranks` ignoring `coverage`): fails "m41, which
+/// holds no key of E, takes no rank".
+#[test]
+fn a_mac_without_a_key_of_the_keyed_epoch_takes_no_reseal_rank() {
+    let split = keyed_split(false);
+    split.heal();
+    let (m22, m7, m41) = (&split.macs.m22, &split.macs.m7, &split.m41);
+    let log = log_of(m22);
+    let id22 = read_identity(m22).unwrap().unwrap();
+    let opened = log.open_audience_entries(&id22).unwrap().unwrap();
+    let active = active(m22);
+    assert!(
+        !log.coverage_due(&id22.recipient(), &active),
+        "CONTROL: only the reseal is due"
+    );
+    let audiences = [EpochAudience::Everyone, EpochAudience::Commons];
+    let ranks = tend_ranks(&log, &opened, &audiences, &active, false);
+    let (_, a7, _) = member_key(m7);
+    let (_, a22, _) = member_key(m22);
+    let (_, a41, _) = member_key(m41);
+    assert_eq!(
+        ranks.order.first(),
+        Some(&a7),
+        "CONTROL: m7 signed E's dependent"
+    );
+    assert!(ranks.order.contains(&a22), "CONTROL: m22 holds E");
+    assert!(
+        !ranks.order.contains(&a41),
+        "m41, which holds no key of E, takes no rank"
+    );
+    split.macs.server.stop();
+}
+
+/// F21 rule 4's attestation is signed only by a Mac that opens the whole audience, so only a
+/// reseal that carries the values covers. m7 holds E and every newest epoch; were it left out of
+/// `[everyone]` (as a host list's member outside `[everyone]` is, whom §3.3.7's host-list rule
+/// still has rotate the list), its `reseal_audience` mints an epoch but carries no value, so it
+/// attests nothing and E stays uncovered.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
+/// `reseal_audience` attesting whether or not it opens the audience whole: fails "a Mac that does
+/// not open the audience whole covers nothing".
+#[test]
+fn a_reseal_that_carries_no_value_covers_nothing() {
+    let split = keyed_split(false);
+    split.heal();
+    let m7 = &split.macs.m7;
+    let (b7, a7, i7) = member_key(m7);
+    let mut log7 = log_of(m7);
+    let id7 = read_identity(m7).unwrap().unwrap();
+    let mut opened = log7.open_audience_entries(&id7).unwrap().unwrap();
+    assert!(
+        opened
+            .fully_unwrapped_audiences
+            .remove(&EpochAudience::Everyone),
+        "CONTROL: m7 opens [everyone] whole"
+    );
+    let mut minted = Vec::new();
+    b7.device()
+        .with_seed(|seed| {
+            let author = log_entries::AuthorCtx {
+                actor: &a7,
+                writer_seed: seed,
+                incarnation: i7,
+                authored_ms: aterm_time::unix_millis().unwrap_or(0),
+            };
+            log_entries::reseal_audience(
+                &mut log7,
+                &opened,
+                &author,
+                &EpochAudience::Everyone,
+                &BTreeSet::from([id7.recipient()]),
+                &mut minted,
+            )
+        })
+        .unwrap();
+    assert!(
+        minted
+            .iter()
+            .any(|r| matches!(r.body(), Body::Epoch { .. })),
+        "CONTROL: it mints an epoch"
+    );
+    assert!(
+        log7.keyed_epochs().iter().all(|k| !k.covered),
+        "a Mac that does not open the audience whole covers nothing"
+    );
+    split.macs.server.stop();
+}
+
+/// F21 rule 7 after the reseal (the hostile review's shape): m22 edits `shared` to v3 after the
+/// heal, before m7's reseal reaches it, so the edit is concurrent with the reseal. On m22 the
+/// reseal's v2 carries m7's write and v3 follows that write, so v3 wins; on m41, which never gets
+/// E's key, the reseal's v2 is a write of its own, a tie-break away from v3. Once E is covered
+/// m41 hides nothing, but it still lacks a keyed key of `[everyone]`, so its removal of m44
+/// re-puts no entry it did not change, and v3 stands on m22.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
+/// `OpenedAudienceEntries::reputs_whole` ignoring `keyless_keyed`: fails "m41's removal re-puts
+/// no entry it did not change".
+#[test]
+fn a_mac_without_a_keyed_key_never_reputs_whole_after_the_reseal() {
+    let split = keyed_split(false);
+    split.heal();
+    let (m22, m7, m41) = (&split.macs.m22, &split.macs.m7, &split.m41);
+    test_put_everyone(m22, "shared", b"v3").expect("m22 edits shared after the heal");
+    let t0 = aterm_time::unix_millis().unwrap_or(0);
+    assert!(
+        !tend_epochs_at(m7, t0).unwrap().is_empty(),
+        "CONTROL: m7 reseals without m22's edit"
+    );
+    split.heal();
+    assert!(
+        !KeyedSplit::hidden(m41),
+        "CONTROL: m41 hides nothing once E is covered"
+    );
+    assert_eq!(
+        KeyedSplit::read(m22, "shared"),
+        Some(b"v3".to_vec()),
+        "CONTROL: v3 on m22"
+    );
+    let (_, a41, _) = member_key(m41);
+    let before: BTreeSet<RecordId> = log_of(m41).records().map(|r| *r.id()).collect();
+    remove_member(m41, &join_code(&split.rec44), false).expect("m41 removes m44");
+    let reput: Vec<RecordId> = log_of(m41)
+        .records()
+        .filter(|r| {
+            !before.contains(r.id())
+                && *r.actor() == a41
+                && matches!(
+                    r.body(),
+                    Body::Put {
+                        audience: EpochAudience::Everyone,
+                        ..
+                    }
+                )
+        })
+        .map(|r| *r.id())
+        .collect();
+    assert!(
+        reput.is_empty(),
+        "m41's removal re-puts no entry it did not change"
+    );
+    split.heal();
+    assert_eq!(
+        KeyedSplit::read(m22, "shared"),
+        Some(b"v3".to_vec()),
+        "v3 stands on m22"
+    );
+    split.macs.server.stop();
+}
+
+/// F21 rule 7 for the Commons control descriptor: a Mac that does not open all of Commons keeps
+/// its text's descriptor as it was, which can be older than the one every Mac reads, so it puts
+/// the descriptor only when the person changed it. `old`, `new` and `edit` stand for three
+/// descriptors.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
+/// `commons_descriptor_due` comparing with the view alone wherever Commons is hidden (the reuse
+/// branch's rule before the review): fails "a stale descriptor is not put while Commons is
+/// hidden".
+#[test]
+fn a_mac_that_does_not_open_all_of_commons_puts_only_a_changed_descriptor() {
+    let (old, new, edit): (&[u8], &[u8], &[u8]) = (b"old", b"new", b"edit");
+    for fresh in [false, true] {
+        assert!(
+            !log_entries::commons_descriptor_due(false, fresh, Some(new), old, Some(Some(old))),
+            "a stale descriptor is not put while Commons is hidden"
+        );
+        assert!(
+            !log_entries::commons_descriptor_due(false, fresh, Some(new), old, None),
+            "an imported text puts no descriptor while Commons is hidden"
+        );
+        assert!(
+            log_entries::commons_descriptor_due(false, fresh, Some(new), edit, Some(Some(old))),
+            "the person's change is put while Commons is hidden"
+        );
+    }
+    assert!(log_entries::commons_descriptor_due(
+        true,
+        false,
+        Some(new),
+        old,
+        Some(Some(old))
+    ));
+    assert!(!log_entries::commons_descriptor_due(
+        true,
+        false,
+        Some(new),
+        new,
+        Some(Some(old))
+    ));
+    assert!(log_entries::commons_descriptor_due(
+        true,
+        true,
+        Some(new),
+        new,
+        None
+    ));
+}
+
+/// F21 rule 4 at the client (the design's test 6, the review's shape): m43, whom m7 let in on side
+/// 2 and who put `w-entry` under m40's epoch E, lacks m22's side-1 epoch after the heal, so its
+/// publish of an edit of `other` (against the text it started from: `draft_document_diff`'s
+/// sealed-away path) mints an epoch holding only that change, with every dependent of E in its
+/// past. That partial mint covers nothing: E stays uncovered, m41 stays hidden once the holders
+/// close their wrap gaps, and m41's removal of m44 re-puts nothing over `shared`.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, and confirmed with cmp): rule 4's
+/// full reseal reduced to any counting epoch (`full` returns `true`, so neither the head clause
+/// nor the attestation clause holds it back): fails "E stays uncovered after m43's partial mint".
+#[test]
+fn a_partial_mint_never_retires_an_epoch_kept_readable() {
+    let split = keyed_split(true);
+    split.heal();
+    let (m22, m7, m41) = (&split.macs.m22, &split.macs.m7, &split.m41);
+    let m43 = split.m43.as_ref().expect("m43");
+    assert!(
+        KeyedSplit::hidden(m43),
+        "CONTROL: m43 lacks m22's side-1 epoch"
+    );
+    assert_eq!(KeyedSplit::read(m22, "w-entry"), Some(b"w1".to_vec()));
+
+    let mut doc = split.doc.clone();
+    doc.set_entry(&Audience::Everyone, "other", b"o2").unwrap();
+    let cfg = config(m43).unwrap().expect("m43's config");
+    let drafted = log_entries::draft_document_diff(
+        m43,
+        &cfg,
+        &cfg.signer.expect("m43 pins the vault's signer"),
+        &[],
+        &read_identity(m43).unwrap().unwrap(),
+        &doc,
+        log_entries::Base {
+            doc: Some(&split.doc),
+            resolve: None,
+            readmit: None,
+        },
+    )
+    .unwrap()
+    .expect("m43 writes the log");
+    assert!(
+        drafted.records.iter().any(|r| matches!(
+            r.body(),
+            Body::Epoch {
+                audience: EpochAudience::Everyone,
+                ..
+            }
+        )),
+        "CONTROL: m43's edit mints a sealed-away [everyone] epoch"
+    );
+    save_records(m43, &encode_records(&drafted.records)).unwrap();
+    split.heal();
+    let keyed = log_of(m22).keyed_epochs();
+    assert!(
+        keyed.iter().any(|k| k.epoch == split.epoch && !k.covered),
+        "E stays uncovered after m43's partial mint: {keyed:?}"
+    );
+
+    let now = aterm_time::unix_millis().unwrap_or(0) + 40 * log_entries::GAP_STEP_MS;
+    for paths in [m22, m7] {
+        log_entries::close_wrap_gaps(paths, now).expect("a holder closes its wrap gaps");
+    }
+    split.heal();
+    assert!(KeyedSplit::hidden(m41), "m41 stays hidden");
+    assert_eq!(
+        KeyedSplit::read(m22, "other"),
+        Some(b"o2".to_vec()),
+        "m43's edit stands"
+    );
+
+    remove_member(m41, &join_code(&split.rec44), false).expect("m41 removes m44");
+    split.heal();
+    for (who, paths) in [("m22", m22), ("m7", m7)] {
+        assert_eq!(
+            KeyedSplit::read(paths, "shared"),
+            Some(b"v2".to_vec()),
+            "{who} reads shared after m41's removal of m44"
+        );
+    }
+
+    split.macs.server.stop();
+}
+
+/// The homes of [`KeyedSplit`] (`w` on) before the heal, kept as a template each
+/// `KeyedEpochs` replay copies, with m40 = R's own write `T` put under its epoch on side 2.
+struct KeyedEpochsFixture {
+    split: KeyedSplit,
+}
+
+impl KeyedEpochsFixture {
+    const HOMES: [&'static str; 5] = ["m22", "m7", "m40", "m41", "m43"];
+
+    fn build() -> Self {
+        let split = keyed_split(true);
+        test_put_everyone(&split.m40, "T", b"t1").expect("m40 puts T under its epoch");
+        Self { split }
+    }
+}
+
+/// One replay of the `KeyedEpochs` model through the real client: m22 = A, m7 = Y, m40 = R,
+/// m41 = X and m43 = W, each a copy of the fixture's home.
+struct KeyedEpochsHarness<'a> {
+    fixture: &'a KeyedEpochsFixture,
+    m22: Paths,
+    m7: Paths,
+    m40: Paths,
+    m41: Paths,
+    m43: Paths,
+    healed: bool,
+    partial: bool,
+    edited: bool,
+}
+
+impl<'a> KeyedEpochsHarness<'a> {
+    fn replay(fixture: &'a KeyedEpochsFixture, run_dir: &Path, path: &[&str]) -> Self {
+        let template = fixture.split.macs.root.path();
+        for home in KeyedEpochsFixture::HOMES {
+            copy_private_tree(&template.join(home), &run_dir.join(home));
+        }
+        let mut h = Self {
+            fixture,
+            m22: Paths::for_home(&run_dir.join("m22")),
+            m7: Paths::for_home(&run_dir.join("m7")),
+            m40: Paths::for_home(&run_dir.join("m40")),
+            m41: Paths::for_home(&run_dir.join("m41")),
+            m43: Paths::for_home(&run_dir.join("m43")),
+            healed: false,
+            partial: false,
+            edited: false,
+        };
+        for action in path {
+            let _ = keyed_epochs_transition(&mut h, action);
+        }
+        h
+    }
+
+    fn all(&self) -> [&Paths; 5] {
+        [&self.m22, &self.m7, &self.m40, &self.m41, &self.m43]
+    }
+
+    /// Every Mac takes every other's records.
+    fn exchange(&self) {
+        let wires: Vec<Vec<u8>> = self
+            .all()
+            .into_iter()
+            .map(|paths| load_records(paths).unwrap().encode())
+            .collect();
+        for paths in self.all() {
+            for wire in &wires {
+                save_records(paths, wire).expect("every Mac keeps every record");
+            }
+        }
+    }
+
+    fn apply(&mut self, action: &str) {
+        let now = aterm_time::unix_millis().unwrap_or(0);
+        // Past every rank's step: a pass at `now` notes first sight, one here acts at any rank.
+        let later = now + 100 * log_entries::GAP_STEP_MS;
+        match action {
+            "Heal" => self.healed = true,
+            "CloseGap" => {
+                for at in [now, later] {
+                    log_entries::close_wrap_gaps(&self.m7, at).expect("m7 closes its wrap gaps");
+                }
+            }
+            "PartialMint" => {
+                let base = &self.fixture.split.doc;
+                // A new entry: `other`, whose winner A's epoch seals, stays there, so W still
+                // lacks an epoch it reads until a holder closes the gap.
+                let mut doc = base.clone();
+                doc.set_entry(&Audience::Everyone, "w-edit", b"x1").unwrap();
+                let cfg = config(&self.m43).unwrap().expect("m43's config");
+                let drafted = log_entries::draft_document_diff(
+                    &self.m43,
+                    &cfg,
+                    &cfg.signer.expect("m43 pins the vault's signer"),
+                    &[],
+                    &read_identity(&self.m43).unwrap().unwrap(),
+                    &doc,
+                    log_entries::Base {
+                        doc: Some(base),
+                        resolve: None,
+                        readmit: None,
+                    },
+                )
+                .unwrap()
+                .expect("m43 writes the log");
+                save_records(&self.m43, &encode_records(&drafted.records)).unwrap();
+                self.partial = true;
+            }
+            "Reseal" => {
+                for at in [now, later] {
+                    tend_epochs_at(&self.m7, at).expect("m7's vault pass");
+                }
+            }
+            "Edit" => {
+                test_put_everyone(&self.m22, "shared", b"v3").expect("m22 puts shared = v3");
+                self.edited = true;
+            }
+            "BlindReput" => {
+                remove_member(&self.m41, &join_code(&self.fixture.split.rec44), false)
+                    .expect("m41 removes m44");
+            }
+            other => panic!("unexpected KeyedEpochs action: {other}"),
+        }
+        self.exchange();
+    }
+
+    fn observe(&self) -> aterm_spec::interp::State {
+        let value = |paths: &Paths| match KeyedSplit::read(paths, "shared").as_deref() {
+            Some(b"v1") => 1,
+            Some(b"v2") => 2,
+            Some(b"v3") => 3,
+            other => panic!("shared reads {other:?}"),
+        };
+        let win = value(&self.m7);
+        if self.healed {
+            assert_eq!(value(&self.m22), win, "the holders read one value");
+        }
+        let covered = log_of(&self.m7)
+            .keyed_epochs()
+            .iter()
+            .any(|k| k.epoch == self.fixture.split.epoch && k.covered);
+        let t = [&self.m22, &self.m7, &self.m41, &self.m43]
+            .into_iter()
+            .any(|paths| KeyedSplit::read(paths, "T").is_some());
+        // W's gap: an `[everyone]` epoch A would hand a Mac it admits that W holds no key of.
+        let gap = {
+            let id22 = read_identity(&self.m22).unwrap().unwrap();
+            let opened22 = log_of(&self.m22)
+                .open_audience_entries(&id22)
+                .unwrap()
+                .unwrap();
+            let id43 = read_identity(&self.m43).unwrap().unwrap();
+            let opened43 = log_of(&self.m43)
+                .open_audience_entries(&id43)
+                .unwrap()
+                .unwrap();
+            Log::admission_epochs(&opened22, &[EpochAudience::Everyone])
+                .iter()
+                .any(|(_, epoch)| !opened43.unwrapped_keys.contains_key(epoch))
+        };
+        aterm_spec::interp::State::from([
+            ("healed", i64::from(self.healed)),
+            ("gap", i64::from(gap)),
+            ("partial", i64::from(self.partial)),
+            ("covered", i64::from(covered)),
+            ("edited", i64::from(self.edited)),
+            ("win", win),
+            ("sx", value(&self.m41)),
+            ("hx", i64::from(KeyedSplit::hidden(&self.m41))),
+            ("t", i64::from(t)),
+        ])
+    }
+}
+
+/// The `KeyedEpochs` projection: `action` run through the real client on `h`'s Macs, then the
+/// model's state read back from them.
+fn keyed_epochs_transition(
+    h: &mut KeyedEpochsHarness<'_>,
+    action: &str,
+) -> aterm_spec::interp::State {
+    h.apply(action);
+    h.observe()
+}
+
+/// The design's test 8: every reachable `KeyedEpochs` state, reached by its first path, is what
+/// the real client gives after that path, and every enabled action from it gives a successor.
+/// Heal is the exchange of every record; CloseGap is m7's `close_wrap_gaps`; PartialMint is m43's
+/// publish of a new entry against the text it started from; Reseal is m7's
+/// `tend_epochs_at`; Edit is m22's put of `shared` = v3; BlindReput is m41's removal of m44. Each
+/// pass that ranks its Macs runs twice, at first sight and past every rank's step.
+///
+/// Negative control in the test: after PartialMint, the state a coverage rule without its head
+/// clause gives (X stops hiding, `hx = 0`) is no successor and breaks `ReadersAgree`.
+///
+/// NEGATIVE CONTROLS (each restored with cp from a backup plus touch, and confirmed with cmp):
+/// - no reseal (`reseal_ready` answers `false`, as before rule 5): fails `Reseal after ["Heal",
+///   "CloseGap"] gave {"covered": 0, "edited": 0, "gap": 0, "healed": 1, "hx": 1, "partial": 0,
+///   "sx": 1, "t": 0, "win": 2}`.
+/// - rule 4's full reseal reduced to any counting epoch (`full` returns `true`): the partial mint
+///   covers E, and the test fails `Reseal after ["Heal", "PartialMint", "CloseGap"] gave
+///   {"covered": 1, "edited": 0, "gap": 0, "healed": 1, "hx": 0, "partial": 1, "sx": 1, "t": 0,
+///   "win": 2}`.
+#[test]
+fn keyed_epochs_model_conforms_and_catches_mutants() {
+    let model = aterm_models_swarm::keyed_epochs_model();
+    aterm_spec::interp::prove_and_catch(&model);
+    let fired = aterm_spec::interp::fired_actions(&model);
+    assert_eq!(fired.len(), 6, "fired actions: {fired:?}");
+
+    let mut paths: std::collections::BTreeMap<aterm_spec::interp::State, Vec<&'static str>> =
+        std::collections::BTreeMap::new();
+    let mut queue = std::collections::VecDeque::from([model.init_state()]);
+    paths.insert(model.init_state(), Vec::new());
+    while let Some(state) = queue.pop_front() {
+        for action in &model.actions {
+            for next in model.successors(action.name, &state) {
+                if !paths.contains_key(&next) {
+                    let mut path = paths[&state].clone();
+                    path.push(action.name);
+                    paths.insert(next.clone(), path);
+                    queue.push_back(next);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        paths.len(),
+        aterm_spec::interp::reachable_states(&model).len()
+    );
+    let found_by: std::collections::BTreeMap<&[&str], &aterm_spec::interp::State> = paths
+        .iter()
+        .map(|(state, path)| (path.as_slice(), state))
+        .collect();
+    assert_eq!(
+        found_by.len(),
+        paths.len(),
+        "every state has a path of its own"
+    );
+
+    let fixture = KeyedEpochsFixture::build();
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let start = model.init_state();
+    let observed = KeyedEpochsHarness::replay(&fixture, &root.path().join("s0"), &[]).observe();
+    assert_eq!(observed, start, "state mismatch after []");
+    let mut judged = BTreeSet::from([&start]);
+    let mut run_id = 0usize;
+    for (state, path) in &paths {
+        for action in &model.actions {
+            if !model.action_enabled(action.name, state) {
+                continue;
+            }
+            run_id += 1;
+            let mut h =
+                KeyedEpochsHarness::replay(&fixture, &root.path().join(format!("t{run_id}")), path);
+            let next_obs = keyed_epochs_transition(&mut h, action.name);
+            let next_path = [path.as_slice(), &[action.name]].concat();
+            match found_by.get(next_path.as_slice()) {
+                Some(&next) => {
+                    assert_eq!(&next_obs, next, "state mismatch after {next_path:?}");
+                    judged.insert(next);
+                }
+                None => assert!(
+                    model.successors(action.name, state).contains(&next_obs),
+                    "{} after {path:?} gave {next_obs:?}",
+                    action.name
+                ),
+            }
+        }
+    }
+    assert_eq!(
+        judged.len(),
+        paths.len(),
+        "every state was replayed and judged"
+    );
+
+    let healed = KeyedEpochsHarness::replay(&fixture, &root.path().join("neg-h"), &["Heal"]);
+    let before = healed.observe();
+    let mut bad =
+        KeyedEpochsHarness::replay(&fixture, &root.path().join("neg"), &["Heal", "PartialMint"])
+            .observe();
+    assert_eq!(
+        bad["hx"], 1,
+        "CONTROL: X still hides after the partial mint"
+    );
+    bad.insert("hx", 0);
+    assert!(
+        !model.successors("PartialMint", &before).contains(&bad),
+        "X unhidden after a partial mint is no successor"
+    );
+    let broken: Vec<&str> = model
+        .invariants
+        .iter()
+        .filter(|inv| !model.check_invariant(inv.name, &bad))
+        .map(|inv| inv.name)
+        .collect();
+    assert!(
+        broken.contains(&"ReadersAgree"),
+        "expected ReadersAgree in {broken:?}"
+    );
+
+    fixture.split.macs.server.stop();
 }

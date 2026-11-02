@@ -2105,7 +2105,7 @@ pub const VERBS: &[VerbSpec] = &[
          otherwise `available=1 phase= account= target= route= known= eligible= wall= observed_at= \
          next_at= detail_count= detail_0= ...`. Text is percent-encoded; `-` means unknown or absent, \
          counts may be zero, times are Unix seconds from the observation (not read time), and a \
-         retained next_at may be past. Phases: unknown, watching, disabled, limited, waiting, probing, \
+         retained next_at may be past. Phases: unknown, paused, watching, disabled, limited, waiting, probing, \
          ready, switching, verifying, signing-in. This read never refreshes credentials.",
     )
     .forms(&[form(Word("recovery")).owner_only()]),
@@ -2150,7 +2150,16 @@ pub const VERBS: &[VerbSpec] = &[
          directory), or no read has landed in the last 4 s). Setup: \
          `setup=<done|pending|pending:<row,…>|->` (this Mac's first-run setup, \
          read from the last status its worker published: no probe, nothing changed; rows \
-         `fda`, `devtools`, `debugger`, `lan`, `ax`, `vault`, `repos`, …). Presence: \
+         `fda`, `devtools`, `debugger`, `lan`, `ax`, `vault`, `repos`, …). Network: \
+         `net=<alab-lan|remote|offline|checking|-> net_kind=<hotspot|lan|cellular|vpn|-> \
+         net_since_ms= internet=<ok|down|path-up|unknown|-> internet_ms= \
+         members=<reachable>/<known>|- away_since_ms=` (this Mac's network place, one Mac-wide \
+         answer every reporter words alike: where it is, whether the internet answered a \
+         measurement in this stay (`path-up` is the path alone, never measured), and how much \
+         of the ALab LAN it reaches; `net_since_ms=`, `internet_ms=` and `away_since_ms=` are \
+         unix ms, `-` where unknown; `checking` while a move settles or before any network is \
+         learned as the ALab LAN, which raises nothing; read from the place's record, cached \
+         for 2 s). Presence: \
          `hand=<turn:<id>[:<holder>]|lease:<holder>|driving:<sid>|-> hand_pid= \
          level=<quiet|note|story|driving|driven|attention|limited|hold> story= why= \
          needs=<frozen|stopped|stalled|login|memory|wall|ask|approval|question|-> needs_n= \
@@ -2532,7 +2541,15 @@ pub const VERBS: &[VerbSpec] = &[
          why=reset|evicted` (`ERR bad since head=` if ahead). Records use `key=value` in base \
          units (`cpu_mc=`, `fp_bytes=`, `write_bps=`, `busy_pm=`) or `unavailable(<why>)` / \
          `lane_off:`. `jobs` lists stuck-engine rows (`job id= kind= consumer= … class= [wait=] \
-         [quiet_ms= phi=] verdict= [no_progress=1]`) and `finding` rows. `disk` lists roots \
+         [quiet_ms= phi=] verdict= [no_progress=1]`) and `finding` rows. Owner-only \
+         `sys name job=<id>|task=<id>` explicitly samples one quiet waiting job in this \
+         session on macOS. One accepted result per current episode and identity/progress \
+         revision, one in flight per instance; process \
+         identity and job progress are rechecked before publication. Replies \
+         `OK named=<word> job=<id> [holder=unknown] took_ms=<n>` or \
+         `ERR unavailable name why=<reason>`; raw stacks stay private, and a lock name \
+         proves no holder. `--json` returns one schema-1 `sys.name` object. Other platforms \
+         reply `why=unsupported`. `disk` lists roots \
          (`state=complete|walking|<refusal> alloc_bytes= [walked_entries=] entries= growth_bps=`) \
          and top `dir` subtrees. Processes print `pid=` and `exe=<word|->` (never argv/env; paths \
          only for the caller's tab; `caller=` is advisory; machine-wide rows beyond the caller's \
@@ -3005,11 +3022,12 @@ pub const VERBS: &[VerbSpec] = &[
          the `SIGKILL` when one follows, is the agent's own. Work the agent runs inside its own \
          process (subagents, workflows, background shells) ends with it, so an agent restarts \
          itself at a stopping point. Under Autopilot `cruise` or `land` the harness then types one \
-         prompt at a relaunched Claude Code's or agy's first rest: it says the agent was \
-         restarted, what ended with it, and to read its handoff and carry on (codex-alab carries \
-         itself on). The prompt waits behind a draft in the composer, and nothing is typed under \
-         `off`, after a person's own message, or into work Land finished or the agent defended \
-         as landed. Options: `pid=<n>` (must lead foreground \
+         restart prompt per relaunch at a relaunched Claude Code's or agy's first rest: it says \
+         the agent was restarted, what ended with it, and to read its handoff and carry on \
+         (codex-alab carries itself on). The loop's own turn-end prompts go on after it, as they \
+         do after any turn. The prompt waits behind a draft in the composer, and nothing is typed \
+         under `off`, after a person's own message, or into work Land finished or the agent \
+         defended as landed. Options: `pid=<n>` (must lead foreground \
          pgrp), `if-stalled` (requires `status input=stalled`), `quiet=<s>` (`ERR busy person \
          human_ms=<ms>` if human input within `<s>` s). Replies `OK restarting pid <n> \
          cause=<stall|asked>[ discarded=<bytes>]`, `OK restart gone pid <n>`, or `ERR restart \
@@ -3368,8 +3386,9 @@ pub const VERBS: &[VerbSpec] = &[
          session itself, `supervisor_proven=1`, and whose landing marks `task` `done \
          why=landed` with its rollout's report). Sets `task` to `working` (`from=<sid|ctl>`) \
          and `autopilot` to `land` (or `autopilot=cruise`; `meta set autopilot land` switches \
-         later); marks `stalled why=shell` if no shell prompt within 20 s, `stalled why=startup` \
-         if no agent composer (for `codex`, no proven claim) within 120 s of `since_ms=`, or \
+         later); marks `stalled why=shell` if its shell ends or a person uses it before its \
+         first prompt, `stalled why=startup` if no agent composer (for `codex`, no proven \
+         claim) within 120 s of `since_ms=`, a shell still drawing no prompt included, or \
          `stalled why=held` if stuck 120 s at an unhandled screen. Refuses with `ERR \
          unsupervised: <switch>` when the window harness cannot supervise (`[harness] enabled = \
          false`, `headless = false`, or `autopilot = \"off\"`), and with `ERR spawn \
@@ -3426,8 +3445,9 @@ pub const VERBS: &[VerbSpec] = &[
          defense and a `git` check that found nothing left to land where it could read; `aterm help \
          harness` names where it cannot), `exited` (`exit=<code>`), or `stalled` \
          (`why=startup|shell|held|signin|install`; it resumes `working why=moved` or `working \
-         why=turn`). `why=` is `landed|marker|done-check|exit|shell|startup|held|turn|moved|\
-         signin|install`. `checked=` is what aterm checked at the landing that marked it `done` \
+         why=turn`; a claim worker a restore brings back is `working why=restored`). `why=` is \
+         `landed|marker|done-check|exit|shell|startup|held|turn|moved|signin|install|restored`. \
+         `checked=` is what aterm checked at the landing that marked it `done` \
          (also on `await task` rows): `<head>@<ref>` where `HEAD`'s 12 digits were on the remote \
          main git named (`3f9a1c2e4b7d@origin/main`), else `pushed`, `no-remote`, `no-repo` or \
          `gone`; none where ",
@@ -4061,7 +4081,7 @@ pub const VERBS: &[VerbSpec] = &[
         "exits [<n>] [since=<id>]: the instance EXIT LEDGER (Owner-only)",
         "— one `exit <id> t=<ms> sid=<sid> local=<n> \
          reason=<shell-exit|ctl-close|ui-close|window-close|unknown> exit_code=<n|-> \
-         by=<sid|human|ctl|bridge|->` line per exited session, read from the closed-session \
+         by=<sid|human|ctl|bridge|harness|->` line per exited session, read from the closed-session \
          index (its last 512 closes, in the order they left the registry; also pushed live via \
          `subscribe @<sid> events` `closing reason= by=` and `subscribe … sessions` \
          `session-exited <sid> reason=`).",

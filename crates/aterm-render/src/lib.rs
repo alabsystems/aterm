@@ -13928,10 +13928,64 @@ impl Renderer {
         let mut ink_walk = InkWalk::new(ink_row);
         let mut char_fg_walk = CharFgWalk::new(char_fg_row);
         let fire_present = !input.fire_patch.is_empty();
-        let mut halo_walk = FireHaloWalk::new(fire_halo_row);
         let row_raster = input.chrome_raster(r);
         let raster_split = row_raster.and_then(|m| m.split);
         let may_have_sel = input.any_selection();
+        if fire_present && !fire_halo_row.is_empty() {
+            let mut next_col = 0usize;
+            for hc in fire_halo_row {
+                let c = usize::from(hc.col);
+                if c < next_col {
+                    continue;
+                }
+                if c >= cols {
+                    break;
+                }
+                next_col = c + 1;
+                let Some(cell) = cells.get(c) else {
+                    break;
+                };
+                if (!has_images || !image_covers(row_images, c))
+                    && !cell.wide
+                    && cell.ch != ' '
+                    && !cell.ch.is_control()
+                {
+                    let (hx, hscale, hanchor_y) = if uniform {
+                        (pad_x + c * cw, scale, anchor_y)
+                    } else {
+                        let p = self.mixed_cell_place(input, r, c, y0);
+                        (p.x, p.scale, p.anchor_y)
+                    };
+                    let cluster = if has_clusters {
+                        cluster_for(row_clusters, c)
+                    } else {
+                        None
+                    };
+                    let key = match plan.get(c).copied().unwrap_or(ColumnGlyph::PerCell) {
+                        ColumnGlyph::Ligated(gid) => self.ligature_key(gid, cell_style(cell)),
+                        ColumnGlyph::LigatedSlice { gid, k, .. } => {
+                            self.ligature_slice_key(gid, k, cell_style(cell))
+                        }
+                        ColumnGlyph::PerCell => self.resolve_cell_key_for_span(
+                            cluster,
+                            cell,
+                            materialized_cell_span(cells, c),
+                        ),
+                    };
+                    let key = self.chrome_icon_key(row_raster, cells, c).unwrap_or(key);
+                    let key = shade_phase_key(key, hx, y0);
+                    self.blit_glyph_halo(
+                        pixels,
+                        w,
+                        hx as i32,
+                        hanchor_y,
+                        key,
+                        hscale,
+                        fire_halo_alpha(hc.strength),
+                    );
+                }
+            }
+        }
         type FgMemo = ((u32, [u8; 3], Option<usize>), (u32, u32));
         let mut fg_memo: Option<FgMemo> = None;
         for (c, cell) in cells.iter().take(cols).enumerate() {
@@ -13998,17 +14052,6 @@ impl Renderer {
                         (eff_fg, under)
                     }
                 };
-                if fire_present && let Some(strength) = halo_walk.at(c as u16) {
-                    self.blit_glyph_halo(
-                        pixels,
-                        w,
-                        x as i32,
-                        anchor_y,
-                        key,
-                        scale,
-                        fire_halo_alpha(strength),
-                    );
-                }
                 match raster_split.filter(|sp| usize::from(sp.col) == c && !selected) {
                     Some(sp) => {
                         let at = i32::try_from(sp.x).unwrap_or(i32::MAX);
@@ -27151,9 +27194,12 @@ mod tests {
             "still drawn in colour"
         );
         let (flo, fhi) = rows_of(&full);
+        let (flo, fhi) = (flo.expect("full inked"), fhi.expect("full inked"));
         assert!(
-            flo.is_some_and(|f| f < top as i32) || fhi.is_some_and(|f| f >= (top + rows) as i32),
-            "CONTROL: the full emoji reaches past them: {flo:?}..={fhi:?}"
+            small.height() < full.height() && (hi - lo) < (fhi - flo),
+            "CONTROL: the full emoji ({flo}..={fhi}, h={}) is taller than the small ({lo}..={hi}, h={})",
+            full.height(),
+            small.height()
         );
     }
 

@@ -6,7 +6,7 @@
 
 use super::{
     discovery::{Hints, Outcome},
-    report::{RepairRound, bounded_error},
+    report::{AuthenticatedConnection, RepairRound, bounded_error},
 };
 use crate::{
     Result,
@@ -34,18 +34,25 @@ const BEACON: Duration = Duration::from_secs(5);
 struct Channel {
     stopped: bool,
     local: Option<IpAddr>,
+    connection: Option<AuthenticatedConnection>,
     #[cfg(test)]
     local_endpoint: Option<SocketAddr>,
     socket: Option<Cancellation>,
 }
 impl Channel {
-    fn install(&mut self, connection: &Connection) -> io::Result<bool> {
+    fn install(&mut self, connection: &Connection, began_ms: u64) -> io::Result<bool> {
         if self.stopped {
             return Ok(false);
         }
         self.socket = Some(connection.cancellation()?);
         let local = connection.local_addr()?;
         self.local = Some(local.ip());
+        self.connection = Some(AuthenticatedConnection {
+            local,
+            peer: connection.peer_addr()?,
+            began_ms,
+            authenticated_ms: 0,
+        });
         #[cfg(test)]
         {
             self.local_endpoint = Some(local);
@@ -76,12 +83,13 @@ impl Worker {
         repair: Repair,
     ) -> io::Result<Self> {
         let incoming = connection.is_some();
+        let began_ms = aterm_time::unix_millis().unwrap_or(0);
         let channel = Arc::new(Mutex::new(Channel::default()));
         if let Some(connection) = &connection {
             channel
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .install(connection)?;
+                .install(connection, began_ms)?;
         }
         let control = channel.clone();
         let task = thread::Builder::new()
@@ -93,6 +101,11 @@ impl Worker {
                 let mut exchange_started = false;
                 let result = (|| -> Result<crate::control::Report> {
                     for attempt in 0..2 {
+                        let began_ms = if attempt == 0 {
+                            began_ms
+                        } else {
+                            aterm_time::unix_millis().unwrap_or(0)
+                        };
                         let (connection, side) = if let Some(connection) = connection.take() {
                             (connection, Side::Responder)
                         } else {
@@ -112,7 +125,7 @@ impl Worker {
                         if !control
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
-                            .install(&connection)?
+                            .install(&connection, began_ms)?
                         {
                             return Err(crate::Error::new(
                                 "automatic repair cancelled before exchange",
@@ -131,9 +144,19 @@ impl Worker {
                 let mut control = control.lock().unwrap_or_else(|p| p.into_inner());
                 let success =
                     result.is_ok() && !control.stopped && repair.authenticated_actor().is_some();
+                let completed_at = Instant::now();
+                let completed_at_ms = aterm_time::unix_millis().unwrap_or(0);
+                let connection = control.connection.zip(repair.authenticated_contact()).map(
+                    |(mut connection, (_, authenticated_at))| {
+                        connection.authenticated_ms =
+                            super::contact_time(completed_at_ms, completed_at, authenticated_at);
+                        connection
+                    },
+                );
                 let report = RepairRound {
                     target,
                     actor: repair.authenticated_actor(),
+                    connection,
                     exchange_started,
                     cancelled: control.stopped,
                     phase: Some(repair.phase()),
@@ -154,8 +177,8 @@ impl Worker {
                         },
                     ),
                     handoff: repair.handoff().cloned(),
-                    completed_at: Instant::now(),
-                    completed_at_ms: aterm_time::unix_millis().unwrap_or(0),
+                    completed_at,
+                    completed_at_ms,
                     dropped_before: 0,
                 };
                 if control.stopped {

@@ -387,6 +387,9 @@ fn signin_and_browser_results_refine_the_captured_account_epoch() {
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
+                if action.name == "Run" && state["browser"] == 1 && !cfg!(unix) {
+                    continue;
+                }
                 let next = epoch_transition(&state, action.name);
                 assert!(
                     model.successors(action.name, &state).contains(&next),
@@ -396,7 +399,7 @@ fn signin_and_browser_results_refine_the_captured_account_epoch() {
             }
         }
     }
-    assert_eq!(cases, 60);
+    assert_eq!(cases, if cfg!(unix) { 60 } else { 12 });
     let mut bad = model.init_state();
     bad.insert("phase", 1);
     bad.insert("case", 1);
@@ -426,6 +429,9 @@ fn signin_and_browser_results_refine_the_captured_account_epoch() {
 #[test]
 fn unbound_rows_keep_the_conservative_global_counter_guard() {
     for browser in [false, true] {
+        if browser && !cfg!(unix) {
+            continue;
+        }
         for cli in [Cli::Claude, Cli::Codex, Cli::Kimi, Cli::Grok] {
             if !browser && cli != Cli::Claude {
                 continue;
@@ -476,6 +482,7 @@ fn unbound_rows_keep_the_conservative_global_counter_guard() {
 /// profile even where an automatic sign-in made it and failed in it (its
 /// [`crate::harness::headless_oauth::PROFILE_UNPROVEN_MARK`] goes), so a renewal then signs in
 /// through it. CONTROL: a window whose site kept no session leaves the folder no profile.
+#[cfg(unix)]
 #[test]
 fn a_windows_sign_in_makes_the_rows_folder_a_profile() {
     use crate::harness::headless_oauth::{PROFILE_UNPROVEN_MARK, has_browser_profile};
@@ -526,6 +533,7 @@ fn a_windows_sign_in_makes_the_rows_folder_a_profile() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_recorded_windows_sign_in_survives_and_reports_profile_adoption_failure() {
     use crate::harness::headless_oauth::{PROFILE_UNPROVEN_MARK, has_browser_profile};

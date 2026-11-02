@@ -3559,6 +3559,13 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.303-login-console-menu.txt");
     pub const LOGIN_OPENING: &str = include_str!("fixtures/claude-2.1.303-login-opening.txt");
     pub const LOGIN_HANDOFF: &str = include_str!("fixtures/claude-2.1.303-login-handoff.txt");
+    /// A person's own `/login` hand-off left over a weekly limit past its reset (MEASURED).
+    pub const LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302: &str =
+        include_str!("fixtures/claude-2.1.302-login-handoff-over-weekly-limit.txt");
+    /// The first frame after that hand-off's Esc (MEASURED; the person's one typed key removed).
+    pub const LOGIN_INTERRUPTED_OVER_WEEKLY_LIMIT_2_1_302: &str = include_str!(
+        "fixtures/claude-2.1.302-login-interrupted-over-weekly-limit-continuing-shortly.txt"
+    );
     pub const LOGIN_ERROR: &str = include_str!("fixtures/claude-2.1.303-login-error.txt");
     pub const LOGIN_INTERRUPTED: &str =
         include_str!("fixtures/claude-2.1.303-login-interrupted.txt");
@@ -3566,6 +3573,22 @@ pub mod fixtures {
     pub const LOGIN_SUCCESS: &str = include_str!("fixtures/claude-2.1.303-login-success.txt");
     pub const LOGIN_PICKER_2_1_310: &str =
         include_str!("fixtures/claude-2.1.310-login-picker-plain.txt");
+    /// A person's own `/login` opened over the weekly limit, at its method picker
+    /// ([`LOGIN_PICKER_2_1_310`]) or its error state ([`LOGIN_ERROR`]): HAND-BUILT from that
+    /// measured `frame`, the reply its `/login` stands under drawing the weekly limit's notice of
+    /// [`LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302`] in place of the login wall it was measured over.
+    #[must_use]
+    pub fn login_over_weekly_limit(frame: &str) -> String {
+        const LIMIT: &str = "  ⎿ \u{a0}You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)\n";
+        let over = [
+            "  ⎿ \u{a0}Invalid API key · Fix external API key\n",
+            "  ⎿ \u{a0}Not logged in · Please run /login\n",
+        ]
+        .into_iter()
+        .fold(frame.to_string(), |f, wall| f.replace(wall, LIMIT));
+        assert_ne!(over, frame, "the surgery found the login wall's row");
+        over
+    }
     pub const LOGIN_PICKER_WARNED_2_1_310: &str =
         include_str!("fixtures/claude-2.1.310-login-picker.txt");
     pub const LOGIN_PICKER_CONSOLE_2_1_310: &str =

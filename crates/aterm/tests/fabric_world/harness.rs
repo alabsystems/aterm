@@ -128,7 +128,9 @@ pub use aterm_spec::wait::until_within;
 /// image before it runs. The folder is `dir`'s, a world's scratch, which a failing test keeps
 /// whole and a pass removes once the world's instances are stopped (a [`World`]'s drop, an owner
 /// world's): nothing handed back removes it while a session runs the copy, and a copy that never
-/// writes its line panics here and leaves it.
+/// writes its line panics here and leaves it. The test worlds' alone: [`aterm_uds::deadline::ad_hoc_copy`]
+/// is a debug-assertions seam, and no bench scenario needs a copy.
+#[cfg(debug_assertions)]
 pub fn own_image(dir: &Path, name: &str) -> PathBuf {
     let path = aterm_tempfile::Builder::new()
         .prefix(&format!("{name}-"))
@@ -488,11 +490,12 @@ pub const STALE_HORIZON: (&str, Duration) = ("ATERM_FABRIC_STALE_AFTER_MS", VERB
 /// take the durable flushes aterm ships, full flushes (`F_FULLFSYNC`), not the plain
 /// `fsync(2)` the binary's load-time mark asks for (`aterm_durable::plain_durable_flushes_in_tests!`).
 /// A line that counts or times their flushes then carries no
-/// [`aterm_durable::PLAIN_DURABLE_FLUSHES`]. Off Apple targets every build flushes as it ships.
+/// [`aterm_durable::PLAIN_DURABLE_FLUSHES`]. Off Apple targets, and in a build without debug
+/// assertions (which has neither the mark nor the seam), every build flushes as it ships.
 pub fn ship_durable_flushes(cmd: &mut aterm_uds::spawnfd::Command) {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", debug_assertions))]
     cmd.env_remove(aterm_durable::seam::TEST_PLAIN_FSYNC_ENV);
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(all(target_vendor = "apple", debug_assertions)))]
     let _ = cmd;
 }
 
@@ -1352,6 +1355,11 @@ impl World {
     pub fn restart_bridge(&self) {
         let pid = self.bridge_pid();
         kill(pid, 9);
+        self.await_bridge_back(pid);
+    }
+
+    /// Wait for aterm's supervisor to bring up, attached, the replacement of the killed `pid`.
+    pub fn await_bridge_back(&self, pid: i32) {
         until("the bridge to come back under a new pid", || {
             let back: i32 = std::fs::read_to_string(self.state.join("pid"))
                 .ok()?
@@ -1540,6 +1548,20 @@ impl World {
                 .parse()
                 .ok()
         })
+    }
+
+    /// The state root the world's aterm resolves under its scratch `HOME`
+    /// ([`aterm_types::dirs::state_dir`]).
+    pub fn instance_state(&self) -> PathBuf {
+        aterm_types::dirs::resolve_state_dir(
+            None,
+            aterm_types::dirs::StatePlatform {
+                home: Some(scratch_home(&self.tmp)),
+                xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+                local_app_data: None,
+            },
+        )
+        .expect("a state root under the scratch HOME")
     }
 
     /// Every `ev` record the node has published, newest last, over every `ev` face it owns.

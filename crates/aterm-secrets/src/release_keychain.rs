@@ -2724,7 +2724,8 @@ mod automatic_tests {
             return;
         };
         let _lease = signing_lease(Path::new(&home)).unwrap();
-        println!("signing-lease-held");
+        // Keep the readiness proof on its own line even after libtest's single-thread prefix.
+        println!("\nsigning-lease-held");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).unwrap();
     }

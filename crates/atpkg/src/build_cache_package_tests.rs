@@ -185,7 +185,7 @@ impl World {
             None,
             &mut |_, _| true,
             fence,
-            Some(Context {
+            super::super::Selection::Package(Context {
                 cache: Some(&self.cache),
                 kernel: &self.kernel,
             }),
@@ -441,7 +441,7 @@ fn a_preserve_request_after_candidate_recording_prevents_the_rename() {
             true
         },
         &Fence::default(),
-        Some(Context {
+        super::super::Selection::Package(Context {
             cache: Some(&world.cache),
             kernel: &world.kernel,
         }),
@@ -489,23 +489,7 @@ fn preservation_during_a_fresh_or_resumed_walk_keeps_the_remaining_payload_and_j
         )
         .unwrap();
         world.settle(FIRST, false).unwrap();
-        let files: Vec<_> = [
-            "debug/deps/unit",
-            "debug/.cargo-lock",
-            super::super::MARKER,
-            "remaining/precious",
-        ]
-        .into_iter()
-        .map(|name| {
-            (
-                name,
-                std::fs::symlink_metadata(world.target.join(name))
-                    .unwrap()
-                    .blocks()
-                    * 512,
-            )
-        })
-        .collect();
+        let files = package_file_allocations(&world.target);
         if resumed {
             let stage = world.cache.join("retiring.noindex");
             super::super::stage_for_process_test(&world.home, &world.target, &stage);
@@ -570,19 +554,27 @@ fn released_retirement(resumed: bool) -> World {
     world
 }
 
-fn package_file_allocations(payload: &Path) -> Vec<(&'static str, u64)> {
-    ["debug/deps/unit", "debug/.cargo-lock", super::super::MARKER]
-        .into_iter()
-        .map(|name| {
-            (
-                name,
-                std::fs::symlink_metadata(payload.join(name))
-                    .unwrap()
-                    .blocks()
-                    * 512,
-            )
-        })
-        .collect()
+fn package_file_allocations(payload: &Path) -> Vec<(PathBuf, u64)> {
+    let mut files = Vec::new();
+    let mut directories = vec![payload.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                directories.push(path);
+            } else {
+                // These fixtures have one name per file. Measure every actual file,
+                // including cache metadata, without depending on the removal walker.
+                assert_eq!(metadata.nlink(), 1);
+                files.push((
+                    path.strip_prefix(payload).unwrap().to_path_buf(),
+                    metadata.blocks() * 512,
+                ));
+            }
+        }
+    }
+    files
 }
 
 fn partial_allocation(removed: &[(PathBuf, super::super::super::Unused)]) -> u64 {
@@ -1620,7 +1612,7 @@ fn a_late_coordinator_replacement_after_candidate_recording_retains_the_original
             true
         },
         &Fence::default(),
-        Some(Context {
+        super::super::Selection::Package(Context {
             cache: Some(&world.cache),
             kernel: &world.kernel,
         }),

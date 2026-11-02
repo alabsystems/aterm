@@ -1732,12 +1732,13 @@ impl PresenceAxis {
 fn lab_network_doc(
     snapshot: Option<&aterm_types::network_state::NetworkStateSnapshot>,
     target: crate::network_deck::Target,
+    caption: Option<&crate::network_deck::PlaceCaption>,
     metrics: &FaceMetrics,
     width: f64,
 ) -> LensDoc<'static> {
     let empty = aterm_types::network_state::NetworkStateSnapshot::default();
     let snapshot = snapshot.unwrap_or(&empty);
-    let mut rows = crate::network_deck::details(snapshot, target);
+    let mut rows = crate::network_deck::details_with_caption(snapshot, target, caption);
     // A selected service needs its own scope before generic network guidance.
     // Keep Scope in the complete report, but present it once in the lens header.
     let scope = if target == crate::network_deck::Target::Accounts {
@@ -1860,7 +1861,7 @@ fn lab_network_doc(
                 "Filled peer: reachable; hollow peer: unconfirmed. Warnings: peer = unknown visibility, local = partial history, service = refresh failed. ↑/↓: machine or service; ←/→: instrument. Reachability grants no account or secret access.".into()
             }
         }),
-        answer: Some(("Now", crate::network_deck::summary(snapshot), InkKind::Words2)),
+        answer: Some(("Now", crate::network_deck::summary_with_caption(snapshot, caption), InkKind::Words2)),
         sections,
         two_order: Vec::new(),
         keeps_first: true,
@@ -1870,6 +1871,90 @@ fn lab_network_doc(
 #[cfg(test)]
 mod network_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn place_only_changes_rekey_and_repaint_the_network_lens_with_or_without_bars() {
+        let _attached = crate::stats_deck::tests::attach_stats();
+        let _place = crate::net_place::hold_scoped(None);
+        for bars in ["deck", "sill", "off"] {
+            crate::net_place::hold(Some(aterm_netplace::sample::home(1000, 1)));
+            let mut app = crate::App::headless_for_test();
+            let wid = crate::WindowId(0);
+            app.config
+                .sys
+                .get_or_insert_with(Default::default)
+                .stats_bars = Some(bars.into());
+            let head = crate::stats_deck::reserved_deck_px(
+                crate::stats_deck::StatsBars::Deck,
+                app.windows[&wid].deck_form,
+                app.windows[&wid].scale,
+                app.win_cell_size(wid).1,
+            ) + 14;
+            {
+                let metrics = &mut app.windows.get_mut(&wid).unwrap().metrics;
+                metrics.head = head;
+                metrics.pad = 12;
+                metrics.pad_top = 2;
+            }
+            app.backend.set_head(head);
+            app.backend.set_pad(12);
+            app.backend.set_pad_top(2);
+            assert!(app.open_network_lens());
+            assert_eq!(app.deck_frame(wid).is_none(), bars == "off");
+            let grid = (app.windows[&wid].cols, app.windows[&wid].rows);
+            let network = app.network_snapshot.clone();
+            let (geom, lens, before) = app.lens_frame(wid).unwrap();
+            assert_eq!(before.form.word(), bars);
+            let before_key = app.stats_lens_fp_for(wid, &geom, &lens, &before);
+            let before_prims = crate::stats_deck::prims_fp(&lens_paint(
+                &geom,
+                &app.lens_input(&before, wid),
+                &lens,
+            ));
+            app.splice_stats_lens(wid);
+            let before_pixels = app.windows[&wid].lens_card.as_ref().unwrap().rgba.clone();
+
+            let mut away = aterm_netplace::sample::hotspot(2000, 2000);
+            crate::net_place::hold(Some(away.clone()));
+            assert_eq!(
+                app.stats_lens_fp_for(wid, &geom, &lens, &before),
+                before_key
+            );
+            assert_eq!(
+                crate::stats_deck::prims_fp(&lens_paint(
+                    &geom,
+                    &app.lens_input(&before, wid),
+                    &lens
+                )),
+                before_prims
+            );
+            let (after_geom, after_lens, after) = app.lens_frame(wid).unwrap();
+            assert_eq!(after.form.word(), bars);
+            let after_key = app.stats_lens_fp_for(wid, &after_geom, &after_lens, &after);
+            assert_ne!(after_key, before_key);
+            app.splice_stats_lens(wid);
+            let card = app.windows[&wid].lens_card.as_ref().unwrap();
+            assert_eq!(card.fp, after_key);
+            assert_ne!(card.rgba, before_pixels);
+            assert!(std::sync::Arc::ptr_eq(&app.network_snapshot, &network));
+            assert!(app.vitals.snapshot.is_none());
+            assert_eq!((app.windows[&wid].cols, app.windows[&wid].rows), grid);
+
+            let after_pixels = card.rgba.clone();
+            away.since_ms = Some(9000);
+            away.alab = aterm_netplace::Alab::Away {
+                since_ms: Some(8000),
+            };
+            crate::net_place::hold(Some(away));
+            assert_eq!(app.stats_lens_fp(wid), after_key);
+            app.splice_stats_lens(wid);
+            assert_eq!(
+                app.windows[&wid].lens_card.as_ref().unwrap().rgba,
+                after_pixels
+            );
+        }
+    }
 
     fn render_presence(
         samples: &[aterm_types::network_state::PresenceSample],
@@ -1909,6 +1994,7 @@ mod network_tests {
         let doc = lab_network_doc(
             Some(&snapshot),
             crate::network_deck::Target::Peer(1),
+            None,
             metrics,
             width,
         );
@@ -5388,7 +5474,13 @@ pub(crate) fn lay_lens(
                 cw,
             };
             let doc = if lens.focus == Instrument::NetworkState {
-                lab_network_doc(input.network, input.network_target, metrics, cw)
+                lab_network_doc(
+                    input.network,
+                    input.network_target,
+                    input.network_place,
+                    metrics,
+                    cw,
+                )
             } else {
                 doc_for(c, lens.focus)
             };
@@ -5517,9 +5609,14 @@ impl crate::App {
     }
 
     /// The lens's input for `wid`.
-    fn lens_input(&self, f: &crate::stats_deck::DeckFrame, wid: crate::WindowId) -> DeckInput<'_> {
+    fn lens_input<'a>(
+        &'a self,
+        f: &'a crate::stats_deck::DeckFrame,
+        wid: crate::WindowId,
+    ) -> DeckInput<'a> {
         DeckInput {
             network: Some(self.network_snapshot.as_ref()),
+            network_place: f.network_place.as_ref(),
             network_target: self
                 .windows
                 .get(&wid)
@@ -5544,10 +5641,21 @@ impl crate::App {
 
     /// The open lens's fingerprint for `wid` (`0` when none).
     pub(crate) fn stats_lens_fp(&self, wid: crate::WindowId) -> u64 {
-        use std::hash::{Hash, Hasher};
         let Some((lg, lens, f)) = self.lens_frame(wid) else {
             return 0;
         };
+        self.stats_lens_fp_for(wid, &lg, &lens, &f)
+    }
+
+    /// Key the same captured frame that the lens paints.
+    fn stats_lens_fp_for(
+        &self,
+        wid: crate::WindowId,
+        lg: &LensGeom,
+        lens: &Lens,
+        f: &crate::stats_deck::DeckFrame,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.vitals.snapshot.as_ref().map(|s| s.seq).hash(&mut h);
         self.network_snapshot.revision.hash(&mut h);
@@ -5559,6 +5667,9 @@ impl crate::App {
         self.network_snapshot.network.accounts_exchange.hash(&mut h);
         crate::network_deck::hash_peer_reachability(&self.network_snapshot, &mut h);
         self.network_snapshot.services.hash(&mut h);
+        if lens.focus == Instrument::NetworkState {
+            f.network_place.hash(&mut h);
+        }
         self.windows
             .get(&wid)
             .map(|ws| ws.stats_lens.network_target)
@@ -5587,7 +5698,7 @@ impl crate::App {
             }
             return;
         };
-        let fp = self.stats_lens_fp(wid);
+        let fp = self.stats_lens_fp_for(wid, &lg, &lens, &f);
         if self
             .windows
             .get(&wid)

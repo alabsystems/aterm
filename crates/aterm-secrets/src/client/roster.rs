@@ -66,6 +66,8 @@ pub(super) fn base_swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRost
 }
 
 pub fn swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
+    // A lock an older build left wide is narrowed first, as the deny list's read narrows it.
+    StateLock::narrow_owned(paths)?;
     let Some(expected) = config(paths)? else {
         return Ok(None);
     };

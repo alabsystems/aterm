@@ -1390,6 +1390,23 @@ pub fn zone(offset_s: i64) -> String {
     format!("UTC{sign}{:02}:{:02}", a / 3600, (a % 3600) / 60)
 }
 
+/// [`stamp`] at `ms`'s own local offset (`local_at`), naming that offset (`UTC±HH:MM`) whenever
+/// it differs from the report header's `header_offset_s`.
+pub(super) fn stamp_at(
+    ms: i64,
+    header_offset_s: i64,
+    date: bool,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> String {
+    let off = local_at(ms.div_euclid(1000)).unwrap_or(header_offset_s);
+    let base = stamp(ms, off, date);
+    if off == header_offset_s {
+        base
+    } else {
+        format!("{base} {}", zone(off))
+    }
+}
+
 /// Parse a `--since` argument (Unix ms, `YYYY-MM-DD`, or ISO-8601 timestamp).
 pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
     parse_since_local(s, local_offset_s, &|_| Some(local_offset_s))
@@ -1465,16 +1482,31 @@ pub fn parse_since_local(
 }
 
 /// The time column: `HH:MM:SS`, with the date when the rows span more than
-/// one local day; `-` for none.
-fn time_cell(t: Option<i64>, l: &Ledger, dated: bool) -> String {
-    t.map_or_else(|| "-".to_string(), |t| stamp(t, l.tz_offset_s, dated))
+/// one local day, and `UTC±HH:MM` when `t`'s local offset differs from the header's; `-` for none.
+fn time_cell_at(
+    t: Option<i64>,
+    header_offset_s: i64,
+    dated: bool,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> String {
+    t.map_or_else(
+        || "-".to_string(),
+        |t| stamp_at(t, header_offset_s, dated, local_at),
+    )
 }
 
-fn spans_days(items: &[Item], offset_s: i64) -> bool {
+fn spans_days_at(
+    items: &[Item],
+    header_offset_s: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> bool {
     let days: Vec<i64> = items
         .iter()
         .filter_map(|i| i.t)
-        .map(|t| (t.div_euclid(1000) + offset_s).div_euclid(86_400))
+        .map(|t| {
+            let secs = t.div_euclid(1000);
+            (secs + local_at(secs).unwrap_or(header_offset_s)).div_euclid(86_400)
+        })
         .collect();
     days.iter().min() != days.iter().max()
 }
@@ -1540,18 +1572,18 @@ pub fn summary_rows(l: &Ledger, s: &Summary) -> Vec<(&'static str, String)> {
     ]
 }
 
-fn heading(l: &Ledger) -> String {
+fn heading_at(l: &Ledger, header_offset_s: i64, local_at: &dyn Fn(i64) -> Option<i64>) -> String {
     format!(
         "worker @{} · manager {} · {} · times {}{}",
         l.worker,
         l.manager
             .as_deref()
             .map_or("-".to_string(), |m| format!("@{m}")),
-        stamp(l.now_ms, l.tz_offset_s, true),
-        zone(l.tz_offset_s),
+        stamp(l.now_ms, header_offset_s, true),
+        zone(header_offset_s),
         l.since_ms.map_or(String::new(), |s| format!(
             " · since {}",
-            stamp(s, l.tz_offset_s, true)
+            stamp_at(s, header_offset_s, true, local_at)
         ))
     )
 }
@@ -1568,10 +1600,20 @@ fn pad(s: &str, w: usize) -> String {
 
 /// Render the ledger as aligned plain-text tables.
 pub fn render_text(l: &Ledger) -> String {
+    render_text_local(l, &|_| Some(l.tz_offset_s))
+}
+
+/// [`render_text`], asking `local_at` (Unix seconds to UTC offset seconds) at each instant so rows
+/// across a daylight-saving change show their own local clock and offset.
+pub fn render_text_local(l: &Ledger, local_at: &dyn Fn(i64) -> Option<i64>) -> String {
     let s = l.summary();
     let items = l.items();
-    let dated = spans_days(&items, l.tz_offset_s);
-    let mut out = format!("aterm drive ledger — {}\n", heading(l));
+    let header_off = local_at(l.now_ms.div_euclid(1000)).unwrap_or(l.tz_offset_s);
+    let dated = spans_days_at(&items, header_off, local_at);
+    let mut out = format!(
+        "aterm drive ledger — {}\n",
+        heading_at(l, header_off, local_at)
+    );
     out.push_str("SOURCES\n");
     for src in &l.sources {
         let _ = writeln!(
@@ -1591,7 +1633,17 @@ pub fn render_text(l: &Ledger) -> String {
         out.push_str("  nothing to show\n");
         return out;
     }
-    let tw = if dated { 20 } else { 9 };
+    let cells: Vec<String> = items
+        .iter()
+        .map(|i| time_cell_at(i.t, header_off, dated, local_at))
+        .collect();
+    let min_tw = if dated { 20 } else { 9 };
+    let tw = cells
+        .iter()
+        .map(|c| c.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(min_tw);
     let _ = writeln!(
         out,
         "  {}  {}  {}  DURATION/LATENCY",
@@ -1599,11 +1651,11 @@ pub fn render_text(l: &Ledger) -> String {
         pad("LANE", 7),
         pad("WHAT", WHAT_CHARS)
     );
-    for i in &items {
+    for (i, cell) in items.iter().zip(&cells) {
         let _ = writeln!(
             out,
             "  {}  {}  {}  {}",
-            pad(&time_cell(i.t, l, dated), tw),
+            pad(cell, tw),
             pad(i.lane.name(), 7),
             pad(&cut(&i.what, WHAT_CHARS), WHAT_CHARS),
             i.dur
@@ -1619,10 +1671,19 @@ fn md_cell(s: &str) -> String {
 
 /// Render the ledger as Markdown tables.
 pub fn render_md(l: &Ledger) -> String {
+    render_md_local(l, &|_| Some(l.tz_offset_s))
+}
+
+/// [`render_md`], asking `local_at` (Unix seconds to UTC offset seconds) at each instant.
+pub fn render_md_local(l: &Ledger, local_at: &dyn Fn(i64) -> Option<i64>) -> String {
     let s = l.summary();
     let items = l.items();
-    let dated = spans_days(&items, l.tz_offset_s);
-    let mut out = format!("# aterm drive ledger\n\n{}\n\n", md_cell(&heading(l)));
+    let header_off = local_at(l.now_ms.div_euclid(1000)).unwrap_or(l.tz_offset_s);
+    let dated = spans_days_at(&items, header_off, local_at);
+    let mut out = format!(
+        "# aterm drive ledger\n\n{}\n\n",
+        md_cell(&heading_at(l, header_off, local_at))
+    );
     out.push_str("## Summary\n\n| | |\n|---|---|\n");
     for (k, v) in summary_rows(l, &s) {
         let _ = writeln!(out, "| {k} | {} |", md_cell(&v));
@@ -1647,7 +1708,7 @@ pub fn render_md(l: &Ledger) -> String {
         let _ = writeln!(
             out,
             "| {} | {} | {} | {} |",
-            time_cell(i.t, l, dated),
+            time_cell_at(i.t, header_off, dated, local_at),
             i.lane.name(),
             md_cell(&i.what),
             md_cell(&i.dur)
@@ -1682,10 +1743,15 @@ pub(super) fn html_text(s: &str) -> String {
 
 /// Render `l` in the requested [`Format`].
 pub fn render(l: &Ledger, format: Format) -> String {
+    render_local(l, format, &|_| Some(l.tz_offset_s))
+}
+
+/// [`render`], asking `local_at` (Unix seconds to UTC offset seconds) at each instant.
+pub fn render_local(l: &Ledger, format: Format, local_at: &dyn Fn(i64) -> Option<i64>) -> String {
     match format {
-        Format::Text => render_text(l),
-        Format::Md => render_md(l),
-        Format::Html => super::ledger_html::render_html(l),
+        Format::Text => render_text_local(l, local_at),
+        Format::Md => render_md_local(l, local_at),
+        Format::Html => super::ledger_html::render_html_local(l, local_at),
     }
 }
 

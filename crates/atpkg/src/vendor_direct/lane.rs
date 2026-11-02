@@ -2969,23 +2969,46 @@ mod tests {
         url
     }
 
-    /// Why a program the vendor lane serves on darwin alone did not land here, naming the
-    /// real host (the fixture world resolves a Windows host as Linux).
-    fn darwin_only(program: &str, why: &str) -> String {
-        format!(
-            "the vendor lane serves {program} on darwin only ({why}), and this host is {}: \
-             the landing half did not run",
-            crate::cli::current_triple()
-        )
+    /// Where the vendor serves no build for the real host (`muse` off darwin, `grok` on
+    /// Windows), assert `install_one` answers `Unavailable` without asking any host, fetching a
+    /// byte, writing a stamp or logging a digest, then let the caller return.
+    fn unserved_here(spec: &'static VendorSpec) -> bool {
+        let host = crate::cli::current_triple();
+        if spec.serves(host) {
+            return false;
+        }
+        let l = world::layout(&format!("unserved-{}", spec.program));
+        let f = Fake::default();
+        let lane = Lane {
+            layout: &l,
+            fetcher: &f,
+            triple: host,
+            policy: &Policy::default(),
+            trust: &world::trust(),
+            legacy_index: None,
+            asked: true,
+            now: NOW,
+            download_turn: None,
+        };
+        let o = install_one(&lane, spec, false);
+        assert!(matches!(o.verdict, Verdict::Unavailable { .. }), "{o:?}");
+        assert!(!o.is_failure(), "{o:?}");
+        assert!(f.gets.borrow().is_empty(), "no host was asked");
+        assert!(f.downloads.borrow().is_empty(), "nothing fetched");
+        assert!(
+            ProgramStamp::read(&l, spec.program).is_none(),
+            "nothing recorded"
+        );
+        assert!(
+            !super::super::digests::digests_path(&l, spec.program).exists(),
+            "nothing logged"
+        );
+        true
     }
 
     fn publish_muse(f: &Fake, version: &str, exe: &[u8]) {
-        let Some((key, file)) = resolve::muse_platform(world::triple()) else {
-            aterm_uds::host::could_not_run(darwin_only(
-                "muse",
-                "Meta's release manifest names macOS builds alone",
-            ));
-        };
+        let (key, file) =
+            resolve::muse_platform(world::triple()).expect("muse is served on this host");
         let version = v(version);
         let url = resolve::muse_url(version, file);
         let manifest_url = resolve::muse_url(version, "manifest.json");
@@ -3041,15 +3064,10 @@ mod tests {
     }
 
     /// Publish grok `version` of `exe`: npm's signed tarball and xAI's bucket copy
-    /// ([`Fake::publish_grok`]). Where xAI serves no build for this host (Windows) the landing
-    /// half could not run.
+    /// ([`Fake::publish_grok`]). Callers guard unserved hosts with [`unserved_here`].
     fn publish_grok(f: &Fake, version: &str, exe: &[u8]) -> world::GrokServed {
-        f.publish_grok(version, exe).unwrap_or_else(|| {
-            aterm_uds::host::could_not_run(format!(
-                "grok is not served for {}, so the landing half did not run",
-                crate::cli::current_triple()
-            ))
-        })
+        f.publish_grok(version, exe)
+            .expect("grok is served on this host")
     }
 
     fn staged(l: &Layout, program: &str) -> Vec<String> {
@@ -3114,6 +3132,9 @@ mod tests {
     /// bucket's raw binary is only sized, and nothing is left in staging.
     #[test]
     fn a_fresh_grok_lands_npms_signed_binary_once_xais_bucket_agrees() {
+        if unserved_here(grok()) {
+            return;
+        }
         let l = world::layout("fresh-grok");
         let f = Fake::default();
         let exe = native_exe("grok 1.0.70");
@@ -3200,6 +3221,9 @@ mod tests {
     /// lands it once the bucket agrees.
     #[test]
     fn a_binary_the_bucket_does_not_agree_with_is_refused_and_memoized() {
+        if unserved_here(grok()) {
+            return;
+        }
         let l = world::layout("grok-disagree");
         let f = Fake::default();
         let exe = native_exe("grok 1.0.70");
@@ -3263,6 +3287,9 @@ mod tests {
     /// refuse before its download.
     #[test]
     fn a_tarball_other_than_the_signed_one_is_refused_before_staging() {
+        if unserved_here(grok()) {
+            return;
+        }
         let l = world::layout("grok-tampered");
         let f = Fake::default();
         let exe = native_exe("grok 1.0.70");
@@ -3322,6 +3349,9 @@ mod tests {
         let skippable = [0x184D_2A50u32.to_le_bytes(), 7u32.to_le_bytes()].concat();
         let trailing_skippable = [&world::zstd(&exe)[..], &skippable, b"padding"].concat();
         let leading_skippable = [&skippable[..], b"padding", &world::zstd(&exe)].concat();
+        if unserved_here(grok()) {
+            return;
+        }
         for (label, zst, why) in [
             ("declares", world::zstd(&longer), "its zstd frame declares"),
             ("checksum", checksum_flipped, "could not be checked"),
@@ -3368,6 +3398,9 @@ mod tests {
     /// binary at once; planning it downloads nothing.
     #[test]
     fn a_grok_landing_needs_room_for_the_tarball_the_bucket_copy_and_the_binary() {
+        if unserved_here(grok()) {
+            return;
+        }
         let l = world::layout("grok-room");
         let f = Fake::default();
         let exe = native_exe("grok 1.0.70");
@@ -3399,6 +3432,9 @@ mod tests {
     /// sha256 and length, and deletes it before npm's tarball is requested.
     #[test]
     fn the_bucket_copy_is_decoded_and_deleted_before_the_tarball_is_fetched() {
+        if unserved_here(grok()) {
+            return;
+        }
         let l = world::layout("grok-agree");
         let f = Fake::default();
         let exe = native_exe("grok 1.0.70");
@@ -3438,6 +3474,9 @@ mod tests {
     /// landed or failed.
     #[test]
     fn a_grok_landing_holds_its_download_turn_from_the_bucket_copy_to_the_tarball() {
+        if unserved_here(grok()) {
+            return;
+        }
         let turns = crate::flow::DownloadTurns::default();
         let (first, second, third) = (turns.ticket(), turns.ticket(), turns.ticket());
         let (policy, trust) = (Policy::default(), world::trust());
@@ -3489,6 +3528,9 @@ mod tests {
     /// the next pass.
     #[test]
     fn a_short_bucket_download_fails_unmemoized_and_lands_on_the_next_pass() {
+        if unserved_here(grok()) {
+            return;
+        }
         let l = world::layout("grok-short");
         let f = Fake::default();
         let exe = native_exe("grok 1.0.70");
@@ -3528,6 +3570,9 @@ mod tests {
     /// is served.
     #[test]
     fn an_unserved_npm_document_or_bucket_copy_is_no_verdict() {
+        if unserved_here(grok()) {
+            return;
+        }
         let exe = native_exe("grok 1.0.70");
         for which in ["npm", "binary", "zst", "tarball"] {
             let l = world::layout(&format!("grok-unserved-{which}"));
@@ -3571,6 +3616,9 @@ mod tests {
     /// compiled registry key) is refused before a byte moves, naming the key.
     #[test]
     fn a_version_document_under_a_key_aterm_does_not_ship_is_refused_before_any_download() {
+        if unserved_here(grok()) {
+            return;
+        }
         let l = world::layout("grok-unknown-key");
         let f = Fake::default();
         publish_grok(&f, "1.0.70", &native_exe("grok 1.0.70"));
@@ -3597,9 +3645,10 @@ mod tests {
     /// version — lays nothing.
     #[test]
     fn a_signed_tarball_the_stager_refuses_lays_nothing() {
-        let Some(platform) = world::grok_platform() else {
-            aterm_uds::host::could_not_run("grok is not served for this host");
-        };
+        if unserved_here(grok()) {
+            return;
+        }
+        let platform = world::grok_platform().expect("grok is served on this host");
         let exe = native_exe("grok 1.0.70");
         let mut longer = exe.clone();
         longer.push(b'!');
@@ -3833,6 +3882,9 @@ mod tests {
         assert!(!o.is_failure());
         assert!(f.gets.borrow().is_empty(), "no host was asked");
         assert!(ProgramStamp::read(&l, "muse").is_none(), "nothing recorded");
+        if unserved_here(muse()) {
+            return;
+        }
         let exe = native_exe("muse 1.4.9-R6298");
         publish_muse(&f, "1.4.9-R6298", &exe);
         let o = run(&l, &f, &Policy::default(), muse());
@@ -5588,6 +5640,9 @@ mod tests {
 
     #[test]
     fn a_muse_digest_is_logged_only_once_the_team_pin_passed_its_bytes() {
+        if unserved_here(muse()) {
+            return;
+        }
         let l = world::layout("muse-pin");
         let f = Fake::default();
         publish_muse(&f, "1.4.9-R6298", &native_exe("not Meta's"));

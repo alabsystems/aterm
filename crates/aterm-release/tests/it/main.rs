@@ -14,6 +14,9 @@
     reason = "never linked into the shipped binary: the release cutter, run from source"
 )]
 
+#[path = "../../src/accepted_measure.rs"]
+#[allow(dead_code)]
+mod accepted_measure;
 #[path = "../../src/apple.rs"]
 #[allow(dead_code)]
 mod apple;
@@ -95,9 +98,13 @@ mod release;
 #[path = "../../src/release_keychain.rs"]
 #[allow(dead_code)]
 mod release_keychain;
+#[path = "../../src/release_status.rs"]
+#[allow(dead_code)]
+mod release_status;
 #[path = "../../src/release_steps.rs"]
 #[allow(dead_code)]
 mod release_steps;
+
 #[path = "../../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;

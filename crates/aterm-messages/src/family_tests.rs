@@ -217,7 +217,8 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             Family::HugeDir,
             Family::ServiceMemory,
             Family::Secrets,
-            Family::Join
+            Family::Join,
+            Family::NetworkPlace
         ]
     );
     // The asking Macs' entries are the members desk's, filed apart from the need ledger's.

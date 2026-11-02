@@ -26,6 +26,10 @@ workspace = true
 dev-seams = []
 
 [dependencies]
+aterm-mail = { workspace = true }
+# This Mac's network place: `aterm fleet peers` names it under its first line and says why no
+# member answers from another network, in the words every reporter uses (`fleet_member`).
+aterm-netplace = { workspace = true }
 # The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
 aterm-spec-anchor = { workspace = true }
@@ -196,7 +200,6 @@ aterm-secrets = { workspace = true }
 aterm-net = { workspace = true }
 
 [dev-dependencies]
-aterm-mail = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-harness = { workspace = true }

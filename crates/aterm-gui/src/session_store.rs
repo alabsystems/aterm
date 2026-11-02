@@ -780,6 +780,7 @@ pub(crate) struct CarriedClaims {
     attention_owners: Vec<String>,
     supervisor: Option<String>,
     claim_known: bool,
+    /// The task record's carry row without its ages ([`crate::task_record::TaskRecord::carry_face`]).
     task: Option<String>,
     /// A proven self-claim's task face, which no loop restates at the successor (`App::self_claim_face`): set beside the record's claims at the park, and beside the live ones at the Commit ([`Self::with_self_face`]).
     self_face: Option<(aterm_agent::harness::acts::TaskFace, i64)>,
@@ -825,7 +826,10 @@ impl CarriedClaims {
             attention_owners: record.attention_owners.clone(),
             supervisor: record.supervisor.as_deref().map(lease_holder),
             claim_known: record.claim_known,
-            task: record.task.clone(),
+            task: record
+                .task
+                .as_deref()
+                .map(crate::task_record::TaskRecord::carry_face),
             self_face: None,
         }
     }
@@ -847,7 +851,10 @@ impl CarriedClaims {
             attention_owners: drawn.attention_owners,
             supervisor: drawn.supervisor.as_deref().map(lease_holder),
             claim_known: drawn.claim_known,
-            task: drawn.task,
+            task: drawn
+                .task
+                .as_deref()
+                .map(crate::task_record::TaskRecord::carry_face),
             self_face: None,
         }
     }
@@ -880,7 +887,10 @@ impl CarriedClaims {
             attention_owners: meta.handoff_attention_owners(),
             claim_known: claim_known && !(supervisor.is_none() && reexec),
             supervisor: supervisor.as_deref().map(lease_holder),
-            task: timeline.task_carry_row(),
+            task: timeline
+                .task_carry_row()
+                .as_deref()
+                .map(crate::task_record::TaskRecord::carry_face),
             self_face,
         }
     }
@@ -1126,12 +1136,14 @@ impl ExitReason {
     }
 }
 
-/// Actor that retired a session (`by=<sid|human|ctl|bridge|->`).
+/// Actor that retired a session (`by=<sid|human|ctl|bridge|harness|->`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExitActor {
     Sid(String),
     Human,
     Ctl,
+    /// aterm's own harness, which ended a worker of its own.
+    Harness,
     #[cfg(any(unix, test))]
     Bridge,
     Unknown,
@@ -1145,6 +1157,7 @@ impl ExitActor {
             ExitActor::Sid(sid) => sid.as_str(),
             ExitActor::Human => "human",
             ExitActor::Ctl => "ctl",
+            ExitActor::Harness => "harness",
             #[cfg(any(unix, test))]
             ExitActor::Bridge => "bridge",
             ExitActor::Unknown => "-",
@@ -2888,9 +2901,12 @@ title = \"zsh\"
         let now = crate::metrics::now_us();
         let holder = crate::harness_host::holder();
         let drawn = CarriedClaims::of_record(&manifest.sessions[1]);
+        // The Commit draws again later: the record's ages have grown, its claims have not.
+        std::thread::sleep(Duration::from_millis(2));
         assert_eq!(
             CarriedClaims::of_session(1, &worker.ctx, now, &holder),
-            drawn
+            drawn,
+            "a record that stood still since the park holds the Commit"
         );
 
         let adopted = handle(8, None);
@@ -2900,6 +2916,7 @@ title = \"zsh\"
         assert_eq!(
             crate::task_record::TaskRecord {
                 since: record.since,
+                started: record.started,
                 ..seeded
             },
             record,
@@ -3553,6 +3570,7 @@ title = \"zsh\"
         assert_eq!(ExitActor::Sid("s-z".into()).as_wire(), "s-z");
         assert_eq!(ExitActor::Human.as_wire(), "human");
         assert_eq!(ExitActor::Ctl.as_wire(), "ctl");
+        assert_eq!(ExitActor::Harness.as_wire(), "harness");
         assert_eq!(ExitActor::Bridge.as_wire(), "bridge");
         assert_eq!(ExitActor::Unknown.as_wire(), "-");
     }

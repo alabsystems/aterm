@@ -1040,3 +1040,44 @@ fn a_line_left_stays_ready_idle_held_as_its_draft() {
         "NEGATIVE CONTROL: typed, no longer due"
     );
 }
+
+/// A DOOR'S LINE LEFT IS THE LOOP'S OWN, NO PERSON'S DRAFT (slice pl1, `turn_end_loop::OwnLine`):
+/// a rule's line written at 31 minutes, its Enter refused, stands in the composer at 32; a minute
+/// on the loop reads no person typing in it ([`Session::person_ago`]), so no person's grace holds a
+/// point on it: the person's own last key, an hour old, is what the loop holds. Negative control
+/// by mutation: the door's write not claiming the line it left (a person typing 120 s before the
+/// read).
+#[test]
+fn a_doors_line_left_is_no_persons_draft() {
+    let line = templates::wait_nudge(31 * MIN);
+    let mut ago = None;
+    let script = Script {
+        set: &enter_refused,
+        ..Script::new(
+            "left-hold-own",
+            Occupancy::Prompt,
+            &[0, 31 * 60, 32 * 60, 33 * 60],
+        )
+    };
+    let ran = script.run(&mut |s, i| {
+        if i == 0 {
+            submits(s, 5);
+        }
+        if i == 2 {
+            standing(s, line.text());
+        }
+        if i == 3 {
+            ago = Some(s.person_ago(s.fx.mono()));
+        }
+    });
+    let rows = hold_rows(&ran);
+    assert!(
+        rows.len() == 1 && rows[0].1.ends_with(" left submits=5"),
+        "left, and standing: {rows:#?}"
+    );
+    let ago = ago.expect("read at 33 minutes");
+    assert!(
+        ago.is_none_or(|ago| ago >= Duration::from_secs(30 * 60)),
+        "no person typing in the door's own line: {ago:?}"
+    );
+}

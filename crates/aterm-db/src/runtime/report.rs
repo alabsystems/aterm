@@ -7,6 +7,20 @@
 use astream_wire::sync::Actor;
 use std::net::SocketAddr;
 
+/// Socket endpoints and original clocks for an authenticated exchange. This proves
+/// contact only; the subsequent control or application exchange may have failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedConnection {
+    /// The actual socket's local endpoint, captured before authentication.
+    pub local: SocketAddr,
+    /// The actual socket's peer, including an accepted connection's source port.
+    pub peer: SocketAddr,
+    /// When the attempt began, before connecting or authenticating.
+    pub began_ms: u64,
+    /// When the peer authenticated, never the later report's collection time.
+    pub authenticated_ms: u64,
+}
+
 /// One automatic owner's completed worker, including failed or cancelled work.
 /// An authenticated actor proves this round's identity exchange, not successful
 /// control repair, application repair or globally converged state.
@@ -15,6 +29,8 @@ pub struct RepairRound {
     /// The advertised service dialled by an outbound worker; None for inbound.
     pub target: Option<SocketAddr>,
     pub actor: Option<Actor>,
+    /// Authenticated socket metadata, independent of later repair success.
+    pub connection: Option<AuthenticatedConnection>,
     pub exchange_started: bool,
     pub cancelled: bool,
     /// Last local operation entered; None when a worker panicked before reporting.
@@ -321,6 +337,7 @@ impl RepairRound {
         Self {
             target,
             actor: None,
+            connection: None,
             exchange_started: false,
             cancelled: false,
             phase: None,

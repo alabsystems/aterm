@@ -8,9 +8,10 @@
 //! * [`Base`]: a launch's base URL, its [`Target`] and the path under it: two gateways' paths on
 //!   one host (`/v1/openai`, `/v1/anthropic`) are two routes a probe reaches alike.
 //! * [`endpoint_of`] / [`endpoint_of_with_agy`]: the base URL a session's own launch names (Claude
-//!   Code's route as its settings chain reads it, Muse Code's `--base-url`, agy's
-//!   `GOOGLE_GEMINI_BASE_URL` or default `generativelanguage.googleapis.com` when `settings.json`
-//!   selects `"modelProvider": "gemini"` on its Gemini API key), or a named [`Endpoint::Gap`]
+//!   Code's route as its settings chain reads it, Muse Code's `--base-url` or
+//!   `-c endpoint_transport.base_url`, agy's `GOOGLE_GEMINI_BASE_URL` or default
+//!   `generativelanguage.googleapis.com` when `settings.json` and `--settings` select
+//!   `"modelProvider": "gemini"` on its Gemini API key), or a named [`Endpoint::Gap`]
 //!   where the launch names none, a proxy carries it, or the program's route is not read: never a
 //!   guessed default.
 //! * [`RouteKey`]: the program and the base URL, which a witness must share with the session it
@@ -257,6 +258,10 @@ pub const AGY_VERTEX: &str = "GOOGLE_GENAI_USE_VERTEXAI";
 /// Gemini Enterprise (`false` overrides [`AGY_VERTEX`]).
 pub const AGY_ENTERPRISE: &str = "GOOGLE_GENAI_USE_ENTERPRISE";
 
+/// The variable that turns agy to an Enterprise LLM Gateway ahead of its Gemini API key and Google
+/// sign-in; its gateway discovery endpoint is not read.
+pub const AGY_GATEWAY_URL: &str = "AGY_LLM_GATEWAY_URL";
+
 /// The variable that names a Claude Code route of its own's endpoint.
 pub const CLAUDE_BASE_URL: &str = "ANTHROPIC_BASE_URL";
 
@@ -343,26 +348,6 @@ fn claude_base(env: &[String]) -> Option<&str> {
     var(env, CLAUDE_BASE_URL).filter(|_| !others)
 }
 
-/// The last `--base-url` value `argv` (its first word the program) passes before `--`.
-fn muse_base_url(argv: &[String]) -> Option<&str> {
-    let mut found = None;
-    let mut words = argv.iter().skip(1);
-    while let Some(w) = words.next() {
-        if w == "--" {
-            break;
-        }
-        if w == MUSE_BASE_URL {
-            found = words.next().map(String::as_str);
-        } else if let Some(v) = w
-            .strip_prefix(MUSE_BASE_URL)
-            .and_then(|r| r.strip_prefix('='))
-        {
-            found = Some(v);
-        }
-    }
-    found.map(str::trim).filter(|v| !v.is_empty())
-}
-
 /// Go's `strconv.ParseBool` grammar, as Google's Go GenAI SDK inside `agy` parses boolean
 /// environment variables.
 fn parse_go_bool(value: &str) -> Option<bool> {
@@ -375,7 +360,7 @@ fn parse_go_bool(value: &str) -> Option<bool> {
 
 /// Why an `agy` launch's Vertex / Enterprise flags leave its Gemini API route unread, following
 /// Google's Go GenAI SDK (`GOOGLE_GENAI_USE_ENTERPRISE` overrides `GOOGLE_GENAI_USE_VERTEXAI`).
-fn agy_vertex_reason(env: &[String]) -> Option<String> {
+pub(super) fn agy_vertex_reason(env: &[String]) -> Option<String> {
     if let Some(v) = var(env, AGY_ENTERPRISE) {
         return match parse_go_bool(v) {
             Some(true) => Some(format!(
@@ -403,29 +388,51 @@ fn agy_vertex_reason(env: &[String]) -> Option<String> {
 /// What `agy`'s `settings.json` (and `--settings`) says of its model backend ([`agy_backend`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgyBackend {
-    /// `settings.json` sets `"modelProvider": "gemini"`, with no `--settings` override: `agy`
-    /// speaks to the Gemini API on [`AGY_API_KEYS`].
+    /// `settings.json` and any `--settings` session override select `"modelProvider": "gemini"`:
+    /// `agy` speaks to the Gemini API on [`AGY_API_KEYS`].
     GeminiApi,
-    /// Settled for the process: `settings.json` is absent, omits `"modelProvider"`, names another
-    /// provider (Google sign-in, gateway), `--settings` overrides it, its config directory cannot
-    /// be resolved, or `settings.json` lies inside a file-provider domain.
+    /// Settled for the process: `settings.json` and `--settings` omit `"modelProvider"`, name
+    /// another provider (Google sign-in, gateway), pass a relative or unparseable `--settings`
+    /// override, its config directory cannot be resolved, or a settings file lies inside a
+    /// file-provider domain.
     Other(String),
-    /// `settings.json` could not be read or parsed this time (as one mid-write cannot): read again
-    /// at the next ask.
+    /// `settings.json` or an absolute `--settings` file could not be read or parsed this time (as
+    /// one mid-write cannot): read again at the next ask.
     Unread(String),
 }
 
-/// THE PURE HALF OF [`agy_backend_on_disk`]: what `argv` and `<config>/settings.json` (`settings`)
-/// say of `agy`'s model backend. Measured on `agy 1.4.12`: `agy` uses `GEMINI_API_KEY` /
-/// `GOOGLE_API_KEY` and `GOOGLE_GEMINI_BASE_URL` only when `settings.json` sets
-/// `"modelProvider": "gemini"`, and `--settings` overrides `settings.json` for the session.
-#[must_use]
-pub fn agy_backend(argv: &[String], settings: &Source) -> AgyBackend {
-    if super::upgrade_agy::has_settings_override(argv) {
-        return AgyBackend::Other(
-            "agy's launch passes --settings, whose session override is not read".to_string(),
-        );
+enum OverrideChoice {
+    GeminiApi,
+    Other(String),
+    Unset,
+}
+
+pub(super) fn parse_settings_object(text: &str) -> Option<aterm_json::Map> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    match aterm_json::from_str::<aterm_json::Value>(text).ok()? {
+        aterm_json::Value::Object(map) => Some(map),
+        _ => None,
     }
+}
+
+fn agy_override_choice(object: &aterm_json::Map, label: &str) -> OverrideChoice {
+    match object.get("modelProvider") {
+        None => OverrideChoice::Unset,
+        Some(aterm_json::Value::Null) => OverrideChoice::Other(format!(
+            "agy's {label} clears modelProvider, so it uses Google sign-in rather than Gemini API"
+        )),
+        Some(aterm_json::Value::String(p)) if p == "gemini" => OverrideChoice::GeminiApi,
+        Some(aterm_json::Value::String(p)) if p.is_empty() => OverrideChoice::Other(format!(
+            "agy's {label} clears modelProvider, so it uses Google sign-in rather than Gemini API"
+        )),
+        Some(aterm_json::Value::String(_)) => OverrideChoice::Other(format!(
+            "agy's {label} sets modelProvider to another backend (not \"gemini\")"
+        )),
+        Some(_) => OverrideChoice::Other(format!("agy's {label} sets a non-string modelProvider")),
+    }
+}
+
+fn agy_settings_file_backend(settings: &Source) -> AgyBackend {
     match settings {
         Source::Missing => AgyBackend::Other(
             "agy's settings.json is absent, so it uses Google sign-in rather than Gemini API"
@@ -433,11 +440,7 @@ pub fn agy_backend(argv: &[String], settings: &Source) -> AgyBackend {
         ),
         Source::Unreadable => AgyBackend::Unread("agy's settings.json could not be read".into()),
         Source::Text(text) => {
-            let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-            let Ok(value) = aterm_json::from_str::<aterm_json::Value>(text) else {
-                return AgyBackend::Unread("agy's settings.json could not be parsed".to_string());
-            };
-            let Some(object) = value.as_object() else {
+            let Some(object) = parse_settings_object(text) else {
                 return AgyBackend::Unread("agy's settings.json could not be parsed".to_string());
             };
             match object.get("modelProvider") {
@@ -459,8 +462,83 @@ pub fn agy_backend(argv: &[String], settings: &Source) -> AgyBackend {
     }
 }
 
-/// Reads `<config>/settings.json` for an `agy` launch (`argv`, `env`, and the host's `host_home`
-/// as both fallback home and file-provider fence) through the bounded regular-file reader
+/// [`agy_backend`] with an optional session `--settings` file document (`override_file`) when
+/// `argv`'s last `--settings` flag names an absolute file path rather than an inline JSON object.
+#[must_use]
+pub fn agy_backend_with_override(
+    argv: &[String],
+    settings: &Source,
+    override_file: Option<&Source>,
+) -> AgyBackend {
+    match super::upgrade_agy::settings_override(argv) {
+        None => agy_settings_file_backend(settings),
+        Some(None) => AgyBackend::Other("agy's launch passes --settings with no value".to_string()),
+        Some(Some(raw)) => {
+            let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(raw).trim_start();
+            if trimmed.starts_with('{') {
+                let Some(object) = parse_settings_object(trimmed) else {
+                    return AgyBackend::Other(
+                        "agy's --settings inline value is not a valid JSON object".to_string(),
+                    );
+                };
+                match agy_override_choice(&object, "--settings") {
+                    OverrideChoice::GeminiApi => AgyBackend::GeminiApi,
+                    OverrideChoice::Other(why) => AgyBackend::Other(why),
+                    OverrideChoice::Unset => agy_settings_file_backend(settings),
+                }
+            } else {
+                if raw.is_empty() {
+                    return AgyBackend::Other(
+                        "agy's launch passes an empty --settings file path".to_string(),
+                    );
+                }
+                match override_file {
+                    None if !Path::new(raw).is_absolute() => AgyBackend::Other(
+                        "agy's launch passes a relative --settings file path, whose session \
+                         override is not read"
+                            .to_string(),
+                    ),
+                    None => AgyBackend::Other(
+                        "agy's launch passes a --settings file path, whose session override is \
+                         not read"
+                            .to_string(),
+                    ),
+                    Some(Source::Missing) => {
+                        AgyBackend::Other("agy's --settings file is absent".to_string())
+                    }
+                    Some(Source::Unreadable) => {
+                        AgyBackend::Unread("agy's --settings file could not be read".to_string())
+                    }
+                    Some(Source::Text(text)) => {
+                        let Some(object) = parse_settings_object(text) else {
+                            return AgyBackend::Unread(
+                                "agy's --settings file could not be parsed".to_string(),
+                            );
+                        };
+                        match agy_override_choice(&object, "--settings file") {
+                            OverrideChoice::GeminiApi => AgyBackend::GeminiApi,
+                            OverrideChoice::Other(why) => AgyBackend::Other(why),
+                            OverrideChoice::Unset => agy_settings_file_backend(settings),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// THE PURE HALF OF [`agy_backend_on_disk`]: what `argv` and `<config>/settings.json` (`settings`)
+/// say of `agy`'s model backend. Measured on `agy 1.4.12`: `agy` uses `GEMINI_API_KEY` /
+/// `GOOGLE_API_KEY` and `GOOGLE_GEMINI_BASE_URL` only when `settings.json` (overlaid with
+/// `--settings`) sets `"modelProvider": "gemini"`.
+#[must_use]
+pub fn agy_backend(argv: &[String], settings: &Source) -> AgyBackend {
+    agy_backend_with_override(argv, settings, None)
+}
+
+/// Reads `<config>/settings.json` and any `--settings` session override for an `agy` launch
+/// (`argv`, `env`, and the host's `host_home` as both fallback home and file-provider fence)
+/// through the bounded regular-file reader
 /// ([`crate::supervise::policy::claude_settings::read_settings_in`]).
 #[must_use]
 pub fn agy_backend_on_disk(
@@ -468,8 +546,82 @@ pub fn agy_backend_on_disk(
     env: &[String],
     host_home: Option<&Path>,
 ) -> AgyBackend {
-    if super::upgrade_agy::has_settings_override(argv) {
-        return agy_backend(argv, &Source::Missing);
+    agy_backend_in_dir(argv, env, None, host_home)
+}
+
+/// [`agy_backend_on_disk`] resolving a relative `--settings` file path against `cwd` when `cwd`
+/// is an absolute directory.
+#[must_use]
+pub fn agy_backend_in_dir(
+    argv: &[String],
+    env: &[String],
+    cwd: Option<&Path>,
+    host_home: Option<&Path>,
+) -> AgyBackend {
+    let mut override_source = None;
+    match super::upgrade_agy::settings_override(argv) {
+        None => {}
+        Some(None) => return agy_backend_with_override(argv, &Source::Missing, None),
+        Some(Some(raw)) => {
+            let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(raw).trim_start();
+            if trimmed.starts_with('{') {
+                let Some(object) = parse_settings_object(trimmed) else {
+                    return agy_backend_with_override(argv, &Source::Missing, None);
+                };
+                if !matches!(
+                    agy_override_choice(&object, "--settings"),
+                    OverrideChoice::Unset
+                ) {
+                    return agy_backend_with_override(argv, &Source::Missing, None);
+                }
+            } else {
+                if raw.is_empty() {
+                    return agy_backend_with_override(argv, &Source::Missing, None);
+                }
+                let raw_path = Path::new(raw);
+                let resolved = if raw_path.is_absolute() {
+                    crate::supervise::policy::git_config::normalise(raw_path)
+                } else if let Some(dir) = cwd.filter(|d| d.is_absolute()) {
+                    crate::supervise::policy::git_config::normalise(&dir.join(raw_path))
+                } else {
+                    return agy_backend_with_override(argv, &Source::Missing, None);
+                };
+                match crate::supervise::policy::claude_settings::read_settings_in(
+                    host_home, &resolved,
+                ) {
+                    Ok(None) => {
+                        return agy_backend_with_override(
+                            argv,
+                            &Source::Missing,
+                            Some(&Source::Missing),
+                        );
+                    }
+                    Err(why) if why.contains("file-provider domain") => {
+                        return AgyBackend::Other(format!("agy's --settings file {why}"));
+                    }
+                    Err(_) => {
+                        return agy_backend_with_override(
+                            argv,
+                            &Source::Missing,
+                            Some(&Source::Unreadable),
+                        );
+                    }
+                    Ok(Some(text)) => {
+                        let falls_through = parse_settings_object(&text).is_some_and(|object| {
+                            matches!(
+                                agy_override_choice(&object, "--settings file"),
+                                OverrideChoice::Unset
+                            )
+                        });
+                        let src = Source::Text(text);
+                        if !falls_through {
+                            return agy_backend_with_override(argv, &Source::Missing, Some(&src));
+                        }
+                        override_source = Some(src);
+                    }
+                }
+            }
+        }
     }
     let Some(config) =
         super::upgrade_agy::config_dir_or(argv, var(env, super::upgrade_agy::HOME_ENV), host_home)
@@ -478,12 +630,14 @@ pub fn agy_backend_on_disk(
     };
     let path = config.join(super::upgrade_agy::SETTINGS_JSON);
     match crate::supervise::policy::claude_settings::read_settings_in(host_home, &path) {
-        Ok(None) => agy_backend(argv, &Source::Missing),
-        Ok(Some(text)) => agy_backend(argv, &Source::Text(text)),
+        Ok(None) => agy_backend_with_override(argv, &Source::Missing, override_source.as_ref()),
+        Ok(Some(text)) => {
+            agy_backend_with_override(argv, &Source::Text(text), override_source.as_ref())
+        }
         Err(why) if why.contains("file-provider domain") => {
             AgyBackend::Other(format!("agy's settings.json {why}"))
         }
-        Err(_) => agy_backend(argv, &Source::Unreadable),
+        Err(_) => agy_backend_with_override(argv, &Source::Unreadable, override_source.as_ref()),
     }
 }
 
@@ -506,15 +660,16 @@ pub fn endpoint_of(
 /// is `api.anthropic.com`; a route of its own is the `ANTHROPIC_BASE_URL` its launch's route
 /// variables name (`env`, [`super::netwatch::launch_env`]) where no other route variable (Bedrock,
 /// Vertex, Foundry, a Unix socket, `CLAUDE_CODE_PROXY…`) is set, and otherwise the route's own
-/// reason as a gap. Muse Code's is its `--base-url`. agy's (`agy`, asked only for `agy` once `env`
-/// is read) requires `settings.json` to select `"modelProvider": "gemini"` with no `--settings`
-/// override ([`AgyBackend::GeminiApi`]), a Gemini API key ([`AGY_API_KEYS`]), and Vertex AI off
-/// ([`AGY_ENTERPRISE`] overriding [`AGY_VERTEX`]): then `GOOGLE_GEMINI_BASE_URL` names a custom
-/// endpoint and its absence names [`AGY_GEMINI_URL`] (`generativelanguage.googleapis.com`). Signed
-/// in with Google (no `"modelProvider": "gemini"` or no key) or on Vertex, agy calls a route those
-/// variables do not name. Each is a gap where a proxy carries it or the program's route is not
-/// read. codex-alab carries its own Autopilot and Grok Build and Kimi Code their own forks, so no
-/// route of theirs is read.
+/// reason as a gap. Muse Code's is its `--base-url` (or `-c endpoint_transport.base_url` when no
+/// `-c endpoint_transport` proxy or custom CA bundle overrides transport). agy's (`agy`, asked
+/// only for `agy` once `env` is read) requires `settings.json` overlaid with `--settings` to
+/// select `"modelProvider": "gemini"` ([`AgyBackend::GeminiApi`]), a Gemini API key
+/// ([`AGY_API_KEYS`]), and Vertex AI off ([`AGY_ENTERPRISE`] overriding [`AGY_VERTEX`]): then
+/// `GOOGLE_GEMINI_BASE_URL` names a custom endpoint and its absence names [`AGY_GEMINI_URL`]
+/// (`generativelanguage.googleapis.com`). Signed in with Google (no `"modelProvider": "gemini"` or
+/// no key) or on Vertex, agy calls a route those variables do not name. Each is a gap where a
+/// proxy carries it or the program's route is not read. codex-alab carries its own Autopilot and
+/// Grok Build and Kimi Code their own forks, so no route of theirs is read.
 #[must_use]
 pub fn endpoint_of_with_agy(
     program: Program,
@@ -536,18 +691,23 @@ pub fn endpoint_of_with_agy(
             let Some(env) = env else {
                 return unread("Muse Code");
             };
-            match muse_base_url(argv) {
-                Some(base) => named(base, "Muse Code's --base-url", env),
-                None => Endpoint::Gap(
-                    "Muse Code's launch names no --base-url (its default endpoint is not read)"
-                        .to_string(),
-                ),
+            match super::upgrade_muse::launch_endpoint(argv, env) {
+                super::upgrade_muse::LaunchEndpoint::BaseUrl { url, source } => {
+                    named(&url, source, env)
+                }
+                super::upgrade_muse::LaunchEndpoint::Gap(why) => Endpoint::Gap(why),
             }
         }
         Program::Agy => {
             let Some(env) = env else {
                 return unread("agy");
             };
+            if var(env, AGY_GATEWAY_URL).is_some() {
+                return Endpoint::Gap(format!(
+                    "agy's launch sets {AGY_GATEWAY_URL}, whose Enterprise LLM Gateway route is \
+                     not read"
+                ));
+            }
             match agy() {
                 AgyBackend::Unread(why) | AgyBackend::Other(why) => return Endpoint::Gap(why),
                 AgyBackend::GeminiApi => {}

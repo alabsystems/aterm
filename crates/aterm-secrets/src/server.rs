@@ -935,7 +935,9 @@ fn launch_at(
         record_writes: Mutex::new(()),
         records_pulls: PullSlots::new(RECORDS_PULLS_AT_ONCE),
         envelope_pulls: PullSlots::new(ENVELOPE_PULLS_AT_ONCE),
+        untaken: crate::membership_log::untaken::Untaken::new(),
         advertiser: Mutex::new(None),
+        records_boot: aterm_uds::rand::hex_token::<16>()?,
         #[cfg(test)]
         waiting: AtomicUsize::new(0),
         #[cfg(test)]
@@ -944,6 +946,24 @@ fn launch_at(
         envelope_gets: AtomicUsize::new(0),
         #[cfg(test)]
         join_gets: AtomicUsize::new(0),
+        #[cfg(test)]
+        record_wakes: AtomicUsize::new(0),
+        #[cfg(test)]
+        record_looks: AtomicUsize::new(0),
+        #[cfg(test)]
+        post_clones: AtomicUsize::new(0),
+        #[cfg(test)]
+        post_verifies: AtomicUsize::new(0),
+        #[cfg(test)]
+        verifying: Mutex::new(None),
+        #[cfg(test)]
+        appends_fail: AtomicBool::new(false),
+        #[cfg(test)]
+        appends_tear: AtomicBool::new(false),
+        #[cfg(test)]
+        appended: Mutex::new(None),
+        #[cfg(test)]
+        writes_fail: AtomicBool::new(false),
     });
     let (refusals, refused) = sync_channel::<TcpStream>(REFUSALS_QUEUED);
     std::thread::Builder::new()
@@ -1056,18 +1076,63 @@ struct Queued {
 /// One vault's membership-record log and the condition its long-polls wait on.
 struct RecordSlot {
     store: crate::membership_log::Store,
-    /// The records file's bytes as this server last read or wrote them, so an unchanged file is
-    /// not decoded again ([`take_records_from_store`]).
-    raw: Vec<u8>,
+    /// The records file as this server last read or wrote it (`docs/DESIGN-fluid-swarm-
+    /// 2026-10-28.md` §4.1 F23, rule 2): a look that finds the same stamp reads nothing
+    /// ([`look_at_records`]). `None` until this server read, wrote or was refused one.
+    stamp: Option<fsx::FileStamp>,
+    /// `Some(n)` when the file holds exactly the records of the log's first `n` (as a set: a
+    /// reload may order them otherwise), so what the log holds past them can go on its end.
+    on_file: Option<usize>,
+    /// A POST is writing the file ([`post_records`], [`Writing`]): a look reads nothing, since
+    /// what the file holds past the stamp may not be durable yet, and reading it would take
+    /// those records into the store and verify the whole file under `server_state`. The POST
+    /// stamps the slot when its write is done.
+    writing: bool,
     wake: Arc<Condvar>,
 }
 
 impl RecordSlot {
-    fn new(store: crate::membership_log::Store, raw: Vec<u8>) -> Self {
+    /// A slot for `store` that knows no records file.
+    fn new(store: crate::membership_log::Store) -> Self {
+        Self::stamped(store, None, None)
+    }
+
+    /// A slot for `store`, the records file as `stamp` names it, holding `on_file`.
+    fn stamped(
+        store: crate::membership_log::Store,
+        stamp: Option<fsx::FileStamp>,
+        on_file: Option<usize>,
+    ) -> Self {
         Self {
             store,
-            raw,
+            stamp,
+            on_file,
+            writing: false,
             wake: Arc::new(Condvar::new()),
+        }
+    }
+}
+
+/// A records POST writing `name`'s file ([`RecordSlot::writing`]): marked while it lives, and
+/// unmarked when it goes, however the POST ends.
+struct Writing<'a> {
+    shared: &'a Shared,
+    name: &'a str,
+}
+
+impl<'a> Writing<'a> {
+    fn mark(shared: &'a Shared, name: &'a str) -> Self {
+        if let Some(slot) = shared.lock_server_state().records.get_mut(name) {
+            slot.writing = true;
+        }
+        Self { shared, name }
+    }
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.shared.lock_server_state().records.get_mut(self.name) {
+            slot.writing = false;
         }
     }
 }
@@ -1112,6 +1177,10 @@ struct Shared {
     /// The pulls of a whole envelope longer than [`ENVELOPE_PEEK`] from peers under way now
     /// ([`ENVELOPE_PULLS_AT_ONCE`]).
     envelope_pulls: PullSlots,
+    /// What each peer sent a records pull that this server's store could not take, by vault and
+    /// the peer's vault URL, for this run ([`crate::membership_log::untaken`]): the next pull from
+    /// that peer names it first, so the peer answers only what is new past it.
+    untaken: crate::membership_log::untaken::Untaken<String>,
     /// The bell the `vault-tend` thread naps on when advertising, rung so a new version updates
     /// its TXT at once.
     advertiser: Mutex<Option<Arc<Bell>>>,
@@ -1123,9 +1192,45 @@ struct Shared {
     /// GETs of a vault's envelope (`/v1/<name>`, long-polls among them) since the start.
     #[cfg(test)]
     envelope_gets: AtomicUsize,
+    /// 16 random bytes in lowercase hex, drawn when the server starts and sent on every records
+    /// GET reply ([`crate::transport::RECORDS_BOOT_HEADER`]): a restart forgets the records the
+    /// store held waiting on a parent, and a member that hears another boot id from a server
+    /// that lacks its frontier posts it the whole store again (`client::Reposted`).
+    records_boot: String,
     /// GETs of a vault's join queue (`/v1/<name>/join`, long-polls among them) since the start.
     #[cfg(test)]
     join_gets: AtomicUsize,
+    /// The records long-polls a POST woke ([`post_records`]) since the start.
+    #[cfg(test)]
+    record_wakes: AtomicUsize,
+    /// The looks at a records file ([`look_for_records`]) since the start.
+    #[cfg(test)]
+    record_looks: AtomicUsize,
+    /// The copies of a records slot's store a POST took ([`post_records`]) since the start.
+    #[cfg(test)]
+    post_clones: AtomicUsize,
+    /// The records a POST verified ([`post_records`]) since the start.
+    #[cfg(test)]
+    post_verifies: AtomicUsize,
+    /// Run by a records POST as it starts verifying its body ([`post_records`]).
+    #[cfg(test)]
+    verifying: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// While set, a records POST's append fails having touched nothing
+    /// ([`Shared::append_records`]), so the POST writes the file whole.
+    #[cfg(test)]
+    appends_fail: AtomicBool,
+    /// While set, a records POST's append puts all but the last byte of its records on the
+    /// file, unflushed, and fails ([`Shared::append_records`]).
+    #[cfg(test)]
+    appends_tear: AtomicBool,
+    /// Run by a records POST once its append is on the file, before it stamps the slot
+    /// ([`Shared::append_records`]).
+    #[cfg(test)]
+    appended: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// While set, a records POST's append and whole write both fail having touched nothing
+    /// ([`Shared::append_records`], [`Shared::write_records`]): `SwarmRecordsFile`'s `Fail`.
+    #[cfg(test)]
+    writes_fail: AtomicBool,
 }
 
 impl Shared {
@@ -1133,6 +1238,52 @@ impl Shared {
         self.server_state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// [`fsx::append_at`] of a records POST's new records ([`post_records`]), which a test's
+    /// disk refuses having touched nothing while `appends_fail` or `writes_fail` is set, or cuts
+    /// short while `appends_tear` is.
+    fn append_records(
+        &self,
+        path: &Path,
+        left: &fsx::FileStamp,
+        bytes: &[u8],
+    ) -> crate::Result<fsx::FileStamp> {
+        #[cfg(test)]
+        {
+            if self.appends_tear.load(Ordering::SeqCst) {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+                file.write_all(&bytes[..bytes.len().saturating_sub(1)])?;
+                return Err(Error::new("the test's disk cut the append short"));
+            }
+            if self.appends_fail.load(Ordering::SeqCst) || self.writes_fail.load(Ordering::SeqCst) {
+                return Err(Error::new("the test's disk refused the append"));
+            }
+        }
+        let appended = fsx::append_at(path, left, bytes);
+        #[cfg(test)]
+        if appended.is_ok() {
+            let hook = self
+                .appended
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        appended
+    }
+
+    /// [`fsx::write_atomic_stamped`] of a records POST's held records ([`post_records`]),
+    /// which a test's disk refuses having touched nothing while `writes_fail` is set.
+    fn write_records(&self, path: &Path, bytes: &[u8]) -> crate::Result<Option<fsx::FileStamp>> {
+        #[cfg(test)]
+        if self.writes_fail.load(Ordering::SeqCst) {
+            return Err(Error::new("the test's disk refused the whole write"));
+        }
+        fsx::write_atomic_stamped(path, bytes, 0o600)
     }
 
     fn pinned_key(&self, name: &str) -> Option<[u8; 32]> {
@@ -1276,17 +1427,12 @@ fn load_with_pins(store: &Path, now: u64, pins: &[(String, [u8; 32])]) -> crate:
                 ));
                 continue;
             }
-            match fsx::read_owned(&path, crate::membership_log::MAX_RECORDS_STREAM) {
-                Ok(Some(bytes)) => match decode_records_held(&state, pins, name, &bytes) {
-                    Ok(decoded) => {
-                        state
-                            .records
-                            .insert(name.to_owned(), RecordSlot::new(decoded, bytes));
-                    }
-                    Err(e) => note(&format!("{file}: skipped: {e}")),
-                },
-                Ok(None) => {}
-                Err(e) => note(&format!("{file}: skipped: {e}")),
+            let keys = held_keys(&state, name).or_else(|| {
+                pins.iter()
+                    .find_map(|(v, key)| (v == name).then(|| vec![*key]))
+            });
+            if let Err(unread) = look_at_records(&mut state, name, &path, keys.as_deref()) {
+                note(&format!("{file}: skipped: {}", unread.into_error()));
             }
         } else if let Some(name) = file
             .strip_suffix(".joins")
@@ -1710,6 +1856,7 @@ fn refuse(mut stream: TcpStream, why: String, refusals: &SyncSender<TcpStream>) 
     let sent = write_reply(
         &mut stream,
         &Reply::text(503, why),
+        None,
         REFUSAL_DEADLINE,
         REFUSAL_DEADLINE,
     );
@@ -1795,6 +1942,11 @@ struct Reply {
     /// `Retry-After`, in seconds: when a refused request may be sent again and be taken.
     retry_after: Option<u64>,
     records_need: bool,
+    /// Whether the reply carries this server's boot id
+    /// ([`crate::transport::RECORDS_BOOT_HEADER`], [`Shared::records_boot`]), as every records
+    /// GET reply does. A flag, not the id: a wider field makes every `Result<_, Reply>` an
+    /// error variant clippy calls too large.
+    records_boot: bool,
 }
 
 enum Body {
@@ -1816,6 +1968,7 @@ impl Reply {
             allow: None,
             retry_after: None,
             records_need: false,
+            records_boot: false,
         }
     }
 
@@ -1835,6 +1988,7 @@ impl Reply {
             allow: None,
             retry_after: None,
             records_need: false,
+            records_boot: false,
         }
     }
 }
@@ -1864,10 +2018,12 @@ const fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-/// Send `reply`, no write blocking longer than `stall` and the whole within `within`.
+/// Send `reply`, no write blocking longer than `stall` and the whole within `within`, with the
+/// server's `boot` id when the reply carries one ([`Reply::records_boot`]).
 fn write_reply(
     stream: &mut TcpStream,
     reply: &Reply,
+    boot: Option<&str>,
     stall: Duration,
     within: Duration,
 ) -> io::Result<()> {
@@ -1897,6 +2053,14 @@ fn write_reply(
     }
     if reply.records_need {
         head.push_str(&format!("{}: 1\r\n", crate::transport::RECORDS_NEED_HEADER));
+    }
+    if reply.records_boot
+        && let Some(boot) = boot
+    {
+        head.push_str(&format!(
+            "{}: {boot}\r\n",
+            crate::transport::RECORDS_BOOT_HEADER
+        ));
     }
     if let Some(secs) = reply.retry_after {
         head.push_str(&format!("Retry-After: {secs}\r\n"));
@@ -1965,6 +2129,7 @@ fn handle(shared: &Shared, mut stream: TcpStream, peer: IpAddr) {
     if write_reply(
         &mut stream,
         &reply,
+        Some(&shared.records_boot),
         tuning.write_stall,
         tuning.answer_deadline,
     )
@@ -2277,7 +2442,7 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
         (Route::Records(name), "GET") => {
             let arrived_on = stream.local_addr().ok().map(|addr| addr.ip());
             let local = (shared.tuning.is_local)(peer, arrived_on);
-            get_records(
+            let mut reply = get_records(
                 shared,
                 stream,
                 name,
@@ -2285,7 +2450,9 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
                 request.subscriber.as_deref(),
                 request.no_wait,
                 local,
-            )
+            );
+            reply.records_boot = true;
+            reply
         }
         (Route::Records(name), _) => {
             let length = match body_length(&request, crate::membership_log::MAX_RECORDS_STREAM) {
@@ -2480,6 +2647,7 @@ fn envelope_reply(held: &Held) -> Reply {
         allow: None,
         retry_after: None,
         records_need: false,
+        records_boot: false,
     }
 }
 
@@ -2747,7 +2915,7 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
     slot.wake.notify_all();
     if let Some(records) = state.records.get(name)
         && records.store.log().is_none()
-        && !records.raw.is_empty()
+        && records.stamp.is_some()
     {
         records.wake.notify_all();
     }
@@ -2880,7 +3048,7 @@ fn take_from_store(shared: &Shared, state: &mut State, name: &str) {
     slot.wake.notify_all();
     if let Some(records) = state.records.get(name)
         && records.store.log().is_none()
-        && !records.raw.is_empty()
+        && records.stamp.is_some()
     {
         records.wake.notify_all();
     }
@@ -2917,32 +3085,11 @@ fn follow_held(
     }
 }
 
-/// [`crate::membership_log::Store::decode`] for `name` on this server ([`follow_held`],
-/// [`kept_records`]).
-fn decode_records_held(
-    state: &State,
-    pins: &[(String, [u8; 32])],
-    name: &str,
-    bytes: &[u8],
-) -> crate::Result<crate::membership_log::Store> {
-    let keys = held_keys(state, name).or_else(|| {
-        pins.iter()
-            .find_map(|(v, key)| (v == name).then(|| vec![*key]))
-    });
-    Ok(kept_records(
-        follow_held(
-            crate::membership_log::Store::for_vault(name)?,
-            keys.as_deref(),
-        ),
-        bytes,
-    ))
-}
-
 /// What this server keeps of a records file's `bytes`, read into `empty`: every record that
 /// verifies and that the store takes, each after its parents, as
-/// [`crate::membership_log::Store::recovering`] reads them, so the records a POST appended
-/// ([`post_records`]) in any order read back, and a file whose last append was cut short keeps
-/// what came before it. A store with no genesis keeps none of its records ([`post_records`]),
+/// [`crate::membership_log::Store::recovering`] reads them, so a file an earlier build wrote
+/// (complete and waiting records, its tail in id order) reads back, and a file whose last append
+/// was cut short keeps what came before it. A store with no genesis keeps none of its records ([`post_records`]),
 /// so a file an earlier build let any LAN host fill reads as the empty store it would be now,
 /// and the next write replaces it.
 fn kept_records(empty: crate::membership_log::Store, bytes: &[u8]) -> crate::membership_log::Store {
@@ -2954,49 +3101,117 @@ fn kept_records(empty: crate::membership_log::Store, bytes: &[u8]) -> crate::mem
     }
 }
 
-/// Merge any verified records written directly at `<name>.records` on disk into memory.
+/// Merge any verified records written directly at `<name>.records` on disk into memory
+/// ([`look_at_records`]). A file the read refuses is remembered by its stamp, and the start loop
+/// notes why; a read that failed leaves nothing remembered, so the next look reads again.
 fn take_records_from_store(shared: &Shared, state: &mut State, name: &str) {
+    let _held_as_it_was = look_for_records(shared, state, name);
+}
+
+/// [`take_records_from_store`], saying why the look read no file: a POST about to write answers
+/// 500 when the read failed ([`post_records`]), since what it held then could replace records on
+/// file it never read.
+///
+/// # Errors
+/// As [`look_at_records`].
+fn look_for_records(shared: &Shared, state: &mut State, name: &str) -> Result<(), fsx::Unread> {
+    #[cfg(test)]
+    shared.record_looks.fetch_add(1, Ordering::SeqCst);
     take_from_store(shared, state, name);
     if vault_capacity_exceeded(state, name) {
-        return;
+        return Ok(());
     }
-    let Ok(Some(bytes)) = fsx::read_owned(
-        &shared.records_path(name),
-        crate::membership_log::MAX_RECORDS_STREAM,
-    ) else {
-        return;
-    };
     let keys = record_keys(shared, state, name);
-    if let Some(slot) = state.records.get_mut(name) {
-        if slot.raw == bytes
-            && (slot.store.log().is_some()
-                || keys.as_deref().is_none_or(|k| slot.store.keys() == Some(k)))
-        {
-            return;
-        }
-        let candidate = kept_records(follow_held(slot.store.clone(), keys.as_deref()), &bytes);
-        slot.raw = bytes;
-        if candidate.log().is_some() {
-            let changed = slot.store.log().map(crate::membership_log::Log::heads)
-                != candidate.log().map(crate::membership_log::Log::heads);
-            slot.store = candidate;
-            if changed {
-                slot.wake.notify_all();
-            }
-        } else {
-            slot.store = follow_held(slot.store.clone(), keys.as_deref());
-        }
-        return;
+    look_at_records(state, name, &shared.records_path(name), keys.as_deref())
+}
+
+/// A look at `name`'s records file at `path`, its store following `keys` ([`held_keys`],
+/// [`record_keys`]; `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rule 3). It stats the file
+/// (`lstat`) and reads it only when the slot's stamp differs, or when a store with no genesis
+/// now follows other keys (a new envelope may name the key that signed the file's genesis):
+/// each long-poll looks on every wake and every liveness tick, and reading and comparing the
+/// whole file each time cost up to [`crate::membership_log::MAX_RECORDS_STREAM`] a look. A
+/// rooted store takes the file's records in place (what it refuses changes nothing); a store
+/// with no genesis keeps them only when they root it ([`kept_records`]). The slot keeps the
+/// stamp of the file it read, and knows the file holds exactly its log (`on_file`) only when
+/// the store was empty before the read and its records' bytes fill the file: then each held
+/// record came from the file, and nothing else is in it. Nothing is cloned.
+///
+/// # Errors
+/// [`fsx::Unread::Refused`]: the read refuses the file (past the bound, an owner or mode it
+/// refuses, a symlink); the slot remembers its stamp anyway, so it is not read again until it
+/// changes. [`fsx::Unread::Failed`]: the read failed (too many open files, an I/O error), or
+/// `name`'s store cannot be made ([`crate::membership_log::Store::for_vault`]); nothing is
+/// remembered, so the next look reads again.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsFile",
+        action = "Restart",
+        project = "aterm_secrets::server::tests::records_file_projection"
+    )
+)]
+fn look_at_records(
+    state: &mut State,
+    name: &str,
+    path: &Path,
+    keys: Option<&[[u8; 32]]>,
+) -> Result<(), fsx::Unread> {
+    if state.records.get(name).is_some_and(|slot| slot.writing) {
+        return Ok(());
     }
-    let Ok(empty) = crate::membership_log::Store::for_vault(name) else {
-        return;
+    let Some(seen) = fsx::stamp(path) else {
+        return Ok(());
     };
-    // Kept even when it holds nothing: the slot remembers the bytes it read (`RecordSlot::raw`),
-    // so an unchanged file is not decoded again.
-    let kept = kept_records(follow_held(empty, keys.as_deref()), &bytes);
-    state
-        .records
-        .insert(name.to_owned(), RecordSlot::new(kept, bytes));
+    if let Some(slot) = state.records.get(name)
+        && slot.stamp == Some(seen)
+        && (slot.store.log().is_some() || keys.is_none_or(|k| slot.store.keys() == Some(k)))
+    {
+        return Ok(());
+    }
+    let read = match fsx::read_owned_stamped(path, crate::membership_log::MAX_RECORDS_STREAM) {
+        Ok(None) => return Ok(()),
+        Ok(Some(read)) => Ok(read),
+        Err(fsx::Unread::Refused(e)) => Err(e),
+        Err(failed @ fsx::Unread::Failed(_)) => return Err(failed),
+    };
+    if !state.records.contains_key(name) {
+        let store = crate::membership_log::Store::for_vault(name).map_err(fsx::Unread::Failed)?;
+        state
+            .records
+            .insert(name.to_owned(), RecordSlot::new(follow_held(store, keys)));
+    }
+    let Some(slot) = state.records.get_mut(name) else {
+        return Ok(());
+    };
+    let (stamp, bytes) = match read {
+        Ok(read) => read,
+        Err(e) => {
+            slot.stamp = Some(seen);
+            slot.on_file = None;
+            return Err(fsx::Unread::Refused(e));
+        }
+    };
+    let was_empty = slot.store.is_empty();
+    let heads = slot.store.log().map(crate::membership_log::Log::heads);
+    let store = follow_held(std::mem::take(&mut slot.store), keys);
+    slot.store = if store.log().is_some() {
+        store.recovering(&bytes)
+    } else {
+        kept_records(store, &bytes)
+    };
+    slot.stamp = Some(stamp);
+    slot.on_file = slot
+        .store
+        .log()
+        .filter(|log| was_empty && log.held_bytes() == bytes.len())
+        .map(crate::membership_log::Log::held_count);
+    if let Some(log) = slot.store.log()
+        && Some(log.heads()) != heads
+    {
+        slot.wake.notify_all();
+    }
+    Ok(())
 }
 
 fn have_query(query: Option<&str>) -> Result<Vec<crate::membership_log::RecordId>, Reply> {
@@ -3035,6 +3250,7 @@ fn records_reply(records: &[crate::membership_log::Record], records_need: bool) 
         allow: None,
         retry_after: None,
         records_need,
+        records_boot: false,
     }
 }
 
@@ -3105,7 +3321,7 @@ fn get_records(
         };
         state
             .records
-            .insert(name.to_owned(), RecordSlot::new(store, Vec::new()));
+            .insert(name.to_owned(), RecordSlot::new(store));
     }
     let Some(slot) = state.records.get(name) else {
         return Reply::empty(204);
@@ -3133,60 +3349,163 @@ fn get_records(
     };
     drop(wake);
     // A slot that read a records file stays though it keeps nothing ([`kept_records`]): taken
-    // out, the next look would decode the whole file again.
+    // out, the next look would read the whole file again.
     if state.records.get(name).is_some_and(|slot| {
-        slot.store.is_empty() && slot.raw.is_empty() && Arc::strong_count(&slot.wake) == 1
+        slot.store.is_empty() && slot.stamp.is_none() && Arc::strong_count(&slot.wake) == 1
     }) {
         state.records.remove(name);
     }
     reply
 }
 
-/// How a records POST reached the file: its records on the end of it, or the file written whole.
-enum RecordsWrite {
-    Appended(Vec<u8>),
-    Whole(Vec<u8>),
-}
-
-/// Take the records `body` brings into `name`'s store and its file. The store is tried on a copy,
-/// which shares every record's bytes with the slot's ([`crate::membership_log::Record`]), so a
-/// POST copies no record's bytes, however large the store. What a POST adds goes on the end of
-/// the file as the slot last read or wrote it ([`fsx::append_at`]), and a reader orders it
-/// ([`kept_records`]); the file is written whole when the store let a waiting record go to make
-/// room, or the file holds other than the store's records or is not as the slot left it.
+/// Take the records `body` brings into `name`'s store and its file
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rules 1 and 4). The file holds the log's
+/// complete records only ([`crate::membership_log::Store::encode_held`]); a record waiting on a
+/// parent is held in memory only, under the store's bounds. The store is tried on a copy, which
+/// shares every record's bytes with the slot's ([`crate::membership_log::Record`]). A POST that
+/// adds only waiting records writes nothing and wakes nobody, since a server serves complete
+/// records alone. One that grows the log puts what it holds past the file on the end of it
+/// ([`fsx::append_at`], already in causal order, so a torn append keeps a causally closed
+/// prefix), or writes the file whole when the slot does not know the file holds exactly the
+/// log's first records or the append fails. So a store at its bound that lets a waiting record
+/// go for a member's complete record appends that record alone, and a `204` means every
+/// complete record the store holds is on disk: while the POST writes, a look reads nothing
+/// ([`RecordSlot::writing`]). When both writes fail the answer is 500 and the slot's records are
+/// unchanged, so a retry adds the records again and writes them; an append cut short gives the
+/// slot the file's stamp, so no look takes the part it left.
+///
+/// The body is framed and its ids named outside every lock (rule 4.1), and a POST whose records
+/// the store holds already (complete or waiting) answers 204 having copied, verified and
+/// written nothing (rule 4.2): any LAN host may POST, and the same records come again from
+/// every member pass and peer pull. The rest are verified outside every lock too (rule 4.3), so
+/// the bodies the server reads at once ([`MAX_PUTS`]) verify at once rather than one after
+/// another under `record_writes`. A record the body brings that the store holds waiting is
+/// offered again from the store (already verified) beside the new ones: a store at its bound
+/// lets its highest waiting record go for each complete one, and a new record that lands before
+/// that record's parent in the same body (or another POST meanwhile) could let it go before its
+/// parent lands.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsFile",
+        action = "PostP",
+        project = "aterm_secrets::server::tests::records_file_projection"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsFile",
+        action = "PostC",
+        project = "aterm_secrets::server::tests::records_file_projection"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsFile",
+        action = "PostJ",
+        project = "aterm_secrets::server::tests::records_file_projection"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "SwarmRecordsFile",
+        action = "Write",
+        project = "aterm_secrets::server::tests::records_file_projection"
+    )
+)]
 fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
     if body.is_empty() {
         return Reply::text(400, "a POST to /records needs at least one record");
+    }
+    let frames = match crate::membership_log::store::frame_ids(body) {
+        Ok(frames) => frames,
+        Err(e) => return Reply::text(400, e.to_string()),
+    };
+    let (unheld, mut records) = {
+        let mut state = shared.lock_server_state();
+        if let Some(reply) = unreadable_records(shared, &mut state, name) {
+            return reply;
+        }
+        if let Some(reply) = refuse_unheld_records(shared, &state, name, local) {
+            return reply;
+        }
+        let store = state.records.get(name).map(|slot| &slot.store);
+        let mut unheld: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut again: Vec<crate::membership_log::Record> = Vec::new();
+        for frame in frames {
+            match store {
+                Some(store) if store.holds(&frame.id) => {}
+                Some(store) => match store.uncomplete(&frame.id) {
+                    Some(record) => again.push(record.clone()),
+                    None => unheld.push(frame.range),
+                },
+                None => unheld.push(frame.range),
+            }
+        }
+        (unheld, again)
+    };
+    // Every record held already: none is new, so none can make the store let one go.
+    if unheld.is_empty() {
+        return Reply::empty(204);
+    }
+    #[cfg(test)]
+    {
+        let verifying = shared
+            .verifying
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(verifying) = verifying {
+            verifying();
+        }
+    }
+    records.reserve(unheld.len());
+    for range in unheld {
+        #[cfg(test)]
+        shared.post_verifies.fetch_add(1, Ordering::SeqCst);
+        match body
+            .get(range)
+            .ok_or_else(|| Error::new("membership record is truncated"))
+            .and_then(crate::membership_log::Record::decode)
+        {
+            Ok(record) => records.push(record),
+            Err(e) => return Reply::text(400, e.to_string()),
+        }
     }
     let _writing = shared
         .record_writes
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let (mut candidate, on_disk) = {
+    let (mut copy, stamp, on_file) = {
         let mut state = shared.lock_server_state();
-        take_records_from_store(shared, &mut state, name);
+        if let Some(reply) = unreadable_records(shared, &mut state, name) {
+            return reply;
+        }
         if let Some(reply) = refuse_unheld_records(shared, &state, name, local) {
             return reply;
         }
         let keys = record_keys(shared, &state, name);
         match state.records.get(name) {
             Some(slot) => (
-                follow_held(slot.store.clone(), keys.as_deref()),
-                slot.raw.len(),
+                {
+                    #[cfg(test)]
+                    shared.post_clones.fetch_add(1, Ordering::SeqCst);
+                    follow_held(slot.store.clone(), keys.as_deref())
+                },
+                slot.stamp,
+                slot.on_file,
             ),
             None => match crate::membership_log::Store::for_vault(name) {
-                Ok(store) => (follow_held(store, keys.as_deref()), 0),
+                Ok(store) => (follow_held(store, keys.as_deref()), None, None),
                 Err(e) => return Reply::text(500, e.to_string()),
             },
         }
     };
-    let before = candidate.inventory();
-    let before_bytes: usize = before
-        .iter()
-        .filter_map(|id| candidate.get_bytes(id))
-        .map(<[u8]>::len)
-        .sum();
-    let added = match candidate.ingest(body) {
+    let held_before = copy.log().map_or(0, crate::membership_log::Log::held_count);
+    let added = match copy.ingest_records(records) {
         Ok(added) => added,
         Err(e) => return Reply::text(400, e.to_string()),
     };
@@ -3201,66 +3520,101 @@ fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply 
     // that hears it lacks its frontier (`server_lacks_have`) posts it the whole store when it
     // has no post to it on record, or `REPOST_AGAIN` after its last whole one
     // (`client::Reposted`); a post of only its new records gets this 422.
-    if candidate.log().is_none() {
+    let Some(held) = copy.log().map(crate::membership_log::Log::held_count) else {
         return Reply::text(
             422,
             "a store with no genesis takes records only with the genesis that roots them",
         );
+    };
+    if held == held_before {
+        // Only waiting records came: nothing for the file, and nothing new to serve. The slot
+        // takes the stamp and `on_file` it had when copied, so a file a look read meanwhile is
+        // read again.
+        let mut state = shared.lock_server_state();
+        match state.records.get_mut(name) {
+            Some(slot) => {
+                slot.store = copy;
+                slot.stamp = stamp;
+                slot.on_file = on_file;
+            }
+            None => {
+                state
+                    .records
+                    .insert(name.to_owned(), RecordSlot::stamped(copy, stamp, on_file));
+            }
+        }
+        return Reply::empty(204);
     }
     let path = shared.records_path(name);
-    let after = candidate.inventory();
-    // Onto a file that holds exactly the store's records (not one an earlier build filled with
-    // records it no longer keeps), and only when none of them went.
-    let tail =
-        (before_bytes > 0 && on_disk == before_bytes && before.is_subset(&after)).then(|| {
-            after
-                .difference(&before)
-                .filter_map(|id| candidate.get_bytes(id))
-                .flatten()
-                .copied()
-                .collect::<Vec<u8>>()
-        });
-    let written = match tail {
-        Some(tail)
-            if fsx::append_at(&path, u64::try_from(on_disk).unwrap_or(u64::MAX), &tail).is_ok() =>
-        {
-            RecordsWrite::Appended(tail)
-        }
-        _ => {
-            let raw = candidate.encode();
-            if let Err(e) = fsx::write_atomic(&path, &raw, 0o600) {
+    let _writing = Writing::mark(shared, name);
+    let tail = match (on_file, stamp) {
+        (Some(on_file), Some(left)) => Some((left, copy.encode_held_from(on_file))),
+        _ => None,
+    };
+    let appended = tail
+        .as_ref()
+        .and_then(|(left, bytes)| shared.append_records(&path, left, bytes).ok());
+    let written = match appended {
+        Some(left) => Some(left),
+        None => match shared.write_records(&path, &copy.encode_held()) {
+            Ok(left) => left,
+            Err(e) => {
                 note(&format!("{name}: could not store records: {e}"));
+                // An append cut short left part of its records on the end of the file, never
+                // flushed: the slot takes the file's stamp so no look takes them in (a POST of
+                // them would answer 204 while they are not durable), and the next growth writes
+                // the file whole. A file another writer put there keeps the slot's stamp, so a
+                // look reads it.
+                let now = fsx::stamp(&path);
+                let mut state = shared.lock_server_state();
+                if let (Some((left, bytes)), Some(now), Some(slot)) =
+                    (&tail, now, state.records.get_mut(name))
+                    && (now.dev, now.ino) == (left.dev, left.ino)
+                    && now.len > left.len
+                    && now.len <= left.len.saturating_add(bytes.len() as u64)
+                {
+                    slot.stamp = Some(now);
+                    slot.on_file = None;
+                }
                 return Reply::text(500, "the server could not write to its store");
             }
-            RecordsWrite::Whole(raw)
-        }
+        },
     };
+    // A whole write whose file another writer replaced at once leaves no stamp: the next look
+    // reads the file, and the next growth writes it whole.
+    let on_file = written.map(|_| held);
     let mut state = shared.lock_server_state();
     match state.records.get_mut(name) {
         Some(slot) => {
-            slot.store = candidate;
-            match written {
-                // A look between the append and here may have read the file already.
-                RecordsWrite::Appended(tail) => {
-                    slot.raw.truncate(on_disk);
-                    slot.raw.extend_from_slice(&tail);
-                }
-                RecordsWrite::Whole(raw) => slot.raw = raw,
-            }
+            // No look read the file while it was written ([`RecordSlot::writing`]).
+            slot.store = copy;
+            slot.stamp = written;
+            slot.on_file = on_file;
+            slot.writing = false;
+            #[cfg(test)]
+            shared.record_wakes.fetch_add(1, Ordering::SeqCst);
             slot.wake.notify_all();
         }
         None => {
-            // The slot went since its copy: the next look reads the file this POST wrote.
-            let raw = match written {
-                RecordsWrite::Appended(_) => Vec::new(),
-                RecordsWrite::Whole(raw) => raw,
-            };
             state
                 .records
-                .insert(name.to_owned(), RecordSlot::new(candidate, raw));
+                .insert(name.to_owned(), RecordSlot::stamped(copy, written, on_file));
         }
     }
     Reply::empty(204)
+}
+
+/// A records POST's look at `name`'s file ([`look_for_records`]): a 500 when the read failed,
+/// since the POST would write what the store holds, and a file it could not read may hold
+/// records the store lacks. A file the read refuses is replaced by the next growth.
+fn unreadable_records(shared: &Shared, state: &mut State, name: &str) -> Option<Reply> {
+    match look_for_records(shared, state, name) {
+        Err(fsx::Unread::Failed(e)) => {
+            note(&format!("{name}: could not read records: {e}"));
+            Some(Reply::text(500, "the server could not read its store"))
+        }
+        Ok(()) | Err(fsx::Unread::Refused(_)) => None,
+    }
 }
 
 /// `POST /v1/<name>/join` from `peer`, which reached this Mac at its address `arrived_on`
@@ -3564,6 +3918,7 @@ fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&st
         allow: None,
         retry_after: None,
         records_need: false,
+        records_boot: false,
     }
 }
 
@@ -3655,6 +4010,7 @@ fn list_heard(shared: &Shared, name: &str) -> Reply {
         allow: None,
         retry_after: None,
         records_need: false,
+        records_boot: false,
     }
 }
 
@@ -3677,6 +4033,7 @@ fn list_verdicts(shared: &Shared, name: &str) -> Reply {
         allow: None,
         retry_after: None,
         records_need: false,
+        records_boot: false,
     }
 }
 
@@ -4364,11 +4721,24 @@ fn pull_from_peer(
         }
         if accepted_records {
             let _slot = shared.records_pulls.take();
-            let have_records = shared
-                .lock_server_state()
-                .records
-                .get(&vault_name)
-                .map_or_else(Vec::new, |slot| slot.store.have());
+            let now = Instant::now();
+            // The ids this pull names and the frontier of the store they came from: what the peer
+            // sends that the store does not take is noted only against a store that still holds
+            // that frontier.
+            let (have_records, named_from) = {
+                let state = shared.lock_server_state();
+                match state.records.get(&vault_name) {
+                    Some(slot) => {
+                        let have = slot.store.have();
+                        let named =
+                            shared
+                                .untaken
+                                .have(&vault_name, &vault_url, &slot.store, &have, now);
+                        (named.ids, slot.store.frontier())
+                    }
+                    None => (Vec::new(), Vec::new()),
+                }
+            };
             let bytes = match crate::transport::fetch_records(
                 &vault_url,
                 &have_records,
@@ -4387,7 +4757,36 @@ fn pull_from_peer(
                 .records
                 .get(&vault_name)
                 .map_or(0, |slot| slot.store.len());
-            let reply = post_records(shared, &vault_name, &bytes, false);
+            let stream = crate::membership_log::untaken::Sent::read(&bytes);
+            let mut reply = post_records(shared, &vault_name, &bytes, false);
+            if reply.status == 400 {
+                // A stream that does not decode as a whole (a record of a kind only a newer build
+                // writes): what of it this build reads, and descends from none it cannot read.
+                let part = stream.readable(&bytes);
+                if !part.is_empty() && part.len() < bytes.len() {
+                    reply = post_records(shared, &vault_name, &part, false);
+                }
+            }
+            // Only a verdict says what the store cannot take: a `204` (it took what it could), or
+            // a `400` (every record refused, or none this build reads). A `500` (it could not
+            // write its store), `507` or `403` judged none of it, and the same pull may land
+            // next pass.
+            if matches!(reply.status, 204 | 400) {
+                let state = shared.lock_server_state();
+                if let Some(slot) = state.records.get(&vault_name) {
+                    shared.untaken.note(
+                        vault_name.clone(),
+                        &vault_url,
+                        &stream,
+                        &crate::membership_log::untaken::Noted {
+                            store: &slot.store,
+                            named_from: &named_from,
+                            now,
+                            source: None,
+                        },
+                    );
+                }
+            }
             if reply.status == 204 {
                 let after_len = shared
                     .lock_server_state()
@@ -5346,6 +5745,36 @@ impl Drop for Children {
         }
     }
 }
+
+/// Host for `SwarmRecordsFile`'s environment markers, so `spec_xref_closure` accounts for
+/// every model action: a torn append, a failed write and another writer are what the disk and
+/// the Mac do to the server, never what it chooses.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SwarmRecordsFile",
+        action = "Tear",
+        reason = "Environment: an append cut short by a crash or a full disk leaves a torn frame"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SwarmRecordsFile",
+        action = "Fail",
+        reason = "Environment: the disk refuses both the append and the whole write"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SwarmRecordsFile",
+        action = "Foreign",
+        reason = "Environment: another writer renames a copy of the file's readable part over it"
+    )
+)]
+#[doc(hidden)]
+pub fn records_file_environment() {}
 
 #[cfg(test)]
 mod tests {
@@ -10790,94 +11219,6 @@ mod tests {
         );
     }
 
-    /// A store a key once seated (a removed Mac's among them) filled to `MAX_RECORDS` with
-    /// records waiting on parents that never arrive lets one go for each record a member posts
-    /// whose parents it holds. The POST that does writes the file whole, holding only the
-    /// store's records, so the file stays one a reader takes and a restart keeps the member's
-    /// record.
-    /// NEGATIVE CONTROL: appending without `post_records`' check that no record went puts the
-    /// member's record after `MAX_RECORDS` others, and the test fails "the file holds more than
-    /// a reader takes".
-    #[test]
-    fn a_post_that_makes_a_full_store_let_a_waiting_record_go_writes_the_file_whole() {
-        use crate::membership_log::{
-            Body, Draft, Evidence, Log, MAX_RECORDS, MAX_RECORDS_STREAM, Record, decode_records,
-            encode_records,
-        };
-
-        let root = aterm_tempfile::tempdir().expect("tempdir");
-        let seed = [7u8; 32];
-        let mut opts = options(root.path(), Duration::from_millis(200));
-        opts.pins = vec![("team".to_owned(), signer_public(&seed).expect("key"))];
-        let running = run(&opts);
-        let (w1, inc1, m1, e1) = record_entrant(1, "m1");
-        let (_, _, _, e2) = record_entrant(2, "m2");
-        let genesis = Record::found(&seed, vec![e1], 1_000).expect("genesis");
-        let waiting = (0..MAX_RECORDS - 1).map(|i| {
-            let mut parent = [0x66; 32];
-            parent[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            Draft {
-                network: *genesis.id(),
-                sequence: 1,
-                previous: None,
-                parents: vec![parent],
-                authored_ms: 2_000 + i as u64,
-                body: Body::Name {
-                    name: format!("w{i}"),
-                },
-            }
-            .sign(&w1, inc1)
-            .expect("signed")
-        });
-        let full = encode_records(
-            &std::iter::once(genesis.clone())
-                .chain(waiting)
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(
-            post_records(&running.shared, "team", &full, false).status,
-            204
-        );
-        assert_eq!(running.stored_records("team").len(), MAX_RECORDS);
-
-        let admit = Log::new(genesis)
-            .expect("log")
-            .draft(
-                &m1,
-                1_001,
-                Body::Admit {
-                    entrant: e2,
-                    evidence: Evidence::Phrase,
-                },
-            )
-            .sign(&w1, inc1)
-            .expect("admit");
-        assert_eq!(
-            post_records(&running.shared, "team", admit.bytes(), false).status,
-            204
-        );
-        let held = running.stored_records("team");
-        assert!(
-            held.inventory().contains(admit.id()),
-            "the store took the admit"
-        );
-        running.stop();
-        let stored = std::fs::read(root.path().join("team.records")).expect("stored");
-        assert!(
-            stored.len() <= MAX_RECORDS_STREAM && decode_records(&stored).is_ok(),
-            "the file holds more than a reader takes"
-        );
-        let reloaded = load(root.path(), 0).expect("reload store");
-        assert_eq!(
-            reloaded
-                .records
-                .get("team")
-                .map(|slot| slot.store.inventory()),
-            Some(held.inventory()),
-            "the restarted server lost the admit"
-        );
-    }
-
     /// A browsed peer at `addr` advertising vault `vault`, as the standing browse hands it to
     /// [`pull_from_peers_shared`].
     fn peer_at(addr: SocketAddr, vault: &str) -> crate::discover::DiscoveredVault {
@@ -11530,5 +11871,1503 @@ mod tests {
             "startup with --pin must decode alab.records under pinned key"
         );
         running3.stop();
+    }
+
+    /// A kind code no build writes yet: a test's stand-in for a newer build's record.
+    const NEWER_KIND: u8 = 0xee;
+
+    /// A server rooted with a founder's genesis and `n0` (posted from its own Mac), the founder's
+    /// log, its keys, and a peer's chain holding the same records.
+    struct Rooted {
+        running: Running,
+        root: aterm_tempfile::TempDir,
+        log: crate::membership_log::Log,
+        records: Vec<crate::membership_log::Record>,
+        writer: [u8; 32],
+        incarnation: [u8; 16],
+        founder: crate::membership_log::MemberId,
+    }
+
+    impl Rooted {
+        fn new() -> Self {
+            use crate::membership_log::{Log, Record, encode_records};
+
+            let root = aterm_tempfile::tempdir().expect("tempdir");
+            let running = run(&options(root.path(), Duration::from_millis(200)));
+            let (writer, incarnation, founder, entrant) = record_entrant(1, "m1");
+            let genesis = Record::found(&[7; 32], vec![entrant], 1_000).expect("genesis");
+            let mut rooted = Self {
+                running,
+                root,
+                log: Log::new(genesis.clone()).expect("log"),
+                records: vec![genesis],
+                writer,
+                incarnation,
+                founder,
+            };
+            rooted.mint();
+            transport::post_records(
+                &format!("http://{}/v1/team", rooted.running.addr),
+                &encode_records(&rooted.records),
+            )
+            .expect("the server holds a genesis");
+            rooted
+        }
+
+        /// The founder's next record, unsigned into nothing.
+        fn next(&self) -> crate::membership_log::Record {
+            self.log
+                .draft(
+                    &self.founder,
+                    2_000 + u64::try_from(self.records.len()).expect("small"),
+                    crate::membership_log::Body::Name {
+                        name: format!("n{}", self.records.len()),
+                    },
+                )
+                .sign(&self.writer, self.incarnation)
+                .expect("signed")
+        }
+
+        /// One more record in the founder's log, held nowhere else yet.
+        fn mint(&mut self) -> crate::membership_log::Record {
+            let record = self.next();
+            self.log.insert(record.clone()).expect("held");
+            self.records.push(record.clone());
+            record
+        }
+    }
+
+    /// A peer at the returned address serving vault `team`'s records from `chain` (the frames
+    /// past the closure of the ids a pull names that it holds) and `404` to anything else. It
+    /// counts the records answers that carry `watched`. Stop it with the flag and a connection.
+    fn chain_peer(
+        chain: crate::membership_log::untaken::chain::Chain,
+        watched: Vec<u8>,
+    ) -> (
+        SocketAddr,
+        Arc<AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use crate::membership_log::untaken::chain::{carries, have_named};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let dialed = accepted(listener);
+        let stop = Arc::new(AtomicBool::new(false));
+        let carried = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (stopping, counting) = (Arc::clone(&stop), Arc::clone(&carried));
+        let peer = std::thread::spawn(move || {
+            while let Ok(mut stream) = dialed.recv_timeout(HANG_DETECTOR) {
+                if stopping.load(Ordering::SeqCst) {
+                    return;
+                }
+                let head = read_request_head(&mut stream);
+                let line = head.lines().next().unwrap_or("");
+                if !(line.starts_with("GET ") && line.contains("/v1/team/records")) {
+                    let _ = stream.write_all(NOT_FOUND);
+                    continue;
+                }
+                let body = chain.past(&have_named(line));
+                if carries(&body, &watched) {
+                    counting.fetch_add(1, Ordering::SeqCst);
+                }
+                let status = if body.is_empty() {
+                    "204 No Content"
+                } else {
+                    "200 OK"
+                };
+                let mut reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                reply.extend_from_slice(&body);
+                let _ = stream.write_all(&reply);
+            }
+        });
+        (addr, stop, carried, peer)
+    }
+
+    /// A peer of a newer build holds a record this server cannot read past what it holds: a pull
+    /// from that peer brings it once, not on every tend pass, although the store refused it
+    /// (`400`): the next pull names it first.
+    /// NEGATIVE CONTROL: `pull_from_peer` naming `slot.store.have()` (main before this fix)
+    /// brings it on both passes ("sent once over two passes: left: 2, right: 1").
+    #[test]
+    fn a_peer_pull_does_not_pull_again_what_this_server_could_not_take() {
+        use crate::membership_log::untaken::chain::Chain;
+
+        let rooted = Rooted::new();
+        let next = rooted.next();
+        let newer = crate::membership_log::with_kind_code(&next, NEWER_KIND);
+        let mut chain = Chain::of(&rooted.records);
+        chain.push_raw(newer.clone(), next.parents().to_vec());
+        let (addr, stop, carried, peer) = chain_peer(chain, newer);
+
+        for _ in 0..2 {
+            assert_eq!(rooted.running.pull_from_peers(&[peer_at(addr, "team")]), 0);
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(addr);
+        peer.join().expect("the peer");
+        rooted.running.stop();
+        assert_eq!(
+            carried.load(Ordering::SeqCst),
+            1,
+            "sent once over two passes"
+        );
+    }
+
+    /// A pull whose records this server could not write (`500`) judged nothing about them, so
+    /// the next pass pulls them again rather than keeping them back for an hour: they are
+    /// records it can take.
+    /// NEGATIVE CONTROL: noting whatever `post_records` answered keeps them back ("pulled again
+    /// after a write that failed: left: 1, right: 2"). Main keeps no memo and passes; this guards
+    /// the memo.
+    #[test]
+    fn a_peer_pull_whose_store_write_fails_is_pulled_again() {
+        use crate::membership_log::untaken::chain::Chain;
+
+        let mut rooted = Rooted::new();
+        let takeable = rooted.mint();
+        let chain = Chain::of(&rooted.records);
+        let file = rooted.root.path().join("team.records");
+        std::fs::remove_file(&file).expect("the records file");
+        std::fs::create_dir(&file).expect("a directory where the file was");
+        let (addr, stop, carried, peer) = chain_peer(chain, takeable.bytes().to_vec());
+
+        for _ in 0..2 {
+            assert_eq!(rooted.running.pull_from_peers(&[peer_at(addr, "team")]), 0);
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(addr);
+        peer.join().expect("the peer");
+        rooted.running.stop();
+        assert_eq!(
+            carried.load(Ordering::SeqCst),
+            2,
+            "pulled again after a write that failed"
+        );
+    }
+
+    /// A peer of a newer build sends a record this server cannot read after one it reads: the
+    /// server takes the one it reads, and the next pull names what it could not take, so the
+    /// peer sends it no more. Before, the whole stream was refused on every pass.
+    /// NEGATIVE CONTROL: posting only the whole stream (no readable part) stores nothing on the
+    /// first pass ("assertion `left == right` failed, left: 0, right: 1"), and the memo then covers
+    /// that record for good. Main's `pull_from_peer` fails the same way.
+    #[test]
+    fn a_peer_pull_takes_the_records_beside_one_this_server_cannot_read() {
+        use crate::membership_log::untaken::chain::Chain;
+
+        let mut rooted = Rooted::new();
+        let readable = rooted.mint();
+        let next = rooted.next();
+        let newer = crate::membership_log::with_kind_code(&next, NEWER_KIND);
+        let mut chain = Chain::of(&rooted.records);
+        chain.push_raw(newer.clone(), next.parents().to_vec());
+        let (addr, stop, carried, peer) = chain_peer(chain, newer);
+
+        assert_eq!(rooted.running.pull_from_peers(&[peer_at(addr, "team")]), 1);
+        let took = rooted
+            .running
+            .stored_records("team")
+            .complete_bytes(readable.id())
+            .is_some();
+        assert_eq!(rooted.running.pull_from_peers(&[peer_at(addr, "team")]), 0);
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(addr);
+        peer.join().expect("the peer");
+        rooted.running.stop();
+        assert!(took, "the server took the record it reads");
+        assert_eq!(
+            carried.load(Ordering::SeqCst),
+            1,
+            "sent once over two passes"
+        );
+    }
+
+    /// A server's options for `root`, pinning vault `team` to the key [`Founded`]'s genesis is
+    /// signed with.
+    fn team_options(root: &Path) -> Options {
+        let mut opts = options(root, Duration::from_millis(200));
+        opts.pins = vec![("team".to_owned(), signer_public(&[7u8; 32]).expect("key"))];
+        opts
+    }
+
+    /// The founder `m1` of vault `team`'s network, its genesis and its log.
+    struct Founded {
+        writer: [u8; 32],
+        incarnation: [u8; 16],
+        founder: crate::membership_log::MemberId,
+        genesis: crate::membership_log::Record,
+        log: crate::membership_log::Log,
+    }
+
+    impl Founded {
+        fn new() -> Self {
+            let (writer, incarnation, founder, entrant) = record_entrant(1, "m1");
+            let genesis = crate::membership_log::Record::found(&[7; 32], vec![entrant], 1_000)
+                .expect("genesis");
+            let log = crate::membership_log::Log::new(genesis.clone()).expect("log");
+            Self {
+                writer,
+                incarnation,
+                founder,
+                genesis,
+                log,
+            }
+        }
+
+        /// The founder's `Name` record after every record `log` holds, authored at `ms`.
+        fn named(
+            &self,
+            log: &crate::membership_log::Log,
+            ms: u64,
+            name: &str,
+        ) -> crate::membership_log::Record {
+            log.draft(
+                &self.founder,
+                ms,
+                crate::membership_log::Body::Name {
+                    name: name.to_owned(),
+                },
+            )
+            .sign(&self.writer, self.incarnation)
+            .expect("signed")
+        }
+
+        /// One more record in the founder's log.
+        fn mint(&mut self, ms: u64, name: &str) -> crate::membership_log::Record {
+            let record = self.named(&self.log, ms, name);
+            self.log.insert(record.clone()).expect("held");
+            record
+        }
+
+        /// A record of the founder's (a seated key) waiting on a parent nobody holds.
+        fn waiting(&self, i: usize) -> crate::membership_log::Record {
+            let mut parent = [0x66; 32];
+            parent[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            crate::membership_log::Draft {
+                network: *self.genesis.id(),
+                sequence: 1,
+                previous: None,
+                parents: vec![parent],
+                authored_ms: 2_000 + i as u64,
+                body: crate::membership_log::Body::Name {
+                    name: format!("w{i}"),
+                },
+            }
+            .sign(&self.writer, self.incarnation)
+            .expect("signed")
+        }
+
+        /// A parent `P` that follows the founder's log and its child `C`, with ids such that
+        /// `C` sorts before `P`: an id-ordered tail writes the child first.
+        fn parent_and_child_sorting_child_first(
+            &self,
+        ) -> (crate::membership_log::Record, crate::membership_log::Record) {
+            for ms in 5_000u64.. {
+                let parent = self.named(&self.log, ms, "parent");
+                let mut with_parent = self.log.clone();
+                with_parent.insert(parent.clone()).expect("parent");
+                let child = self.named(&with_parent, ms + 1, "child");
+                if child.id() < parent.id() {
+                    return (parent, child);
+                }
+            }
+            unreachable!("ids are uniform: half of all pairs sort the child first")
+        }
+    }
+
+    /// The inode of the file at `path`.
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .expect("the records file")
+            .ino()
+    }
+
+    /// The records store a server started on `root` reads back.
+    fn reloaded(root: &Path) -> crate::membership_log::Store {
+        load(root, 0)
+            .expect("reload store")
+            .records
+            .remove("team")
+            .map(|slot| slot.store)
+            .unwrap_or_default()
+    }
+
+    /// What identifies a file's contents, read by the test itself (not the code under test):
+    /// its device, inode, length and change times.
+    fn file_stamp(path: &Path) -> (u64, u64, u64, i64, i64, i64, i64) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).expect("the records file");
+        (
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        )
+    }
+
+    /// F23 (rule 3): long-polls parked on a full store look at the file on each wake and each
+    /// liveness tick, and a look of an unchanged file reads nothing. Before, each look read and
+    /// compared the whole file (up to 64 MiB) under `server_state`. The polls park for as long
+    /// as the hang detector, so they are all parked until the server stops, and the test waits
+    /// for their looks (counted), not for a time.
+    /// NEGATIVE CONTROL: a look that reads on every call (the stamp check skipped) fails
+    /// "assertion `left == right` failed: parked subscribers read the records file again" with
+    /// left 39, right 0 (at least the looks waited for); main before F23, which read and compared
+    /// the bytes on every look, failed an earlier form of the test with left 84.
+    #[test]
+    fn parked_subscribers_on_a_full_store_read_the_file_once() {
+        use crate::membership_log::{MAX_RECORDS, encode_records};
+
+        const LOOKS: usize = 30;
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let mut opts = team_options(root.path());
+        opts.hold = HANG_DETECTOR;
+        let tuning = Tuning {
+            liveness_every: Duration::from_millis(10),
+            ..Tuning::default()
+        };
+        let running = run_tuned(&opts, tuning);
+        let founded = Founded::new();
+        let full: Vec<_> = std::iter::once(founded.genesis.clone())
+            .chain((0..MAX_RECORDS - 1).map(|i| founded.waiting(i)))
+            .collect();
+        assert_eq!(
+            post_records(&running.shared, "team", &encode_records(&full), false).status,
+            204
+        );
+        let path = root.path().join("team.records");
+        let frontier = running.stored_records("team").frontier();
+        let reads = fsx::reads_of(&path);
+        let url = format!("http://{}/v1/team", running.addr);
+        let polls: Vec<_> = (0..3)
+            .map(|_| {
+                let (url, frontier) = (url.clone(), frontier.clone());
+                std::thread::spawn(move || {
+                    transport::fetch_records(
+                        &url,
+                        &frontier,
+                        Some(HANG_DETECTOR),
+                        HANG_DETECTOR,
+                        None,
+                    )
+                })
+            })
+            .collect();
+        let parked = Instant::now();
+        while running.waiting() < 3 {
+            assert!(parked.elapsed() < HANG_DETECTOR, "the polls never parked");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let looks = running.shared.record_looks.load(Ordering::SeqCst);
+        for _ in 0..5 {
+            if let Some(slot) = running.shared.lock_server_state().records.get("team") {
+                slot.wake.notify_all();
+            }
+        }
+        while running.shared.record_looks.load(Ordering::SeqCst) < looks + LOOKS {
+            assert!(
+                parked.elapsed() < HANG_DETECTOR,
+                "the polls stopped looking"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        running.stop();
+        for poll in polls {
+            assert!(
+                poll.join().expect("poll").expect("answered").is_empty(),
+                "nothing new"
+            );
+        }
+        let read_again = fsx::reads_of(&path) - reads;
+        assert_eq!(
+            read_again, 0,
+            "parked subscribers read the records file again"
+        );
+    }
+
+    /// F23 (rules 2 and 3): a file renamed over the records file with the same length, holding
+    /// other records, is read again: the slot's stamp names the inode and the change times, not
+    /// the length alone.
+    /// NEGATIVE CONTROL: a stamp compared by its length alone fails "the server missed a file
+    /// renamed over it with the same length". (Main before F23 compared the bytes, and passed.)
+    #[test]
+    fn a_records_file_replaced_with_the_same_length_is_read_again() {
+        use crate::membership_log::encode_records;
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let founded = Founded::new();
+        let one = founded.named(&founded.log, 5_000, "one-a");
+        let other = founded.named(&founded.log, 5_000, "one-b");
+        assert_eq!(one.bytes().len(), other.bytes().len());
+        assert_eq!(
+            post_records(
+                &running.shared,
+                "team",
+                &encode_records([&founded.genesis, &one]),
+                false
+            )
+            .status,
+            204
+        );
+        assert!(running.stored_records("team").contains(one.id()));
+        let path = root.path().join("team.records");
+        let beside = root.path().join("team.records.new");
+        std::fs::write(&beside, encode_records([&founded.genesis, &other])).expect("beside");
+        std::fs::set_permissions(&beside, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("mode");
+        let before = file_stamp(&path);
+        std::fs::rename(&beside, &path).expect("renamed over");
+        assert_eq!(file_stamp(&path).2, before.2, "the same length");
+        let took = running.stored_records("team").contains(other.id());
+        running.stop();
+        assert!(
+            took,
+            "the server missed a file renamed over it with the same length"
+        );
+    }
+
+    /// F23 (rule 1, failure case 6): a seated key's waiting records fill a store to its bound,
+    /// and a member's complete record then makes the store let one go. Before, that POST wrote
+    /// the file whole (up to 64 MiB) each time; now the file holds complete records only, so a
+    /// drop never touches it and the record goes on the end of the file alone.
+    /// NEGATIVE CONTROL: writing `encode()` whole fails "assertion `left == right` failed: the POST
+    /// wrote the records file whole" (another inode), as main before F23 did.
+    #[test]
+    fn a_complete_record_at_a_full_store_appends_only_itself() {
+        use crate::membership_log::{Body, Evidence, MAX_RECORDS, encode_records};
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let founded = Founded::new();
+        let full: Vec<_> = std::iter::once(founded.genesis.clone())
+            .chain((0..MAX_RECORDS - 1).map(|i| founded.waiting(i)))
+            .collect();
+        let post = |body: &[u8]| post_records(&running.shared, "team", body, false).status;
+        assert_eq!(post(&encode_records(&full)), 204);
+        assert_eq!(running.stored_records("team").len(), MAX_RECORDS);
+        let path = root.path().join("team.records");
+        let before = file_stamp(&path);
+        let admit = founded
+            .log
+            .draft(
+                &founded.founder,
+                1_001,
+                Body::Admit {
+                    entrant: record_entrant(2, "m2").3,
+                    evidence: Evidence::Phrase,
+                },
+            )
+            .sign(&founded.writer, founded.incarnation)
+            .expect("admit");
+        assert_eq!(post(admit.bytes()), 204);
+        let after = file_stamp(&path);
+        running.stop();
+        assert_eq!(after.1, before.1, "the POST wrote the records file whole");
+        assert_eq!(
+            after.2,
+            before.2 + admit.bytes().len() as u64,
+            "the POST put more than its record on the file"
+        );
+        let store = reloaded(root.path());
+        let log = store.log().expect("rooted");
+        assert!(log.get(admit.id()).is_some(), "the restart lost the record");
+        assert_eq!(log.waiting(), 0, "a waiting record reached the file");
+    }
+
+    /// F23 review: a full store holds honest child `C` waiting on `P`, and a body brings `X`, `P`
+    /// and `C`, where `X` is complete and lands first (its id below `P`'s). `X` makes the store
+    /// let its highest waiting record go, which is `C`; `C` lands from the body after `P`. Before,
+    /// the POST dropped every frame the store held, waiting ones too, so `C` was neither held nor
+    /// waiting once the POST answered 204, and the pull that brought it noted it untaken.
+    /// NEGATIVE CONTROL: dropping every held frame (`store.contains`, as the branch before this
+    /// fix did) fails "the full store lost the waiting child its parent's POST brought".
+    #[test]
+    fn a_waiting_child_posted_with_its_parent_lands_at_a_full_store() {
+        use crate::membership_log::{MAX_RECORDS, encode_records};
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let founded = Founded::new();
+        let (parent, child) = (5_000u64..)
+            .step_by(2)
+            .find_map(|ms| {
+                let parent = founded.named(&founded.log, ms, "parent");
+                let mut with_parent = founded.log.clone();
+                with_parent.insert(parent.clone()).expect("parent");
+                let child = founded.named(&with_parent, ms + 1, "child");
+                (child.id()[0] == 0xff && parent.id()[0] >= 0x10).then_some((parent, child))
+            })
+            .expect("about one pair in 270 has these ids");
+        let first = (100_000u64..)
+            .map(|ms| founded.named(&founded.log, ms, "first"))
+            .find(|first| first.id() < parent.id())
+            .expect("one record in 16 sorts below the parent");
+        let full: Vec<_> = std::iter::once(founded.genesis.clone())
+            .chain(
+                (0..)
+                    .map(|i| founded.waiting(i))
+                    .filter(|w| w.id() < child.id())
+                    .take(MAX_RECORDS - 2),
+            )
+            .collect();
+        let post = |body: &[u8]| post_records(&running.shared, "team", body, false).status;
+        assert_eq!(post(&encode_records(&full)), 204);
+        assert_eq!(post(child.bytes()), 204);
+        let store = running.stored_records("team");
+        assert_eq!(store.len(), MAX_RECORDS, "the store is full");
+        assert!(store.uncomplete(child.id()).is_some(), "the child waits");
+        assert_eq!(post(&encode_records([&first, &parent, &child])), 204);
+        let held = running
+            .stored_records("team")
+            .log()
+            .is_some_and(|log| log.get(child.id()).is_some());
+        running.stop();
+        assert!(
+            held,
+            "the full store lost the waiting child its parent's POST brought"
+        );
+        let reloaded = reloaded(root.path());
+        let log = reloaded.log().expect("rooted");
+        assert!(log.get(child.id()).is_some(), "the restart lost the child");
+    }
+
+    /// F23 (rule 4.6): a POST that adds only records waiting on a parent writes nothing and
+    /// wakes no long-poll, since a server serves complete records only.
+    /// NEGATIVE CONTROL: sending a POST that added only waiting records down the write path fails
+    /// "assertion `left == right` failed: a POST of waiting records woke the long-polls" (left 1,
+    /// right 0); main before F23, which appended them, failed "a POST of waiting records wrote
+    /// the file".
+    #[test]
+    fn a_post_of_only_waiting_records_writes_nothing() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let founded = Founded::new();
+        assert_eq!(
+            post_records(&running.shared, "team", founded.genesis.bytes(), false).status,
+            204
+        );
+        let path = root.path().join("team.records");
+        let before = file_stamp(&path);
+        let wakes = running.shared.record_wakes.load(Ordering::SeqCst);
+        let waiting = founded.waiting(0);
+        assert_eq!(
+            post_records(&running.shared, "team", waiting.bytes(), false).status,
+            204
+        );
+        let kept = running.stored_records("team").contains(waiting.id());
+        let after = file_stamp(&path);
+        let woke = running.shared.record_wakes.load(Ordering::SeqCst) - wakes;
+        running.stop();
+        assert!(kept, "the store keeps the record waiting");
+        assert_eq!(after, before, "a POST of waiting records wrote the file");
+        assert_eq!(woke, 0, "a POST of waiting records woke the long-polls");
+    }
+
+    /// F23 (rules 1 and 4.7): a child posted before its parent waits in memory and never reaches
+    /// the file; its parent's POST appends the parent, then the child, so the file stays in
+    /// causal order and a restart holds both complete.
+    /// NEGATIVE CONTROL: an id-ordered tail fails "the file does not end P, C"; main before F23,
+    /// which wrote waiting records too, failed "a waiting record reached the file".
+    #[test]
+    fn waiting_records_never_reach_the_file() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let founded = Founded::new();
+        let (parent, child) = founded.parent_and_child_sorting_child_first();
+        let post = |body: &[u8]| post_records(&running.shared, "team", body, false).status;
+        let path = root.path().join("team.records");
+        assert_eq!(post(founded.genesis.bytes()), 204);
+        assert_eq!(post(child.bytes()), 204);
+        assert!(
+            std::fs::read(&path).expect("stored") == founded.genesis.bytes(),
+            "a waiting record reached the file"
+        );
+        assert_eq!(post(parent.bytes()), 204);
+        let stored = std::fs::read(&path).expect("stored");
+        running.stop();
+        assert!(
+            stored == [founded.genesis.bytes(), parent.bytes(), child.bytes()].concat(),
+            "the file does not end P, C"
+        );
+        let store = reloaded(root.path());
+        let log = store.log().expect("rooted");
+        assert!(log.get(parent.id()).is_some() && log.get(child.id()).is_some());
+        assert_eq!(log.waiting(), 0);
+    }
+
+    /// F23 (failure case 2): a power loss inside an append keeps what came before it, and since
+    /// the tail is in causal order nothing waits after the reload. The file is then longer than
+    /// the records it holds, so the next POST (the member's retry of the records that heard no
+    /// `204`) writes it whole rather than onto the torn bytes, and the reload after it holds every
+    /// record.
+    /// NEGATIVE CONTROLS: an id-ordered tail cut inside P fails "assertion `left == right`
+    /// failed: the reload left a record waiting" (left 1, right 0), as main before F23 did; an
+    /// append onto the torn bytes (`on_file` known without its length check) fails "the reload
+    /// after the next POST lost a record".
+    #[test]
+    fn a_torn_append_leaves_no_record_waiting_and_the_next_post_writes_whole() {
+        use crate::membership_log::encode_records;
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let opts = team_options(root.path());
+        let running = run(&opts);
+        let founded = Founded::new();
+        let (parent, child) = founded.parent_and_child_sorting_child_first();
+        let path = root.path().join("team.records");
+        for body in [founded.genesis.bytes(), child.bytes(), parent.bytes()] {
+            assert_eq!(
+                post_records(&running.shared, "team", body, false).status,
+                204
+            );
+        }
+        running.stop();
+
+        // A power loss cut the append of P short.
+        let stored = std::fs::read(&path).expect("stored");
+        let at = stored
+            .windows(parent.bytes().len())
+            .position(|window| window == parent.bytes())
+            .expect("P is on the file");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_len(at as u64 + 40))
+            .expect("a torn tail");
+        let store = reloaded(root.path());
+        let log = store.log().expect("rooted");
+        assert_eq!(log.waiting(), 0, "the reload left a record waiting");
+        assert!(log.get(founded.genesis.id()).is_some());
+
+        let running = run(&opts);
+        let torn = inode(&path);
+        assert_eq!(
+            post_records(
+                &running.shared,
+                "team",
+                &encode_records([&parent, &child]),
+                false
+            )
+            .status,
+            204
+        );
+        let rewritten = inode(&path) != torn;
+        running.stop();
+        let store = reloaded(root.path());
+        let log = store.log().expect("rooted");
+        assert!(
+            log.get(parent.id()).is_some() && log.get(child.id()).is_some(),
+            "the reload after the next POST lost a record"
+        );
+        assert!(rewritten, "the POST after a torn tail appended onto it");
+    }
+
+    /// F23 (failure case 1): a restart loses exactly the waiting set, and a peer pull brings a
+    /// lost record back with its parent: the server appends P, then C.
+    /// NEGATIVE CONTROLS: the file of main before F23 held the waiting record, and the test failed
+    /// "the restart kept a waiting record"; a peer that lacks C fails "the pull did not append P,
+    /// then C".
+    #[test]
+    fn a_restart_forgets_waiting_records_and_a_pull_brings_them_back() {
+        use crate::membership_log::encode_records;
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let opts = team_options(root.path());
+        let running = run(&opts);
+        let founded = Founded::new();
+        let (parent, child) = founded.parent_and_child_sorting_child_first();
+        for body in [founded.genesis.bytes(), child.bytes()] {
+            assert_eq!(
+                post_records(&running.shared, "team", body, false).status,
+                204
+            );
+        }
+        running.stop();
+        assert!(
+            !reloaded(root.path()).contains(child.id()),
+            "the restart kept a waiting record"
+        );
+
+        let peer_root = aterm_tempfile::tempdir().expect("tempdir");
+        let peer = run(&team_options(peer_root.path()));
+        assert_eq!(
+            post_records(
+                &peer.shared,
+                "team",
+                &encode_records([&founded.genesis, &parent, &child]),
+                false
+            )
+            .status,
+            204
+        );
+        let running = run(&opts);
+        let path = root.path().join("team.records");
+        let before = std::fs::read(&path).expect("stored");
+        let pulled = running.pull_from_peers(&[peer_at(peer.addr, "team")]);
+        let after = std::fs::read(&path).expect("stored");
+        let held = running.stored_records("team");
+        running.stop();
+        peer.stop();
+        assert_eq!(pulled, 1);
+        assert!(
+            after == [before.as_slice(), parent.bytes(), child.bytes()].concat(),
+            "the pull did not append P, then C"
+        );
+        assert!(held.log().and_then(|log| log.get(child.id())).is_some());
+    }
+
+    /// F23 (compatibility, a new reader and an old file): a file 0.146 wrote holds the log and
+    /// then its waiting records. The first growth writes it whole with complete records only,
+    /// and the second goes on the end; v0.146's whole-stream read takes the new file.
+    /// NEGATIVE CONTROL: `on_file` known without its length check appends onto the old file and
+    /// fails "assertion `left != right` failed: the first growth appended onto an old file", as
+    /// main before F23 did.
+    #[test]
+    fn an_old_file_with_waiting_records_is_rewritten_once_then_appended() {
+        use crate::membership_log::{Store, encode_records};
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let mut founded = Founded::new();
+        let mut old = Store::for_vault("team").expect("store");
+        old.insert(founded.genesis.clone()).expect("genesis");
+        old.insert(founded.waiting(0)).expect("waits");
+        let path = root.path().join("team.records");
+        fsx::write_atomic(&path, &old.encode(), 0o600).expect("as 0.146 wrote it");
+
+        let running = run(&team_options(root.path()));
+        let first = founded.mint(5_000, "first");
+        let old_inode = inode(&path);
+        assert_eq!(
+            post_records(&running.shared, "team", first.bytes(), false).status,
+            204
+        );
+        let rewritten = inode(&path);
+        let after_first = std::fs::read(&path).expect("stored");
+        let second = founded.mint(5_001, "second");
+        assert_eq!(
+            post_records(&running.shared, "team", second.bytes(), false).status,
+            204
+        );
+        let appended = inode(&path);
+        running.stop();
+        assert_ne!(
+            rewritten, old_inode,
+            "the first growth appended onto an old file"
+        );
+        assert!(
+            after_first == encode_records([&founded.genesis, &first]),
+            "the rewrite kept waiting bytes"
+        );
+        assert_eq!(
+            appended, rewritten,
+            "the second growth wrote the file whole"
+        );
+        let v146 = Store::decode("team", &std::fs::read(&path).expect("stored"))
+            .expect("v0.146 reads the new file");
+        assert_eq!(
+            v146.complete_inventory(),
+            [*founded.genesis.id(), *first.id(), *second.id()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    /// F23 (rule 4.7, failure case 4): when the append fails, the POST writes the file whole: a
+    /// new inode holds the record, the answer is 204, and a restart holds it. The append is
+    /// tried first, as the record before shows (it keeps the inode), and the test's disk fails
+    /// it having touched nothing (`appends_fail`).
+    /// NEGATIVE CONTROLS: a failed append taken as done (`.ok().or(Some(left))`) fails "the
+    /// restart lost the record the POST answered 204 for"; answering 500 when the append fails
+    /// fails "assertion `left == right` failed: a failed append answered 500" (left 500, right
+    /// 204). (Main before F23 never appended, and wrote the file whole each time.)
+    #[test]
+    fn a_failed_append_writes_the_file_whole() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let mut founded = Founded::new();
+        let post = |record: &crate::membership_log::Record| {
+            post_records(&running.shared, "team", record.bytes(), false).status
+        };
+        assert_eq!(post(&founded.genesis), 204);
+        let path = root.path().join("team.records");
+        let first = founded.mint(5_000, "first");
+        let whole = inode(&path);
+        assert_eq!(post(&first), 204);
+        assert_eq!(inode(&path), whole, "the record before is appended");
+        let second = founded.mint(5_001, "second");
+        running.shared.appends_fail.store(true, Ordering::SeqCst);
+        let answered = post(&second);
+        running.shared.appends_fail.store(false, Ordering::SeqCst);
+        let rewritten = inode(&path) != whole;
+        running.stop();
+        assert_eq!(answered, 204, "a failed append answered 500");
+        assert!(
+            reloaded(root.path()).contains(second.id()),
+            "the restart lost the record the POST answered 204 for"
+        );
+        assert!(rewritten, "the POST wrote the file whole");
+    }
+
+    /// F23 review 4: a read of the records file that fails (too many open files, an I/O error)
+    /// is no refusal: nothing is remembered, the next look reads the file again, and a POST whose
+    /// look failed answers 500 rather than write what its store holds over records it never
+    /// read. Before, every read error kept the file's stamp, so later looks read nothing and the
+    /// next growth wrote the file whole with only that POST's records.
+    /// NEGATIVE CONTROLS: a failed read remembered as a refusal (the slot keeps the stamp) fails
+    /// "the POST replaced records on file it never read"; a POST that writes though its look
+    /// failed fails the same.
+    #[test]
+    fn a_failed_read_of_the_records_file_is_tried_again() {
+        use crate::membership_log::encode_records;
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let mut founded = Founded::new();
+        let kept = founded.mint(5_000, "kept");
+        let first = run(&team_options(root.path()));
+        assert_eq!(
+            post_records(
+                &first.shared,
+                "team",
+                &encode_records([&founded.genesis, &kept]),
+                false
+            )
+            .status,
+            204
+        );
+        first.stop();
+        let path = root.path().join("team.records");
+        // The start's look, the POST's first look, and the look after it.
+        fsx::fail_reads(&path, 3);
+        let running = run(&team_options(root.path()));
+        let later = founded.mint(5_001, "later");
+        let body = encode_records([&founded.genesis, &later]);
+        let failed = post_records(&running.shared, "team", &body, false).status;
+        let _third_failed_look = running.stored_records("team");
+        let retried = post_records(&running.shared, "team", &body, false).status;
+        running.stop();
+        fsx::fail_reads(&path, 0);
+        let reloaded = reloaded(root.path());
+        assert!(
+            reloaded.complete_bytes(kept.id()).is_some(),
+            "the POST replaced records on file it never read"
+        );
+        let log = reloaded.log().expect("rooted");
+        assert_eq!(failed, 500, "a POST wrote though its look failed");
+        assert_eq!(retried, 204);
+        assert!(log.get(later.id()).is_some(), "the retry wrote nothing");
+    }
+
+    /// F23 review 3: a look while a POST appends (each parked long-poll's liveness tick, any
+    /// GET) reads nothing and takes nothing: what the file holds past the slot's stamp may not be
+    /// flushed yet, and reading it verified the whole file under `server_state`. The POST stamps
+    /// the slot when its write is done, and then the store holds the record.
+    /// NEGATIVE CONTROL: a look that ignores `RecordSlot::writing` fails "assertion `left ==
+    /// right` failed: a look while the POST appended read the file" (left 1, right 0).
+    #[test]
+    fn a_look_while_a_post_appends_reads_and_takes_nothing() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let mut founded = Founded::new();
+        assert_eq!(
+            post_records(&running.shared, "team", founded.genesis.bytes(), false).status,
+            204
+        );
+        let path = root.path().join("team.records");
+        let record = founded.mint(5_000, "record");
+        let (entered, appending) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        *running
+            .shared
+            .appended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(move || {
+            let _ = entered.send(());
+            let _ = released
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv_timeout(HANG_DETECTOR);
+        }));
+        let shared = Arc::clone(&running.shared);
+        let posted = record.clone();
+        let post = std::thread::spawn(move || post_records(&shared, "team", posted.bytes(), false));
+        appending
+            .recv_timeout(HANG_DETECTOR)
+            .expect("the POST appends");
+        let reads = fsx::reads_of(&path);
+        let took = {
+            let mut state = running.shared.lock_server_state();
+            take_records_from_store(&running.shared, &mut state, "team");
+            state
+                .records
+                .get("team")
+                .is_some_and(|slot| slot.store.contains(record.id()))
+        };
+        let read = fsx::reads_of(&path) - reads;
+        let _ = release.send(());
+        let status = post.join().expect("the POST").status;
+        let held = running.stored_records("team").contains(record.id());
+        running.stop();
+        assert_eq!(read, 0, "a look while the POST appended read the file");
+        assert!(
+            !took,
+            "a look took the record before the POST stamped the slot"
+        );
+        assert_eq!(status, 204);
+        assert!(held, "the store holds the record once the POST answers");
+    }
+
+    /// F23 review 3: an append cut short leaves its first record whole on the file, unflushed,
+    /// and the whole write fails too: the answer is 500, and no look takes that record in (a
+    /// POST of it would answer 204 while it is not durable). The retry writes the file whole,
+    /// and a restart holds both records.
+    /// NEGATIVE CONTROL: a 500 that leaves the slot's stamp as it was fails "a look took a
+    /// record the cut append left unflushed".
+    #[test]
+    fn a_cut_append_that_answers_500_leaves_its_records_out_of_the_store() {
+        use crate::membership_log::encode_records;
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let mut founded = Founded::new();
+        assert_eq!(
+            post_records(&running.shared, "team", founded.genesis.bytes(), false).status,
+            204
+        );
+        let path = root.path().join("team.records");
+        let whole = inode(&path);
+        let parent = founded.mint(5_000, "parent");
+        let child = founded.mint(5_001, "child");
+        let body = encode_records([&parent, &child]);
+        running.shared.appends_tear.store(true, Ordering::SeqCst);
+        running.shared.writes_fail.store(true, Ordering::SeqCst);
+        let failed = post_records(&running.shared, "team", &body, false).status;
+        running.shared.appends_tear.store(false, Ordering::SeqCst);
+        running.shared.writes_fail.store(false, Ordering::SeqCst);
+        assert_eq!(failed, 500, "both writes failed");
+        assert_eq!(inode(&path), whole, "the cut append went onto the file");
+        let took = running.stored_records("team").contains(parent.id());
+        assert_eq!(
+            post_records(&running.shared, "team", &body, false).status,
+            204
+        );
+        let rewritten = inode(&path) != whole;
+        running.stop();
+        assert!(!took, "a look took a record the cut append left unflushed");
+        assert!(rewritten, "the retry wrote onto the cut append");
+        let reloaded = reloaded(root.path());
+        let log = reloaded.log().expect("rooted");
+        assert!(
+            log.get(parent.id()).is_some() && log.get(child.id()).is_some(),
+            "the restart lost a record the retry answered 204 for"
+        );
+    }
+
+    /// F23 (rule 4.7, failure case 4): when both writes fail (the test's disk refuses the append
+    /// and the whole write having touched nothing, `writes_fail`) the answer is 500 and the slot
+    /// is unchanged, so the retry adds the record again and writes it.
+    /// NEGATIVE CONTROL: the slot taking the copy before the write fails "assertion `left ==
+    /// right` failed: a failed write changed the slot". Main before F23 already answered 500 with
+    /// the slot unchanged, and passed.
+    #[test]
+    fn a_failed_write_answers_500_and_the_retry_writes() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let mut founded = Founded::new();
+        assert_eq!(
+            post_records(&running.shared, "team", founded.genesis.bytes(), false).status,
+            204
+        );
+        let held = running.stored_records("team").inventory();
+        let record = founded.mint(5_000, "record");
+        running.shared.writes_fail.store(true, Ordering::SeqCst);
+        let failed = post_records(&running.shared, "team", record.bytes(), false).status;
+        running.shared.writes_fail.store(false, Ordering::SeqCst);
+        assert_eq!(failed, 500, "both writes failed");
+        assert_eq!(
+            running.stored_records("team").inventory(),
+            held,
+            "a failed write changed the slot"
+        );
+        assert_eq!(
+            post_records(&running.shared, "team", record.bytes(), false).status,
+            204
+        );
+        running.stop();
+        assert!(
+            reloaded(root.path()).contains(record.id()),
+            "the retry wrote nothing"
+        );
+    }
+
+    /// F23 (rule 4.2): a POST whose records the store holds already answers 204 having copied,
+    /// verified and written nothing. Any LAN host may POST, and each such POST copied the store's
+    /// maps and verified every signature under `record_writes`.
+    /// NEGATIVE CONTROL: cloning before the `contains` check fails "assertion `left == right`
+    /// failed: a POST of held records copied the store" (left 1, right 0), as main before F23
+    /// did.
+    #[test]
+    fn a_post_of_held_records_clones_and_verifies_nothing() {
+        use crate::membership_log::encode_records;
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let mut founded = Founded::new();
+        let record = founded.mint(5_000, "record");
+        let body = encode_records([&founded.genesis, &record]);
+        assert_eq!(
+            post_records(&running.shared, "team", &body, false).status,
+            204
+        );
+        let path = root.path().join("team.records");
+        let before = file_stamp(&path);
+        let clones = running.shared.post_clones.load(Ordering::SeqCst);
+        let verifies = running.shared.post_verifies.load(Ordering::SeqCst);
+        assert_eq!(
+            post_records(&running.shared, "team", &body, false).status,
+            204
+        );
+        let cloned = running.shared.post_clones.load(Ordering::SeqCst) - clones;
+        let verified = running.shared.post_verifies.load(Ordering::SeqCst) - verifies;
+        let after = file_stamp(&path);
+        running.stop();
+        assert_eq!(cloned, 0, "a POST of held records copied the store");
+        assert_eq!(verified, 0, "a POST of held records verified them");
+        assert_eq!(after, before, "a POST of held records wrote the file");
+    }
+
+    /// F23 (rule 4.3): a POST verifies its body outside every lock, so a POST still verifying
+    /// holds back no other POST. Before, every POST verified its body under `record_writes`, one
+    /// after another.
+    /// NEGATIVE CONTROL: verifying under `record_writes` (as main before F23 did) hangs POST B
+    /// behind POST A, and the hang detector fails "assertion `left == right` failed: POST B waited
+    /// on POST A's verification" (left `Err(Timeout)`, right `Ok(204)`).
+    #[test]
+    fn a_post_in_verification_holds_no_lock_another_post_needs() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&team_options(root.path()));
+        let mut founded = Founded::new();
+        assert_eq!(
+            post_records(&running.shared, "team", founded.genesis.bytes(), false).status,
+            204
+        );
+        let a = founded.mint(5_000, "a");
+        let b = founded.mint(5_001, "b");
+        let (entered, in_verification) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let first = AtomicBool::new(true);
+        *running
+            .shared
+            .verifying
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                let _ = entered.send(());
+                let _ = released
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .recv_timeout(HANG_DETECTOR);
+            }
+        }));
+        let shared = Arc::clone(&running.shared);
+        let post_a = std::thread::spawn(move || post_records(&shared, "team", a.bytes(), false));
+        in_verification
+            .recv_timeout(HANG_DETECTOR)
+            .expect("POST A verifies");
+        let (answered, answer) = std::sync::mpsc::channel();
+        let shared = Arc::clone(&running.shared);
+        let post_b = std::thread::spawn(move || {
+            let _ = answered.send(post_records(&shared, "team", b.bytes(), false).status);
+        });
+        let b_status = answer.recv_timeout(HANG_DETECTOR);
+        let _ = release.send(());
+        let a_status = post_a.join().expect("POST A").status;
+        post_b.join().expect("POST B");
+        running.stop();
+        assert_eq!(b_status, Ok(204), "POST B waited on POST A's verification");
+        assert_eq!(a_status, 204);
+    }
+
+    /// F23 (rule 8): every records GET reply carries the server's boot id
+    /// (`X-Aterm-Records-Boot`), a `204` as well as a `200`, the same until the server restarts
+    /// and another after: a restart forgets the records it held waiting, and the boot id is how a
+    /// member hears that it must post its whole store again (`client::Reposted`).
+    /// NEGATIVE CONTROL: a boot id that does not change at a restart (`"0"` 32 times) fails
+    /// "assertion `left != right` failed: the restart kept its boot id".
+    #[test]
+    fn a_records_get_carries_a_boot_id_a_restart_changes() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let founded = Founded::new();
+        let boots = |url: &str| {
+            let fetch = |have: &[crate::membership_log::RecordId]| {
+                crate::transport::fetch_records_sync(url, have, None, HANG_DETECTOR, None)
+                    .expect("a records GET")
+            };
+            let (whole, frontier) = (fetch(&[]), fetch(&[*founded.genesis.id()]));
+            assert_eq!(
+                crate::membership_log::decode_records(&whole.bytes)
+                    .expect("records")
+                    .len(),
+                1,
+                "the GET from nothing sent the genesis"
+            );
+            assert!(
+                frontier.bytes.is_empty(),
+                "the GET at the frontier sent records"
+            );
+            (whole.boot, frontier.boot)
+        };
+        let running = run(&team_options(root.path()));
+        let url = format!("http://{}/v1/team", running.addr);
+        assert_eq!(
+            post_records(&running.shared, "team", founded.genesis.bytes(), false).status,
+            204
+        );
+        let (first, again) = boots(&url);
+        running.stop();
+        let first = first.expect("a 200 carried no boot id");
+        assert_eq!(
+            again.as_deref(),
+            Some(first.as_str()),
+            "a 204 carried another boot id"
+        );
+
+        let running = run(&team_options(root.path()));
+        let url = format!("http://{}/v1/team", running.addr);
+        let (restarted, again) = boots(&url);
+        running.stop();
+        let restarted = restarted.expect("the restarted server sent no boot id");
+        assert_eq!(again.as_deref(), Some(restarted.as_str()));
+        assert_ne!(restarted, first, "the restart kept its boot id");
+    }
+
+    /// The records `SwarmRecordsFile` names, as one founder's log signs them: `P`, a child of
+    /// the genesis; `C`, a child of `P`, its id sorting before `P`'s (an id-ordered tail writes
+    /// it first); and `J`, waiting on a parent nobody holds.
+    struct RecordsFileCast {
+        founded: Founded,
+        p: crate::membership_log::Record,
+        c: crate::membership_log::Record,
+        j: crate::membership_log::Record,
+    }
+
+    impl RecordsFileCast {
+        fn new() -> Self {
+            let founded = Founded::new();
+            let (p, c) = founded.parent_and_child_sorting_child_first();
+            let j = founded.waiting(0);
+            Self { founded, p, c, j }
+        }
+
+        /// The record a model `post` names (1 `P`, 2 `C`, 3 `J`).
+        fn posted(&self, post: i64) -> &crate::membership_log::Record {
+            match post {
+                1 => &self.p,
+                2 => &self.c,
+                3 => &self.j,
+                other => panic!("no POST in flight ({other})"),
+            }
+        }
+    }
+
+    /// A real server replaying `SwarmRecordsFile`'s actions on its own store folder: a POST is
+    /// `post_records` itself, `Fail` is its 500 with `writes_fail` set, `Tear` puts half of the
+    /// append's first frame on the file's end, `Foreign` renames a copy of the file's readable
+    /// part over it, and `Restart` stops the server and starts another on the folder.
+    struct RecordsFileRun<'a> {
+        cast: &'a RecordsFileCast,
+        root: PathBuf,
+        running: Option<Running>,
+        post: i64,
+        acked: (bool, bool),
+        restarted: i64,
+    }
+
+    impl<'a> RecordsFileRun<'a> {
+        fn replay(cast: &'a RecordsFileCast, root: PathBuf, path: &[&str]) -> Self {
+            std::fs::create_dir_all(&root).expect("store folder");
+            let running = run(&team_options(&root));
+            assert_eq!(
+                post_records(&running.shared, "team", cast.founded.genesis.bytes(), false).status,
+                204
+            );
+            let mut replayed = Self {
+                cast,
+                root,
+                running: Some(running),
+                post: 0,
+                acked: (false, false),
+                restarted: 0,
+            };
+            for action in path {
+                replayed.apply(action);
+            }
+            replayed
+        }
+
+        fn shared(&self) -> &Shared {
+            &self.running.as_ref().expect("a running server").shared
+        }
+
+        fn file(&self) -> PathBuf {
+            self.root.join("team.records")
+        }
+
+        fn apply(&mut self, action: &str) {
+            match action {
+                "PostP" => self.post = 1,
+                "PostC" => self.post = 2,
+                "PostJ" => self.post = 3,
+                "Write" => {
+                    let record = self.cast.posted(self.post);
+                    let status = post_records(self.shared(), "team", record.bytes(), false).status;
+                    assert_eq!(status, 204, "Write answered {status}");
+                    let held = |id| {
+                        self.shared()
+                            .lock_server_state()
+                            .records
+                            .get("team")
+                            .and_then(|slot| slot.store.log().map(|log| log.get(id).is_some()))
+                            .unwrap_or(false)
+                    };
+                    self.acked = (held(self.cast.p.id()), held(self.cast.c.id()));
+                    self.post = 0;
+                }
+                "Fail" => {
+                    let record = self.cast.posted(self.post);
+                    self.shared().writes_fail.store(true, Ordering::SeqCst);
+                    let status = post_records(self.shared(), "team", record.bytes(), false).status;
+                    self.shared().writes_fail.store(false, Ordering::SeqCst);
+                    assert_eq!(status, 500, "Fail answered {status}");
+                    self.post = 0;
+                }
+                "Tear" => {
+                    use std::io::Write as _;
+                    let first = self.cast.posted(self.post).bytes();
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(self.file())
+                        .expect("the records file");
+                    file.write_all(&first[..first.len() / 2])
+                        .expect("a torn frame");
+                    self.post = 0;
+                }
+                "Foreign" => {
+                    let bytes = std::fs::read(self.file()).expect("the records file");
+                    let readable = self.frames(&bytes).1;
+                    let copy = self.root.join("copy");
+                    std::fs::write(&copy, &bytes[..readable]).expect("a copy");
+                    std::fs::set_permissions(
+                        &copy,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                    )
+                    .expect("mode");
+                    std::fs::rename(&copy, self.file()).expect("renamed over");
+                }
+                "Restart" => {
+                    self.running.take().expect("a running server").stop();
+                    self.running = Some(run(&team_options(&self.root)));
+                    self.post = 0;
+                    self.restarted += 1;
+                }
+                other => panic!("unexpected SwarmRecordsFile action: {other}"),
+            }
+        }
+
+        /// The model's records among the frames of `bytes` past the genesis, in order (1 `P`, 2
+        /// `C`, 3 `J`), and where the readable part ends: a frame that is none of them whole is
+        /// torn, and ends the read.
+        fn frames(&self, bytes: &[u8]) -> (Vec<i64>, usize) {
+            let genesis = self.cast.founded.genesis.bytes();
+            assert!(
+                bytes.starts_with(genesis),
+                "the file does not start with the genesis"
+            );
+            let mut at = genesis.len();
+            let mut found = Vec::new();
+            'frames: while at < bytes.len() {
+                for (code, record) in [(1, &self.cast.p), (2, &self.cast.c), (3, &self.cast.j)] {
+                    if bytes[at..].starts_with(record.bytes()) {
+                        found.push(code);
+                        at += record.bytes().len();
+                        continue 'frames;
+                    }
+                }
+                break;
+            }
+            (found, at)
+        }
+
+        fn observe(&self) -> aterm_spec::interp::State {
+            records_file_projection(self)
+        }
+    }
+
+    /// `SwarmRecordsFile`'s variables, read off a real server and its file.
+    fn records_file_projection(run: &RecordsFileRun<'_>) -> aterm_spec::interp::State {
+        let bytes = std::fs::read(run.file()).expect("the records file");
+        let (frames, readable) = run.frames(&bytes);
+        let torn = readable < bytes.len();
+        let count = i64::try_from(frames.len()).expect("frames");
+        let place = |code: i64| {
+            frames
+                .iter()
+                .position(|found| *found == code)
+                .map_or(0, |i| i64::try_from(i).expect("place") + 1)
+        };
+        let state = run.shared().lock_server_state();
+        let slot = state.records.get("team").expect("the records slot");
+        let log = slot.store.log().expect("a rooted store");
+        let complete = |record: &crate::membership_log::Record| log.get(record.id()).is_some();
+        let waiting = |record: &crate::membership_log::Record| {
+            slot.store.contains(record.id()) && !complete(record)
+        };
+        aterm_spec::interp::State::from([
+            ("post", run.post),
+            ("hp", i64::from(complete(&run.cast.p))),
+            ("hc", i64::from(complete(&run.cast.c))),
+            ("wc", i64::from(waiting(&run.cast.c))),
+            ("wj", i64::from(waiting(&run.cast.j))),
+            ("fp", place(1)),
+            ("fc", place(2)),
+            ("fj", place(3)),
+            ("len", count + i64::from(torn)),
+            ("tear", if torn { count + 1 } else { 0 }),
+            ("onf", i64::from(slot.on_file.is_some())),
+            ("same", i64::from(slot.stamp == fsx::stamp(&run.file()))),
+            ("ap", i64::from(run.acked.0)),
+            ("ac", i64::from(run.acked.1)),
+            ("restarted", run.restarted),
+        ])
+    }
+
+    /// F23: `SwarmRecordsFile` holds its laws, each of its mutants breaks one, and the server's
+    /// records file refines it: from every state the model reaches, every action it enables,
+    /// replayed on a real server (a fresh store folder for each), gives a successor the model
+    /// allows there, and the state the model's walk found by that path exactly.
+    /// NEGATIVE CONTROL: the state an id-ordered tail torn after its first frame leaves (`C`
+    /// whole on the file, `P` torn behind it) is no successor of `Tear` from the state where
+    /// `P` lands with `C` waiting, and breaks `FileHoldsCompleteOnly`.
+    #[test]
+    fn records_file_conforms() {
+        let model = aterm_models_swarm::records_file_model();
+        aterm_spec::interp::prove_and_catch(&model);
+        let fired = aterm_spec::interp::fired_actions(&model);
+        assert_eq!(fired.len(), model.actions.len(), "fired actions: {fired:?}");
+
+        let mut paths: BTreeMap<aterm_spec::interp::State, Vec<&'static str>> = BTreeMap::new();
+        let mut queue = std::collections::VecDeque::from([model.init_state()]);
+        paths.insert(model.init_state(), Vec::new());
+        while let Some(state) = queue.pop_front() {
+            for action in &model.actions {
+                for next in model.successors(action.name, &state) {
+                    if !paths.contains_key(&next) {
+                        let mut path = paths[&state].clone();
+                        path.push(action.name);
+                        paths.insert(next.clone(), path);
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            paths.len(),
+            aterm_spec::interp::reachable_states(&model).len()
+        );
+        let found_by: BTreeMap<&[&str], &aterm_spec::interp::State> = paths
+            .iter()
+            .map(|(state, path)| (path.as_slice(), state))
+            .collect();
+
+        let cast = RecordsFileCast::new();
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let start = RecordsFileRun::replay(&cast, root.path().join("s0"), &[]);
+        assert_eq!(
+            start.observe(),
+            model.init_state(),
+            "state mismatch after []"
+        );
+        if let Some(running) = start.running {
+            running.stop();
+        }
+        let mut judged = BTreeSet::from([model.init_state()]);
+        let mut run_id = 0usize;
+        for (state, path) in &paths {
+            for action in &model.actions {
+                if !model.action_enabled(action.name, state) {
+                    continue;
+                }
+                run_id += 1;
+                let mut replayed =
+                    RecordsFileRun::replay(&cast, root.path().join(format!("t{run_id}")), path);
+                replayed.apply(action.name);
+                let observed = replayed.observe();
+                if let Some(running) = replayed.running.take() {
+                    running.stop();
+                }
+                let next_path = [path.as_slice(), &[action.name]].concat();
+                match found_by.get(next_path.as_slice()) {
+                    Some(&next) => {
+                        assert_eq!(&observed, next, "state mismatch after {next_path:?}");
+                        judged.insert(next.clone());
+                    }
+                    None => assert!(
+                        model.successors(action.name, state).contains(&observed),
+                        "{} after {path:?} gave {observed:?}",
+                        action.name
+                    ),
+                }
+            }
+        }
+        assert_eq!(
+            judged.len(),
+            paths.len(),
+            "every state was replayed and judged"
+        );
+
+        // Negative control: `P` lands with `C` waiting, and the append of the tail in id order
+        // is cut after its first frame.
+        let lands = ["PostC", "Write", "PostP"];
+        let mut bad = RecordsFileRun::replay(&cast, root.path().join("neg-id-order"), &lands);
+        let before = paths
+            .iter()
+            .find(|(_, path)| path.as_slice() == lands)
+            .map(|(state, _)| state.clone())
+            .expect("the model reaches P landing with C waiting");
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(bad.file())
+                .expect("the records file");
+            file.write_all(cast.c.bytes()).expect("C whole");
+            file.write_all(&cast.p.bytes()[..cast.p.bytes().len() / 2])
+                .expect("P torn");
+        }
+        bad.post = 0;
+        let bad_state = bad.observe();
+        if let Some(running) = bad.running.take() {
+            running.stop();
+        }
+        assert_eq!((bad_state["fc"], bad_state["tear"]), (1, 2));
+        assert!(
+            !model.successors("Tear", &before).contains(&bad_state),
+            "an id-ordered tail torn after its first frame is a successor of Tear"
+        );
+        assert!(
+            !model.check_invariant("FileHoldsCompleteOnly", &bad_state),
+            "an id-ordered tail torn after its first frame holds FileHoldsCompleteOnly"
+        );
     }
 }

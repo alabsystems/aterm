@@ -284,6 +284,7 @@ impl<C: Ctl> Session<'_, C> {
         self.box_ask = None;
         self.adopted_box = false;
         self.turn_end_due = None;
+        self.edge_moved = false;
         self.stall_termed = false;
         let behind = self.claim.watching_behind().map(str::to_string);
         let attention = if let Some(holder) = behind {

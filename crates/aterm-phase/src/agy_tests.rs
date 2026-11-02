@@ -706,6 +706,17 @@ fn agys_saved_and_conversation_answers_are_never_one_shot() {
         "  3. Yes, grant permission for touch (Persist to settings.json)",
     );
     let talk = edited(&rows, "  2. ", "  2. Yes, allow touch in this conversation");
+    // The suffix's target is the build's to name (1.4.12 draws its `(Persist to %s)`
+    // templates): a saved refusal under another target is still a saved answer.
+    let denied_saved = edited(
+        &rows,
+        "  3. ",
+        "  3. No, and always deny for touch (Persist to project settings)",
+    );
+    assert_eq!(
+        roles(&prompt(&denied_saved).expect("the box"))[2],
+        Role::Persist
+    );
     let p = prompt(&saved).expect("the box");
     assert_eq!(roles(&p)[2], Role::Persist);
     assert!(crate::prompt::settles_later(&p.options[2].label));
@@ -2495,6 +2506,37 @@ fn a_subscription_quota_is_a_usage_wall_that_names_its_reset() {
             card_no_effort.effort.as_deref()
         ),
         ("Claude Sonnet 5.5", None)
+    );
+    let right_aligned_no_effort: Vec<String> = measured_rows
+        .iter()
+        .map(|row| {
+            row.replace(
+                "Claude Opus 5.5 · high · 1 task(s) · /tasks",
+                "                          Claude Sonnet 5.5",
+            )
+        })
+        .collect();
+    assert_eq!(
+        footer_model(&right_aligned_no_effort).as_deref(),
+        Some("Claude Sonnet 5.5")
+    );
+    let torn_footer: Vec<String> = measured_rows
+        .iter()
+        .map(|row| {
+            row.replace(
+                "Claude Opus 5.5 · high · 1 task(s) · /tasks",
+                "Claude Opus                                ",
+            )
+        })
+        .collect();
+    assert_eq!(footer_model(&torn_footer), None);
+    let card_torn_footer = launch_card(&torn_footer).expect("launch card falls back to banner");
+    assert_eq!(
+        (
+            card_torn_footer.model.as_str(),
+            card_torn_footer.effort.as_deref()
+        ),
+        ("Gemini 4 Argon", Some("high"))
     );
     let mut with_notice = measured_rows.clone();
     let top_rule = with_notice

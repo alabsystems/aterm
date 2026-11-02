@@ -31,13 +31,10 @@ struct Fnv(u64);
 
 impl Fnv {
     fn new() -> Fnv {
-        Fnv(0xcbf2_9ce4_8422_2325)
+        Fnv(aterm_hash::FNV64_OFFSET)
     }
     fn update(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= u64::from(b);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        self.0 = aterm_hash::fnv1a_64_extend(self.0, bytes);
     }
 }
 

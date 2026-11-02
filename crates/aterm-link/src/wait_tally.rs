@@ -12,11 +12,14 @@
 
 use std::io;
 use std::path::Path;
-#[cfg(any(test, debug_assertions))]
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(test, debug_assertions))]
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use aterm_types::wait_tally::{put_row, row_len, row_text, sum_text, Words};
+pub use aterm_types::wait_tally::{Hist, Unit, BUCKETS};
 
 /// The development seam that turns the tally on.
 pub const SEAM: &str = "ATERM_LINK_WAIT_TALLY";
@@ -26,28 +29,6 @@ pub const FILE: &str = "wait-tally";
 
 /// What the line starts with: the format's name and version.
 const HEAD: &str = "wait-tally v=2";
-
-/// The log2 bands each row counts in ([`Hist::buckets`]).
-pub const BUCKETS: usize = 18;
-
-/// What a row's values measure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unit {
-    /// Nanoseconds of `Instant`, the monotonic clock.
-    Ns,
-    /// A count. Band 0 is 0.
-    Count,
-}
-
-impl Unit {
-    /// How far a value is shifted before its band is its bit length.
-    const fn shift(self) -> u32 {
-        match self {
-            Unit::Ns => 10,
-            Unit::Count => 0,
-        }
-    }
-}
 
 /// One thing the loop does, counted ([`Hist`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -239,97 +220,6 @@ pub fn lane_row(line: &str) -> Row {
     }
 }
 
-/// One row's values since the process started.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Hist {
-    pub count: u64,
-    pub total: u64,
-    /// The largest value counted.
-    pub max: u64,
-    pub buckets: [u32; BUCKETS],
-}
-
-impl Hist {
-    /// The band `v` falls into.
-    #[must_use]
-    pub fn band(v: u64, unit: Unit) -> usize {
-        let shifted = v >> unit.shift();
-        let bits = (u64::BITS - shifted.leading_zeros()) as usize;
-        bits.min(BUCKETS - 1)
-    }
-
-    /// The least value band `i` holds.
-    #[must_use]
-    pub fn floor(i: usize, unit: Unit) -> u64 {
-        if i == 0 {
-            0
-        } else {
-            (1u64 << (i - 1).min(63)) << unit.shift()
-        }
-    }
-
-    /// Count `v`.
-    pub fn add(&mut self, v: u64, unit: Unit) {
-        self.count = self.count.saturating_add(1);
-        self.total = self.total.saturating_add(v);
-        self.max = self.max.max(v);
-        let b = &mut self.buckets[Hist::band(v, unit)];
-        *b = b.saturating_add(1);
-    }
-
-    /// How many values were at least band `i`'s floor.
-    #[must_use]
-    pub fn at_least(&self, i: usize) -> u64 {
-        self.buckets
-            .iter()
-            .skip(i)
-            .map(|&n| u64::from(n))
-            .sum::<u64>()
-    }
-
-    /// The floor and (for every band but the last) the bound of the highest band holding a value.
-    #[must_use]
-    pub fn top(&self, unit: Unit) -> Option<(u64, Option<u64>)> {
-        let i = self.buckets.iter().rposition(|&n| n > 0)?;
-        let bound = (i + 1 < BUCKETS).then(|| Hist::floor(i + 1, unit));
-        Some((Hist::floor(i, unit), bound))
-    }
-
-    /// What was counted between `earlier` and `self`.
-    ///
-    /// # Errors
-    /// A count, a total or a band that went backwards.
-    pub fn since(&self, earlier: &Hist) -> Result<Hist, String> {
-        let back = |what: &str, then: u64, now: u64| {
-            format!("its `{what}` went backwards, {then} to {now}")
-        };
-        let mut buckets = [0u32; BUCKETS];
-        for (i, slot) in buckets.iter_mut().enumerate() {
-            *slot = self.buckets[i]
-                .checked_sub(earlier.buckets[i])
-                .ok_or_else(|| {
-                    back(
-                        &format!("band {i}"),
-                        u64::from(earlier.buckets[i]),
-                        u64::from(self.buckets[i]),
-                    )
-                })?;
-        }
-        Ok(Hist {
-            count: self
-                .count
-                .checked_sub(earlier.count)
-                .ok_or_else(|| back("count", earlier.count, self.count))?,
-            total: self
-                .total
-                .checked_sub(earlier.total)
-                .ok_or_else(|| back("total", earlier.total, self.total))?,
-            max: if self.max > earlier.max { self.max } else { 0 },
-            buckets,
-        })
-    }
-}
-
 /// The loop's time since this process started, and where its inbox group cursor stood at the write.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tally {
@@ -345,58 +235,6 @@ pub struct Tally {
     pub rows: [Hist; ROWS],
 }
 
-/// Writes `v` as exactly `out.len()` lowercase hex digits.
-fn put_hex(out: &mut [u8], mut v: u64) {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    for slot in out.iter_mut().rev() {
-        *slot = DIGITS[(v & 0xf) as usize];
-        v >>= 4;
-    }
-}
-
-/// The text of one row: ` <name>=<count>,<total>,<max>,<band>.<band>…`, every
-/// number fixed-width hex (16 digits, 8 for a band).
-fn row_text(row: Row, h: &Hist) -> Vec<u8> {
-    let mut out = vec![b'0'; row_len(row)];
-    put_row(&mut out, row, h);
-    out
-}
-
-/// A row's text's length: its name's, and 214.
-const fn row_len(row: Row) -> usize {
-    1 + row.name().len() + 1 + 3 * 17 + BUCKETS * 9 - 1
-}
-
-/// [`row_text`] written into `out`, which is exactly [`row_len`] long: the
-/// in-place rewrite of one row's place in the line ([`Recorder::idle`]).
-fn put_row(out: &mut [u8], row: Row, h: &Hist) {
-    let name = row.name().as_bytes();
-    out[0] = b' ';
-    out[1..=name.len()].copy_from_slice(name);
-    let mut at = 1 + name.len();
-    out[at] = b'=';
-    at += 1;
-    for (i, v) in [h.count, h.total, h.max].into_iter().enumerate() {
-        if i > 0 {
-            out[at] = b',';
-            at += 1;
-        }
-        put_hex(&mut out[at..at + 16], v);
-        at += 16;
-    }
-    out[at] = b',';
-    at += 1;
-    for (i, &n) in h.buckets.iter().enumerate() {
-        if i > 0 {
-            out[at] = b'.';
-            at += 1;
-        }
-        put_hex(&mut out[at..at + 8], u64::from(n));
-        at += 8;
-    }
-    debug_assert_eq!(at, out.len());
-}
-
 /// The head: the format, the pid, the cursor, the clock and the dir flag,
 /// zero-padded decimal so its length is fixed.
 fn head_text(t: &Tally) -> String {
@@ -407,11 +245,6 @@ fn head_text(t: &Tally) -> String {
         t.at_ns,
         u8::from(t.dir)
     )
-}
-
-/// The ` sum=<16 hex>\n` tail of a line whose body is `body`.
-fn sum_text(body: &[u8]) -> String {
-    format!(" sum={:016x}\n", checksum(body))
 }
 
 /// Every line's length ([`Tally::render`]): the head's ([`head_text`]: the
@@ -427,16 +260,8 @@ fn line_len() -> usize {
         + 20
         + " dir=".len()
         + 1;
-    let rows: usize = Row::ALL.iter().map(|&row| row_len(row)).sum();
+    let rows: usize = Row::ALL.iter().map(|&row| row_len(row.name())).sum();
     head + rows + " sum=".len() + 16 + "\n".len()
-}
-
-/// THE LINE'S CHECKSUM: aterm-hash's word-at-a-time Fx hash, not FNV-1a. It
-/// only has to tell a torn read from a whole line, and the loop pays for it
-/// at every idle write: over a line of about 6 KiB FNV-1a's byte-serial
-/// multiply chain was most of the write's cost ([`Row::TallyWrite`]).
-fn checksum(body: &[u8]) -> u64 {
-    aterm_hash::fx_hash_bytes(body)
 }
 
 impl Tally {
@@ -468,7 +293,7 @@ impl Tally {
     pub fn render(&self) -> String {
         let mut body = head_text(self).into_bytes();
         for row in Row::ALL {
-            body.extend_from_slice(&row_text(row, self.row(row)));
+            body.extend_from_slice(&row_text(row.name(), self.row(row)));
         }
         let sum = sum_text(&body);
         body.extend_from_slice(sum.as_bytes());
@@ -480,100 +305,20 @@ impl Tally {
     /// # Errors
     /// A line that is not one.
     pub fn parse(text: &str) -> Result<Tally, String> {
-        let line = text
-            .strip_suffix('\n')
-            .ok_or_else(|| format!("an unterminated tally line: {text:?}"))?;
-        let (body, sum) = line
-            .rsplit_once(" sum=")
-            .ok_or_else(|| format!("a tally line with no checksum: {line:?}"))?;
-        let want = format!("{:016x}", checksum(body.as_bytes()));
-        if sum != want {
-            return Err(format!(
-                "a tally line whose checksum is {sum}, not {want} (a read that raced the write, \
-                 or not a tally): {line:?}"
-            ));
-        }
-        let rest = body
-            .strip_prefix(HEAD)
-            .and_then(|rest| rest.strip_prefix(' '))
-            .ok_or_else(|| format!("not a `{HEAD}` line: {line:?}"))?;
-        let mut words = rest.split(' ');
-        let mut next = |key: &str| -> Result<&str, String> {
-            words
-                .next()
-                .and_then(|w| w.strip_prefix(key))
-                .and_then(|w| w.strip_prefix('='))
-                .ok_or_else(|| format!("a tally line with no `{key}=` in its place: {line:?}"))
-        };
-        let dec = |key: &str, v: &str| -> Result<u64, String> {
-            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| v.parse::<u64>().ok())
-                .flatten()
-                .ok_or_else(|| format!("a tally line whose `{key}` is not a number: {line:?}"))
-        };
-        let pid = u32::try_from(dec("pid", next("pid")?)?)
-            .map_err(|_| format!("a tally line whose pid is not a pid: {line:?}"))?;
-        let committed = dec("committed", next("committed")?)?;
-        let at_ns = dec("at", next("at")?)?;
-        let dir = match next("dir")? {
+        let mut words = Words::of(text, HEAD)?;
+        let pid = words.pid()?;
+        let committed = words.dec("committed")?;
+        let at_ns = words.dec("at")?;
+        let dir = match words.next("dir")? {
             "0" => false,
             "1" => true,
-            _ => return Err(format!("a tally line whose `dir` is not 0 or 1: {line:?}")),
-        };
-        let hex = |key: &str, v: &str, width: usize| -> Result<u64, String> {
-            if v.len() != width {
-                return Err(format!(
-                    "a tally line whose `{key}` is not {width} hex digits: {line:?}"
-                ));
-            }
-            if !v.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(format!("a tally line whose `{key}` is not hex: {line:?}"));
-            }
-            u64::from_str_radix(v, 16)
-                .map_err(|_| format!("a tally line whose `{key}` is not hex: {line:?}"))
+            _ => return Err(format!("a tally line whose `dir` is not 0 or 1: {text:?}")),
         };
         let mut rows = [Hist::default(); ROWS];
         for (slot, row) in rows.iter_mut().zip(Row::ALL) {
-            let key = row.name();
-            let value = next(key)?;
-            let mut fields = value.split(',');
-            let mut field = |what: &str| -> Result<&str, String> {
-                fields
-                    .next()
-                    .ok_or_else(|| format!("a tally line whose `{key}` has no {what}: {line:?}"))
-            };
-            let count = hex(key, field("count")?, 16)?;
-            let total = hex(key, field("total")?, 16)?;
-            let max = hex(key, field("max")?, 16)?;
-            let bands = field("bands")?;
-            if fields.next().is_some() {
-                return Err(format!(
-                    "a tally line whose `{key}` has fields past its bands: {line:?}"
-                ));
-            }
-            let mut buckets = [0u32; BUCKETS];
-            let mut parts = bands.split('.');
-            for b in &mut buckets {
-                let part = parts.next().ok_or_else(|| {
-                    format!("a tally line whose `{key}` has fewer than {BUCKETS} bands: {line:?}")
-                })?;
-                *b = u32::try_from(hex(key, part, 8)?).unwrap_or(u32::MAX);
-            }
-            if parts.next().is_some() {
-                return Err(format!(
-                    "a tally line whose `{key}` has more than {BUCKETS} bands: {line:?}"
-                ));
-            }
-            *slot = Hist {
-                count,
-                total,
-                max,
-                buckets,
-            };
+            *slot = words.hist(row.name())?;
         }
-        if words.next().is_some() {
-            return Err(format!("a tally line with words past its fields: {line:?}"));
-        }
+        words.end()?;
         Ok(Tally {
             pid,
             committed,
@@ -657,14 +402,14 @@ impl Stamp {
 }
 
 /// Rows another part of the bridge keeps for the recorder, under a lock of its own.
-#[cfg(any(test, debug_assertions))]
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
 #[derive(Debug, Default)]
 pub(crate) struct Kept {
     on: AtomicBool,
     rows: Mutex<[Hist; ROWS]>,
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
 impl Kept {
     /// Count from now on (`true`), or no more.
     pub(crate) fn turn_on(&self, on: bool) {
@@ -696,7 +441,7 @@ impl Kept {
     }
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
 /// One span a [`Kept`] counts when it drops ([`Kept::timer`]).
 #[derive(Debug)]
 pub(crate) struct Timer<'a> {
@@ -705,7 +450,7 @@ pub(crate) struct Timer<'a> {
     started: Option<Instant>,
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
 impl Drop for Timer<'_> {
     fn drop(&mut self) {
         if let Some(started) = self.started {
@@ -769,7 +514,7 @@ impl Recorder {
             started: Instant::now(),
             tally: Tally {
                 pid: std::process::id(),
-                dir: cfg!(any(test, debug_assertions)),
+                dir: cfg!(any(test, debug_assertions, feature = "dev-seams")),
                 ..Tally::default()
             },
             written: None,
@@ -846,9 +591,9 @@ impl Recorder {
                 line[..head.len()].copy_from_slice(head.as_bytes());
                 let mut at = head.len();
                 for row in Row::ALL {
-                    let len = row_len(row);
+                    let len = row_len(row.name());
                     if self.tally.row(row) != last.row(row) {
-                        put_row(&mut line[at..at + len], row, self.tally.row(row));
+                        put_row(&mut line[at..at + len], row.name(), self.tally.row(row));
                     }
                     at += len;
                 }
@@ -884,6 +629,7 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_types::wait_tally::checksum;
 
     fn hist(values: &[u64], unit: Unit) -> Hist {
         let mut h = Hist::default();

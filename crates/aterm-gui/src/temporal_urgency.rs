@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::thread::Thread;
 
 use crate::qos::{Role, RoleObservation};
 
@@ -31,6 +32,8 @@ pub(super) struct Demands {
     total: AtomicUsize,
     counts: [AtomicUsize; 3],
     observed: Mutex<Option<RoleObservation>>,
+    /// The writer these demands are for, once it has adopted them ([`Self::adopt_writer`]).
+    writer: OnceLock<Thread>,
 }
 
 impl Demands {
@@ -39,7 +42,16 @@ impl Demands {
             total: AtomicUsize::new(0),
             counts: std::array::from_fn(|_| AtomicUsize::new(0)),
             observed: Mutex::new(None),
+            writer: OnceLock::new(),
         })
+    }
+
+    /// Name `writer` as the thread these demands are for, so each new demand
+    /// unparks it ([`Self::acquire`]): a writer napping off its channel
+    /// (`temporal::serve`) then serves the demand at once. The first adoption
+    /// stands.
+    pub(super) fn adopt_writer(&self, writer: Thread) {
+        let _ = self.writer.set(writer);
     }
 
     pub(super) fn acquire(self: &Arc<Self>, reason: Reason) -> Demand {
@@ -51,6 +63,9 @@ impl Demands {
             })
             .expect("recorder urgency count exhausted");
         self.counts[reason.index()].fetch_add(1, Ordering::AcqRel);
+        if let Some(writer) = self.writer.get() {
+            writer.unpark();
+        }
         Demand {
             owner: self.clone(),
             reason,

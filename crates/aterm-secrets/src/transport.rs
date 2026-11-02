@@ -586,6 +586,13 @@ pub const NO_WAIT_HEADER: &str = "X-Aterm-No-Wait";
 /// names a record the server's own log does not hold, so the caller posts its records back.
 pub const RECORDS_NEED_HEADER: &str = "X-Aterm-Records-Need";
 
+/// Header on every `/records` GET reply of a server since F23: 32 lowercase hex digits, 16 random
+/// bytes the server draws when it starts. A restart forgets the records the server held waiting
+/// on a parent (its file holds complete records only), so a member that hears another boot id
+/// from a server that lacks its frontier posts it the whole store again
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rule 8).
+pub const RECORDS_BOOT_HEADER: &str = "X-Aterm-Records-Boot";
+
 /// Fetch bytes at `source` ([`FETCH_MARGIN`], [`Fetched::NoNewer`], [`Fetched::Missing`]).
 pub fn fetch(source: &Source, after: Option<u64>, wait: Duration) -> crate::Result<Fetched> {
     fetch_as(source, after, wait, None)
@@ -1106,18 +1113,46 @@ pub fn fetch_records(
     total: Duration,
     subscriber: Option<&str>,
 ) -> crate::Result<Vec<u8>> {
-    fetch_records_sync(url, have, wait, total, subscriber).map(|(bytes, _)| bytes)
+    fetch_records_sync(url, have, wait, total, subscriber).map(|answer| answer.bytes)
+}
+
+/// What a server answered a records GET ([`fetch_records_sync`]).
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "only the unix records pass (`client::sync_records_inner`) reads `needs` and `boot`"
+    )
+)]
+pub(crate) struct RecordsAnswer {
+    /// The records it sent: empty for a `204`, a `404` or a long poll held past its deadline.
+    pub(crate) bytes: Vec<u8>,
+    /// Whether it lacks at least one record the GET's `have` named ([`RECORDS_NEED_HEADER`]).
+    pub(crate) needs: bool,
+    /// The boot id it sent ([`RECORDS_BOOT_HEADER`]): `None` from a server before F23, or one
+    /// that sent no 32 lowercase hex digits there.
+    pub(crate) boot: Option<String>,
+}
+
+impl RecordsAnswer {
+    const fn none() -> Self {
+        Self {
+            bytes: Vec::new(),
+            needs: false,
+            boot: None,
+        }
+    }
 }
 
 /// [`fetch_records`], also returning whether the server signaled [`RECORDS_NEED_HEADER`] (`"1"`)
-/// because it lacks at least one record named in `have`.
+/// because it lacks at least one record named in `have`, and the boot id it sent.
 pub(crate) fn fetch_records_sync(
     url: &str,
     have: &[crate::membership_log::RecordId],
     wait: Option<Duration>,
     total: Duration,
     subscriber: Option<&str>,
-) -> crate::Result<(Vec<u8>, bool)> {
+) -> crate::Result<RecordsAnswer> {
     let deadline = match wait {
         Some(w) => w.saturating_add(FETCH_MARGIN).max(total),
         None => total,
@@ -1141,17 +1176,29 @@ pub(crate) fn fetch_records_sync(
     let response = match request.send_phased(&[]) {
         Ok(response) => response,
         Err(failed) if wait.is_some() && held_past_deadline(&failed) => {
-            return Ok((Vec::new(), false));
+            return Ok(RecordsAnswer::none());
         }
         Err(aterm_http::SendError { error, .. }) => {
             return Err(transport_error("fetching records from", url, &error));
         }
     };
     let needs = response.header(RECORDS_NEED_HEADER) == Some("1");
+    let boot = response
+        .header(RECORDS_BOOT_HEADER)
+        .filter(|id| id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .map(str::to_owned);
     match response.status() {
-        200 => Ok((response.body().to_vec(), needs)),
-        204 => Ok((Vec::new(), needs)),
-        404 => Ok((Vec::new(), false)),
+        200 => Ok(RecordsAnswer {
+            bytes: response.body().to_vec(),
+            needs,
+            boot,
+        }),
+        204 => Ok(RecordsAnswer {
+            bytes: Vec::new(),
+            needs,
+            boot,
+        }),
+        404 => Ok(RecordsAnswer::none()),
         status => Err(refused(
             "fetching records from",
             url,
@@ -1811,20 +1858,39 @@ pub fn wait_joins_from(
     after: Option<u64>,
     wait: Duration,
 ) -> crate::Result<(Joins, Option<IpAddr>)> {
+    wait_joins_from_within(url, after, wait.saturating_add(FETCH_MARGIN))
+}
+
+/// Read a join queue within the remaining shared deadline, including connection and response.
+/// A mirror's vault verification and its queue read share this same deadline.
+#[cfg(any(unix, test))]
+pub(crate) fn wait_joins_from_until(
+    url: &str,
+    after: Option<u64>,
+    until: std::time::Instant,
+) -> crate::Result<(Joins, Option<IpAddr>)> {
+    let remaining = until
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| Error::of_kind(ErrorKind::TimedOut, "join queue deadline elapsed"))?;
+    wait_joins_from_within(url, after, remaining)
+}
+
+fn wait_joins_from_within(
+    url: &str,
+    after: Option<u64>,
+    within: Duration,
+) -> crate::Result<(Joins, Option<IpAddr>)> {
     let target = match after {
         Some(after) => with_query(&join_url(url), &format!("after={after}")),
         None => join_url(url),
     };
     let noting = Arc::new(PeerNoting::default());
-    let response = match Client::new(
-        Trust::PlatformVerifier,
-        ProxyMode::Direct,
-        wait.saturating_add(FETCH_MARGIN),
-    )
-    .with_connector(Arc::clone(&noting) as Arc<dyn aterm_http::Connect>)
-    .get(&target)
-    .limit(JOINS_BODY)
-    .send_phased(&[])
+    let response = match Client::new(Trust::PlatformVerifier, ProxyMode::Direct, within)
+        .with_connector(Arc::clone(&noting) as Arc<dyn aterm_http::Connect>)
+        .get(&target)
+        .limit(JOINS_BODY)
+        .send_phased(&[])
     {
         Ok(response) => response,
         Err(failed) if after.is_some() && held_past_deadline(&failed) => {
@@ -2629,6 +2695,17 @@ mod tests {
             retry_after.map_or_else(String::new, |secs| format!("Retry-After: {secs}\r\n"));
         format!("HTTP/1.1 429 Too Many Requests\r\n{header}Content-Length: 9\r\n\r\nslow down")
             .into_bytes()
+    }
+
+    #[test]
+    fn a_join_queue_read_obeys_its_shared_deadline() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/alab", silent.local_addr().unwrap());
+        let started = std::time::Instant::now();
+        let error = wait_joins_from_until(&url, None, started + Duration::from_millis(200))
+            .expect_err("the silent queue cannot hold the reader past its deadline");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(started.elapsed() < HANG_DETECTOR);
     }
 
     #[test]

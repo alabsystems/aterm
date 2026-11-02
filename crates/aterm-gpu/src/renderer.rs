@@ -12031,7 +12031,6 @@ impl GpuRenderer {
                     aterm_render::fire_halo_row_slice(&input.fire_halo, row)
                 }));
             let raster_split = input.chrome_raster(r).and_then(|m| m.split);
-            let windowed = win != (i32::MIN, i32::MAX);
             let mut ink_top = i32::MAX;
             type FgMemo = ((u32, [u8; 3], Option<usize>), ([u8; 4], [u8; 4]));
             let mut fg_memo: Option<FgMemo> = None;
@@ -12127,37 +12126,31 @@ impl GpuRenderer {
                     }
                 };
                 let quad = slot.quad((pad + cx) as f32, anchor_y, baseline, scale, (aw, ah));
-                if quad.is_none() && !windowed {
-                    continue;
-                }
                 if fire_present && let Some(strength) = halo_walk.at(c as u16) {
-                    let a = aterm_render::fire_halo_alpha(strength);
-                    for &(dx, dy) in &aterm_render::HALO_DILATE_OFFSETS {
-                        let (hrect, huv) = match (run, quad) {
-                            (None, Some((rect, uv))) if !windowed => (
-                                [rect[0] + dx as f32, rect[1] + dy as f32, rect[2], rect[3]],
-                                uv,
-                            ),
-                            _ => {
-                                let stamp = if windowed {
-                                    clip_rows(
-                                        own,
-                                        (win.0.saturating_sub(dy), win.1.saturating_sub(dy)),
-                                    )
-                                } else {
-                                    scale
-                                };
-                                let Some((hr, hu)) = slot.quad(
-                                    (pad + cx) as f32 + dx as f32,
-                                    anchor_y,
-                                    baseline,
-                                    stamp,
-                                    (aw, ah),
-                                ) else {
-                                    continue;
-                                };
-                                ([hr[0], hr[1] + dy as f32, hr[2], hr[3]], hu)
+                    const HALO_LIFT: i32 = {
+                        let mut lift = 0;
+                        let mut i = 0;
+                        while i < aterm_render::HALO_DILATE_OFFSETS.len() {
+                            let dy = aterm_render::HALO_DILATE_OFFSETS[i].1;
+                            if dy < lift {
+                                lift = dy;
                             }
+                            i += 1;
+                        }
+                        lift
+                    };
+                    ink_top = ink_top.min(slot.ink_reach(anchor_y + HALO_LIFT, baseline, own));
+                    let a = aterm_render::fire_halo_alpha(strength);
+                    let cell_x = (pad + cx) as i32;
+                    for &(dx, dy) in &aterm_render::HALO_DILATE_OFFSETS {
+                        let Some((hrect, huv)) = slot.quad(
+                            (cell_x + dx) as f32,
+                            anchor_y + dy,
+                            baseline,
+                            scale,
+                            (aw, ah),
+                        ) else {
+                            continue;
                         };
                         glyph_halo_inst.push(GlyphInstance {
                             rect: hrect,

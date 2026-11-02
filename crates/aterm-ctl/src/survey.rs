@@ -1778,7 +1778,11 @@ pub(crate) fn read_survey(
                 addr: None,
             }],
         };
-        notes.extend(fleet_note(&peers).map(str::to_owned));
+        notes.extend(fleet_note_at(
+            &peers,
+            place_now().as_ref(),
+            &aterm_netplace::words::Words::now(),
+        ));
         unserved = replies.is_empty()
             && !peers.is_empty()
             && peers.iter().all(|peer| peer.fault == PeerFault::Unserved);
@@ -1851,6 +1855,44 @@ pub(crate) const NO_NETWORK_NOTE: &str = "This machine had no route to any peer'
 pub(crate) const SANDBOX_NOTE: &str = "Every peer's connect was refused to this process itself \
      (EPERM or EACCES): a sandbox around it, such as Claude Code's Bash sandbox, or a firewall, \
      not the peers; run the read where it may open network connections.";
+
+/// This Mac's network place for a fleet read's note ([`fleet_note_at`]); none in a unit test (the
+/// state root is the person's) or off Unix.
+fn place_now() -> Option<aterm_netplace::Place> {
+    #[cfg(all(unix, not(test)))]
+    {
+        aterm_types::dirs::state_dir().map(|state| aterm_netplace::read(&state))
+    }
+    #[cfg(not(all(unix, not(test))))]
+    {
+        None
+    }
+}
+
+/// The note a fleet read ends with, given this Mac's network place `place`: away from the ALab LAN
+/// (on another network), a read no dialled peer answered says where this Mac is
+/// (`aterm_netplace::words::survey_note`), not a Local Network privacy blame and not nothing (the
+/// timeouts of a hotspot); a sandbox that refused every connect is still said as the sandbox.
+/// Elsewhere it is [`fleet_note`]'s.
+pub(crate) fn fleet_note_at(
+    peers: &[PeerSurvey],
+    place: Option<&aterm_netplace::Place>,
+    words: &aterm_netplace::words::Words<'_>,
+) -> Option<String> {
+    let note = fleet_note(peers);
+    if note == Some(SANDBOX_NOTE) {
+        return note.map(str::to_owned);
+    }
+    let dialled = peers.iter().any(|peer| peer.fault != PeerFault::NotDialled);
+    let answered = peers.iter().any(|peer| peer.answer.is_ok());
+    if dialled
+        && !answered
+        && let Some(away) = place.and_then(|place| aterm_netplace::words::survey_note(place, words))
+    {
+        return Some(away);
+    }
+    note.map(str::to_owned)
+}
 
 /// Return a shared diagnostic note if all dialled peers failed with the same local fault.
 pub(crate) fn fleet_note(peers: &[PeerSurvey]) -> Option<&'static str> {

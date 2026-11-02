@@ -662,13 +662,8 @@ impl PanelTrack {
     /// A hash of what the dots look like: place, state, blindness, and level and saturation in steps of 1/32.
     #[must_use]
     pub fn fingerprint(&self) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut mix = |v: u64| {
-            for b in v.to_le_bytes() {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        };
+        let mut h = aterm_hash::FNV64_OFFSET;
+        let mut mix = |v: u64| h = aterm_hash::fnv1a_64_u64_le(h, v);
         for dot in self.dots() {
             mix(u64::from(dot.row));
             mix(u64::from(dot.bullet.start));

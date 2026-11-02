@@ -13,7 +13,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 7, "0.7");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 8, "0.8");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -1057,11 +1057,33 @@ fn is_clock(word: &str) -> bool {
     })
 }
 
-fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
+fn strip_model_failed(message: &str) -> Option<&str> {
+    message
+        .strip_prefix(const { crate::anchor!("muse.wall.model_failed") })
+        .or_else(|| {
+            // Its own tries spent (1.4.13): `model failed after 1 attempt: …` or
+            // `model failed after 10 attempts: …`.
+            let after =
+                message.strip_prefix(const { crate::anchor!("muse.wall.model_failed_after") })?;
+            let (n, rest) = after.split_once(' ')?;
+            let tries = n.parse::<u32>().ok()?;
+            if tries == 1 {
+                rest.strip_prefix(const { crate::anchor!("muse.wall.model_failed_attempt") })
+            } else {
+                rest.strip_prefix(const { crate::anchor!("muse.wall.model_failed_attempts") })
+            }
+        })
+}
+
+fn is_auth_wall(message: &str) -> bool {
     let auth = [
         crate::anchor!("muse.wall.key"),
         crate::anchor!("muse.wall.saved_key"),
         crate::anchor!("muse.wall.no_login"),
+        crate::anchor!("muse.wall.saved_login"),
+        crate::anchor!("muse.wall.still_unauthorized"),
+        crate::anchor!("muse.wall.not_logged_in_cli"),
+        crate::anchor!("muse.wall.not_logged_in_key"),
         crate::anchor!("muse.wall.payment_api"),
         crate::anchor!("muse.wall.payment_muse"),
         crate::anchor!("muse.wall.onboarding"),
@@ -1073,7 +1095,11 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
         crate::anchor!("muse.wall.canceled"),
         crate::anchor!("muse.wall.unreachable"),
     ];
-    if auth.contains(&message) || lost.iter().any(|l| message.starts_with(l)) {
+    auth.contains(&message) || lost.iter().any(|l| message.starts_with(l))
+}
+
+fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
+    if is_auth_wall(message) {
         return Some((WallKind::Auth, None));
     }
     if let Some(rest) = message.strip_prefix(const { crate::anchor!("muse.wall.usage") }) {
@@ -1113,16 +1139,10 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
             .filter(|at| !at.is_empty());
         return Some((WallKind::UsageSession, reset));
     }
-    let rest = message
-        .strip_prefix(const { crate::anchor!("muse.wall.model_failed") })
-        .or_else(|| {
-            // Its own tries spent (1.4.13): `model failed after 10 attempts: …`.
-            let after =
-                message.strip_prefix(const { crate::anchor!("muse.wall.model_failed_after") })?;
-            let (n, rest) = after.split_once(' ')?;
-            n.parse::<u32>().ok()?;
-            rest.strip_prefix(const { crate::anchor!("muse.wall.model_failed_attempts") })
-        })?;
+    let rest = strip_model_failed(message)?;
+    if is_auth_wall(rest) {
+        return Some((WallKind::Auth, None));
+    }
     let code = rest
         .strip_prefix(const { crate::anchor!("muse.wall.api_error") })
         .and_then(|r| r.get(..4))
@@ -1158,7 +1178,8 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
 /// Extracts Muse Code's own login-remedy clause from an authentication wall message.
 #[must_use]
 pub fn remedy(message: &str) -> Option<String> {
-    let m = crate::text::trim(message);
+    let trimmed = crate::text::trim(message);
+    let m = strip_model_failed(trimmed).unwrap_or(trimmed);
     if m == const { crate::anchor!("muse.wall.key") } {
         let (_, r) = m.split_once(" — ")?;
         return Some(
@@ -1169,8 +1190,28 @@ pub fn remedy(message: &str) -> Option<String> {
     if m == const { crate::anchor!("muse.wall.saved_key") } {
         return m.split_once(" — ").map(|(_, r)| r.to_string());
     }
-    if m == const { crate::anchor!("muse.wall.no_login") } {
+    if [
+        crate::anchor!("muse.wall.no_login"),
+        crate::anchor!("muse.wall.still_unauthorized"),
+    ]
+    .contains(&m)
+    {
         return m.split_once("; ").map(|(_, r)| r.to_string());
+    }
+    if [
+        crate::anchor!("muse.wall.not_logged_in_cli"),
+        crate::anchor!("muse.wall.not_logged_in_key"),
+    ]
+    .contains(&m)
+    {
+        return m.split_once(": ").map(|(_, r)| r.to_string());
+    }
+    if m == const { crate::anchor!("muse.wall.saved_login") } {
+        let (_, r) = m.split_once(". ")?;
+        let r = r.trim_end_matches('.');
+        let mut chars = r.chars();
+        let first = chars.next()?;
+        return Some(format!("{}{}", first.to_lowercase(), chars.as_str()));
     }
     if [
         crate::anchor!("muse.wall.payment_api"),

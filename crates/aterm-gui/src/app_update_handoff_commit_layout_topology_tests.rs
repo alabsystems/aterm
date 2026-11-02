@@ -51,6 +51,9 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
                 lost: None,
                 held: false,
                 holds: Vec::new(),
+                claim_ended: false,
+                not_claim_worker: false,
+                claim_worker: None,
             })),
             focused_path: Vec::new(),
             zoomed: false,
@@ -182,6 +185,9 @@ fn a_real_topology_change_still_rejects_the_commit() {
             lost: None,
             held: false,
             holds: Vec::new(),
+            claim_ended: false,
+            not_claim_worker: false,
+            claim_worker: None,
         }));
     assert_ne!(
         commit_layout_topology(&committed),

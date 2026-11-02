@@ -41,6 +41,10 @@ aterm-codec = { workspace = true }
 # The `edit` request, its ticket replies and `await edit` (`amacs_protocol`), for the `amacs`
 # client's exchanges: one grammar with the server, and no editor engine in this crate's graph.
 amacs-protocol = { workspace = true }
+# This Mac's network place: a fleet read no peer answered while it is on another network says
+# where it is (`survey::fleet_note_at`), in the words every reporter uses. First-party, low (it
+# depends on no aterm-ctl).
+aterm-netplace = { workspace = true }
 
 # The census's process table (`kproc::records`), read in-process instead of running `ps`.
 # First-party, and so is each crate it brings (its `libc` is aterm-libc).

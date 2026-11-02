@@ -20,6 +20,12 @@ pub const EXECUTION_CONTEXT_UNREAD_FINDING: &str = "Account execution context is
 pub const EXECUTION_RECORDS_UNREAD_FINDING: &str = "Account execution records are unreadable";
 pub const EXECUTION_REFRESH_FINDING: &str = "Awaiting a fresh account execution check";
 pub const EXECUTION_HISTORY_PREFIX: &str = "Previous execution check: ";
+pub const OBSERVER_BUSY_FINDING: &str = "Account observer is busy; current recovery is unknown";
+pub const RECOVERY_HISTORY_PREFIX: &str = "Previous recovery observation: ";
+pub const SESSION_AUTOPILOT_OFF_FINDING: &str =
+    "Session Autopilot is off; no further account recovery is scheduled";
+pub const RECOVERY_RESUME_FINDING: &str =
+    "Awaiting a fresh account recovery decision after Autopilot Off";
 
 #[cfg(test)]
 #[path = "account_progress_ranking_tests.rs"]
@@ -44,6 +50,8 @@ pub fn account_progress_ranking_environment() {}
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ProgressPhase {
     Unknown,
+    /// Selection is paused, or awaits a decision after its supervisor resumed.
+    Paused,
     Watching,
     Disabled,
     Limited,
@@ -62,6 +70,21 @@ pub enum ProgressPhase {
     },
 }
 
+/// A blocker observed for the session's own account, without account or machine labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OwnClaimBlocker {
+    HeldElsewhere { until: i64 },
+    CannotRecord,
+}
+
+/// Claim evidence from the same retained decision as the account inventory.
+/// It grants no current execution or switching authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OwnClaimFinding {
+    pub blocker: OwnClaimBlocker,
+    pub pinned: bool,
+}
+
 /// An observed session decision, not an instruction to activate credentials.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AccountProgress {
@@ -73,6 +96,7 @@ pub struct AccountProgress {
     pub wall: Option<String>,
     pub details: Vec<String>,
     pub next_at: Option<i64>,
+    pub own_claim: Option<OwnClaimFinding>,
 }
 
 impl AccountProgress {
@@ -87,6 +111,7 @@ impl AccountProgress {
             wall: None,
             details: Vec::new(),
             next_at: None,
+            own_claim: None,
         }
     }
 }
@@ -260,7 +285,12 @@ pub fn enrich_inventory_with_identity(
     // The other rows' reasons say only why none can take the session; why it may not keep its own
     // account leads while it waits, as that is why it waits (a turn end's yield,
     // docs/DESIGN-fluid-swarm-2026-10-28.md F19).
-    if let Some(line) = own_claim_note(roster, state, enrolled, me, progress.observed_at) {
+    progress.own_claim = None;
+    if let Some((finding, line)) = own_claim_note(roster, state, enrolled, me, progress.observed_at)
+    {
+        if progress.account.as_deref() == me.label() {
+            progress.own_claim = Some(finding);
+        }
         if progress.phase == ProgressPhase::Waiting {
             progress.details.insert(0, line);
         } else {
@@ -283,17 +313,23 @@ fn own_claim_note(
     enrolled: &BTreeSet<String>,
     me: &Me<'_>,
     now: i64,
-) -> Option<String> {
+) -> Option<(OwnClaimFinding, String)> {
     let label = me.label()?;
-    let why = match state.lease_verdict(label, now) {
-        Err(accounts::WhyNot::LeasedElsewhere { until }) => format!(
+    let blocker = match state.lease_verdict(label, now) {
+        Err(accounts::WhyNot::LeasedElsewhere { until }) => {
+            OwnClaimBlocker::HeldElsewhere { until }
+        }
+        Err(accounts::WhyNot::Unclaimed) => OwnClaimBlocker::CannotRecord,
+        _ => return None,
+    };
+    let why = match blocker {
+        OwnClaimBlocker::HeldElsewhere { until } => format!(
             "another Mac holds it until {}",
             super::usage::rfc3339_utc(until)
         ),
-        Err(accounts::WhyNot::Unclaimed) => "this Mac cannot claim it: it cannot record account \
-                                             claims, and this is not one of its home accounts"
+        OwnClaimBlocker::CannotRecord => "this Mac cannot claim it: it cannot record account \
+                                        claims, and this is not one of its home accounts"
             .to_owned(),
-        _ => return None,
     };
     let pin = state
         .active
@@ -304,13 +340,18 @@ fn own_claim_note(
             let here = enrolled.contains(&row.label);
             accounts::condition(row, state, here, now).runs()
         });
-    Some(match pin {
+    let finding = OwnClaimFinding {
+        blocker,
+        pinned: pin.is_some(),
+    };
+    let line = match pin {
         Some(row) => format!(
             "{label}: {why}; the pin on {} keeps the session from moving",
             row.label
         ),
         None => format!("{label}: {why}"),
-    })
+    };
+    Some((finding, line))
 }
 
 #[cfg(test)]
@@ -729,8 +770,9 @@ mod tests {
             NOW - 60,
         );
         assert!(!walled.is_empty());
-        let read = |state: &State, phase: ProgressPhase| {
-            let mut progress = AccountProgress::unknown(NOW);
+        let observe = |state: &State, phase: ProgressPhase, now| {
+            let mut progress = AccountProgress::unknown(now);
+            progress.account = Some("pool-a".into());
             progress.phase = phase;
             enrich_inventory(
                 &mut progress,
@@ -741,13 +783,21 @@ mod tests {
                 &me,
                 Some(&Point::TurnEnd),
             );
-            progress.details
+            progress
         };
+        let read = |state: &State, phase| observe(state, phase, NOW).details;
         let label = |line: &String| line.split(':').next().map(str::to_owned);
         let first = |details: &[String]| details.first().and_then(label);
 
         let waits = read(&unclaimed, ProgressPhase::Waiting);
         assert_eq!(first(&waits), Some("pool-a".to_string()));
+        assert_eq!(
+            observe(&unclaimed, ProgressPhase::Waiting, NOW).own_claim,
+            Some(OwnClaimFinding {
+                blocker: OwnClaimBlocker::CannotRecord,
+                pinned: false,
+            })
+        );
         assert!(
             waits
                 .iter()
@@ -762,6 +812,12 @@ mod tests {
         };
         let held = read(&pinned, ProgressPhase::Waiting);
         assert!(
+            observe(&pinned, ProgressPhase::Waiting, NOW)
+                .own_claim
+                .unwrap()
+                .pinned
+        );
+        assert!(
             held[0]
                 .strip_prefix(waits[0].as_str())
                 .is_some_and(|rest| rest.contains("pool-a")),
@@ -772,6 +828,20 @@ mod tests {
         senior.unrecorded = false;
         senior.note_lease("pool-a", "1c1d", NOW + 3600, NOW - 60);
         let elsewhere = read(&senior, ProgressPhase::Waiting);
+        let captured = observe(&senior, ProgressPhase::Waiting, NOW);
+        assert_eq!(
+            captured.own_claim,
+            Some(OwnClaimFinding {
+                blocker: OwnClaimBlocker::HeldElsewhere { until: NOW + 3600 },
+                pinned: false,
+            })
+        );
+        assert_eq!(captured.observed_at, NOW);
+        assert!(
+            observe(&senior, ProgressPhase::Waiting, NOW + 3600)
+                .own_claim
+                .is_none()
+        );
         assert_eq!(first(&elsewhere), Some("pool-a".to_string()));
         assert!(elsewhere[0].contains(&super::super::usage::rfc3339_utc(NOW + 3600)));
 
@@ -787,6 +857,11 @@ mod tests {
                 .all(|line| label(line).as_deref() != Some("pool-a")),
             "claims this Mac records leave its own account unremarked"
         );
+        assert!(
+            observe(&recorded, ProgressPhase::Waiting, NOW)
+                .own_claim
+                .is_none()
+        );
 
         let mut prepared = unclaimed.clone();
         prepared.prepared_accounts.insert("pool-a".to_string());
@@ -797,5 +872,28 @@ mod tests {
                 .all(|line| label(line).as_deref() != Some("pool-a")),
             "a preparation-only account is the execution gate's to report: {gated:?}"
         );
+        assert!(
+            observe(&prepared, ProgressPhase::Waiting, NOW)
+                .own_claim
+                .is_none()
+        );
+
+        for account in [None, Some("main")] {
+            let mut changed = captured.clone();
+            changed.account = account.map(str::to_owned);
+            enrich_inventory(
+                &mut changed,
+                &roster,
+                &senior,
+                &Logins::default(),
+                &enrolled,
+                &me,
+                Some(&Point::TurnEnd),
+            );
+            assert!(
+                changed.own_claim.is_none(),
+                "a stale binding cannot retain the own-account finding"
+            );
+        }
     }
 }

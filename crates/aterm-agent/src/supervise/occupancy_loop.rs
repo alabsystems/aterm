@@ -737,7 +737,8 @@ impl<C: Ctl> Session<'_, C> {
     /// THE RULES' VERDICTS at a break at `now_ms` on the open `hold`, and the wake the book's head
     /// opens ([`rules::wake_opens`]): the book as the loop last read it, the wake episodes its
     /// facts told, and the break's pick ranked (D6) on a recording with slice 2's doors
-    /// (`Fx::slice2_recorded`), slice 1's pick otherwise.
+    /// (`Fx::slice2_recorded`), slice 1's pick otherwise; `wait-nudge` names `wake` as the
+    /// recording's build typed it (`[setup] occupancy.nudge_wake`, [`WakeSight::nudge_wake`]).
     pub(super) fn break_verdicts(
         &self,
         reading: &OccupancyReading,
@@ -761,6 +762,7 @@ impl<C: Ctl> Session<'_, C> {
             wall_ms: self.hold_wall_ms(now_ms),
             told: &told,
             ranked: self.fx.slice2_recorded(),
+            nudge_wake: self.setup.occupancy_nudge_wake,
         };
         let verdicts = rules::decide(
             reading,

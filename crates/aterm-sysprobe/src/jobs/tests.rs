@@ -1016,27 +1016,101 @@ fn the_tail_check_reads_only_the_appended_bytes() {
     );
 }
 
+#[cfg(unix)]
+fn open_test_pty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let ensure_cloexec = |fd: &OwnedFd| {
+        // SAFETY: `fd` is an open owned descriptor; `F_GETFD`/`F_SETFD` only touch fd flags.
+        unsafe {
+            let cur = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+            assert!(cur != -1, "F_GETFD: {}", std::io::Error::last_os_error());
+            if cur & libc::FD_CLOEXEC == 0 {
+                assert_eq!(
+                    libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, cur | libc::FD_CLOEXEC),
+                    0,
+                    "F_SETFD: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    };
+
+    let mut flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let mut redrives = 0u32;
+    let master = loop {
+        // SAFETY: `posix_openpt` takes only a flag word and returns a fresh fd or -1.
+        let fd = unsafe { libc::posix_openpt(flags) };
+        if fd >= 0 {
+            // SAFETY: `posix_openpt` returned a fresh descriptor owned only here.
+            break unsafe { OwnedFd::from_raw_fd(fd) };
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINVAL) if flags & libc::O_CLOEXEC != 0 => flags &= !libc::O_CLOEXEC,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Some(-6) if redrives < 8 => redrives += 1,
+            _ => panic!("posix_openpt: {err}"),
+        }
+    };
+    ensure_cloexec(&master);
+    // SAFETY: `master` is a live ptmx descriptor; `grantpt` and `unlockpt` take no pointers.
+    unsafe {
+        assert_eq!(
+            libc::grantpt(master.as_raw_fd()),
+            0,
+            "grantpt: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::unlockpt(master.as_raw_fd()),
+            0,
+            "unlockpt: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut buf = [0 as libc::c_char; 128];
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    // SAFETY: `TIOCPTYGNAME` writes at most 128 NUL-terminated bytes into `buf`.
+    let rc = unsafe {
+        libc::ioctl(
+            master.as_raw_fd(),
+            libc::TIOCPTYGNAME as libc::c_ulong,
+            buf.as_mut_ptr(),
+        )
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    // SAFETY: `buf` is a 128-byte buffer and `ptsname_r` takes its exact length.
+    let rc = unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+    assert_eq!(
+        rc,
+        0,
+        "pts name ({rc}): {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `buf` is NUL-terminated on `rc == 0`; `open` returns a fresh fd or -1.
+    let s = unsafe {
+        libc::open(
+            buf.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    assert!(s >= 0, "open follower: {}", std::io::Error::last_os_error());
+    // SAFETY: `open` returned a fresh descriptor owned only here.
+    let follower = unsafe { OwnedFd::from_raw_fd(s) };
+    ensure_cloexec(&follower);
+    (master, follower)
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn this_process_reads_itself_with_threads_counters_and_descriptors() {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsRawFd;
     let mut fds = [0 as std::ffi::c_int; 2];
     // SAFETY: two writable descriptors' room.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    let (mut m, mut s) = (-1, -1);
-    // SAFETY: two writable ints; no name, mode or size is asked for.
-    let rc = unsafe {
-        libc::openpty(
-            &raw mut m,
-            &raw mut s,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
-    // SAFETY: `openpty` opened both, and nothing else owns them.
-    let (_master, follower) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+    let (_master, follower) = open_test_pty();
     let mut reader = JobsReader::new();
     let me = std::process::id();
     let f = reader
@@ -1785,21 +1859,8 @@ fn a_member_reading_carries_its_program_check() {
 #[cfg(unix)]
 #[test]
 fn a_terminal_whose_queue_cannot_be_counted_gives_no_word() {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let (mut m, mut s) = (-1, -1);
-    // SAFETY: two writable ints; no name, mode or size is asked for.
-    let rc = unsafe {
-        libc::openpty(
-            &raw mut m,
-            &raw mut s,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
-    // SAFETY: `openpty` opened both, and nothing else owns them.
-    let (_master, follower) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+    use std::os::fd::AsRawFd;
+    let (_master, follower) = open_test_pty();
     let fd = follower.as_raw_fd();
     assert_eq!(
         word_of(fd, |at| {
@@ -1822,22 +1883,9 @@ fn a_terminal_whose_queue_cannot_be_counted_gives_no_word() {
 #[cfg(unix)]
 #[test]
 fn a_ptys_word_is_read_through_its_device_node() {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
-    let (mut m, mut s) = (-1, -1);
-    // SAFETY: two writable ints; no name, mode or size is asked for.
-    let rc = unsafe {
-        libc::openpty(
-            &raw mut m,
-            &raw mut s,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
-    // SAFETY: `openpty` opened both, and nothing else owns them.
-    let (master, follower) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+    let (master, follower) = open_test_pty();
     let node = std::fs::File::from(follower.try_clone().expect("dup"));
     let dev = u32::try_from(node.metadata().expect("fstat").rdev()).expect("a 32-bit device");
     let me = std::process::id();

@@ -255,6 +255,7 @@ fn completed(report: Report, peer: [u8; 48]) -> RepairRound {
     RepairRound {
         target: None,
         actor: Some(peer),
+        connection: None,
         exchange_started: true,
         cancelled: false,
         phase: Some(crate::control::Phase::ControlComplete),

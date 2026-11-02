@@ -110,10 +110,16 @@ impl Grid {
     /// changing retention settings or the absolute numbering of the live frame.
     /// Returns false if an in-progress reflow or a stored-prefix failure prevents
     /// the trim; the caller must discard this speculative replay in that case.
+    ///
+    /// From then on a drain of the staged rows may hold them staged instead
+    /// (`Grid::holds_replay_history`): they are the oldest rows, which this trim
+    /// discards first, so storing them would only materialize and compress rows
+    /// the next trim drops.
     pub fn trim_replay_history(&mut self, keep: usize) -> bool {
         if self.storage.scrollback_detached_for_reflow {
             return false;
         }
+        self.storage.replay_trim = keep;
         let mut remove = self.scrollback_lines().saturating_sub(keep);
         if remove == 0 {
             return true;

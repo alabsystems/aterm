@@ -263,16 +263,16 @@ impl Presentation {
     }
 }
 
-/// 64-bit FNV-1a hasher.
+/// 64-bit FNV-1a hasher, a byte at a time through `aterm_hash`'s step.
 pub(crate) struct Fnv(u64);
 
 impl Fnv {
     pub(crate) const fn new() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
+        Self(aterm_hash::FNV64_OFFSET)
     }
 
     pub(crate) fn byte(&mut self, b: u8) {
-        self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        self.0 = aterm_hash::fnv_mix_u64(self.0, u64::from(b));
     }
 
     pub(crate) fn num(&mut self, n: u64) {
@@ -1391,6 +1391,24 @@ fn place_capsules(
 pub(crate) mod tests {
     use super::*;
     use crate::model::Decision;
+
+    /// Bytes, words and strings (each with its 0 ending) reach [`Fnv`] as `aterm_hash` folds them.
+    #[test]
+    fn the_band_hasher_folds_as_aterm_hash_does() {
+        let mut fnv = Fnv::new();
+        assert_eq!(fnv.0, aterm_hash::FNV64_OFFSET);
+        fnv.byte(0x7f);
+        let mut want = aterm_hash::fnv1a_64(&[0x7f]);
+        assert_eq!(fnv.0, want);
+        for word in [0, 1, u64::MAX, 0x0102_0304_0506_0708] {
+            fnv.num(word);
+            want = aterm_hash::fnv1a_64_u64_le(want, word);
+            assert_eq!(fnv.0, want, "{word:#x}");
+        }
+        fnv.str("é a");
+        want = aterm_hash::fnv1a_64_extend(want, "é a\0".as_bytes());
+        assert_eq!(fnv.0, want);
+    }
 
     /// Paint a layout's words into exactly `cols` cells the way the host will.
     pub(crate) fn render(row: &RowLayout, cols: usize) -> String {

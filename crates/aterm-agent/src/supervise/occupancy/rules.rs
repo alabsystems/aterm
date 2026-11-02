@@ -446,6 +446,11 @@ pub struct WakeSight<'a> {
     /// is [`Verdict::Outranked`]. Else slice 1's pick: the first due in [`RuleId::ALL`]'s order
     /// goes, and the session's pace holds the rest.
     pub ranked: bool,
+    /// `wait-nudge` names `wake` (§3.2: it never names a verb before that verb ships): every live
+    /// loop's line does, and a replay's where its header says its build's did (`[setup]
+    /// occupancy.nudge_wake`). Else slice 1's line, which every build before typed, slice 2's
+    /// doors in its recording or not ([`templates::wait_nudge_slice1`]).
+    pub nudge_wake: bool,
 }
 
 fn never_told(_: u64) -> bool {
@@ -464,6 +469,7 @@ impl WakeSight<'static> {
             wall_ms: 0,
             told: &never_told,
             ranked: false,
+            nudge_wake: false,
         }
     }
 }
@@ -636,7 +642,7 @@ pub fn decide(
                 Some(_) if spent(rule, books, now_ms) => {
                     return (rule, Verdict::Spent);
                 }
-                Some(hold) => line(rule, r, hold, now_ms),
+                Some(hold) => line_as(rule, r, hold, now_ms, wakes.nudge_wake),
             },
         };
         let verdict = match opened {
@@ -691,16 +697,30 @@ fn wake_line(wake: &WakeSeen) -> FactLine {
     templates::wake(wake.ord, wake.class, &wake.kinds, None, None)
 }
 
-/// `rule`'s line on `hold` at `now_ms`, where the machine lets it go (`hold-room`'s terms on the
+/// `rule`'s line on `hold` at `now_ms` (`wait-nudge`'s naming `wake`, as a host that serves it
+/// types it), where the machine lets it go (`hold-room`'s terms on the
 /// board, [`HOLD_ROOM_SLOTS`], [`HOLD_ROOM_MACHINE`] and `disk=ok`, in a session whose jobs held
 /// a build slot during the hold), else `None`. The caller judged the rest
 /// ([`holds_but_machine`]): [`decide`] on the board's look, and the door's write again on the
 /// board its host re-read for it, whose figures the line then types.
 #[must_use]
 pub fn line(rule: RuleId, r: &OccupancyReading, hold: HoldSeen, now_ms: i64) -> Option<FactLine> {
+    line_as(rule, r, hold, now_ms, true)
+}
+
+/// `rule`'s line as [`line`] makes it, with `wait-nudge`'s as slice 1 typed it where the
+/// recording's build named no `wake` in it (`!nudge_wake`, [`WakeSight::nudge_wake`]).
+fn line_as(
+    rule: RuleId,
+    r: &OccupancyReading,
+    hold: HoldSeen,
+    now_ms: i64,
+    nudge_wake: bool,
+) -> Option<FactLine> {
     let held_ms = now_ms.saturating_sub(hold.since_ms);
     match rule {
-        RuleId::WaitNudge => Some(templates::wait_nudge(held_ms)),
+        RuleId::WaitNudge if nudge_wake => Some(templates::wait_nudge(held_ms)),
+        RuleId::WaitNudge => Some(templates::wait_nudge_slice1(held_ms)),
         RuleId::HoldRoom => {
             if !r.fresh()
                 || r.room != Some(true)

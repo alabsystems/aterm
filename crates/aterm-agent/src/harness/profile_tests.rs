@@ -2259,8 +2259,13 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
             .take();
     }
 
+    // Measured on `agy 1.4.12`: `GEMINI_API_KEY` / `GOOGLE_API_KEY` in `env` without
+    // `"modelProvider": "gemini"` still uses Google OAuth sign-in, whereas `"modelProvider":
+    // "gemini"` (in `settings.json` or `--settings`), `AGY_LLM_GATEWAY_URL`, Vertex AI env, or a
+    // newer non-consumer `applyAuthResult:` in `cli.log` leaves OAuth subscription `None`.
     let mut keyed = env.clone();
     keyed.push("GEMINI_API_KEY=secret".to_owned());
+    keyed.push("GOOGLE_API_KEY=secret".to_owned());
     assert_eq!(
         agy_subscription_for(
             &argv,
@@ -2269,9 +2274,115 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
             &SubscriptionDisplay::default(),
             None,
             now,
+        )
+        .and_then(|s| s.email),
+        Some("interviewstreetuser@gmail.com".to_owned()),
+        "API keys in env without modelProvider keep Google OAuth sign-in"
+    );
+
+    let mut gw_env = env.clone();
+    gw_env.push("AGY_LLM_GATEWAY_URL=http://127.0.0.1:4100".to_owned());
+    assert_eq!(
+        agy_subscription_for(
+            &argv,
+            &gw_env,
+            &home,
+            &SubscriptionDisplay::default(),
+            None,
+            now
         ),
         None
     );
+    let mut vertex_env = env.clone();
+    vertex_env.push("GOOGLE_GENAI_USE_VERTEXAI=true".to_owned());
+    assert_eq!(
+        agy_subscription_for(
+            &argv,
+            &vertex_env,
+            &home,
+            &SubscriptionDisplay::default(),
+            None,
+            now,
+        ),
+        None
+    );
+
+    std::fs::write(
+        cfg.join("settings.json"),
+        "{\"modelProvider\":\"gemini\"}\n",
+    )
+    .expect("write gemini settings");
+    assert_eq!(
+        agy_subscription_for(
+            &argv,
+            &keyed,
+            &home,
+            &SubscriptionDisplay::default(),
+            None,
+            now
+        ),
+        None,
+        "modelProvider: gemini in settings.json selects Gemini API rather than OAuth"
+    );
+    let cleared_argv = vec![
+        argv[0].clone(),
+        "--settings={\"modelProvider\":null}".to_owned(),
+    ];
+    assert_eq!(
+        agy_subscription_for(
+            &cleared_argv,
+            &keyed,
+            &home,
+            &SubscriptionDisplay::default(),
+            None,
+            now,
+        )
+        .and_then(|s| s.email),
+        Some("interviewstreetuser@gmail.com".to_owned()),
+        "--settings clearing modelProvider restores Google OAuth sign-in"
+    );
+    std::fs::remove_file(cfg.join("settings.json")).expect("remove gemini settings");
+
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    std::fs::write(
+        work.join("rel-ovr.json"),
+        "{\"modelProvider\":\"gemini\"}\n",
+    )
+    .expect("write relative override");
+    let rel_argv = vec![argv[0].clone(), "--settings=rel-ovr.json".to_owned()];
+    assert_eq!(
+        agy_subscription_in_dir(
+            &rel_argv,
+            &keyed,
+            Some(&work),
+            &home,
+            &SubscriptionDisplay::default(),
+            None,
+            now,
+        ),
+        None,
+        "relative --settings file selecting modelProvider: gemini suppresses OAuth subscription"
+    );
+
+    // A >128 KiB `cli.log` whose head had `authMethod=consumer` and whose tail has a newer
+    // `authMethod=gemini_api_key` must neither fall back to `cli.log`'s head nor keep `prev.email`.
+    let mut big_log = log_bytes.to_vec();
+    big_log.extend(std::iter::repeat_n(b'x', 140 * 1024));
+    big_log.extend_from_slice(
+        b"\nI1022 09:40:00.000000 375 server_oauth.go:224] applyAuthResult: email=, authMethod=gemini_api_key, quotaProject=\n",
+    );
+    std::fs::write(cfg.join("cli.log"), &big_log).expect("write big non-consumer cli.log");
+    let stale_prev = SubscriptionDisplay {
+        email: Some("interviewstreetuser@gmail.com".to_owned()),
+        ..SubscriptionDisplay::default()
+    };
+    assert_eq!(
+        agy_subscription_for(&argv, &env, &home, &stale_prev, None, now),
+        None,
+        "non-consumer applyAuthResult at tail suppresses both head fallback and prev.email"
+    );
+    std::fs::write(cfg.join("cli.log"), log_bytes).expect("restore cli.log after big log test");
 
     // An expired WeeklyFigure on `prev` must not leave stale `prev.weekly` text when no live
     // figure replaces it, whereas an on-screen `/usage` reading (`weekly_figure: None`) stays

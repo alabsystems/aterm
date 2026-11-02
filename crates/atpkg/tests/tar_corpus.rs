@@ -101,18 +101,14 @@ fn walk_mine(bytes: &[u8]) -> Walk {
 }
 
 thread_local! {
-    static GOLDEN: Cell<u64> = const { Cell::new(0xcbf2_9ce4_8422_2325) };
+    static GOLDEN: Cell<u64> = const { Cell::new(aterm_hash::FNV64_OFFSET) };
 }
 
 /// Fold `bytes` (and a separator) into this test thread's digest.
 fn feed(bytes: &[u8]) {
     GOLDEN.with(|g| {
-        let mut h = g.get();
-        for &b in bytes.iter().chain(&[0xff]) {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0100_0000_01b3);
-        }
-        g.set(h);
+        let h = aterm_hash::fnv1a_64_extend(g.get(), bytes);
+        g.set(aterm_hash::fnv1a_64_extend(h, &[0xff]));
     });
 }
 
@@ -180,7 +176,7 @@ impl Batch {
 /// Assert this thread's digest, then reset it.
 #[track_caller]
 fn pin(expected: &str) {
-    let got = GOLDEN.with(|g| g.replace(0xcbf2_9ce4_8422_2325));
+    let got = GOLDEN.with(|g| g.replace(aterm_hash::FNV64_OFFSET));
     assert_eq!(format!("{got:016x}"), expected, "the pinned corpus changed");
 }
 

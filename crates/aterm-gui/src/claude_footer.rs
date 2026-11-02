@@ -3229,9 +3229,10 @@ fn resolve_facts_at_with_cwd(
             if prog == aterm_phase::Program::Agy
                 && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
             {
-                if let Some(read) = aterm_agent::harness::profile::agy_subscription_for(
+                if let Some(read) = aterm_agent::harness::profile::agy_subscription_in_dir(
                     &args.argv,
                     &args.env,
+                    cwd.as_deref(),
                     home,
                     &sub,
                     prev_card_model.as_deref().or(model.as_deref()),
@@ -3272,6 +3273,7 @@ fn resolve_facts_at_with_cwd(
                 }),
                 account: None,
                 account_progress: None,
+                account_progress_busy: false,
                 top_effort: None,
                 off: footer::FactMask::default(),
                 subscription: Some(sub),
@@ -3815,6 +3817,7 @@ pub(crate) fn fingerprint(
         owner,
         account,
         account_progress,
+        account_progress_busy,
         top_effort: _,
         off: _,
         subscription,
@@ -3841,6 +3844,7 @@ pub(crate) fn fingerprint(
     (model_open, effort_open, effort_for, owner, account, off).hash(&mut h);
     subscription.hash(&mut h);
     account_progress.hash(&mut h);
+    account_progress_busy.hash(&mut h);
     context.hash(&mut h);
     glance.hash(&mut h);
     if usage {
@@ -6411,7 +6415,7 @@ struct Tail {
 
 /// The cache term of a tail's `cells` ([`Tail::term`]).
 fn tail_term(cells: &[RenderCell]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    let mut h = aterm_hash::FNV64_OFFSET;
     for c in cells {
         for word in [
             u64::from(c.ch),
@@ -6419,7 +6423,7 @@ fn tail_term(cells: &[RenderCell]) -> u64 {
             u64::from(pack_rgb(c.bg)),
             u64::from(c.bold) | u64::from(c.italic) << 1 | (c.underline as u64) << 2,
         ] {
-            h = (h ^ word).wrapping_mul(0x0000_0100_0000_01b3);
+            h = aterm_hash::fnv_mix_u64(h, word);
         }
     }
     h | 1
@@ -15690,6 +15694,24 @@ mod tests {
         let main = app.claude_footer_fp(wid, &plan);
         publish(&app, session, on("work-2"));
         assert_ne!(app.claude_footer_fp(wid, &plan), main);
+    }
+
+    #[test]
+    fn progress_read_availability_moves_the_repaint_key_without_changing_history() {
+        let mut facts = facts();
+        facts.account_progress =
+            Some(aterm_agent::harness::account_progress::AccountProgress::unknown(100));
+        let retained = facts.account_progress.clone();
+        for usage in [false, true] {
+            let key =
+                |facts: &FooterFacts| fingerprint(Some(facts), None, usage, FactMask::default());
+            let before = key(&facts);
+            facts.account_progress_busy = true;
+            assert_ne!(key(&facts), before);
+            assert_eq!(facts.account_progress, retained);
+            facts.account_progress_busy = false;
+            assert_eq!(key(&facts), before);
+        }
     }
 
     #[test]

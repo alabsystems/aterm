@@ -167,19 +167,23 @@
 //!   marks (Ghostty's `rowWillBeShifted` with `clearGrapheme`; xterm leaves the
 //!   halves torn); a narrowing resize that cuts a spacer off leaves its lead a
 //!   default blank.
-//! * **Grapheme clusters, in part**: a zero-width code point
-//!   ([`is_combining_mark`]: a combining mark, a variation selector, the
-//!   zero-width (non-)joiner or another format control) attaches, up to
-//!   [`MAX_COMBINING`] per cell, onto the preceding glyph on the row (the lead
-//!   of a wide one, or the current cell at column 0 / left margin) without
-//!   advancing the cursor, and so does a glyph aterm joins to the cluster
-//!   before it: a skin-tone modifier after a wide glyph, the second regional
-//!   indicator of a flag, and a glyph other than ASCII after an attached
-//!   `U+200D`. aterm goes further (a VS16 widens a narrow emoji base and a VS15
-//!   narrows a wide one, a skin-tone modifier joins only an emoji modifier
-//!   base, and a mark at column 0 of a wrapped row joins the glyph that ends
-//!   the row above); the fold models none of that, and aterm's differential
-//!   oracle generates none of it.
+//! * **Grapheme clusters**: a zero-width code point ([`is_combining_mark`]: a
+//!   combining mark, a variation selector, the zero-width (non-)joiner or
+//!   another format control) attaches, up to [`MAX_COMBINING`] per cell, without
+//!   advancing the cursor: to the glyph parked under a pending wrap, else to the
+//!   one left of the cursor, a wide glyph's lead rather than its spacer. At
+//!   column 0 or the left margin none precedes it, even on a row that continues
+//!   the one above, so it takes the cursor's own cell (xterm's `char_was_written`
+//!   cleared by CR or a motion, Alacritty), the lead if that cell is a spacer.
+//!   After a motion elsewhere the cell left of the cursor is still the one, as in
+//!   aterm and Ghostty (xterm takes the cursor's own there). A glyph aterm joins to
+//!   the cluster before it attaches the same way: a skin-tone modifier after a wide
+//!   emoji modifier base, the second regional indicator of a flag, and a glyph
+//!   other than ASCII after a `U+200D` that was the last thing printed.
+//!   `U+FE0F` (VS16) widens a text-default emoji to two columns where the line
+//!   has room for its spacer, and `U+FE0E` (VS15) narrows a wide glyph to one,
+//!   leaving the cursor where it is. Neither resolves a pending wrap. aterm's differential oracle compares all of
+//!   this cell by cell, marks included.
 //! * DECSC/DECRC save and restore the cursor position (with a pending wrap)
 //!   and the SGR rendition, as xterm's `CursorSave`/`CursorRestore` do; a
 //!   restore from a slot never saved homes the cursor and resets the
@@ -949,6 +953,56 @@ const fn is_emoji_modifier(ch: char) -> bool {
     u >= 0x1F3FB && u <= 0x1F3FF
 }
 
+/// `Emoji_Modifier_Base=Yes` of Unicode 16.0.0 (`emoji-data.txt`), adjacent
+/// ranges merged, ascending: the glyphs a skin-tone modifier joins (UTS #51).
+const EMOJI_MODIFIER_BASE_RANGES: [(u32, u32); 40] = [
+    (0x261D, 0x261D),
+    (0x26F9, 0x26F9),
+    (0x270A, 0x270D),
+    (0x1F385, 0x1F385),
+    (0x1F3C2, 0x1F3C4),
+    (0x1F3C7, 0x1F3C7),
+    (0x1F3CA, 0x1F3CC),
+    (0x1F442, 0x1F443),
+    (0x1F446, 0x1F450),
+    (0x1F466, 0x1F478),
+    (0x1F47C, 0x1F47C),
+    (0x1F481, 0x1F483),
+    (0x1F485, 0x1F487),
+    (0x1F48F, 0x1F48F),
+    (0x1F491, 0x1F491),
+    (0x1F4AA, 0x1F4AA),
+    (0x1F574, 0x1F575),
+    (0x1F57A, 0x1F57A),
+    (0x1F590, 0x1F590),
+    (0x1F595, 0x1F596),
+    (0x1F645, 0x1F647),
+    (0x1F64B, 0x1F64F),
+    (0x1F6A3, 0x1F6A3),
+    (0x1F6B4, 0x1F6B6),
+    (0x1F6C0, 0x1F6C0),
+    (0x1F6CC, 0x1F6CC),
+    (0x1F90C, 0x1F90C),
+    (0x1F90F, 0x1F90F),
+    (0x1F918, 0x1F91F),
+    (0x1F926, 0x1F926),
+    (0x1F930, 0x1F939),
+    (0x1F93C, 0x1F93E),
+    (0x1F977, 0x1F977),
+    (0x1F9B5, 0x1F9B6),
+    (0x1F9B8, 0x1F9B9),
+    (0x1F9BB, 0x1F9BB),
+    (0x1F9CD, 0x1F9CF),
+    (0x1F9D1, 0x1F9DD),
+    (0x1FAC3, 0x1FAC5),
+    (0x1FAF0, 0x1FAF8),
+];
+
+/// Whether `ch` is an emoji a skin-tone modifier joins ([`EMOJI_MODIFIER_BASE_RANGES`]).
+const fn is_emoji_modifier_base(ch: char) -> bool {
+    in_ranges(ch as u32, &EMOJI_MODIFIER_BASE_RANGES)
+}
+
 /// Returns `true` when `ch` occupies two grid columns, as aterm draws it: an
 /// East Asian Wide or Fullwidth character (`WIDE_RANGES`, the `wcwidth == 2`
 /// of UAX #11) that takes a column at all ([`is_combining_mark`] wins, so
@@ -1245,6 +1299,10 @@ pub struct Screen {
     bracketed_paste: bool,
     /// DEC `?2026` synchronized output mode (`BSU` `?2026h` .. `ESU` `?2026l`).
     synchronized_output: bool,
+    /// The last code point printed was `U+200D` (or a glyph that joined after it): a glyph
+    /// after anything else starts a cell of its own, even beside a cell whose last mark is a
+    /// joiner, as aterm's `last_combining_was_zwj` has it.
+    joiner_open: bool,
 }
 
 /// Maximum byte length of a sanitized `OSC 0` / `OSC 2` window title retained on [`Folder`].
@@ -1547,6 +1605,7 @@ impl Screen {
             focus_events: false,
             bracketed_paste: false,
             synchronized_output: false,
+            joiner_open: false,
         }
     }
 
@@ -1818,7 +1877,8 @@ impl Screen {
         let ext_modes = (self.app_cursor_keys as u8)
             | ((self.focus_events as u8) << 1)
             | ((self.bracketed_paste as u8) << 2)
-            | ((self.synchronized_output as u8) << 3);
+            | ((self.synchronized_output as u8) << 3)
+            | ((self.joiner_open as u8) << 4);
         if ext_modes != 0 {
             out.extend_from_slice(&[4, ext_modes]);
         }
@@ -2008,7 +2068,10 @@ impl Screen {
         if let Some(slot) = self.grid.get_mut(si) {
             *slot = spacer;
         }
-        if spacer_col >= end {
+        // A selector resolves no wrap. One pending here sits mid-line, the margin it was parked
+        // on having gone (DECLRMM reset, a resize), and stays where it is, as aterm keeps it.
+        if self.wrap_pending() {
+        } else if spacer_col >= end {
             self.set_wrap_at(spacer_col);
         } else {
             self.col =
@@ -2059,6 +2122,7 @@ impl Screen {
         // hold (`wide_island`).
         let width = wide_cell_width_clamp(char_display_width(ch) as u64, 2) as u8;
         if width == 0 {
+            self.joiner_open = ch == '\u{200D}';
             if ch == '\u{FE0F}' && self.try_widen_vs16() {
                 return;
             }
@@ -2076,14 +2140,16 @@ impl Screen {
         // that cell without advancing the cursor or resolving a pending wrap
         // ([`joins_cluster`]).
         if self.wrap_pending() || (self.col != self.left && self.col > 0) {
+            let joiner_open = self.joiner_open;
             let base_idx = self.idx(self.row, self.active_base_col());
             if let Some(base) = self.grid.get_mut(base_idx) {
-                if joins_cluster(base, ch) {
+                if joins_cluster(base, ch, joiner_open) {
                     base.push_combining(ch);
                     return;
                 }
             }
         }
+        self.joiner_open = false;
         // Deferred wrap: a pending wrap resolves on the next glyph.
         if self.wrap_pending() {
             self.wrap_line();
@@ -3376,18 +3442,21 @@ fn emit_deep_combining_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
 
 /// Whether glyph `ch` continues the grapheme cluster that `base`, the glyph
 /// before it, holds, as aterm joins one: a skin-tone modifier after a wide
-/// glyph (aterm asks for a wide emoji modifier base), the second regional
-/// indicator of a flag, and a glyph other than ASCII after an attached
-/// `\u{200D}` (Zero-Width Joiner).
-fn joins_cluster(base: &Cell, ch: char) -> bool {
-    (is_emoji_modifier(ch) && base.width == 2)
+/// emoji modifier base (wide of itself or by a `\u{FE0F}` it holds), the
+/// second regional indicator of a flag, and a glyph other than ASCII after an
+/// attached `\u{200D}` (Zero-Width Joiner) that was the last thing printed.
+fn joins_cluster(base: &Cell, ch: char, joiner_open: bool) -> bool {
+    (is_emoji_modifier(ch)
+        && base.width == 2
+        && is_emoji_modifier_base(base.ch)
+        && (char_display_width(base.ch) == 2 || base.combining_marks().contains(&'\u{FE0F}')))
         || (is_regional_indicator(ch)
             && is_regional_indicator(base.ch)
             && !base
                 .combining_marks()
                 .iter()
                 .any(|&m| is_regional_indicator(m)))
-        || (!ch.is_ascii() && base.last_combining() == Some('\u{200D}'))
+        || (joiner_open && !ch.is_ascii() && base.last_combining() == Some('\u{200D}'))
 }
 
 fn slice_has_wide_cells(cells: &[Cell]) -> bool {

@@ -533,6 +533,7 @@ pub(crate) fn owner_scene(o: Owner) -> Snapshot {
 pub(crate) fn owner_input(snap: &Snapshot) -> DeckInput<'_> {
     DeckInput {
         network: None,
+        network_place: None,
         network_target: crate::network_deck::Target::Overview,
         snap: Some(snap),
         prev_snap: None,

@@ -442,6 +442,7 @@ tests/feature_flip_parity.rs	live_font_feature_flip_keeps_parity	atlas-follows-c
 tests/feature_flip_parity.rs	live_font_feature_flip_reaches_gpu_pixels	atlas-follows-cpu-rasters	
 tests/feature_flip_parity.rs	live_ligature_flip_changes_gpu_pixels_and_keeps_parity	atlas-follows-cpu-rasters	gpu-frame-refines-cpu
 tests/fire_halo_gpu.rs	both_backends_render_the_fire_contrast_halo	gpu-frame-refines-cpu	
+tests/fire_halo_gpu.rs	fire_contrast_halo_clips_at_its_own_row_floor	gpu-frame-refines-cpu	
 tests/fire_patch_parity.rs	damaged_path_fire_patch_parity_cpu_matches_gpu	cached-render-equals-fresh	
 tests/fire_patch_parity.rs	fire_patch_head_band_parity_cpu_matches_gpu	gpu-frame-refines-cpu	
 tests/fire_patch_parity.rs	fire_patch_synthetic_field_is_byte_exact_over_text	gpu-frame-refines-cpu	

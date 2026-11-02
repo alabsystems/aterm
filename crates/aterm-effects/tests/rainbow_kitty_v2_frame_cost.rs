@@ -378,12 +378,8 @@ fn replica_fingerprint(under: &[GlowQuad], out: &[GlowQuad], halos: &[RainHalo])
     if under.is_empty() && out.is_empty() && halos.is_empty() {
         return 0;
     }
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |v: u64| {
-        h ^= v;
-        h = h.wrapping_mul(PRIME);
-    };
+    let mut h = aterm_hash::FNV64_OFFSET;
+    let mut mix = |v: u64| h = aterm_hash::fnv_mix_u64(h, v);
     for q in under.iter().chain(out.iter()) {
         mix(u64::from(q.row));
         mix(u64::from(q.x) << 16 | u64::from(q.y));

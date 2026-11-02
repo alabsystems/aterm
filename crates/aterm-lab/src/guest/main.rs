@@ -35,8 +35,9 @@
 //! - `procs EXE OUT`: every [`WATCH_EVERY`], the processes running EXE with no argument (the app,
 //!   as LaunchServices opens it; never a command run from it): `up` with the kernel's start time
 //!   for each that appears, `down` for each that goes ([`procs`]).
-//! - `member HOME LISTEN OUT [--allow NAME]`: the Allowing member of the `vault-phrase` row, F10's
-//!   members desk on the vault custody under HOME behind an `ask`-only listener on loopback,
+//! - `member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE]`: the Allowing member of the `vault-phrase` row, F10's
+//!   members desk on the vault custody under HOME behind an `ask`-only listener on loopback
+//!   or, with `--advertise`, at the guest's address under a private lab service,
 //!   which presses Allow for the first Mac that asks and writes the phrase to OUT ([`member`]).
 //! - `captures EXE DIR OUT SOURCE=FILE...`, `capture EXE DIR OUT KEY [WORDS...]`: the app's
 //!   window through its own `aterm ctl image` at each milestone the lane's records name, and at
@@ -110,7 +111,7 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
-    let usage = "usage: aterm-lab-guest census OUT | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY";
+    let usage = "usage: aterm-lab-guest census OUT | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY";
     match args.first().map(String::as_str) {
         Some("census") => census(&Out::open(args.get(1).ok_or(usage)?)?),
         Some("person") => {

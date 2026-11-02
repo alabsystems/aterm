@@ -364,6 +364,23 @@ fn fleet_keys_are_set_and_removed_in_place() {
     assert_eq!(without_fleet("theme = \"Nord\"\n"), Ok(None));
 }
 
+/// What a [`Listener`]'s survey answer says of the instance that answered it: its aterm version
+/// and its `window=` word (`None`: none, as an older aterm's answer says).
+#[derive(Clone, Copy)]
+struct Said {
+    version: &'static str,
+    window: Option<bool>,
+}
+
+impl Said {
+    /// What every listener's answer says unless it was made [`Listener::answering`]: its issuer's
+    /// own version, and no `window=` word.
+    const OLDER: Self = Self {
+        version: "0.95.0",
+        window: None,
+    };
+}
+
 /// A fleet listener served in process, which so must finish each handshake: it gives each one
 /// [`HANG`] ([`serve_with_handshake`]).
 struct Listener {
@@ -409,7 +426,18 @@ impl Listener {
             state,
             &[FleetOp::Survey, FleetOp::Book, FleetOp::Join],
             (None, Vec::new()),
-            true,
+            (true, Said::OLDER),
+        )
+    }
+
+    /// [`Listener::serve`] whose survey answers say `said` of the instance that answered.
+    fn answering(listener: TcpListener, state: &Path, said: Said) -> Self {
+        Self::reading(
+            listener,
+            state,
+            &[FleetOp::Survey, FleetOp::Book, FleetOp::Join],
+            (None, Vec::new()),
+            (false, said),
         )
     }
 
@@ -419,7 +447,7 @@ impl Listener {
         serves: &'static [FleetOp],
         named: (Option<String>, Vec<String>),
     ) -> Self {
-        Self::reading(listener, state, serves, named, false)
+        Self::reading(listener, state, serves, named, (false, Said::OLDER))
     }
 
     fn reading(
@@ -427,7 +455,7 @@ impl Listener {
         state: &Path,
         serves: &'static [FleetOp],
         (claim, rows): (Option<String>, Vec<String>),
-        rereads: bool,
+        (rereads, said): (bool, Said),
     ) -> Self {
         let _ = aterm_uds::keep_out_of_children(&listener);
         let port = listener.local_addr().unwrap().port();
@@ -488,11 +516,16 @@ impl Listener {
                                 let mut byte = [0u8; 1];
                                 while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {}
                                 let reply = format!(
-                                    "OK {}\ninstance pid=1 host=127.0.0.1 version=0.95.0 \
-                                     sessions={} level=facts cut=0 at_ms=1 node={}\n{}",
+                                    "OK {}\ninstance pid=1 host=127.0.0.1 version={} \
+                                     sessions={} level=facts cut=0 at_ms=1 node={}{}\n{}",
                                     rows.len() + 1,
+                                    said.version,
                                     rows.len(),
                                     claim.as_deref().unwrap_or(&issuer.node),
+                                    said.window.map_or_else(String::new, |w| format!(
+                                        " window={}",
+                                        u8::from(w)
+                                    )),
                                     rows.iter()
                                         .map(|row| format!("{row}\n"))
                                         .collect::<String>()
@@ -813,6 +846,85 @@ fn init_then_join_registers_and_peers_checks_each_peer() {
     assert_eq!(key_of(&member.places), kept, "leave keeps the node key");
 }
 
+/// NODE AND WINDOW VERSIONS (m16, 2026-11-02): a Mac's node job (`aterm node serve`) signs its
+/// book entry with its own version and relays a survey to the Mac's window, whose answer says the
+/// window's version; after an update the two can differ (m16: node 0.147.0, window 0.146.0). So
+/// `peers` shows both, apart: the book's under NODE VERSION, the answer's under WINDOW VERSION,
+/// `none` where the node job answered with no window open (`window=0`), and an older aterm's
+/// answer (no `window=` word: its window held the port) as its window's.
+/// NEGATIVE CONTROL: the listing before this fix, the book's version under one VERSION header,
+/// fails "the header names both"; a WINDOW VERSION taken from the book fails "the window's
+/// version is shown"; a NODE VERSION taken from the answer fails "the node's version is kept".
+#[test]
+fn peers_shows_a_nodes_version_and_its_windows_apart() {
+    for (window, shown) in [
+        (Some(true), "0.94.0"),
+        (Some(false), "none"),
+        (None, "0.94.0"),
+    ] {
+        let (issuer, code, _serving) = issuing_answering(
+            "versions-issuer",
+            Said {
+                version: "0.94.0",
+                window,
+            },
+        );
+        let member = World::new("versions-member");
+        let opts = Opts {
+            port: Some(closed_port()),
+            host: Some("127.0.0.1".to_owned()),
+            ..Opts::default()
+        };
+        ok(join(&member.places, &opts, &code));
+        let issuer_node = member::node_id(&issuer.places.state).unwrap();
+        let listed = ok(list_peers(&member.places, HANG));
+        let header = listed
+            .lines()
+            .find(|line| line.trim_start().starts_with("NODE "))
+            .unwrap_or_else(|| panic!("a header:\n{listed}"));
+        assert!(
+            header.contains("NODE VERSION") && header.contains("WINDOW VERSION"),
+            "the header names both ({window:?}):\n{listed}"
+        );
+        let row: Vec<&str> = listed
+            .lines()
+            .find(|line| line.trim_start().starts_with(short(&issuer_node)))
+            .unwrap_or_else(|| panic!("the issuer's row:\n{listed}"))
+            .split_whitespace()
+            .collect();
+        assert!(
+            row.iter().any(|word| word.starts_with("ok,")),
+            "the issuer answered ({window:?}):\n{listed}"
+        );
+        assert_eq!(
+            row.get(4).copied(),
+            Some("0.95.0"),
+            "the node's version is kept ({window:?}):\n{listed}"
+        );
+        assert_eq!(
+            row.get(5).copied(),
+            Some(shown),
+            "the window's version is shown ({window:?}):\n{listed}"
+        );
+        // A peer not reached has no answer to say a window's version by.
+        let theirs = ok(list_peers(&issuer.places, HANG));
+        let row: Vec<&str> = theirs
+            .lines()
+            .find(|line| {
+                line.trim_start()
+                    .starts_with(short(&member::node_id(&member.places.state).unwrap()))
+            })
+            .unwrap_or_else(|| panic!("the member's row:\n{theirs}"))
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            row.get(5).copied(),
+            Some("-"),
+            "an unreached peer's window is unknown ({window:?}):\n{theirs}"
+        );
+    }
+}
+
 /// AWAY FROM EVERY MEMBER (docs/DESIGN-fluid-swarm-2026-10-28.md F4): when every peer `peers`
 /// dialled went unanswered, the listing ends by saying so once, with the last this book heard of
 /// one; where a peer answered, it does not.
@@ -929,6 +1041,49 @@ fn a_member_away_from_its_issuer_says_since_the_issuers_last_answer() {
         )),
         "a line of its own says when the issuer last answered:\n{away}"
     );
+}
+
+/// `fleet peers` says this Mac's network place under its first line, in the words every reporter
+/// uses; with no member reached while it is on another network (a phone hotspot), why: it is
+/// elsewhere. On the ALab LAN the same unreached read gives no such why.
+/// NEGATIVE CONTROL: dropping the why line's push leaves the hotspot's unreached read with no why,
+/// and this test fails at "why no member answers from another network".
+#[test]
+fn fleet_peers_says_where_this_mac_is_and_why_none_answer_from_elsewhere() {
+    let (_issuer, code, serving) = issuing("place-issuer");
+    let member = World::new("place-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    drop(serving.take());
+    fn utc(_: i64) -> Option<i64> {
+        Some(0)
+    }
+    let now_ms = aterm_time::unix_millis().unwrap();
+    let words = aterm_netplace::words::Words { now_ms, zone: &utc };
+    let away = aterm_netplace::sample::hotspot(now_ms - 60_000, now_ms - 60_000);
+    let listed = ok(list_peers_at(&member.places, HANG, Some(&away), &words));
+    assert_eq!(
+        listed.lines().nth(1),
+        Some(aterm_netplace::words::header(&away, &words).as_str()),
+        "the place under the first line:\n{listed}"
+    );
+    let why = aterm_netplace::words::why_away(&away, &words).expect("away");
+    assert!(
+        listed.lines().any(|line| line == why),
+        "why no member answers from another network:\n{listed}"
+    );
+    let home = aterm_netplace::sample::home(now_ms - 60_000, 0);
+    let listed = ok(list_peers_at(&member.places, HANG, Some(&home), &words));
+    assert_eq!(
+        listed.lines().nth(1),
+        Some(aterm_netplace::words::header(&home, &words).as_str()),
+        "{listed}"
+    );
+    assert!(!listed.contains(&why), "{listed}");
 }
 
 /// Each member that did not answer gets a line of its own after the table, in the table's order:
@@ -2139,6 +2294,47 @@ fn an_init_beside_an_aterm_that_answers_nothing_says_so_at_once() {
     }
     drop(held_silent);
     drop(bound);
+}
+
+/// The node job claims this Mac's listen, which it also does while another program holds the port:
+/// a stall there names both causes and what moves the listener, and a window that answers nothing
+/// as one such holder, not as the only cause. NEGATIVE CONTROL: `answers_no_handshake` asked ahead
+/// of the claim: the window's sentence alone, and the job's label is missing.
+#[test]
+fn a_stall_on_the_port_the_node_job_claims_names_the_job_and_every_cause_it_leaves_open() {
+    let world = World::new("stall-node-job");
+    std::fs::create_dir_all(&world.places.state).unwrap();
+    let at = SocketAddr::from(([127, 0, 0, 1], 7100));
+    let stall = |here: &Here| own_listener_stalled(&world.places, at, " just now", here);
+    let unclaimed = stall(&Here::Absent);
+    assert!(
+        unclaimed.contains("another program holds that port"),
+        "{unclaimed}"
+    );
+    let _job = crate::node_service::NodeJobLock::try_acquire_port(&world.places.state)
+        .unwrap()
+        .expect("the port's lock");
+    // The lock is the job's claim, which it keeps while another program holds the port, so the
+    // sentence names both causes and the act that moves the listener.
+    for here in [Here::Absent, Here::Answers(Some("listening".to_owned()))] {
+        let claimed = stall(&here);
+        assert!(
+            claimed.contains(crate::node_service::NODE_LABEL),
+            "{claimed}"
+        );
+        assert!(claimed.contains("too busy"), "{claimed}");
+        assert!(claimed.contains("another program"), "{claimed}");
+        assert!(claimed.contains("moves it"), "{claimed}");
+    }
+    // A stopped window may be what holds the port, or only a window the load stopped answering.
+    let stopped = stall(&Here::Stopped(4242));
+    assert!(stopped.contains("`kill -CONT 4242`"), "{stopped}");
+    let silent = stall(&Here::Silent(Some(4242)));
+    assert!(silent.contains("(pid 4242)"), "{silent}");
+    for said in [stopped, silent] {
+        assert!(said.contains(crate::node_service::NODE_LABEL), "{said}");
+        assert!(said.contains("moves it"), "{said}");
+    }
 }
 
 #[test]
@@ -4008,7 +4204,7 @@ fn a_first_join_its_issuer_never_answers_says_it_kept_the_node_key() {
 }
 
 #[test]
-fn every_reason_a_fleet_read_gives_fits_its_row() {
+fn every_reason_a_fleet_read_gives_has_the_expected_fault() {
     use aterm_ctl::PeerFault;
     use aterm_net::fleet_member::Stage;
     let at = std::net::SocketAddr::from(([192, 168, 100, 200], 7100));
@@ -4202,13 +4398,6 @@ fn every_reason_a_fleet_read_gives_fits_its_row() {
         ),
     ];
     for (why, fault) in &reasons {
-        let text = why.to_string();
-        assert!(
-            text.chars().count() <= aterm_ctl::UNANSWERED_REASON_CHARS,
-            "{} > {}: {text}",
-            text.chars().count(),
-            aterm_ctl::UNANSWERED_REASON_CHARS
-        );
         assert_eq!(fault_of(why), *fault, "{why:?}");
     }
 }
@@ -4336,6 +4525,87 @@ fn a_join_at_another_machines_address_is_told_its_host_not_its_port() {
     assert!(
         unplaced.contains("`--port <n>` (or with `--host <h>`"),
         "{unplaced}"
+    );
+}
+
+/// A manual join registers at this Mac's own `.local` name; when another Mac answers for that
+/// name, a free port cannot help (the fleet would dial the other Mac at any port), so it is told
+/// its LAN address. Two nodes of one Mac keep the port advice.
+#[test]
+fn a_join_at_its_own_name_another_mac_answers_for_is_told_its_lan_address() {
+    let holder = "ab".repeat(16);
+    let refused = |placing: &Placing| {
+        not_recorded_with(
+            "192.168.1.10:7100",
+            &JoinFailed::PlaceHeld {
+                place: "m62.local:7100".to_owned(),
+                node: holder.clone(),
+            },
+            (Path::new("/state"), false),
+            placing,
+        )
+    };
+    // This Mac is m62.local at 192.168.1.237; its routes name that address.
+    let here = |host: &str| matches!(host, "m62.local" | "192.168.1.237" | "127.0.0.1");
+    let lan = || Some("192.168.1.237".to_owned());
+
+    let elsewhere = refused(&Placing {
+        here,
+        lookup: |_| vec![IpAddr::from([192, 168, 1, 50])],
+        lan,
+    });
+    assert!(
+        elsewhere.contains("m62.local, this machine's own name, resolves to 192.168.1.50")
+            && elsewhere.contains("with `--host 192.168.1.237`, and join again")
+            && !elsewhere.contains("--port"),
+        "{elsewhere}"
+    );
+    let unrouted = refused(&Placing {
+        here,
+        lookup: |_| vec![IpAddr::from([192, 168, 1, 50])],
+        lan: || None,
+    });
+    assert!(
+        unrouted.contains("with `--host <this machine's LAN address>`, and join again"),
+        "{unrouted}"
+    );
+
+    // Negative controls: wherever the name reaches this Mac, or the lookup places it nowhere a
+    // dial walks, the held place is this Mac's own and the port is the one to change.
+    let port = "name a free port with `--port <n>`, and join again";
+    for lookup in [
+        (|_| vec![IpAddr::from([192, 168, 1, 237])]) as fn(&str) -> Vec<IpAddr>,
+        |_| {
+            vec![
+                IpAddr::from([192, 168, 1, 50]),
+                IpAddr::from([192, 168, 1, 237]),
+            ]
+        },
+        |_| vec![IpAddr::from([127, 0, 0, 1])],
+        |_| Vec::new(),
+        |_| vec!["fe80::1".parse().unwrap()],
+        |_| vec![IpAddr::from([8, 8, 8, 8])],
+    ] {
+        let own = refused(&Placing { here, lookup, lan });
+        assert!(own.contains(port) && !own.contains("--host"), "{own}");
+    }
+    // Another machine's name is no name of this Mac's: its lookup is never asked.
+    let theirs = not_recorded_with(
+        "192.168.1.10:7100",
+        &JoinFailed::PlaceHeld {
+            place: "m9.local:7100".to_owned(),
+            node: holder.clone(),
+        },
+        (Path::new("/state"), false),
+        &Placing {
+            here,
+            lookup: |host| panic!("looked {host} up"),
+            lan,
+        },
+    );
+    assert!(
+        theirs.contains("`--port <n>` (or with `--host <h>`"),
+        "{theirs}"
     );
 }
 
@@ -4761,11 +5031,13 @@ fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not
     // in place of the survey's own deadline would end before it connects.
     let read = with_issuer_read_within(Duration::ZERO, || survey(&word, 2 * HANG));
     let said = read.peers[0].answer.as_ref().expect_err("it hung up");
+    let reason = Unreached::Handshake(
+        word.parse().unwrap(),
+        FleetError::Io(io::ErrorKind::UnexpectedEof.into()),
+    )
+    .to_string();
     assert_eq!(
-        said,
-        &format!(
-            "{word} hung up mid-handshake: its fleet listener restarting, or no aterm; try again"
-        ),
+        said, &reason,
         "the host dial's whole reason, which leaves no room for a lead"
     );
     hanging.join().unwrap();
@@ -6354,6 +6626,11 @@ fn a_join_of_another_fleet_whose_key_cannot_be_written_leaves_the_book_as_it_was
 }
 
 fn issuing(tag: &str) -> (World, String, Listener) {
+    issuing_answering(tag, Said::OLDER)
+}
+
+/// [`issuing`] whose listener's survey answers say `said` of the instance that answered.
+fn issuing_answering(tag: &str, said: Said) -> (World, String, Listener) {
     let world = World::new(tag);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let _ = aterm_uds::keep_out_of_children(&listener);
@@ -6368,7 +6645,7 @@ fn issuing(tag: &str) -> (World, String, Listener) {
         ));
     }
     let code = placed(&world, ("127.0.0.1", listener.local_addr().unwrap().port()));
-    let serving = Listener::serve(listener, &world.places.state);
+    let serving = Listener::answering(listener, &world.places.state, said);
     (world, code, serving)
 }
 
@@ -10100,7 +10377,14 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
         "unexpected drive refusal: {drive_refused:?}"
     );
     let parsed_code = JoinCode::parse(&code).expect("parse code");
-    let dials = join_places(&member.places, &Opts::default(), &parsed_code);
+    let (denied, log) = denied_and_log(&member.places);
+    let denied = denied.expect("this member's deny list reads");
+    let dials = join_places(
+        &member.places,
+        &Opts::default(),
+        &parsed_code,
+        (&denied, log.as_deref()),
+    );
     assert!(
         dials.contains(&("192.168.1.77".to_owned(), 7100)),
         "active peer must remain in join_places: {dials:?}"
@@ -10113,5 +10397,72 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
         drive_grants(&member.places, &["m22".to_owned()], None).expect("active m22 may drive");
     assert_eq!(granted.len(), 1);
     assert_eq!(granted[0].node, peer_id.node());
+
+    // A deny list this member cannot read (its `source.toml` other users may read, which every
+    // vault read refuses) could name m22: no grant names it, no drive reaches it and no join
+    // dials anyone, each refusal saying to try again, until a read succeeds.
+    // NEGATIVE CONTROL (2026-11-01): with `denied_and_log` reading an unreadable deny list as one
+    // that names no one (`.unwrap_or_default()`), this fails (`an unreadable deny list is no
+    // list`), and so does each verb that read it so on its own (`no grant names a node while the
+    // deny list is unread`, `no drive while the deny list is unread`, `no join while the deny
+    // list is unread`).
+    let source = paths.dir.join("source.toml");
+    let set = |mode| {
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set(0o644);
+    let (unread, _) = denied_and_log(&member.places);
+    let grant = drive_grants(&member.places, &["m22".to_owned()], None);
+    let drive = drive_fleet_in(&member.places, peer_id.node(), Duration::from_millis(50));
+    let joined = join(&member.places, &sync_here(), &code);
+    set(0o600);
+    assert_eq!(unread, None, "an unreadable deny list is no list");
+    assert!(
+        grant.is_err_and(|why| failure_words(why).contains(DENY_LIST_UNREAD)),
+        "no grant names a node while the deny list is unread"
+    );
+    assert!(
+        drive.is_err_and(|refused| refused.again && refused.why.contains(DENY_LIST_UNREAD)),
+        "no drive while the deny list is unread"
+    );
+    assert!(
+        joined.is_err_and(|why| failure_words(why).contains(DENY_LIST_UNREAD)),
+        "no join while the deny list is unread"
+    );
+    assert!(
+        drive_grants(&member.places, &["m22".to_owned()], None).is_ok(),
+        "m22 is granted again once the list reads"
+    );
     running.stop();
+}
+
+/// On a phone hotspot, a member dialled on the hotspot itself that this Mac found no route to
+/// was refused by this Mac's own Local Network privacy: `fleet peers` blames that, not being
+/// away; one off the hotspot (the home LAN's address) is what being away explains.
+/// NEGATIVE CONTROL: `no_route_on_this_network` answering `false` whatever the address leaves
+/// the on-hotspot member's refusal to the away why, and "this Mac's privacy refused a member on
+/// this network" fails.
+#[test]
+fn a_no_route_to_a_member_on_this_network_is_never_explained_by_being_away() {
+    let hotspot = aterm_netplace::sample::hotspot(1_000, 900);
+    let no_route = |ip: [u8; 4]| {
+        Unreached::Connect(
+            std::net::SocketAddr::from((ip, 7100)),
+            std::io::Error::from(std::io::ErrorKind::HostUnreachable),
+        )
+    };
+    assert!(
+        no_route_on_this_network(&no_route([172, 20, 10, 5]), Some(&hotspot)),
+        "this Mac's privacy refused a member on this network"
+    );
+    assert!(!no_route_on_this_network(
+        &no_route([192, 168, 4, 9]),
+        Some(&hotspot)
+    ));
+    assert!(!no_route_on_this_network(&no_route([172, 20, 10, 5]), None));
+    let refused = Unreached::Connect(
+        std::net::SocketAddr::from(([172, 20, 10, 5], 7100)),
+        std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+    );
+    assert!(!no_route_on_this_network(&refused, Some(&hotspot)));
 }

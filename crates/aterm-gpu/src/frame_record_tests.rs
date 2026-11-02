@@ -81,13 +81,14 @@ fn native_adapter() -> String {
     name
 }
 
-/// A renderer armed with this build's arm.
-fn record_renderer() -> GpuRenderer {
+/// A renderer armed with this build's arm on `family` (`None`: the default
+/// system or bundled primary face).
+fn record_renderer_with(family: Option<&str>) -> GpuRenderer {
     let ctx = GpuContext::new_headless()
         .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU context: {e}")));
-    let cpu = Renderer::from_system_with_family(None, 18.0, Theme::default())
+    let cpu = Renderer::from_system_with_family(family, 18.0, Theme::default())
         .unwrap_or_else(|| aterm_spec::host::could_not_run("no system monospace font"));
-    let mut gpu = GpuRenderer::from_parts(ctx, cpu, None, Theme::default())
+    let mut gpu = GpuRenderer::from_parts(ctx, cpu, family.map(str::to_owned), Theme::default())
         .expect("the GPU renderer assembles on an acquired device");
     #[cfg(target_os = "macos")]
     gpu.arm_metal_for_test();
@@ -281,6 +282,10 @@ impl Drawing {
 /// for a present, a layer, a video frame, an EDR present and a blit or crown
 /// row the CPU's run of the present's shaders over it.
 fn draw_frames() -> Drawing {
+    draw_frames_with(None)
+}
+
+fn draw_frames_with(family: Option<&str>) -> Drawing {
     let mut d = Drawing {
         frames: Vec::new(),
         distinct: Vec::new(),
@@ -289,7 +294,7 @@ fn draw_frames() -> Drawing {
 
     // Readbacks: the encode plan, three frames each (the second and third
     // reuse the residency), every stream each fixture claims drawn.
-    let mut gpu = record_renderer();
+    let mut gpu = record_renderer_with(family);
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     let mut fixtures = fixtures(&gpu, true);
@@ -380,7 +385,7 @@ fn draw_frames() -> Drawing {
     // over the resident offscreen, the present copy, bloom, shimmer, the
     // glide with its apron, the card, the letterbox blit with the bell
     // inversion and the drop overlay, and the SDR crown.
-    let mut gpu = record_renderer();
+    let mut gpu = record_renderer_with(family);
     gpu.set_bloom(true);
     gpu.set_shimmer(true);
     gpu.set_shimmer_phase_for_test(Some(7.25));
@@ -487,7 +492,7 @@ fn draw_frames() -> Drawing {
 
     // The translucent window: a background opacity under 1 reaches the
     // readback's alpha (the virtual present's target is opaque).
-    let mut gpu = record_renderer();
+    let mut gpu = record_renderer_with(family);
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     let input = fixtures_base_for_cursor();
@@ -506,12 +511,12 @@ fn draw_frames() -> Drawing {
         "window/translucent/readback".to_owned(),
     ));
     #[cfg(target_os = "macos")]
-    window_layer_frames(&mut d);
-    video_take_frames(&mut d);
+    window_layer_frames(&mut d, family);
+    video_take_frames(&mut d, family);
     #[cfg(any(target_os = "macos", windows))]
-    edr_present_frames(&mut d);
+    edr_present_frames(&mut d, family);
     #[cfg(target_os = "macos")]
-    blit_frames(&mut d);
+    blit_frames(&mut d, family);
     #[cfg(target_os = "macos")]
     crown_row_frames(&mut d);
     d
@@ -664,11 +669,11 @@ fn tray_twin(frame: &mut Frame, tray: &TrayQuad<'_>) {
 /// readback with R and B exchanged, so its frames hold them so, and their
 /// twins too.
 #[cfg(target_os = "macos")]
-fn window_layer_frames(d: &mut Drawing) {
+fn window_layer_frames(d: &mut Drawing, family: Option<&str>) {
     let input = fixtures_base_for_cursor();
     for (label, opacity) in [("opaque", 1.0f32), ("translucent", 0.55)] {
         let translucent = opacity < 1.0;
-        let mut gpu = record_renderer();
+        let mut gpu = record_renderer_with(family);
         gpu.set_bloom(false);
         gpu.set_shimmer(false);
         gpu.set_background_opacity(opacity);
@@ -729,8 +734,8 @@ fn window_layer_frames(d: &mut Drawing) {
 /// The video tap: a take of three headless presents (a still frame, a glide
 /// frame, a changed row) through the arm's capture ring, each frame as the
 /// take holds it.
-fn video_take_frames(d: &mut Drawing) {
-    let mut gpu = record_renderer();
+fn video_take_frames(d: &mut Drawing, family: Option<&str>) {
+    let mut gpu = record_renderer_with(family);
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     let (_, scroll, _) = fixtures(&gpu, true)
@@ -848,8 +853,8 @@ fn edr_input(gpu: &GpuRenderer) -> RenderInput {
 /// lifts a channel above 1.0, and the scale lifts the white text above 1.0
 /// without it.
 #[cfg(any(target_os = "macos", windows))]
-fn edr_present_frames(d: &mut Drawing) {
-    let mut gpu = record_renderer();
+fn edr_present_frames(d: &mut Drawing, family: Option<&str>) {
+    let mut gpu = record_renderer_with(family);
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     gpu.set_hdr_glow(true);
@@ -1153,9 +1158,9 @@ fn blit_uniform(
 /// (under the inversion, and below a surfaceless strip). Each source frame is
 /// a row of its own; each blit's row is its destination's texels.
 #[cfg(target_os = "macos")]
-fn blit_frames(d: &mut Drawing) {
+fn blit_frames(d: &mut Drawing, family: Option<&str>) {
     use crate::metal::ffi::PixelFormat;
-    let mut gpu = record_renderer();
+    let mut gpu = record_renderer_with(family);
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     let mut win = WindowGpu::new();
@@ -1753,6 +1758,75 @@ fn armed_frames_hold_to_their_cpu_twins() {
     end_unless_the_colour_row_ran();
 }
 
+const IOSEVKA_SEMIBOLD_FONT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../aterm-render/assets/bundled/IosevkaTerm-SemiBold.ttf"
+);
+const IOSEVKA_REGULAR_FONT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../aterm-render/assets/bundled/IosevkaTerm-Regular.ttf"
+);
+const JETBRAINS_FONT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../aterm-render/assets/bundled/JetBrainsMono-Regular.ttf"
+);
+
+/// Every twinned frame also holds to its CPU twin under the bundled primary
+/// faces (including Windows' Iosevka Term Semibold + ExtraBold pair and, when
+/// `aterm-render/embedded-font` is active via feature unification, the virtual
+/// `bundled:…` identities with [`aterm_render::bundled::letter_descent_floor`]).
+#[test]
+fn armed_frames_hold_to_their_cpu_twins_on_bundled_faces() {
+    let arch = std::env::consts::ARCH;
+    let adapter = native_adapter();
+    let mut faces = vec![
+        ("IosevkaTerm-SemiBold.ttf", IOSEVKA_SEMIBOLD_FONT),
+        ("IosevkaTerm-Regular.ttf", IOSEVKA_REGULAR_FONT),
+        ("JetBrainsMono-Regular.ttf", JETBRAINS_FONT),
+    ];
+    if aterm_render::bundled::IOSEVKA_ACTIVE {
+        faces.push((
+            "bundled:Iosevka Term",
+            aterm_render::bundled::IOSEVKA_FAMILY,
+        ));
+    }
+    if aterm_render::bundled::IOSEVKA_SEMIBOLD_ACTIVE {
+        faces.push((
+            "bundled:Iosevka Term Semibold",
+            aterm_render::bundled::IOSEVKA_SEMIBOLD_FAMILY,
+        ));
+    }
+    for (label, family) in faces {
+        let Drawing {
+            frames,
+            distinct,
+            twins,
+        } = draw_frames_with(Some(family));
+        let drawn = rows_of(&frames);
+        let digests: std::collections::BTreeMap<&str, &str> = drawn
+            .iter()
+            .map(|(n, (_, sha))| (n.as_str(), sha.as_str()))
+            .collect();
+        for (a, b) in &distinct {
+            assert_ne!(
+                digests.get(a.as_str()),
+                digests.get(b.as_str()),
+                "{label}: {a} and {b} differ in their input, so their frames must differ"
+            );
+        }
+        let verdict = judge(arch, &adapter, &frames, &twins);
+        assert!(
+            verdict.findings.is_empty(),
+            "THE {ARM} ARM'S FRAMES ARE NOT THEIR CPU TWINS' on {adapter} ({arch}, face {label}; \
+             {} of {} twinned frames): {:#?}",
+            verdict.findings.len(),
+            verdict.twinned,
+            verdict.findings
+        );
+    }
+    end_unless_the_colour_row_ran();
+}
+
 /// The recorded rows for `arch` on `adapter`, by frame name.
 fn recorded_rows<'a>(
     arch: &str,
@@ -1801,7 +1875,7 @@ fn findings_of(
 /// `distinct` pairs that inputs reach the bytes.
 #[cfg(windows)]
 fn flipped_instance_byte_fails_its_twin() {
-    let mut gpu = record_renderer();
+    let mut gpu = record_renderer_with(None);
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     let (name, input, _) = fixtures(&gpu, true)

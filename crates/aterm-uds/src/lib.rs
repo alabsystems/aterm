@@ -208,6 +208,9 @@ pub mod account;
 ))]
 pub mod asleep;
 
+#[cfg(target_os = "macos")]
+mod darwin_loader;
+
 /// A deadline on a call that can block forever: in this process ([`deadline::Gate`], the shared [`deadline::TRUST`] gate) or in a child ([`deadline::output_until`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod deadline;
@@ -308,6 +311,8 @@ pub mod spawnfd;
 #[cfg(not(unix))]
 #[path = "spawnfd_nonunix.rs"]
 pub mod spawnfd;
+/// Explicit, identity-bound macOS stack sampling with a closed wait kind and a retained private report.
+pub mod wait_sample;
 
 /// The soft descriptor floor a process that fans work out over many threads
 /// and children raises itself toward ([`spawnfd::raise_soft_nofile`]): a stock

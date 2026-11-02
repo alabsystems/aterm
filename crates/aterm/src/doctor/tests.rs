@@ -2105,6 +2105,131 @@ fn outside_the_account_s_own_shell_no_develop_layer_is_read() {
     assert!(stand.composed.borrow().is_empty());
 }
 
+/// `base.agents.primer` runs the window's primer pass for the agents `aterm init` finds: a plan
+/// names the files and runs no pass, an apply runs one and its read-back settles, and the next
+/// run is `Ok`. The off switch and a dev bundle run no pass, and nothing detected is no change. A
+/// file the pass cannot read stops none of the others: the pass still runs while another is due,
+/// the unreadable one fails the row on its read-back, and with nothing else due it blocks the row
+/// and runs no pass. Negative control: a pass that leaves the files as they were fails the row on
+/// its read-back.
+#[test]
+fn base_agents_primer_runs_the_window_pass_and_settles() {
+    use aterm_converge::{Item, Mode, NoJournal};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    static PRIMED: AtomicBool = AtomicBool::new(false);
+    static PASSES: AtomicUsize = AtomicUsize::new(0);
+    fn pending(_: &Path) -> aterm_primer::PrimePending {
+        aterm_primer::PrimePending {
+            detected: vec!["claude"],
+            looked: vec!["~/.claude".to_owned()],
+            due: if PRIMED.load(SeqCst) {
+                Vec::new()
+            } else {
+                vec!["~/.claude/CLAUDE.md (absent)".to_owned()]
+            },
+            errors: Vec::new(),
+        }
+    }
+    fn nothing(_: &Path) -> aterm_primer::PrimePending {
+        aterm_primer::PrimePending {
+            looked: vec!["~/.claude".to_owned(), "~/.codex".to_owned()],
+            ..aterm_primer::PrimePending::default()
+        }
+    }
+    fn unreadable(home: &Path) -> aterm_primer::PrimePending {
+        aterm_primer::PrimePending {
+            errors: vec!["claude: ~/.claude/skills/x/SKILL.md: unreadable: denied".to_owned()],
+            ..pending(home)
+        }
+    }
+    fn prime(_: &Path) -> aterm_primer::AutoPrime {
+        PASSES.fetch_add(1, SeqCst);
+        PRIMED.store(true, SeqCst);
+        aterm_primer::AutoPrime {
+            agents: Vec::new(),
+            summary: String::new(),
+        }
+    }
+    fn idle(_: &Path) -> aterm_primer::AutoPrime {
+        PASSES.fetch_add(1, SeqCst);
+        aterm_primer::AutoPrime {
+            agents: Vec::new(),
+            summary: String::new(),
+        }
+    }
+    type Pending = fn(&Path) -> aterm_primer::PrimePending;
+    type Prime = fn(&Path) -> aterm_primer::AutoPrime;
+    let run = |(enabled, other_bundle): (bool, bool), pending: Pending, prime: Prime, mode| {
+        let items: Vec<Box<dyn Item>> = vec![Box::new(super::AgentPrimerItem {
+            home: Some(PathBuf::from("/Users//h")),
+            enabled,
+            other_bundle,
+            pending,
+            prime,
+        })];
+        aterm_converge::run(&items, mode, &mut NoJournal)
+            .unwrap()
+            .remove(0)
+    };
+    let on = (true, false);
+
+    let planned = run(on, pending, prime, Mode::Plan);
+    assert_eq!(planned.outcome, Outcome::Planned, "{planned:?}");
+    assert_eq!(
+        planned.from.as_deref(),
+        Some("~/.claude/CLAUDE.md (absent)")
+    );
+    assert_eq!(PASSES.load(SeqCst), 0, "a plan runs no pass");
+    let changed = run(on, pending, prime, Mode::Apply);
+    assert_eq!(changed.outcome, Outcome::Changed, "{changed:?}");
+    assert_eq!(PASSES.load(SeqCst), 1);
+    let again = run(on, pending, prime, Mode::Apply);
+    assert_eq!(again.outcome, Outcome::Ok, "{again:?}");
+    assert_eq!(PASSES.load(SeqCst), 1, "a settled run runs no pass");
+
+    PRIMED.store(false, SeqCst);
+    for (gates, outcome) in [
+        ((false, false), Outcome::NotApplicable),
+        ((true, true), Outcome::Ok),
+    ] {
+        let row = run(gates, pending, prime, Mode::Apply);
+        assert_eq!(row.outcome, outcome, "{gates:?}: {row:?}");
+    }
+    let none = run(on, nothing, prime, Mode::Apply);
+    assert_eq!(none.outcome, Outcome::NotApplicable, "{none:?}");
+    assert!(
+        none.why
+            .as_deref()
+            .is_some_and(|why| why.contains("looked for ~/.claude, ~/.codex")),
+        "{none:?}"
+    );
+    assert_eq!(PASSES.load(SeqCst), 1, "no gate runs a pass");
+
+    let planned = run(on, unreadable, prime, Mode::Plan);
+    assert_eq!(planned.outcome, Outcome::Planned, "{planned:?}");
+    assert_eq!(
+        planned.from.as_deref(),
+        Some(
+            "~/.claude/CLAUDE.md (absent), claude: ~/.claude/skills/x/SKILL.md: unreadable: denied"
+        )
+    );
+    let partial = run(on, unreadable, prime, Mode::Apply);
+    assert_eq!(partial.outcome, Outcome::Failed, "{partial:?}");
+    assert_eq!(PASSES.load(SeqCst), 2, "an unreadable file stops no other");
+    let blocked = run(on, unreadable, prime, Mode::Apply);
+    assert_eq!(blocked.outcome, Outcome::Blocked, "{blocked:?}");
+    assert_eq!(
+        PASSES.load(SeqCst),
+        2,
+        "a block with nothing due runs no pass"
+    );
+
+    PRIMED.store(false, SeqCst);
+    let unsettled = run(on, pending, idle, Mode::Apply);
+    assert_eq!(unsettled.outcome, Outcome::Failed, "{unsettled:?}");
+    assert_eq!(PASSES.load(SeqCst), 3);
+}
+
 /// `base.ai.accounts` names each other CLI's pool this machine keeps after Claude Code's
 /// (`…; other CLIs: codex 1, kimi 1`), stands on those pools alone where Claude Code has no
 /// source, and is a change where Codex's pool, which syncs by default, has a row of this
@@ -2540,15 +2665,18 @@ fn bare_doctor_sets_indexed_rust_docs_aside_and_builds_nothing_otherwise() {
 
 /// Every `aterm init` line this doctor prints for the base layer it composes, and the ones the
 /// crates it composes print for the Command Line Tools (aterm-uds's tool table, atpkg's C
-/// toolchain act), is one init takes over that base layer (`base.ai.accounts`, `base.clt`,
-/// `base`): each remedy rendered as a row's tail, then copied out of the text as a person
-/// would. A misspelt id is the negative control.
+/// toolchain act), is one init takes over that base layer (`base.ai.accounts`,
+/// `base.agents.primer`, `base.clt`, `base`): each remedy rendered as a row's tail, then copied
+/// out of the text as a person would. A misspelt id is the negative control.
 #[cfg(target_os = "macos")]
 #[test]
 fn every_init_line_doctor_prints_is_one_init_takes() {
     use aterm_converge::{Explain, Item as _, Probe, Remedy};
     let base = aterm_machines::init::Base {
-        items: vec![Box::new(super::AiAccountsItem)],
+        items: vec![
+            Box::new(super::AiAccountsItem),
+            Box::new(super::AgentPrimerItem::live()),
+        ],
         held: None,
         clt: super::command_line_tools(),
         toolset: None,
@@ -2567,6 +2695,14 @@ fn every_init_line_doctor_prints_is_one_init_takes() {
         tail(
             super::AiAccountsItem
                 .explain(&Probe::Blocked { why: String::new() })
+                .remedy,
+        ),
+        tail(
+            super::AgentPrimerItem::live()
+                .explain(&Probe::Change {
+                    from: String::new(),
+                    to: String::new(),
+                })
                 .remedy,
         ),
         tail(aterm_machines::init_clt::place().remedy),

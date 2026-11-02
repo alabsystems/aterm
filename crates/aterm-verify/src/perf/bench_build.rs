@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The MEASURED lanes' bench build, shared by `fabric` and `restore-e2e`: the arm's cargo
+//! The MEASURED lanes' build support, shared by `fabric`, `restore-e2e` and `commons-quiet`: the arm's cargo
 //! profile read back from cargo's own plan and config before anything runs ([`prepare`]), the
 //! aterm the bench launches pinned by path and identity ([`Built`], [`another_build`]), the bench
 //! run with its words in one environment variable ([`run_bench`]), and the provenance an entry
@@ -60,8 +60,8 @@ pub(crate) fn prepare<'a>(
             profile.name()
         )));
     }
-    let audit = audit(&targo, build_args)?;
-    if let Some(why) = audit.refusal(profile.every_crate_at()) {
+    let audit = audit(&targo, "bench", build_args)?;
+    if let Some(why) = audit.refusal(units::Promise::of(profile)) {
         return Err(Halt::Fail(format!(
             "the `{}` arm's build is not what the arm says: {why}",
             profile.name()
@@ -181,7 +181,7 @@ pub(crate) struct Targo<'a> {
 }
 
 impl<'a> Targo<'a> {
-    fn new(driver: &'a CargoDriver) -> Self {
+    pub(crate) fn new(driver: &'a CargoDriver) -> Self {
         Targo {
             driver,
             build_dir: crate::perf::driver::workspace_build_dir().map(str::to_string),
@@ -206,7 +206,7 @@ impl<'a> Targo<'a> {
         lead
     }
 
-    fn command(&self, verb: &str) -> Command {
+    pub(crate) fn command(&self, verb: &str) -> Command {
         let mut cmd = aterm_uds::spawnfd::command(&self.driver.program);
         cmd.args(self.lead(verb)).current_dir(workspace_root());
         for (key, _) in std::env::vars_os() {
@@ -220,7 +220,7 @@ impl<'a> Targo<'a> {
         cmd
     }
 
-    fn display(&self, verb: &str, args: &[&str]) -> String {
+    pub(crate) fn display(&self, verb: &str, args: &[&str]) -> String {
         let mut parts = vec![self.driver.program.display().to_string()];
         parts.extend(self.lead(verb));
         parts.extend(args.iter().map(|s| (*s).to_string()));
@@ -291,15 +291,19 @@ fn probe_git_facts(dir: &Path) -> [String; 3] {
     [commit, full, dev_commits]
 }
 
-fn audit(targo: &Targo<'_>, build_args: &[&str]) -> Result<units::Audit, Halt> {
+pub(crate) fn audit(
+    targo: &Targo<'_>,
+    verb: &str,
+    build_args: &[&str],
+) -> Result<units::Audit, Halt> {
     let mut plan_args = build_args.to_vec();
     plan_args.extend(["--unit-graph", "-Z", "unstable-options"]);
-    let graph = targo.output("bench", &plan_args, "the build plan")?;
+    let graph = targo.output(verb, &plan_args, "the build plan")?;
     units::Audit::of(&graph)
         .map_err(|why| Halt::Fail(format!("the build plan does not read: {why}")))
 }
 
-fn config_rustflags(targo: &Targo<'_>) -> Result<Vec<flags::Source>, Halt> {
+pub(crate) fn config_rustflags(targo: &Targo<'_>) -> Result<Vec<flags::Source>, Halt> {
     let table = |name: &str| -> Result<Option<String>, Halt> {
         let args = ["-Z", "unstable-options", "get", "--format", "json", name];
         let out = targo

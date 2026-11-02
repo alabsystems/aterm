@@ -786,42 +786,51 @@ impl App {
                         )
                     })
                     .unwrap_or_default();
-                Some(restore::RestoredView::Terminal(
-                    restore::TerminalLeafRestore {
-                        cwd,
-                        title,
-                        profile: None,
-                        local_id: Some(terminal.session),
-                        user_title: user_meta.user_title,
-                        description: user_meta.description,
-                        icon: user_meta.icon,
-                        role: user_meta.role,
-                        attention: user_meta.attention,
-                        questions: user_meta.questions,
-                        autopilot: user_meta.autopilot,
-                        land_at: user_meta.land_at,
-                        autopilot_by: user_meta.autopilot_set_by.map(|set_by| set_by.carried()),
-                        theme: self
-                            .kept_session_theme(terminal.session)
-                            .map(|theme| theme.selector.clone()),
-                        agent: owed.clone(),
-                        supervised: if carry_drafts && owed.is_none() {
-                            self.hosted_agent(terminal.session).map(Box::new)
-                        } else {
-                            None
-                        },
-                        lost: if carry_drafts {
-                            self.hosted_lost_word(terminal.session).map(Box::new)
-                        } else {
-                            None
-                        },
-                        held: !carry_drafts && self.restore_session_held(terminal.session),
-                        sid,
-                        lineage,
-                        log_ep,
-                        holds: Vec::new(),
+                let claim = self
+                    .pool
+                    .get(terminal.session)
+                    .and_then(|s| crate::harness_host::credit_claim::claim_worker(&s.ctx));
+                // Marked from the agent the leaf carries here (a handoff's owed one), and again
+                // once a desk's agents are filled in (`fill_desk_agents`).
+                let mut leaf = restore::TerminalLeafRestore {
+                    cwd,
+                    title,
+                    profile: None,
+                    local_id: Some(terminal.session),
+                    user_title: user_meta.user_title,
+                    description: user_meta.description,
+                    icon: user_meta.icon,
+                    role: user_meta.role,
+                    attention: user_meta.attention,
+                    questions: user_meta.questions,
+                    autopilot: user_meta.autopilot,
+                    land_at: user_meta.land_at,
+                    autopilot_by: user_meta.autopilot_set_by.map(|set_by| set_by.carried()),
+                    theme: self
+                        .kept_session_theme(terminal.session)
+                        .map(|theme| theme.selector.clone()),
+                    agent: owed.clone(),
+                    supervised: if carry_drafts && owed.is_none() {
+                        self.hosted_agent(terminal.session).map(Box::new)
+                    } else {
+                        None
                     },
-                ))
+                    lost: if carry_drafts {
+                        self.hosted_lost_word(terminal.session).map(Box::new)
+                    } else {
+                        None
+                    },
+                    held: !carry_drafts && self.restore_session_held(terminal.session),
+                    sid,
+                    lineage,
+                    log_ep,
+                    holds: Vec::new(),
+                    claim_ended: claim.as_ref().is_some_and(|&(_, ended)| ended),
+                    not_claim_worker: false,
+                    claim_worker: claim.map(|(folder, _)| folder),
+                };
+                leaf.mark_claim_bystander();
+                Some(restore::RestoredView::Terminal(leaf))
             }
             crate::tab_model::View::Native(native) => {
                 let app = self.native_runtime.app(native.instance)?;
@@ -1063,6 +1072,9 @@ impl App {
         let pool = &self.pool;
         self.crash_journal
             .carry_forward(manifest, &|id| pool.get(id).and_then(Self::handed_session));
+        // Whichever agent each leaf now carries, a relaunch still owed or one carried forward from
+        // the predecessor's image included.
+        manifest.mark_claim_bystanders();
     }
 
     fn desk_holds(&self, id: u64) -> Vec<String> {
@@ -3293,20 +3305,55 @@ impl App {
     ) {
         self.carry_restored_lineage(leaf, filling);
         let mut held_at = None;
+        let filled_by_a_live_shell = match &filling {
+            FillingShell::Registered(session) => self
+                .pool
+                .get(*session)
+                .is_some_and(|live| live.handoff_local_id.is_some()),
+            FillingShell::Unregistered(session) => session.handoff_local_id.is_some(),
+        } || leaf.local_id.is_some_and(|named| {
+            self.pool
+                .iter()
+                .any(|live| live.handoff_local_id == Some(named))
+        });
+        // A claim worker's tab: the worker brought back, or still running in a shell the PTY
+        // keeper hands back, or a tab whose worker is not coming back, its leaf with no agent to
+        // relaunch (its shell is all an ended worker leaves, and a quit forgets a running one's)
+        // or its worker ended. A layout before `claim_worker` names only an agent, one a later
+        // writer says is someone's own (`not_claim_worker`) none.
+        let worker = leaf
+            .claim_worker
+            .as_deref()
+            .or_else(|| {
+                leaf.agent
+                    .as_ref()
+                    .filter(|_| !leaf.not_claim_worker)
+                    .map(|agent| agent.cwd.as_str())
+            })
+            .map(|folder| {
+                let gone = leaf.agent.is_none() && !filled_by_a_live_shell;
+                (folder, leaf.claim_ended || gone)
+            });
+        if ids == LeafIds::Retired
+            && !self.handoff_successor
+            && let Some((folder, ended)) = worker
+        {
+            let (session, ctx) = match &filling {
+                FillingShell::Registered(session) => (
+                    *session,
+                    self.pool.get(*session).map(|live| live.ctx.clone()),
+                ),
+                FillingShell::Unregistered(session) => (session.id, Some(session.ctx.clone())),
+            };
+            if let Some(ctx) = ctx {
+                crate::harness_host::credit_claim::note_restored_worker(
+                    &ctx, session, folder, ended,
+                );
+            }
+        }
         if ids == LeafIds::Retired
             && let Some(agent) = &leaf.agent
         {
-            let filled_by_a_live_shell = match &filling {
-                FillingShell::Registered(session) => self
-                    .pool
-                    .get(*session)
-                    .is_some_and(|live| live.handoff_local_id.is_some()),
-                FillingShell::Unregistered(session) => session.handoff_local_id.is_some(),
-            } || leaf.local_id.is_some_and(|named| {
-                self.pool
-                    .iter()
-                    .any(|live| live.handoff_local_id == Some(named))
-            });
             if !self.handoff_successor && filled_by_a_live_shell {
                 aterm_log::info!(
                     "restore: the agent of a reattached shell is still running; not relaunched"

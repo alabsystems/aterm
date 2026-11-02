@@ -119,18 +119,23 @@ pub(crate) fn serve_ask(
     // A Mac that is ALab's already but whose vault key changed proves its fleet node key on this
     // connection and is let back in with nobody (`aterm_secrets::client::readmit`), as far as
     // this Mac's fleet book allows it (read here, on the connection's thread).
-    let prove = |proving: &desk::Proving<'_>| {
-        let paths = aterm_secrets::client::Paths::live()?;
+    let book = |proving: &desk::Proving<'_>| {
         let peers = aterm_types::dirs::state_dir()
-            .and_then(|state| aterm_net::fleet_member::read_peers(&state).ok())
-            .unwrap_or_default();
-        let book = aterm_agent::vault_join::book_word(
-            &peers,
+            .and_then(|state| aterm_net::fleet_member::read_peers(&state).ok());
+        aterm_agent::vault_join::book_word_read(
+            peers.as_deref(),
             &proving.node,
             Some(peer.ip()),
             aterm_time::unix_millis().unwrap_or(0),
-        );
-        aterm_secrets::client::prove_at(&paths, proving, book)
+        )
+    };
+    let prove = |proving: &desk::Proving<'_>| {
+        let paths = aterm_secrets::client::Paths::live()?;
+        aterm_secrets::client::prove_at(&paths, proving, book(proving))
+    };
+    let refuses = |proving: &desk::Proving<'_>| {
+        let paths = aterm_secrets::client::Paths::live().ok()?;
+        aterm_secrets::client::refuses_before_possession(&paths, proving, book(proving))
     };
     let served = desk::serve_with(
         desk,
@@ -139,21 +144,29 @@ pub(crate) fn serve_ask(
         &bundle,
         Some(desk::Proof {
             decide: &prove,
+            refuses: &refuses,
             fleet: None,
         }),
     );
     CHANGED.store(true, Ordering::Release);
     match served {
         Ok(Some(let_in)) => {
-            aterm_log::info!(
-                "members: let {} in from {peer}{}",
-                let_in.allowed.name(),
-                if let_in.logged {
-                    " by the membership log"
-                } else {
-                    ""
-                }
-            );
+            let by_log = if let_in.logged {
+                " by the membership log"
+            } else {
+                ""
+            };
+            match &let_in.delivered {
+                desk::Delivered::Unacknowledged(why) => aterm_log::warn!(
+                    "members: sent {} its bundle{by_log} from {peer}, not acknowledged ({why}); \
+                     its row stays allowed for Allow again",
+                    let_in.allowed.name()
+                ),
+                desk::Delivered::Acknowledged | desk::Delivered::Written => aterm_log::info!(
+                    "members: let {} in from {peer}{by_log}",
+                    let_in.allowed.name()
+                ),
+            }
             if let Some(note) = &let_in.note {
                 aterm_log::warn!(
                     "members: {} took F10's files: {note}",
@@ -549,11 +562,15 @@ impl Members {
 }
 
 impl App {
-    /// The entries of the Macs asking to join and the undo rows, once the desk or the approver's
-    /// record changed, and the phrase sheet closed once its phrase was used, burned or expired.
+    /// Refresh the join entries and undo rows when the desk or approver changes or carried
+    /// alerts retire; close the phrase sheet once its phrase was used, burned or expired.
     pub(crate) fn follow_member_requests(&mut self) {
+        // A seamless update can carry old standing join alerts even when there is no
+        // desk or approver change. No current producer owns these obsolete rows.
+        let now = std::time::Instant::now();
+        let retired = self.retire_obsolete_join_alerts(now);
         let desk = CHANGED.swap(false, Ordering::AcqRel);
-        if crate::secrets_asking::take_changed() || desk {
+        if crate::secrets_asking::take_changed() || desk || retired != 0 {
             self.refresh_member_rows();
         }
         self.close_spent_phrase_sheet();

@@ -43,15 +43,21 @@ fn every_script_resolves_to_a_face_that_really_contains_it() {
             checked += 1;
             if let Some(path) = r.debug_fallback_pick_path(ch) {
                 file_picks += 1;
-                let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-                    panic!(
-                        "{script}: {ch:?} (U+{:04X}) picked unreadable {path}: {e}",
-                        ch as u32
-                    )
-                });
-                let faces = aterm_font::fonts_in_collection(&bytes).unwrap_or(1);
+                let owned;
+                let bytes: &[u8] = if let Some(b) = aterm_render::bundled::face_for_id(&path) {
+                    b
+                } else {
+                    owned = std::fs::read(&path).unwrap_or_else(|e| {
+                        panic!(
+                            "{script}: {ch:?} (U+{:04X}) picked unreadable {path}: {e}",
+                            ch as u32
+                        )
+                    });
+                    &owned
+                };
+                let faces = aterm_font::fonts_in_collection(bytes).unwrap_or(1);
                 let real = (0..faces).any(|i| {
-                    aterm_font::Face::parse(&bytes, i)
+                    aterm_font::Face::parse(bytes, i)
                         .ok()
                         .and_then(|f| f.glyph_index(ch))
                         .is_some_and(|g| g.0 != 0)

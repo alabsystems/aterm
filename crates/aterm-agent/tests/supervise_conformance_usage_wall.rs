@@ -9,6 +9,7 @@ use aterm_agent::harness::tap::Window;
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::limit::{ResetSpec, place_reset, within_a_session_window};
 use aterm_agent::supervise::phase::Phase;
+use aterm_agent::supervise::policy::login::{OVER_LIMIT_UNUSED, RULE_LOGIN_OVER_LIMIT};
 use aterm_agent::supervise::policy::turn_end::{
     Cleared, Clearing, FIRED_EARLY, RULE_CONTINUE, RULE_LIMIT_RESUME, TurnEndAction,
     TurnEndReading, TurnEndState, TurnEndTiming, cleared_text, decide_turn_end,
@@ -22,12 +23,24 @@ use crate::common::cnst;
 
 type State = BTreeMap<&'static str, i64>;
 
-/// Base `SupervisorUsageWall` model (`Hidden = 0`, `Leaves = 1`, `OwnAct = 0`).
+/// Base `SupervisorUsageWall` model (`Hidden = 0`, `Leaves = 1`, `OwnAct = 0`, no person's
+/// `/login`: `Dialog = 0`).
 fn walled_model() -> Model {
     aterm_spec::interp::with_consts(
         &supervisor_usage_wall_model(),
-        &[("Hidden", 0), ("OwnAct", 0), ("Credits", 0), ("Tapped", 0)],
+        &[
+            ("Hidden", 0),
+            ("OwnAct", 0),
+            ("Credits", 0),
+            ("Tapped", 0),
+            ("Dialog", 0),
+        ],
     )
+}
+
+/// [`walled_model`] with a person's own `/login` opened over the shown wall (`Dialog = 1`).
+fn dialog_model() -> Model {
+    aterm_spec::interp::with_consts(&walled_model(), &[("Dialog", 1)])
 }
 
 /// [`walled_model`] with the usage tap timing a wall whose notice is cut
@@ -48,6 +61,7 @@ fn credits_model() -> Model {
             ("Leaves", 0),
             ("Unread", 0),
             ("Tapped", 0),
+            ("Dialog", 0),
         ],
     )
 }
@@ -79,6 +93,9 @@ const WALL: &str = include_str!(
 );
 const LIVE: &str = include_str!(
     "../../aterm-phase/src/fixtures/claude-2.1.283-wall-weekly-goal-paused-spinner.txt"
+);
+const HANDOFF: &str = include_str!(
+    "../../aterm-phase/src/fixtures/claude-2.1.302-login-handoff-over-weekly-limit.txt"
 );
 
 /// 2026-09-28 20:00 PDT, when the wall in every state is printed.
@@ -180,10 +197,12 @@ enum Screen {
     Left,
     OnCredits,
     Live,
+    /// A person's own `/login` over the wall ([`over_dialog`]).
+    Dialog,
 }
 
 impl Screen {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Walled,
         Self::WalledShell,
         Self::CutWalled,
@@ -194,10 +213,12 @@ impl Screen {
         Self::Left,
         Self::OnCredits,
         Self::Live,
+        Self::Dialog,
     ];
 
     fn of(st: &State) -> Self {
         match st["wall"] {
+            1 if st["dialog"] >= 1 => Self::Dialog,
             1 if st["cut"] == 1 && st["bg"] == 1 => Self::CutWalledShell,
             1 if st["cut"] == 1 => Self::CutWalled,
             1 if st["bg"] == 1 => Self::WalledShell,
@@ -223,6 +244,7 @@ impl Screen {
             Self::Left => left(),
             Self::OnCredits => on_credits(),
             Self::Live => screen(LIVE),
+            Self::Dialog => over_dialog(),
         }
     }
 
@@ -280,6 +302,28 @@ fn on_credits() -> Vec<String> {
         .position(|r| r.contains("bypass permissions on"))
         .expect("the mode row");
     rows[mode] = format!("{:<115}Now using usage credits", rows[mode]);
+    rows
+}
+
+/// THE MEASURED WALL UNDER A PERSON'S OWN `/login` (derived): the wall's transcript to its done
+/// row, then Claude Code 2.1.302's measured fullscreen hand-off panel in the composer's place
+/// ([`HANDOFF`], measured over another weekly wall), its rule drawn at the wall's width. The
+/// shell the tab counted is not drawn: the panel covers the footer that names it.
+fn over_dialog() -> Vec<String> {
+    let mut rows = walled(false);
+    let done = rows
+        .iter()
+        .position(|r| r.starts_with("✻ Sautéed"))
+        .expect("the wall's done row");
+    rows.truncate(done + 1);
+    let width = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0);
+    let panel = screen(HANDOFF);
+    let top = panel
+        .iter()
+        .position(|r| r.starts_with('▔'))
+        .expect("the panel's rule");
+    rows.push("▔".repeat(width));
+    rows.extend(panel[top + 1..].iter().cloned());
     rows
 }
 
@@ -370,6 +414,29 @@ fn with_rows_before_the_done_row(mut rows: Vec<String>, extra: &[&str]) -> Vec<S
 /// Construct the `TurnEndReading` for `st` under `run` (`masked` keeps a
 /// screen with active background work `Busy` regardless of turn-end text).
 fn reading(
+    st: &State,
+    worked: Option<Duration>,
+    reset: Option<Instant>,
+    run: Run,
+    real: &Real,
+) -> TurnEndReading {
+    let mut t = reading_of(st, worked, reset, run, &real.st);
+    if st["dialog"] >= 1 {
+        assert_eq!(
+            t.login_screen,
+            Some(aterm_phase::LoginScreen::Browser),
+            "{st:?}"
+        );
+        // The person's newest key: when they opened the dialog, or (`DialogUnused`) one
+        // `OVER_LIMIT_UNUSED` before it went unused.
+        t.person = real
+            .dialog_key
+            .map(|key| real.now.saturating_duration_since(key));
+    }
+    t
+}
+
+fn reading_of(
     st: &State,
     worked: Option<Duration>,
     reset: Option<Instant>,
@@ -466,6 +533,10 @@ struct Run {
     uncapped: bool,
     /// The loop with no usage tap source: no reading reaches the clock.
     no_tap: bool,
+    /// THE 2026-10-31 DECIDER ([`decide`]): nothing at a person's own `/login` dialog, as the
+    /// login arm decided before `login-over-limit@v1` (`dialog_act`'s `Nothing` at the hand-off),
+    /// so the dialog over the wall is never waited out or closed.
+    dialog_left_open: bool,
 }
 
 #[derive(Clone)]
@@ -482,6 +553,8 @@ struct Real {
     tap: Option<TapClock>,
     /// When the cut wall appeared (unix seconds).
     cut_at: i64,
+    /// The person's newest key in their own `/login` over the wall (`None`: no dialog).
+    dialog_key: Option<Instant>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -496,6 +569,10 @@ enum Verdict {
     /// The owner told: the credits hold's word where a reader takes the
     /// credits notice for a spend wall (`Run::credits_as_wall`).
     Told,
+    /// The Esc that closes a person's own `/login` over the wall (`LoginClosed`).
+    Close,
+    /// A wait on a person's own `/login` still in use, past the wall's due.
+    Held,
 }
 
 fn expected(m: &Model, st: &State) -> Verdict {
@@ -504,6 +581,23 @@ fn expected(m: &Model, st: &State) -> Verdict {
     }
     if st["held"] == 1 {
         return Verdict::Take;
+    }
+    if st["dialog"] == 1 {
+        if st["unused"] == 0 {
+            return Verdict::Held;
+        }
+        if m.action_enabled("LoginClosed", st) {
+            return Verdict::Close;
+        }
+        let cap = cnst(m, "Cap");
+        let due = (1..=cap)
+            .find(|&k| {
+                let mut later = st.clone();
+                later.insert("clock", (st["clock"] + k).min(cap));
+                m.action_enabled("LoginClosed", &later)
+            })
+            .unwrap_or_else(|| panic!("a dialog no tick ever closes: {st:?}"));
+        return Verdict::Wait(MIN * u32::try_from(due).unwrap());
     }
     if st["cut"] == 1 && st["tap"] == 0 {
         return Verdict::Wait(minutes(m, "Rung2"));
@@ -538,6 +632,8 @@ fn verdict(a: &TurnEndAction, now: Instant) -> Verdict {
         TurnEndAction::WaitUntil { why, .. } if why.starts_with("the worker to take") => {
             Verdict::Take
         }
+        TurnEndAction::WaitUntil { why, .. } if why.ends_with("to stand unused") => Verdict::Held,
+        TurnEndAction::Cancel { rule_id } if *rule_id == RULE_LOGIN_OVER_LIMIT => Verdict::Close,
         TurnEndAction::WaitUntil { until, .. } => {
             Verdict::Wait(until.saturating_duration_since(now))
         }
@@ -545,6 +641,21 @@ fn verdict(a: &TurnEndAction, now: Instant) -> Verdict {
         TurnEndAction::Escalate { .. } => Verdict::Told,
         other => panic!("an act the model has no word for: {other:?}"),
     }
+}
+
+/// The decider under test: the real [`decide_turn_end`], or under `Run::dialog_left_open` the
+/// 2026-10-31 one, whose login arm returned `Nothing` at a person's own `/login` dialog.
+fn decide(
+    st: &TurnEndState,
+    r: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+    run: Run,
+) -> TurnEndAction {
+    if run.dialog_left_open && r.login_screen.is_some() && st.login_typed_at().is_none() {
+        return TurnEndAction::Nothing;
+    }
+    decide_turn_end(st, r, cfg, now)
 }
 
 fn mirror(
@@ -564,7 +675,7 @@ fn mirror(
         "CreditsTurnEnds" => {
             let mut quiet = after.clone();
             quiet.insert("wall", 0);
-            let mut t = reading(&quiet, Some(LONG), real.reset, run, &real.st);
+            let mut t = reading(&quiet, Some(LONG), real.reset, run, real);
             t.phase = Phase::Idle;
             t.said_tail = Some("Stage done.".to_string());
             real.st.observe(&t, now);
@@ -573,25 +684,25 @@ fn mirror(
             real.appeared = now;
             real.reset = Some(on_the_print(now));
             let worked = (before["held"] == 0).then_some(LONG);
-            let r = reading(after, worked, real.reset, run, &real.st);
+            let r = reading(after, worked, real.reset, run, real);
             real.st.observe(&r, now);
         }
         "WallAppearsLeft" => {
             real.appeared = now;
             real.reset = Some(on_the_print(now));
-            let r = reading(after, None, real.reset, run, &real.st);
+            let r = reading(after, None, real.reset, run, real);
             real.st.observe(&r, now);
         }
         "PersonWallLeft" => {
             let mut quiet = before.clone();
             quiet.insert("wall", 0);
-            let mut end = reading(&quiet, Some(LONG), real.reset, run, &real.st);
+            let mut end = reading(&quiet, Some(LONG), real.reset, run, real);
             end.phase = Phase::Idle;
             end.said_tail = Some("Stage done.".to_string());
             real.st.observe(&end, now);
             real.appeared = now;
             real.reset = Some(on_the_print(now));
-            let r = reading(after, None, real.reset, run, &real.st);
+            let r = reading(after, None, real.reset, run, real);
             real.st.observe(&r, now);
         }
         "OlderLeftResumed" => {
@@ -603,7 +714,7 @@ fn mirror(
             } else {
                 now.checked_sub(off).expect("an instant half an hour back")
             });
-            let r = reading(after, None, real.reset, run, &real.st);
+            let r = reading(after, None, real.reset, run, real);
             real.st.observe(&r, now);
         }
         "OwnActTyped" => {
@@ -611,7 +722,7 @@ fn mirror(
                 text: "keep going".to_string(),
                 rule_id: RULE_CONTINUE,
             };
-            let r = reading(before, None, real.reset, run, &real.st);
+            let r = reading(before, None, real.reset, run, real);
             real.st.acted(&typed, &r, now);
         }
         "WallFoundSitting" => {
@@ -620,7 +731,7 @@ fn mirror(
                 now.checked_sub(misplaced_before_the_print())
                     .expect("an instant 11 h back"),
             );
-            let r = reading(after, None, real.reset, run, &real.st);
+            let r = reading(after, None, real.reset, run, real);
             real.st.observe(&r, now);
         }
         "Tick" => {
@@ -634,14 +745,14 @@ fn mirror(
             real.now += MIN;
             real.unix += 60;
             if before["held"] == 1 {
-                let r = reading(after, None, real.reset, run, &real.st);
+                let r = reading(after, None, real.reset, run, real);
                 real.st.observe(&r, real.now);
             }
         }
         "Act" => {
-            let r = reading(before, None, real.reset, run, &real.st);
+            let r = reading(before, None, real.reset, run, real);
             real.st.observe(&r, now);
-            let a = decide_turn_end(&real.st, &r, cfg, now);
+            let a = decide(&real.st, &r, cfg, now, run);
             if !matches!(a, TurnEndAction::Type { .. }) {
                 return false;
             }
@@ -653,7 +764,7 @@ fn mirror(
             if worked.is_some() || answered {
                 real.reset = Some(on_the_print(real.appeared));
             }
-            let r = reading(after, worked, real.reset, run, &real.st);
+            let r = reading(after, worked, real.reset, run, real);
             real.st.observe(&r, now);
         }
         "MetInWindow" | "MetLeftUnread" => {
@@ -661,13 +772,13 @@ fn mirror(
             if answered {
                 real.reset = Some(on_the_print(real.appeared));
             }
-            let r = reading(after, None, real.reset, run, &real.st);
+            let r = reading(after, None, real.reset, run, real);
             real.st.observe(&r, now);
         }
         "Taken" => {
             let mut quiet = after.clone();
             quiet.insert("wall", 0);
-            let mut t = reading(&quiet, Some(LONG), real.reset, run, &real.st);
+            let mut t = reading(&quiet, Some(LONG), real.reset, run, real);
             t.phase = Phase::Idle;
             t.said_tail = Some("Stage done.".to_string());
             real.st.observe(&t, now);
@@ -678,11 +789,11 @@ fn mirror(
             real.cut_at = real.unix;
             real.tap = Some(TapClock::new(real.unix));
             real.reset = None;
-            let r = reading(after, Some(LONG), None, run, &real.st);
+            let r = reading(after, Some(LONG), None, run, real);
             real.st.observe(&r, now);
         }
         "TapReads" | "TapRollsOver" => {
-            let r = reading(after, None, None, run, &real.st);
+            let r = reading(after, None, None, run, real);
             let kind = r.wall.expect("the cut wall");
             let windows = UsageWindow::of_wall(kind, &r.wall_message);
             assert_eq!(windows, [UsageWindow::SevenDay], "{r:#?}");
@@ -715,11 +826,11 @@ fn mirror(
                     now.checked_sub(off).expect("an instant minutes back")
                 }
             });
-            let r = reading(after, None, real.reset, run, &real.st);
+            let r = reading(after, None, real.reset, run, real);
             real.st.observe(&r, now);
         }
         "NoticeLeaves" | "ConversationResumed" | "ArmedConversationResumed" => {
-            let r = reading(after, None, real.reset, run, &real.st);
+            let r = reading(after, None, real.reset, run, real);
             real.st.observe(&r, now);
         }
         "PersonTurnServed" => {
@@ -737,7 +848,35 @@ fn mirror(
             }
             real.st.observe(&t, now);
         }
+        "PersonOpensLogin" => {
+            real.dialog_key = Some(now);
+            let r = reading(after, None, real.reset, run, real);
+            real.st.observe(&r, now);
+        }
+        "DialogUnused" => {
+            real.dialog_key = now.checked_sub(OVER_LIMIT_UNUSED);
+            let r = reading(after, None, real.reset, run, real);
+            real.st.observe(&r, now);
+        }
+        "LoginClosed" => {
+            let r = reading(before, None, real.reset, run, real);
+            real.st.observe(&r, now);
+            let a = decide(&real.st, &r, cfg, now, run);
+            if verdict(&a, now) != Verdict::Close {
+                return false;
+            }
+            real.st.acted(&a, &r, now);
+            real.dialog_key = None;
+            let r = reading(after, None, real.reset, run, real);
+            real.st.observe(&r, now);
+        }
+        "PersonClosesLogin" => {
+            real.dialog_key = None;
+            let r = reading(after, None, real.reset, run, real);
+            real.st.observe(&r, now);
+        }
         "WallMasked"
+        | "LoginLeftOpen"
         | "GivesUp"
         | "MetKeepsTheGuess"
         | "MemoryLost"
@@ -797,6 +936,7 @@ fn walk_until(m: &Model, strict: bool, run: Run, first_off: bool) -> Walked {
         reset: Some(base),
         tap: None,
         cut_at: 0,
+        dialog_key: None,
     };
     let mut seen: BTreeSet<State> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), init)]);
@@ -817,9 +957,9 @@ fn walk_until(m: &Model, strict: bool, run: Run, first_off: bool) -> Walked {
             }
         }
         let mut at = real.st.clone();
-        let here = reading(&st, None, real.reset, run, &real.st);
+        let here = reading(&st, None, real.reset, run, &real);
         at.observe(&here, real.now);
-        let got = verdict(&decide_turn_end(&at, &here, &cfg, real.now), real.now);
+        let got = verdict(&decide(&at, &here, &cfg, real.now, run), real.now);
         let want = expected(m, &st);
         if got != want {
             assert!(
@@ -889,6 +1029,59 @@ fn tier1_the_real_reader_and_decider_continue_a_usage_wall_exactly_where_the_mod
             states.len()
         );
     }
+}
+
+/// A PERSON'S OWN `/login` OVER THE WALL (`Dialog = 1`): every reachable state of
+/// [`dialog_model`] agrees with the real reader and decider. While the dialog is in use the tab
+/// waits on the person's hand; once it stands unused, it waits for the wall's due and closes the
+/// dialog with its Esc (`login-over-limit@v1`) exactly where `LoginClosed` is enabled, and the
+/// wall's act follows where `Act` is.
+#[test]
+fn tier1_a_persons_login_over_the_wall_is_closed_exactly_where_the_model_closes_it() {
+    let m = dialog_model();
+    let walked = walk(&m, true, Run::default());
+    let dialogs = walked.states.iter().filter(|st| st["dialog"] == 1).count();
+    let closable = walked
+        .states
+        .iter()
+        .filter(|st| m.action_enabled("LoginClosed", st))
+        .count();
+    assert!(dialogs > 20 && closable > 5, "{dialogs} {closable}");
+    for a in [
+        "PersonOpensLogin",
+        "DialogUnused",
+        "LoginClosed",
+        "PersonClosesLogin",
+        "Act",
+        "Taken",
+    ] {
+        assert!(walked.fired.contains_key(a), "{a}: {:?}", walked.fired);
+    }
+}
+
+/// THE 2026-10-31 DECIDER DISAGREES WITH THE REAL CODE: one whose login arm leaves a person's
+/// own `/login` over the wall theirs whatever the wall owes (`Run::dialog_left_open`: `Nothing`
+/// at the dialog, the arm before `login-over-limit@v1`) disagrees at the states where the dialog
+/// stands, the unused dialog's the incident's among them, and nowhere else.
+#[test]
+fn the_loop_that_leaves_a_persons_login_open_over_the_wall_disagrees() {
+    let m = dialog_model();
+    let run = Run {
+        dialog_left_open: true,
+        ..Run::default()
+    };
+    let walked = walk(&m, false, run);
+    let off = &walked.off;
+    assert!(
+        off.iter().any(|st| st["dialog"] == 1 && st["unused"] == 1),
+        "the decider that never closes it agreed where the dialog stood unused: {off:?}"
+    );
+    assert!(off.iter().all(|st| st["dialog"] == 1), "{off:?}");
+    assert!(
+        !walked.fired.contains_key("LoginClosed"),
+        "the decider that never closes it closed it: {:?}",
+        walked.fired
+    );
 }
 
 /// Verify `ArmedConversationResumed` does not end the current limit wait when

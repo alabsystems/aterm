@@ -1404,9 +1404,10 @@ fn boxed(d: &Decided, command: &str) -> bool {
 
 /// Check that aterm's disk worker `sid` ran [`FIRST_BASH`] with no box (no row of its approval
 /// ledger), in its own folder (its result), and its dry run ([`FREE_DRY`]) under its fence:
-/// approved under [`RULE_DISK_WORKER`], a result of it the verb's own summary ([`WOULD_FREE`]),
-/// which only a run of it prints. A dry run its fence declined, for want of a shell snapshot or
-/// any other reason, fails here, as that worker can free nothing.
+/// approved under [`RULE_DISK_WORKER`](aterm_agent::supervise::policy::RULE_DISK_WORKER), a
+/// result of it the verb's own summary ([`WOULD_FREE`]), which only a run of it prints. A dry run
+/// its fence declined, for want of a shell snapshot or any other reason, fails here, as that
+/// worker can free nothing.
 fn ran_its_reads(lane: &Lane<'_>, v: &mut Verdict, sid: &str) {
     let all = crate::workers::transcripts(lane.run);
     let talk = worker_talk(&all);

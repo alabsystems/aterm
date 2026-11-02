@@ -1056,7 +1056,7 @@ fn alab_launcher(b: &crate::ai::testing::Box3, reads: bool) {
     let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/codex"), reads);
     std::fs::write(
         b.pkg.agents_dir().join("codex"),
-        format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
+        crate::harness::codex_alab::twin_text(&exe),
     )
     .expect("launcher");
 }
@@ -1302,7 +1302,7 @@ fn a_codex_pool_judges_the_program_a_launch_runs_not_the_managed_copy() {
     let now = 1_800_000_000_i64;
     let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/codex"), true);
     std::fs::create_dir_all(b.pkg.bin_dir()).expect("bin");
-    let launcher = format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display());
+    let launcher = crate::harness::codex_alab::twin_text(&exe);
     std::fs::write(b.pkg.bin_dir().join("codex"), &launcher).expect("managed copy");
     let config = b.dir.path().join("config");
     std::fs::create_dir_all(&config).expect("config");

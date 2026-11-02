@@ -252,7 +252,8 @@ impl SysQuery {
     ///
     /// # Errors
     /// [`USAGE`] for an unknown or second view, an unknown key, an invalid value, a bare `name`,
-    /// or `scope=`, `depth=` or `instances=` on a view that does not take it;
+    /// or `scope=`, `depth=` or `instances=` on a view that does not take it, or read options
+    /// other than JSON formatting or the advisory caller label on an explicit `name` action;
     /// [`WHY_USAGE`] for any other word after `why`.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
         let mut q = Self {
@@ -338,6 +339,16 @@ impl SysQuery {
             }
         }
         if naming && q.name.is_none() {
+            return Err(USAGE);
+        }
+        if naming
+            && (q.scope.is_some()
+                || q.top_set
+                || q.depth.is_some()
+                || q.fresh_ms.is_some()
+                || q.since.is_some())
+        {
+            // Naming is an explicit action in the resolved session, not a scoped/delta read.
             return Err(USAGE);
         }
         if q.scope.is_some() && q.view.default_scope().is_none() {
@@ -572,6 +583,42 @@ mod tests {
         ] {
             assert!(!rows_only(owner), "{owner}");
         }
+    }
+
+    #[test]
+    fn naming_keeps_advisory_caller_without_resource_read_options() {
+        for text in [
+            "name job=b1",
+            "name task=call1 --json",
+            "--json name job=b1",
+            "name job=b1 caller=s-origin",
+            "name task=call1 --json caller=s-origin",
+        ] {
+            assert!(SysQuery::parse(text).is_ok(), "{text}");
+        }
+        for option in [
+            "scope=tab",
+            "scope=aterm",
+            "top=1",
+            "depth=1",
+            "fresh=0",
+            "since=1.1",
+            "instances=all",
+        ] {
+            assert_eq!(
+                SysQuery::parse(&format!("name job=b1 {option}")),
+                Err(USAGE),
+                "{option}"
+            );
+        }
+        let query = SysQuery::parse("name job=b1 caller=s-unrelated").unwrap();
+        assert_eq!(query.name, Some(NameTarget::Job("b1".into())));
+        assert_eq!(query.caller.as_deref(), Some("s-unrelated"));
+        assert_eq!(query.scope, None);
+        assert!(
+            !query.target_rows_only(),
+            "advisory metadata grants no scope"
+        );
     }
 
     /// `left` reads the target's pane or tab, or with `scope=aterm` every session's rows; a

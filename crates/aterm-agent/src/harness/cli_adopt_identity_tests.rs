@@ -101,7 +101,8 @@ fn run_case(case: i64) -> (i64, i64, i64) {
                 17 | 18 => std::fs::write(
                     &path,
                     format!(
-                        "[[account]]\nlabel='existing'\nclass='dedicated'\ndir='/unrelated'\nemail='{}'\n",
+                        "[[account]]\nlabel='existing'\nclass='dedicated'\ndir='{}'\nemail='{}'\n",
+                        crate::harness::host_path::abs("/unrelated"),
                         if case == 17 {
                             "other@example.test"
                         } else {

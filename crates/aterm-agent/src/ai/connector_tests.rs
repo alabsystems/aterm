@@ -256,14 +256,19 @@ fn every_grok_auth_word_is_one_of_the_builds_login_ended_texts() {
         .filter(|a| a.id.starts_with("grok.auth."))
         .collect();
     assert!(texts.len() > 20, "the filter keeps the login texts");
-    // The named sign-in helper's opener is the words before the helper's name.
+    // The named sign-in helper's opener is the words before the helper's name, and a 401's
+    // drawn failure stands composed from its opening and its ending on the measured frame.
     let prefix = "grok.auth.not_renewed.named";
+    let drawn = "Authentication required: your session has expired or your credentials were \
+                 rejected. Run /login to re-authenticate, then resend your message.";
     for a in &texts {
         let line = if a.id == prefix {
             format!(
                 "{} okta-helper could not renew it in the background.",
                 a.text
             )
+        } else if a.id == "grok.auth.required.open" || a.id == "grok.auth.required.tail" {
+            drawn.to_string()
         } else {
             a.text.to_string()
         };
@@ -272,6 +277,13 @@ fn every_grok_auth_word_is_one_of_the_builds_login_ended_texts() {
     assert!(
         !says(GROK.auth_words, aterm_phase::anchors::anchor(prefix)),
         "CONTROL: {prefix}"
+    );
+    assert!(
+        !says(
+            GROK.auth_words,
+            aterm_phase::anchors::anchor("grok.auth.required.open")
+        ),
+        "CONTROL: grok.auth.required.open"
     );
     for word in GROK.auth_words {
         assert!(

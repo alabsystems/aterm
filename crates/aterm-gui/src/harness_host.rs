@@ -1542,6 +1542,8 @@ impl ExitWatched {
 struct AccountKept {
     progress: Option<progress::BoundProgress>,
     execution_progress: Option<progress::BoundProgress>,
+    /// An Off transition retires display authority without changing the retained decision.
+    progress_policy: Arc<()>,
     advised: Option<Advised>,
     /// The newest calculation owns publication; queued advice remains usable until replaced.
     advice_id: Arc<()>,
@@ -1894,6 +1896,7 @@ struct Advised {
 struct AdviceTurn {
     id: Arc<()>,
     generation: Arc<Mutex<()>>,
+    progress_policy: Arc<()>,
 }
 
 impl PartialEq for AdviceTurn {
@@ -1954,6 +1957,7 @@ impl AdviceTurn {
             Self {
                 id,
                 generation: Arc::clone(&k.account.landing),
+                progress_policy: Arc::clone(&k.account.progress_policy),
             }
         })
     }
@@ -2045,7 +2049,9 @@ impl AdviceRequest {
                 return None;
             }
             let advice = advice.filter(|_| self.snap.is_some());
-            k.account.progress = progress;
+            if Arc::ptr_eq(&self.turn.progress_policy, &k.account.progress_policy) {
+                k.account.progress = progress;
+            }
             k.account.advised = match advice.as_ref().and_then(AccountAdvice::past_probe) {
                 Some(AccountAdvice::Move { to, .. }) => Some(Advised {
                     to: to.clone(),
@@ -2860,9 +2866,6 @@ pub(crate) enum HostNote {
         sid: String,
         offer: aterm_agent::harness::credit_offers::Offer,
     },
-    /// The credit claim worker `sid`, which this process started, has run
-    /// [`credit_claim::WORKER_FOR`]: its Autopilot goes Off, so Land types nothing more into it.
-    CreditClaimExpired { sid: String },
     /// macOS's program check is stuck ([`crate::program_check_watch`]).
     ProgramCheckStuck { workers: u64, limit: Option<u64> },
     /// The program check is not stuck.
@@ -4121,6 +4124,19 @@ impl UpgradeRun {
     /// Whether `step` is the same person's hold as the step before it at this point (`wait:attended` again, no turn between).
     fn repeats(&self, step: &str) -> bool {
         upgrade_drive::attended(step) && self.attended > 0 && self.last == step
+    }
+
+    /// [`Self::after`] for a relaunch's carry-on. A person's keys let go within their grace, and the
+    /// prompt and the loop's own act both wait on this look ([`WorkerIdle::carry_holds`]), so a
+    /// carry-on their keys hold is looked at every [`upgrade_drive::HOLD_LOOK`], as one their draft
+    /// holds is: the ladder a held upgrade climbs would put the prompt minutes past the keys.
+    fn after_carry(&mut self, step: &str, grace_s: u32) -> After {
+        let after = self.after(step, grace_s);
+        if step == "wait:held" {
+            After::Later(upgrade_drive::HOLD_LOOK)
+        } else {
+            after
+        }
     }
 
     /// [`upgrade_drive::after`] for one step's word, the counts kept.
@@ -6889,7 +6905,12 @@ impl WorkerIdle {
             self.reread_after_act(Instant::now());
             laps::lap("snapshot.after");
         }
-        match run.after(&step, self.grace) {
+        let after = if what == "carry-on" {
+            run.after_carry(&step, self.grace)
+        } else {
+            run.after(&step, self.grace)
+        };
+        match after {
             After::NextIdle => {
                 self.upgrade_runs(&mut run);
                 self.park.store(true, Ordering::SeqCst);
@@ -7060,22 +7081,10 @@ impl WorkerIdle {
         }
     }
 
-    /// The claim act's look at a decided idle turn end ([`credit_claim::step`]): first, every
-    /// claim worker of this process that has run its time is handed to the window to stop
-    /// ([`HostNote::CreditClaimExpired`]), whatever this session's gate (a worker's own turn end,
-    /// where Land would type next, is such a look); then, under its gate, the live offers in the
-    /// profile this session's own process reads, each due one recorded and handed to the window
-    /// ([`HostNote::CreditClaim`]).
+    /// The claim act's look at a decided idle turn end ([`credit_claim::step`]): under its gate,
+    /// the live offers in the profile this session's own process reads, each due one recorded and
+    /// handed to the window ([`HostNote::CreditClaim`]).
     fn credit_claim_step(&self) {
-        for sid in credit_claim::RUNNING.expired(std::time::Instant::now()) {
-            aterm_log::info!(
-                "harness @{}: the credit claim worker @{sid} has run {} min: its Autopilot goes \
-                 Off",
-                self.sid,
-                credit_claim::WORKER_FOR.as_secs() / 60
-            );
-            (self.hooks.note)(HostNote::CreditClaimExpired { sid });
-        }
         let gate = credit_claim::Gate {
             on: self.on() && !self.beside(),
             // Only Claude Code caches these offers; a new agent is named here by the compiler.
@@ -11667,6 +11676,8 @@ struct State {
     live: Vec<String>,
     stops: Vec<StopHandle>,
     off: std::collections::HashSet<String>,
+    /// Version of the host's published per-session Off verdicts.
+    off_revision: u64,
     unsupervised: bool,
 }
 
@@ -14249,7 +14260,7 @@ fn host_pass(
         cfg_gen,
         hooks,
     );
-    publish_off(shared, &host.workers, &wanted, &off);
+    publish_off(shared, &host.workers, &wanted, &off, hooks);
     if active {
         host.was_off.retain(|sid| rostered.contains_key(sid));
         host.was_off.extend(
@@ -14490,7 +14501,9 @@ pub(crate) enum StartupState {
     StalledAtStartup,
     /// `stalled why=held`, the held deadline's own mark.
     StalledHeld,
-    /// Anything else: `done`, `exited`, the launcher's `stalled why=shell`.
+    /// Anything else: `done`, `exited`, the launcher's `stalled why=shell`, and the `working
+    /// why=restored` record a restore gives a claim worker it brings back, whose program started
+    /// before the restore (`credit_claim::note_restored_worker`).
     Other,
     /// A record no deadline's stall stands on whose session still carries a deadline's own attention ([`deadline_attention_stands`]).
     StallOver,
@@ -16098,18 +16111,37 @@ fn publish_off(
     workers: &Workers,
     wanted: &HashMap<String, Program>,
     off: &OffSessions,
+    hooks: &Hooks,
 ) {
-    let mut known: std::collections::HashSet<String> = shared
+    let kept: Vec<_> = shared
         .kept
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .keys()
-        .cloned()
+        .iter()
+        .map(|(sid, kept)| (sid.clone(), Arc::clone(kept)))
         .collect();
+    let mut known: std::collections::HashSet<String> =
+        kept.iter().map(|(sid, _)| sid.clone()).collect();
     known.extend(wanted.keys().cloned());
     known.extend(workers.0.keys().cloned());
     known.retain(|sid| off.contains(sid));
-    shared.lock().off = known;
+    let previous = shared.lock().off.clone();
+    if previous == known {
+        return;
+    }
+    // No host-state guard crosses a Kept lock. Both edges retire old receipts, including
+    // a calculation that began before Off or completed while Off and is published late.
+    for (sid, kept) in kept {
+        if previous.contains(&sid) != known.contains(&sid) {
+            with_kept_of(&kept, |kept| kept.account.progress_policy = Arc::new(()));
+        }
+    }
+    {
+        let mut state = shared.lock();
+        state.off = known;
+        state.off_revision = state.off_revision.wrapping_add(1);
+    }
+    (hooks.note)(HostNote::AccountProgress);
 }
 
 /// The host's live workers as it leaves them ([`State::live`]).
@@ -17627,9 +17659,10 @@ fn live_acts(store: Store, sock: String) -> Acts {
         route: Arc::new(crate::harness_netprobe::route_of_agent),
         claude_env: Arc::new(crate::harness_netprobe::launch_env_of_agent),
         agy_backend: Arc::new(|snap, env| {
-            aterm_agent::harness::witness::agy_backend_on_disk(
+            aterm_agent::harness::witness::agy_backend_in_dir(
                 &snap.argv,
                 env,
+                Some(std::path::Path::new(&snap.cwd)),
                 aterm_types::dirs::home_dir().as_deref(),
             )
         }),
@@ -18275,7 +18308,7 @@ fn account_usage_live(
         home.and_then(|home| upgrade_drive::named_last_answer(home, agent.snap, by))
             .and_then(|at| i64::try_from(at).ok())
     };
-    let said = |at: i64| usage_said(seen, at, crate::presence::local_offset_at(at).unwrap_or(0));
+    let said = |at: i64| usage_said_local(seen, at, &crate::presence::local_offset_at);
     let read = UsageRead {
         env: &env,
         started: process_started(&agent.snap.start),
@@ -18287,13 +18320,25 @@ fn account_usage_live(
 }
 
 /// What `seen` says, as true at `at` in the zone `offset` seconds east of UTC.
+#[cfg(test)]
 fn usage_said(seen: &UsageSeen, at: i64, offset: i64) -> accounts::UsageSaid {
+    usage_said_local(seen, at, &|_| Some(offset))
+}
+
+/// What `seen` says, as true at `at`, placing any local reset clock at its target instant's
+/// offset (`local_at`).
+fn usage_said_local(
+    seen: &UsageSeen,
+    at: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> accounts::UsageSaid {
+    let offset = local_at(at).unwrap_or(0);
     let place = |text: &str| {
         aterm_agent::supervise::limit::parse_reset(text).map(|spec| {
-            aterm_agent::supervise::limit::reset_at_with(
+            aterm_agent::supervise::limit::reset_at_local(
                 &spec,
                 at,
-                offset,
+                local_at,
                 &aterm_agent::supervise::limit::zone_offset_at,
             )
         })

@@ -2205,6 +2205,7 @@ pub struct Session<'a, C: Ctl> {
     reprint_jumps: u32,
     wall_answered: Option<(Instant, String)>,
     wall_memory: Option<wall_memory::WallMemory>,
+    stale_open_wall: Option<approvals::OpenWall>,
     wall_verdict: Option<wall_confirm::Verdict>,
     wall_conversation: Option<(u64, super::policy::turn_end::Conversation)>,
     wall_refused_said: Option<String>,
@@ -2279,6 +2280,11 @@ pub struct Session<'a, C: Ctl> {
     held: bool,
     rejudge: bool,
     host_held: bool,
+    /// An edge (`word_edge`, `reach_edge`, `witness_edge`, …) called [`Self::turn_end_now`] while
+    /// no `Due` had yet run out and [`Self::turn_end_again`] read a one-read frame of another
+    /// point (`Again::Moved`): if the next look finds the handed point back on screen, decide it
+    /// then without waiting on a later or absent `Due`.
+    pub(super) edge_moved: bool,
     /// The point's decision was made but not carried out: the host's step at a new point comes
     /// before [`Self::turn_end_execute`] ([`Self::host_steps_here`]).
     decision_owed: bool,
@@ -2317,9 +2323,10 @@ pub struct Session<'a, C: Ctl> {
     /// A line this loop wrote and did not submit ([`Self::left_line_look`]). Gone at the loop's next
     /// write, at another point, or once the worker works.
     left_line: Option<turn_end_loop::LeftLine>,
-    /// That line's text and the act that wrote it ([`turn_end_loop::OwnLine`]), kept past the look
-    /// that decides it again and past another point: no person's draft, and its Enter that act's.
-    /// Gone at the loop's next write or once the worker works.
+    /// That line's text and who wrote it ([`turn_end_loop::OwnLine`]), kept past the look that
+    /// decides it again and past another point: no person's draft, and its Enter its writer's.
+    /// Gone at the loop's next write, once the worker works, or (the accounts probe's `/usage`)
+    /// once the probe ends.
     own_line: Option<turn_end_loop::OwnLine>,
     /// The model the handed point's footer named ([`named_model`]), or the first a read of that
     /// point named where its own read named none: the one baseline every read of the point is
@@ -2567,6 +2574,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             stuck_dialog: None,
             stuck_still: None,
             wall_memory: None,
+            stale_open_wall: None,
             wall_verdict: None,
             wall_conversation: None,
             wall_refused_said: None,
@@ -2622,6 +2630,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             held: false,
             rejudge: false,
             host_held: false,
+            edge_moved: false,
             decision_owed: false,
             replies_stopped: false,
             host_passed: None,
@@ -2931,6 +2940,13 @@ impl<'a, C: Ctl> Session<'a, C> {
     #[cfg(test)]
     pub(crate) fn set_occupancy_k_looks(&mut self, k: i64) {
         self.setup.occupancy_k_looks = k;
+    }
+
+    /// Sets whether the occupancy door's `wait-nudge` names `wake`, as a build before it named it
+    /// recorded, in tests.
+    #[cfg(test)]
+    pub(crate) fn set_occupancy_nudge_wake(&mut self, named: bool) {
+        self.setup.occupancy_nudge_wake = named;
     }
 
     /// Lets a hold on a box outlast its countdown, the deny cap's negative control.
@@ -5430,11 +5446,17 @@ impl<'a, C: Ctl> Session<'a, C> {
             state.handed_submit = submit_mark(self.reader(&point.screen.rows), &point.screen);
             self.point_model = named_model(self.reader(&point.screen.rows), &point.screen.rows);
             if review.unattended() {
+                // A person told now to close their own `/login` over the limit
+                // ([`Exception::tells_login_over_limit`]) is the limit's answer: no second notice.
                 let handled = point_escalated
                     || !matches!(
                         turn_end,
                         TurnEndAction::Nothing | TurnEndAction::Escalate { .. }
-                    );
+                    )
+                    || self
+                        .exception_now
+                        .as_ref()
+                        .is_some_and(Exception::tells_login_over_limit);
                 self.limit_after(&point, deadline, handled, review)?;
             }
             self.decision_owed = true;
@@ -6327,6 +6349,7 @@ impl<C: Ctl> Session<'_, C> {
         self.watch_sleep();
         let mut seen_key: Option<String> = None;
         let mut verdict_seq = seen.screen.seq;
+        let mut since_recheck = Duration::ZERO;
         let request = anchor
             .as_ref()
             .filter(|_| !held)
@@ -6391,6 +6414,10 @@ impl<C: Ctl> Session<'_, C> {
             if self.word_edge(&seen, anchor.is_some(), opts, allow, review)? {
                 return Ok(None);
             }
+            if std::mem::take(&mut self.edge_moved) {
+                self.turn_end_now(&seen, opts, allow, review)?;
+                return Ok(None);
+            }
             if self.look_at.is_some_and(|at| self.fx.mono() >= at) {
                 self.look_at = None;
                 return Ok(None);
@@ -6445,8 +6472,8 @@ impl<C: Ctl> Session<'_, C> {
                         }
                     }
                 } else if let Some(words) = self.agent_wake(&seen, &mut seen_key) {
-                    let recheck = step >= AGENT_RECHECK.min(self.setup.wait_step);
-                    match self.park(&["agent", words], step.min(AGENT_RECHECK), rest)? {
+                    let waited = step.min(AGENT_RECHECK);
+                    match self.park(&["agent", words], waited, rest)? {
                         Wait::Latched => {
                             self.agent_woke =
                                 Some(seen_key.take().unwrap_or_else(|| self.review_key(&seen)));
@@ -6457,15 +6484,20 @@ impl<C: Ctl> Session<'_, C> {
                             continue;
                         }
                         Wait::TimedOut => {
-                            if recheck
-                                && self.moved_under_verdict(
+                            // A TURN TOO SHORT TO MOVE THE WORD IS FOUND HERE, so the look comes by
+                            // what has been waited: a retry due every 2 s (a take-down still owed)
+                            // cuts every step short, and must not hold back this read.
+                            since_recheck += waited;
+                            if since_recheck >= AGENT_RECHECK.min(self.setup.wait_step) {
+                                since_recheck = Duration::ZERO;
+                                if self.moved_under_verdict(
                                     &seen,
                                     &mut seen_key,
                                     &mut verdict_seq,
                                     review,
-                                )?
-                            {
-                                return Ok(None);
+                                )? {
+                                    return Ok(None);
+                                }
                             }
                         }
                         Wait::Unsupported => self.caps.await_agent = Some(false),
@@ -8109,16 +8141,19 @@ fn point_upto(reader: &dyn ScreenReader, rows: &[String]) -> usize {
 /// WHERE A PROGRAM'S OWN TURN ENDS ON ITS SCREEN, so no draft typed, pasted or cleared in its
 /// composer, and nothing its footer draws, moves a point ([`point_key`], [`submit_mark`]): agy's
 /// transcript, which ends at a running turn's spinner row or above its composer's frame, its notice
-/// cards and its feedback survey ([`aterm_phase::agy::transcript_end`]), and Kimi Code's turn above
-/// its composer's top row ([`aterm_phase::kimi::composer_rows`]). `None` where the point keeps
-/// Claude Code's rule: Claude Code's and Muse Code's frames are its own, and it stops above them
-/// and the status rows over them, which their frame's top would not; Codex and Grok Build have no
-/// composer their readers find; and Kimi Code's screen with no composer drawn.
+/// cards and its feedback survey ([`aterm_phase::agy::transcript_end`]), Kimi Code's turn above
+/// its composer's top row ([`aterm_phase::kimi::composer_rows`]), and Grok Build's above its
+/// composer's box ([`aterm_phase::grok::composer_rows`]: its draft's words are never read, a
+/// suggestion the empty composer offers being one a row cannot tell from a draft). `None` where
+/// the point keeps Claude Code's rule: Claude Code's and Muse Code's frames are its own, and it
+/// stops above them and the status rows over them, which their frame's top would not; Codex has
+/// no composer its reader finds; and Kimi Code's or Grok Build's screen with no composer drawn.
 fn own_turn_end(reader: &dyn ScreenReader, rows: &[String]) -> Option<usize> {
     match reader.program() {
         Program::Agy => Some(reader.transcript_end(rows).min(rows.len())),
         Program::Kimi => aterm_phase::kimi::composer_rows(rows).map(|(top, _, _)| top),
-        Program::Claude | Program::Muse | Program::Codex | Program::Grok | Program::Generic => None,
+        Program::Grok => aterm_phase::grok::composer_rows(rows).map(|(top, _, _)| top),
+        Program::Claude | Program::Muse | Program::Codex | Program::Generic => None,
     }
 }
 

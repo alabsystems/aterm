@@ -15,6 +15,15 @@ pub const MAC_ONLY_REFUSAL: &str = "this cut says nothing about Linux: pass --li
 pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release cutter
 
 USAGE
+  targo --unverified ship release status [--json]
+      Read this clone's current or latest release, first reported failure, log
+      paths and validation timing without starting, resuming or building it.
+
+  targo --unverified ship accept-measure-failure REPORT REASON
+      Only on the owner's explicit instruction to ship the known measurement defect:
+      accept the journaled artifact after all other release checks passed.
+      Keeps the failed report and its digest; never writes a passing verification.
+
   targo --unverified ship release [--bump | --commit REV]
                  (--mac-only | --linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]...)
@@ -191,9 +200,9 @@ USAGE
       release, 3 a gate could not run (each line names its fix), 130 interrupted
   targo --unverified ship harness-bump
                            write the harness versions the `harness versions` gate
-                           asks for: each harness (claude, codex, agy, grok, kimi,
-                           muse) whose sources (its reader in crates/aterm-phase/src
-                           and the shared lane crates/aterm-agent/src/harness/)
+                           asks for: each harness (claude, agy, grok, kimi, muse)
+                           whose sources (its reader in crates/aterm-phase/src and
+                           its files in crates/aterm-agent/src/harness/)
                            changed since the previous public release under an
                            unchanged HARNESS_VER gets its minor raised by one, and
                            CHANGELOG [Unreleased] a line naming it. A harness
@@ -354,6 +363,10 @@ pub enum PinSource {
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
     Help,
+    AcceptMeasure {
+        report: std::path::PathBuf,
+        reason: String,
+    },
     LinuxBuild {
         version: String,
         build: u64,
@@ -379,6 +392,9 @@ pub enum Cmd {
     /// `release`: the one release command ([`crate::release`]).
     Release(crate::release::ReleaseOptions),
     Status,
+    ReleaseStatus {
+        json: bool,
+    },
     /// `check`: would a release of one commit pass ([`crate::release_steps::check`]).
     Check(crate::release_steps::CheckOptions),
     Recover {
@@ -508,7 +524,30 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                  journal reserved"
             )),
         },
+        "release" if it.clone().next() == Some("status") => {
+            it.next();
+            let json = match (it.next(), it.next()) {
+                (None, None) => false,
+                (Some("--json"), None) => true,
+                _ => return Err("release status accepts only --json".into()),
+            };
+            Ok(Cmd::ReleaseStatus { json })
+        }
         "release" => parse_release(&mut it).map(Cmd::Release),
+        "accept-measure-failure" => {
+            let report = it
+                .next()
+                .ok_or("accept-measure-failure requires REPORT REASON")?
+                .into();
+            let reason = it
+                .next()
+                .ok_or("accept-measure-failure requires REPORT REASON")?
+                .to_string();
+            if it.next().is_some() {
+                return Err("accept-measure-failure requires REPORT REASON".into());
+            }
+            Ok(Cmd::AcceptMeasure { report, reason })
+        }
         "pin-verifier" => match (it.next(), it.next(), it.next()) {
             (Some("--from-release"), Some(tag), None) if !tag.starts_with('-') => {
                 Ok(Cmd::PinVerifier(PinSource::Release(tag.to_string())))
@@ -1053,6 +1092,9 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             Ok(())
         }
         Cmd::Build => crate::artifact::run_build(&repo_root()?),
+        Cmd::AcceptMeasure { report, reason } => {
+            crate::accepted_measure::record(&repo_root()?, &report, &reason).map_err(Error::new)
+        }
         Cmd::Cut {
             abandon: Some(v), ..
         } => verify::run_abandon(&repo_root()?, &v),
@@ -1070,6 +1112,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             },
         },
         Cmd::Status => verify::run_status(&repo_root()?),
+        Cmd::ReleaseStatus { json } => crate::release_status::run(&repo_root()?, json),
         Cmd::Check(opts) => match crate::release_steps::check(&repo_root()?, &opts) {
             0 => Ok(()),
             code => Err(Error::new(format!("check exited {code}"))),

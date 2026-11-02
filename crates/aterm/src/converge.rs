@@ -20,9 +20,10 @@
 //! ([`publish_lan`]).
 //! `sync.awake` starts the installed app's aCaffiene mug when none runs, so the subscriber's pass
 //! keeps a Mac with no window awake ([`aterm_acaffiene::cli::keep_installed_awake`], which first
-//! retires the old `aterm caffeine` name's login jobs no aterm will run again), and never
-//! turns a person's off on: neither keep-awake's off nor, at the subscriber's pass, Enable at
-//! Startup's.
+//! retires the old `aterm caffeine` name's login jobs no aterm will run again), retires those old
+//! login jobs directly when the mug already runs ([`aterm_acaffiene::cli::retire_old_jobs`]), and
+//! never turns a person's off on: neither keep-awake's off nor, at the subscriber's pass, Enable
+//! at Startup's.
 
 use aterm_machines::init::{Base, BaseLock};
 use aterm_machines::sync::peers::Lan;
@@ -1472,6 +1473,14 @@ impl Ports for Live {
 
     fn awake_startup_off(&self) -> bool {
         aterm_acaffiene::cli::installed_startup_turned_off()
+    }
+
+    fn awake_retired_jobs(&self) -> Vec<String> {
+        aterm_acaffiene::cli::retired_old_jobs()
+    }
+
+    fn retire_awake_old_jobs(&self) -> Result<String, String> {
+        aterm_acaffiene::cli::retire_old_jobs()
     }
 
     fn keep_awake(&self) -> Result<String, String> {

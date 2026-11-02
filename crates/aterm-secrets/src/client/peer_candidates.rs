@@ -9,13 +9,15 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-/// Consumers advance independently: a read cannot skip a record peer or a join destination.
+/// Consumers advance independently: a read cannot skip a record peer, a join destination or
+/// an approver queue.
 #[derive(Clone, Copy)]
 pub(super) enum PeerUse {
     Records,
     Envelope,
     Reader,
     Join,
+    Queue,
 }
 
 impl PeerUse {
@@ -25,6 +27,7 @@ impl PeerUse {
             Self::Envelope => 1,
             Self::Reader => 2,
             Self::Join => 3,
+            Self::Queue => 4,
         }
     }
 }
@@ -44,14 +47,14 @@ enum DiscoverySource<'a> {
 /// The subscriber owns its selection cursors with its discovery source.
 pub(super) struct PeerDiscovery<'a> {
     source: DiscoverySource<'a>,
-    from: [AtomicUsize; 4],
+    from: [AtomicUsize; 5],
 }
 
 impl<'a> PeerDiscovery<'a> {
     const fn new(source: DiscoverySource<'a>) -> Self {
         Self {
             source,
-            from: [const { AtomicUsize::new(0) }; 4],
+            from: [const { AtomicUsize::new(0) }; 5],
         }
     }
 
@@ -77,7 +80,7 @@ impl<'a> PeerDiscovery<'a> {
     }
 
     fn cursor(&self, purpose: PeerUse) -> &AtomicUsize {
-        static DIRECT_FROM: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+        static DIRECT_FROM: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
         if matches!(self.source, DiscoverySource::Direct(_)) {
             &DIRECT_FROM[purpose.index()]
         } else {
@@ -194,6 +197,57 @@ impl<'a> PeerDiscovery<'a> {
             crate::discover::resolve_all,
         )
     }
+
+    /// Every queue becomes the first candidate in turn, including across fresh readers.
+    /// Keep the configured source and a still-authorized cached listing available outside
+    /// the rotating batch for fallback and idle long-polling.
+    pub(super) fn select_queues(
+        &self,
+        paths: &Paths,
+        config: &Config,
+        primary: &str,
+        policy: &[String],
+        current: &str,
+    ) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        let mut urls: Vec<_> = std::iter::once(primary)
+            .chain(policy.iter().map(String::as_str))
+            .filter_map(|raw| normalized_url(raw, &config.name))
+            .filter(|url| seen.insert(transport::describe(url).to_ascii_lowercase()))
+            .collect();
+        if urls.is_empty() {
+            return urls;
+        }
+        let cursor = Cursor {
+            memory: self.cursor(PeerUse::Queue),
+            saved: matches!(self.source, DiscoverySource::Direct(_))
+                .then_some((paths, PeerUse::Queue)),
+        };
+        let first = cursor
+            .select((0..urls.len()).collect::<Vec<_>>(), 1)
+            .into_iter()
+            .next()
+            .unwrap_or(0);
+        let retained: Vec<_> = [primary, current]
+            .into_iter()
+            .filter_map(|required| {
+                urls.iter()
+                    .find(|url| {
+                        transport::describe(url)
+                            .eq_ignore_ascii_case(&transport::describe(required))
+                    })
+                    .cloned()
+            })
+            .collect();
+        urls.rotate_left(first);
+        urls.truncate(MAX_CANDIDATES);
+        for retained in retained {
+            if !urls.contains(&retained) {
+                urls.push(retained);
+            }
+        }
+        urls
+    }
 }
 
 enum Pool {
@@ -236,14 +290,21 @@ impl Cursor<'_> {
 const CURSOR_FILE: &str = "peer-cursors";
 const CURSOR_LOCK: &str = "peer-cursors.lock";
 
-/// Scheduling hints contain offsets, never endpoints or authority. The join hint is separate
-/// so an older process can keep reading and updating the original three-offset file.
+/// Scheduling hints contain offsets, never endpoints or authority. Join senders and queue
+/// readers have separate hints, so neither advances the other or the vault-read cursors.
 /// A busy, damaged or unwritable hint leaves in-process rotation available.
 /// The lock covers only this bounded file update, never DNS or an HTTP request.
 fn saved_start(paths: &Paths, purpose: PeerUse, count: usize, limit: usize) -> Option<usize> {
     const MAX_SIZE: usize = 4 + 3 * 8;
     let (name, lock, magic, slots, index) = match purpose {
         PeerUse::Join => ("join-peer-cursor", "join-peer-cursor.lock", b"APJ1", 1, 0),
+        PeerUse::Queue => (
+            "join-queue-turn-cursor",
+            "join-queue-turn-cursor.lock",
+            b"AQT1",
+            1,
+            0,
+        ),
         PeerUse::Records | PeerUse::Envelope | PeerUse::Reader => {
             (CURSOR_FILE, CURSOR_LOCK, b"APC1", 3, purpose.index())
         }
@@ -284,7 +345,7 @@ fn saved_start(paths: &Paths, purpose: PeerUse, count: usize, limit: usize) -> O
     usize::try_from(start).ok()
 }
 
-fn normalized(raw: &str, vault: &str, primary: &str) -> Option<String> {
+fn normalized_url(raw: &str, vault: &str) -> Option<String> {
     let base = raw.split_once('#').map_or(raw, |(base, _)| base).trim();
     let (transport::Source::Url(clean), None) =
         transport::parse_source(base, Path::new("/")).ok()?
@@ -294,9 +355,14 @@ fn normalized(raw: &str, vault: &str, primary: &str) -> Option<String> {
     (transport::vault_name(&transport::Source::Url(clean.clone()))
         .ok()
         .as_deref()
-        == Some(vault)
-        && !transport::describe(&clean).eq_ignore_ascii_case(&transport::describe(primary)))
+        == Some(vault))
     .then_some(clean)
+}
+
+fn normalized(raw: &str, vault: &str, primary: &str) -> Option<String> {
+    let clean = normalized_url(raw, vault)?;
+    (!transport::describe(&clean).eq_ignore_ascii_case(&transport::describe(primary)))
+        .then_some(clean)
 }
 
 impl Plan {
@@ -489,12 +555,14 @@ mod tests {
         let path = paths.dir.join(CURSOR_FILE);
         fsx::write_atomic(&path, &original, 0o600).unwrap();
         assert_eq!(saved_start(&paths, PeerUse::Join, 35, 16), Some(0));
+        assert_eq!(saved_start(&paths, PeerUse::Queue, 35, 16), Some(0));
         assert_eq!(
             fsx::read_private(&path, 28).unwrap().unwrap().as_slice(),
             original
         );
         assert_eq!(saved_start(&paths, PeerUse::Reader, 35, 16), Some(13));
         assert_eq!(saved_start(&paths, PeerUse::Join, 35, 16), Some(16));
+        assert_eq!(saved_start(&paths, PeerUse::Queue, 35, 16), Some(16));
         let updated = fsx::read_private(&path, 28).unwrap().unwrap();
         assert_eq!(&updated.as_slice()[..20], &original[..20]);
         assert_eq!(&updated.as_slice()[20..], &29_u64.to_le_bytes());

@@ -154,6 +154,7 @@ fn register_opens_the_session_and_deregister_closes_it_with_the_ledgers_tale() {
 fn exit_actors_and_reasons_map_onto_the_logs_words() {
     assert_eq!(exit_actor(&ExitActor::Human), Actor::Human);
     assert_eq!(exit_actor(&ExitActor::Ctl), Actor::Ctl);
+    assert_eq!(exit_actor(&ExitActor::Harness), Actor::Harness);
     assert_eq!(exit_actor(&ExitActor::Bridge), Actor::Bridge);
     assert_eq!(exit_actor(&ExitActor::Unknown), Actor::Nobody);
     assert_eq!(

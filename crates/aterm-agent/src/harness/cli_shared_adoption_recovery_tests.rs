@@ -580,6 +580,12 @@ pub(crate) fn transition(
 fn adoption_recovery_conforms_and_catches_stuck_or_unfenced_requests() {
     let model = aterm_models_harness::shared_adoption_recovery_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 0);
+    // Automatic Claude adoption links a headless opener (`cli::opener_link`) and reads private
+    // staged bytes (`shared_provider::read_staged_bytes`) only on Unix; off Unix
+    // `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+    if !cfg!(unix) {
+        return;
+    }
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

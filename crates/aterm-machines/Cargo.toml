@@ -84,6 +84,11 @@ aterm-containment = { workspace = true }
 # The loopback GitHub the key calls are tested against.
 agh-fake = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+# The tty tests' pseudo-terminal (`open_pty_pair`): both ends close-on-exec from birth, and
+# `posix_openpt` redrives XNU's `EREDRIVEOPEN` race.
+aterm-pty = { workspace = true }
+
 # Dev only (AGENTS.md: `aterm` is the one shipped executable): the crate as a standalone
 # executable, `aterm-machines-dev machines <verb>`, so the agent can be enrolled into a test VM
 # before `aterm machines` is routed in crates/aterm, plus `enroll-through`, which enrolls over an

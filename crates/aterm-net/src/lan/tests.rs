@@ -346,6 +346,14 @@ fn loopback_is_explicit_and_the_witness_owns_its_exact_connection() {
     assert!(Connection::connect(peer, Scope::Lan, Duration::from_secs(1)).is_err());
     let connected = Connection::connect(peer, Scope::Loopback, Duration::from_secs(1)).unwrap();
     let accepted = Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap();
+    assert_eq!(
+        connected.peer_addr().unwrap(),
+        accepted.local_addr().unwrap()
+    );
+    assert_eq!(
+        accepted.peer_addr().unwrap(),
+        connected.local_addr().unwrap()
+    );
     let (_stream, mut proof) = connected.into_parts();
     proof.recheck().unwrap();
     proof

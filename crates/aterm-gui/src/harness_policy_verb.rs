@@ -126,9 +126,22 @@ pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 9] {
 /// The reply line, newline-terminated: `OK effective=<on|off>` alone for an edge token, the whole
 /// policy for the owner, opening with the harness contracts this aterm serves (`contract=2,3`:
 /// codex-alab's self-claim and a rostered harness's scoped claim,
-/// [`aterm_agent::harness::contract::SERVED`]).
+/// [`aterm_agent::harness::contract::SERVED`]; none under the negative control's seam,
+/// [`crate::harness_claim::served`]).
 #[must_use]
 pub(crate) fn reply(facts: &PolicyFacts, rules: Option<&str>, owner: bool) -> String {
+    reply_serving(facts, rules, owner, crate::harness_claim::served())
+}
+
+/// [`reply`] with `contract=` saying `served`, or no `contract=` key at all for `None` (an aterm
+/// predating contract 3).
+#[must_use]
+pub(crate) fn reply_serving(
+    facts: &PolicyFacts,
+    rules: Option<&str>,
+    owner: bool,
+    served: Option<&str>,
+) -> String {
     let (on, why) = facts.effective;
     let on = if on { "on" } else { "off" };
     if !owner {
@@ -141,11 +154,10 @@ pub(crate) fn reply(facts: &PolicyFacts, rules: Option<&str>, owner: bool) -> St
             crate::control::pct_encode(v)
         }
     };
-    let mut line = format!(
-        "OK gen={} effective={on} why={why} contract={}",
-        facts.generation,
-        aterm_agent::harness::contract::served_word()
-    );
+    let mut line = format!("OK gen={} effective={on} why={why}", facts.generation);
+    if let Some(served) = served {
+        line.push_str(&format!(" contract={served}"));
+    }
     for (key, value) in facts.policy.texts() {
         let value = if key == "continue_text" {
             continuation_text(&facts.policy, rules)
@@ -477,7 +489,8 @@ mod tests {
 
     /// THE HANDSHAKE (contract v3 §8.1 item 1): the owner's reply lists the contracts this aterm
     /// serves, codex-alab's 2 and the roster's 3, effective or not; an edge token's reply, which
-    /// can claim nothing, does not.
+    /// can claim nothing, does not; and an aterm serving none (the negative control's seam,
+    /// `crate::harness_claim::served`) has no `contract=` key, the rest of its reply as before.
     #[test]
     fn the_owners_reply_lists_the_served_contracts() {
         let on = reply(&facts(SupervisorConfig::default()), None, true);
@@ -491,6 +504,20 @@ mod tests {
             Some("2,3")
         );
         assert_eq!(field(&reply(&off, None, false), "contract"), None);
+        let before = reply_serving(&facts(SupervisorConfig::default()), None, true, None);
+        assert_eq!(field(&before, "contract"), None, "{before}");
+        assert!(
+            before.starts_with("OK gen=7 effective=on why=enabled "),
+            "the rest of the reply stands: {before}"
+        );
+        assert_eq!(
+            field(
+                &reply_serving(&facts(SupervisorConfig::default()), None, true, Some("2,3")),
+                "contract"
+            )
+            .as_deref(),
+            Some("2,3")
+        );
     }
 
     /// The policy answers for the agent a rostered harness runs (Grok Build under grok-alab, whose

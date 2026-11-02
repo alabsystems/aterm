@@ -275,11 +275,18 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
-    pub(super) fn write_attention_target(&mut self) -> Result<String, Fail> {
-        let _duty = self
-            .attention_duty
+    /// THE DUTY AN ATTENTION WRITE GOES UNDER: the one that raised the entry, else the one in hand.
+    /// An entry this loop did not raise (a loop before it left it, or it came with an adopted box)
+    /// has neither, and comes down as the turn end's: needs-you is the loop's own to take down, and
+    /// the host's door refuses a write that names no duty, every retry, for the session's life.
+    fn attention_scope(&self) -> Scope {
+        self.attention_duty
             .or(self.duty.get())
-            .map(|scope| self.metadata_duty_guard(scope));
+            .unwrap_or(Scope::TurnEnd)
+    }
+
+    pub(super) fn write_attention_target(&mut self) -> Result<String, Fail> {
+        let _duty = self.metadata_duty_guard(self.attention_scope());
         if self.handing_over() {
             self.arm_attention_retry();
             return Ok("skipped: the watcher is handing its badges over".to_string());
@@ -427,9 +434,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        let _duty = self
-            .attention_duty
-            .map(|scope| self.metadata_duty_guard(scope));
+        let _duty = self.metadata_duty_guard(self.attention_scope());
         self.metadata_global = opts.policy.autopilot;
         self.arm_attention_retry();
         match self.metadata_authority(false) {
@@ -665,16 +670,19 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let reader = self.reader(&point.screen.rows);
+        // A dialog of no kind aterm reads has no duty to answer it ([`duty::prompt_scope`]), and
+        // telling a person of it needs one: it is the approvals' to tell, whose words it carries
+        // ("no approval rule answers this box"), and only the badge goes under that duty.
         let scope = if let Some(prompt) = reader.prompt(&point.screen.rows) {
-            duty::prompt_scope(prompt.kind)
+            duty::prompt_scope(prompt.kind).unwrap_or(Scope::Approvals)
         } else if reader.wall(&point.screen.rows).is_some() {
-            Some(Scope::Walls)
+            Scope::Walls
         } else if point.phase == Phase::Question {
-            Some(Scope::Questions)
+            Scope::Questions
         } else {
-            Some(Scope::TurnEnd)
+            Scope::TurnEnd
         };
-        let _duty = scope.map(|scope| self.metadata_duty_guard(scope));
+        let _duty = self.metadata_duty_guard(scope);
         let key = self.review_key(point);
         if std::mem::take(&mut self.adopted_box)
             && self.box_ask.as_ref().is_some_and(|b| b.key == key)

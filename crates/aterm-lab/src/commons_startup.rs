@@ -20,12 +20,13 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 mod conflict;
+mod local_follower;
 mod peer_cycle;
 mod readiness;
 pub(crate) mod table;
 
 const HANG: Duration = Duration::from_secs(60);
-const USAGE: &str = "commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS | --peer-cycle [--peer-details]]";
+const USAGE: &str = "commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS | --peer-cycle [--peer-details] | --local-follower]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -33,6 +34,7 @@ enum Mode {
     Suppressed,
     Observe(u64),
     PeerCycle { details: bool },
+    LocalFollower,
 }
 
 fn options(options: &[String]) -> Result<(bool, Mode), Fail> {
@@ -44,6 +46,7 @@ fn options(options: &[String]) -> Result<(bool, Mode), Fail> {
         [] => Mode::Normal,
         [flag] if flag == "--suppressed" => Mode::Suppressed,
         [flag] if flag == "--peer-cycle" => Mode::PeerCycle { details: false },
+        [flag] if flag == "--local-follower" => Mode::LocalFollower,
         [cycle, details] if cycle == "--peer-cycle" && details == "--peer-details" => {
             Mode::PeerCycle { details: true }
         }
@@ -330,6 +333,8 @@ fn require_enrolled(paths: &Paths, log_backed: bool) -> Result<(), Fail> {
 /// its own restart with the source still absent, and reconnects the source.
 /// It checks authenticated reachability and retained local account data separately.
 /// `--peer-details` adds selected-peer native captures and requires a bundled executable.
+/// `--local-follower` adds a fresh window sharing the source vault through another configuration.
+/// It checks the GUI's retained owner observation and the window's ordinary CLI inventory reads.
 /// # Errors
 /// Usage or I/O, custody setup, failed host startup, interruption, or an observer,
 /// enrollment or exact eligible application value missing after the hang detector.
@@ -542,7 +547,7 @@ pub fn cmd(args: &[String]) -> Res {
     conflict.received(&paths[0], &out, "conflict-source-final.json")?;
     conflict.received(&paths[1], &out, "conflict-recipient-final.json")?;
     image(&window, &out, "restarted.png")?;
-    let (_node, window, peer_cycle) = if matches!(mode, Mode::PeerCycle { .. }) {
+    let (node, window, peer_cycle) = if matches!(mode, Mode::PeerCycle { .. }) {
         peer_cycle::Cycle {
             source: &source,
             recipient: &restarted,
@@ -559,6 +564,19 @@ pub fn cmd(args: &[String]) -> Res {
         .run(node)?
     } else {
         (node, window, None)
+    };
+    let local_follower = if mode == Mode::LocalFollower {
+        Some(local_follower::run(
+            &source,
+            &aterm,
+            port,
+            node.0.id(),
+            &application,
+            &rows,
+            &out,
+        )?)
+    } else {
+        None
     };
     if let Mode::Observe(observe) = mode {
         println!("commons-startup observing the running window for {observe}s");
@@ -595,6 +613,7 @@ pub fn cmd(args: &[String]) -> Res {
             "after_restart": aterm_codec::hex::encode_lower(&after_restart),
             "offline_conflict": conflict.summary(),
             "peer_cycle": peer_cycle,
+            "local_follower": local_follower,
             "runtime_constructed_by_lab": false,
             "repair_driven_by_lab": false,
         }),
@@ -612,6 +631,10 @@ mod tests {
         let parse =
             |words: &[&str]| options(&words.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
         assert_eq!(parse(&[]).unwrap(), (false, Mode::Normal));
+        assert_eq!(
+            parse(&["--log-backed", "--local-follower"]).unwrap(),
+            (true, Mode::LocalFollower)
+        );
         assert_eq!(
             parse(&["--peer-cycle"]).unwrap(),
             (false, Mode::PeerCycle { details: false })
@@ -634,6 +657,9 @@ mod tests {
         );
         for words in [
             vec!["--suppressed", "--peer-cycle"],
+            vec!["--local-follower", "--peer-cycle"],
+            vec!["--local-follower", "--suppressed"],
+            vec!["--local-follower", "--observe", "1"],
             vec!["--peer-cycle", "--suppressed"],
             vec!["--observe", "1", "--peer-cycle"],
             vec!["--peer-cycle", "--observe", "1"],

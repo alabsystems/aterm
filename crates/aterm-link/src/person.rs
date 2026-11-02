@@ -420,7 +420,7 @@ fn inbox(
         inbox_log_identity(&mut conn)?
     };
     let (_, (_, end)) = conn.fetch(0, &filter, 0)?;
-    let offset = crate::fabric::local_offset();
+    let offset = crate::fabric::local_offset_at_ms(crate::now_ms());
     eprintln!(
         "aterm fabric inbox — {person}'s mail on fleet {} ({}){}",
         cfg.fleet,
@@ -465,35 +465,15 @@ fn inbox(
                 if off >= end {
                     break;
                 }
-                let (b, _) = Body::decode(&body);
-                let (re, verdict, dl) = (b.re, b.verdict.clone(), b.dl);
-                let t = crate::fabric::traffic_of_body(&cfg.fleet, off, &subject, b);
-                let mut line = format!(
-                    "@{off}  {}  {}  from={} trust={}",
-                    crate::fabric::clock(t.t_ms, crate::now_ms(), offset.unwrap_or(0)),
-                    t.kind,
-                    t.from,
-                    t.trust
+                let line = inbox_delivery_line(
+                    (&cfg.fleet, &cap),
+                    off,
+                    &subject,
+                    &body,
+                    crate::now_ms(),
+                    offset,
+                    &aterm_uds::zone::local_offset_at,
                 );
-                if let Some(re) = re {
-                    line.push_str(&format!(" re={re}"));
-                }
-                if let Some(v) = verdict {
-                    line.push_str(&format!(" verdict={}", safe(&v, 16)));
-                }
-                if let Some(dl) = dl {
-                    line.push_str(&format!(" dl={dl}"));
-                }
-                line.push_str("  text=");
-                line.push_str(&safe(&t.text, TEXT_CAP));
-                line.push('\n');
-                if matches!(t.kind.as_str(), "ask" | "task") && t.from.contains('@') {
-                    line.push_str(&format!(
-                        "    answer: aterm fabric post --cap-file {cap} to=@{} kind=answer \
-                         re={off} <text>\n",
-                        t.from
-                    ));
-                }
                 out.write_all(line.as_bytes())
                     .and_then(|()| out.flush())
                     .map_err(|error| io::Error::new(error.kind(), Unprinted { error, peek }))?;
@@ -539,6 +519,46 @@ fn inbox_log_identity(conn: &mut Conn) -> io::Result<Option<astream_broker::LogI
         Some(log) => Ok(Some(log)),
         None => conn.log_identity(),
     }
+}
+
+pub(crate) fn inbox_delivery_line(
+    (fleet, cap): (&str, &str),
+    off: u64,
+    subject: &str,
+    raw: &[u8],
+    now_ms: u64,
+    header_offset: Option<i64>,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> String {
+    let (b, _) = Body::decode(raw);
+    let (re, verdict, dl) = (b.re, b.verdict.clone(), b.dl);
+    let t = crate::fabric::traffic_of_body(fleet, off, subject, b);
+    let mut line = format!(
+        "@{off}  {}  {}  from={} trust={}",
+        crate::fabric::clock_at(t.t_ms, now_ms, header_offset, local_at),
+        t.kind,
+        t.from,
+        t.trust
+    );
+    if let Some(re) = re {
+        line.push_str(&format!(" re={re}"));
+    }
+    if let Some(v) = verdict {
+        line.push_str(&format!(" verdict={}", safe(&v, 16)));
+    }
+    if let Some(dl) = dl {
+        line.push_str(&format!(" dl={dl}"));
+    }
+    line.push_str("  text=");
+    line.push_str(&safe(&t.text, TEXT_CAP));
+    line.push('\n');
+    if matches!(t.kind.as_str(), "ask" | "task") && t.from.contains('@') {
+        line.push_str(&format!(
+            "    answer: aterm fabric post --cap-file {cap} to=@{} kind=answer re={off} <text>\n",
+            t.from
+        ));
+    }
+    line
 }
 
 fn went_silent(e: io::Error, bound: Duration) -> io::Error {

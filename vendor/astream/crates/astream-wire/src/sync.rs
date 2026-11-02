@@ -563,4 +563,264 @@ mod tests {
         assert_eq!(Fork::between(&a, &header(2, 1, 0, Some(1), &[1])), None);
         assert_eq!(Fork::between(&a, &header(2, 1, 2, Some(1), &[])), None);
     }
+
+    /// What `observes` answers to, written apart from it: `later` reaches `earlier` along the
+    /// parents of retained records, and both ends are retained.
+    fn reaches_through_retained(index: &Index, later: &Digest, earlier: &Digest) -> bool {
+        fn walk(index: &Index, at: &Digest, earlier: &Digest, seen: &mut BTreeSet<Digest>) -> bool {
+            let Some(header) = index.get(at) else {
+                return false;
+            };
+            at == earlier
+                || (seen.insert(*at)
+                    && header
+                        .parents
+                        .iter()
+                        .any(|parent| walk(index, parent, earlier, seen)))
+        }
+        walk(index, later, earlier, &mut BTreeSet::new())
+    }
+
+    /// The first pair of `ids` on which `answer` and the law above disagree.
+    fn observation_breach(
+        index: &Index,
+        ids: &[u8],
+        answer: impl Fn(&Digest, &Digest) -> bool,
+    ) -> Option<(u8, u8)> {
+        ids.iter()
+            .flat_map(|later| ids.iter().map(move |earlier| (*later, *earlier)))
+            .find(|(later, earlier)| {
+                let (later, earlier) = ([*later; 32], [*earlier; 32]);
+                answer(&later, &earlier) != reaches_through_retained(index, &later, &earlier)
+            })
+    }
+
+    /// The first record `view` gets wrong, written apart from the projection: it admits a record
+    /// of a quarantined actor, an excluded record, or one with a parent it has not admitted first
+    /// (so anything depending on any of those), or it lets a retained record be both admitted and
+    /// pending, or neither.
+    fn projection_breach(
+        index: &Index,
+        excluded: &BTreeSet<Digest>,
+        view: &Projection,
+    ) -> Option<Digest> {
+        let quarantined: BTreeSet<Actor> = index.forks().into_keys().collect();
+        let mut admitted = BTreeSet::new();
+        for id in &view.ordered {
+            let Some(header) = index.get(id) else {
+                return Some(*id);
+            };
+            if quarantined.contains(&header.actor)
+                || excluded.contains(id)
+                || !header
+                    .parents
+                    .iter()
+                    .all(|parent| admitted.contains(parent))
+            {
+                return Some(*id);
+            }
+            admitted.insert(*id);
+        }
+        index
+            .inventory()
+            .find(|id| admitted.contains(*id) == view.pending.contains(*id))
+            .copied()
+    }
+
+    /// A forked actor's two records (1 and 2), a dependent of them (3), a record with a gap below
+    /// it (4), a record the tests exclude (5) and its dependent (6), and one record nothing
+    /// withholds (7).
+    fn withheld_history() -> Vec<Header> {
+        vec![
+            header(1, 1, 1, None, &[]),
+            header(2, 1, 1, None, &[]),
+            header(3, 2, 1, None, &[1]),
+            header(4, 3, 2, Some(9), &[9]),
+            header(5, 4, 1, None, &[]),
+            header(6, 5, 1, None, &[5]),
+            header(7, 6, 1, None, &[]),
+        ]
+    }
+
+    #[test]
+    fn observes_is_false_across_a_missing_intermediate() {
+        let mut index = Index::new(8);
+        index.insert(header(1, 1, 1, None, &[])).unwrap();
+        index.insert(header(3, 1, 3, Some(2), &[2])).unwrap();
+        assert!(
+            !index.observes(&[3; 32], &[1; 32]),
+            "both ends are retained and the link between them is not"
+        );
+        assert!(index.observes(&[3; 32], &[3; 32]));
+        // The missing record proves the link once it is here, in the direction the link runs.
+        index.insert(header(2, 1, 2, Some(1), &[1])).unwrap();
+        assert!(index.observes(&[3; 32], &[1; 32]));
+        assert!(!index.observes(&[1; 32], &[3; 32]));
+    }
+
+    #[test]
+    fn observes_is_false_for_a_record_not_retained() {
+        let mut index = Index::new(8);
+        index.insert(header(1, 1, 1, None, &[])).unwrap();
+        index.insert(header(3, 2, 1, None, &[1, 2])).unwrap();
+        assert!(index.observes(&[3; 32], &[1; 32]));
+        assert!(
+            !index.observes(&[3; 32], &[2; 32]),
+            "an `earlier` a retained record names as its parent and nothing retains"
+        );
+        assert!(
+            !index.observes(&[2; 32], &[1; 32]),
+            "a `later` not retained"
+        );
+        assert!(
+            !index.observes(&[2; 32], &[2; 32]),
+            "equality is reflexive only for a retained record"
+        );
+    }
+
+    #[test]
+    fn a_refusal_leaves_the_whole_index_unchanged() {
+        let mut index = Index::new(3);
+        for h in [
+            header(1, 1, 1, None, &[]),
+            header(2, 1, 1, None, &[]),
+            header(3, 2, 2, Some(4), &[4]),
+        ] {
+            index.insert(h).unwrap();
+        }
+        let state = |index: &Index| {
+            let records: Vec<Header> = index
+                .inventory()
+                .map(|id| index.get(id).unwrap().clone())
+                .collect();
+            let excluding = index.project_excluding(&BTreeSet::from([[2; 32]]));
+            (records, index.forks(), index.project(), excluding)
+        };
+        let before = state(&index);
+        assert!(!before.1.is_empty() && !before.2.pending.is_empty());
+        let too_many: Vec<u8> = (0..=MAX_PARENTS as u8).collect();
+        for (refused, why) in [
+            (header(9, 1, 0, None, &[]), Refusal::Shape),
+            (header(9, 1, 1, Some(1), &[1]), Refusal::Shape),
+            (header(9, 1, 2, None, &[]), Refusal::Shape),
+            (header(9, 1, 2, Some(1), &[]), Refusal::Shape),
+            (header(9, 1, 1, None, &[2, 1]), Refusal::Shape),
+            (header(9, 1, 1, None, &[1, 1]), Refusal::Shape),
+            (header(9, 1, 1, None, &[9]), Refusal::Shape),
+            (header(200, 1, 1, None, &too_many), Refusal::Shape),
+            (header(1, 7, 1, None, &[]), Refusal::DigestCollision),
+            (header(9, 7, 1, None, &[]), Refusal::Capacity),
+        ] {
+            assert_eq!(index.insert(refused), Err(why));
+            assert_eq!(state(&index), before, "{why:?} changed the index");
+        }
+        assert_eq!(
+            index.insert(header(1, 1, 1, None, &[])),
+            Ok(false),
+            "an identical duplicate is no refusal, at capacity too"
+        );
+        assert_eq!(state(&index), before);
+    }
+
+    #[test]
+    fn exactly_max_parents_is_shaped() {
+        let most: Vec<u8> = (0..MAX_PARENTS as u8).collect();
+        let mut index = Index::new(1);
+        assert_eq!(index.insert(header(200, 1, 1, None, &most)), Ok(true));
+    }
+
+    #[test]
+    fn every_order_and_duplicate_converges_on_what_it_withholds() {
+        let records = withheld_history();
+        let excluded = BTreeSet::from([[5; 32]]);
+        let mut reference = Index::new(16);
+        for h in &records {
+            reference.insert(h.clone()).unwrap();
+        }
+        let whole = reference.project();
+        let view = reference.project_excluding(&excluded);
+        assert_eq!(whole.quarantined, BTreeSet::from([[1; 48]]));
+        assert_eq!(whole.ordered, [[5; 32], [6; 32], [7; 32]]);
+        assert_eq!(view.ordered, [[7; 32]]);
+        assert_eq!(
+            view.pending,
+            [1, 2, 3, 4, 5, 6].map(|id| [id; 32]).into_iter().collect()
+        );
+        assert_eq!(reference.inventory().count(), records.len());
+        assert_eq!(
+            projection_breach(&reference, &BTreeSet::new(), &whole),
+            None
+        );
+        assert_eq!(projection_breach(&reference, &excluded, &view), None);
+        permutations(&records, &mut |order| {
+            let mut index = Index::new(16);
+            for h in order {
+                assert_eq!(index.insert(h.clone()), Ok(true));
+                assert_eq!(index.insert(h.clone()), Ok(false));
+            }
+            assert_eq!(index.project(), whole);
+            assert_eq!(index.project_excluding(&excluded), view);
+            assert_eq!(index.forks(), reference.forks());
+        });
+    }
+
+    #[test]
+    fn the_observation_law_catches_a_walk_that_crosses_a_missing_parent() {
+        let mut index = Index::new(8);
+        index.insert(header(1, 1, 1, None, &[])).unwrap();
+        index.insert(header(3, 1, 3, Some(2), &[2])).unwrap();
+        index.insert(header(4, 2, 1, None, &[3])).unwrap();
+        index.insert(header(5, 3, 1, None, &[1, 6])).unwrap();
+        index.insert(header(6, 4, 1, None, &[5])).unwrap();
+        let ids = [1, 2, 3, 4, 5, 6];
+        assert_eq!(
+            observation_breach(&index, &ids, |later, earlier| index
+                .observes(later, earlier)),
+            None
+        );
+        // Planted: an actor's dense chain read as if no link of it could be missing, the
+        // watermark reasoning this index exists to refuse.
+        let watermark = |later: &Digest, earlier: &Digest| {
+            index.observes(later, earlier)
+                || matches!(
+                    (index.get(later), index.get(earlier)),
+                    (Some(l), Some(e)) if l.actor == e.actor && l.sequence >= e.sequence
+                )
+        };
+        assert_eq!(
+            observation_breach(&index, &ids, watermark),
+            Some((3, 1)),
+            "NEGATIVE CONTROL: the law misses an `observes` that crosses a missing parent"
+        );
+    }
+
+    #[test]
+    fn the_projection_law_catches_a_dependent_of_a_quarantined_actor() {
+        let mut index = Index::new(16);
+        for h in withheld_history() {
+            index.insert(h).unwrap();
+        }
+        let none = BTreeSet::new();
+        let excluded = BTreeSet::from([[5; 32]]);
+        // Planted, one by one: the projection admits what it must withhold, the dependent of a
+        // quarantined actor and of an excluded record among them.
+        for (policy, id) in [(&none, 1), (&none, 3), (&excluded, 5), (&excluded, 6)] {
+            let mut planted = index.project_excluding(policy);
+            assert!(planted.pending.remove(&[id; 32]));
+            planted.ordered.push([id; 32]);
+            assert_eq!(
+                projection_breach(&index, policy, &planted),
+                Some([id; 32]),
+                "NEGATIVE CONTROL: the law misses record {id} admitted"
+            );
+        }
+        // Planted: a withheld record dropped from the view, as if it had left the inventory.
+        let mut planted = index.project();
+        assert!(planted.pending.remove(&[1; 32]));
+        assert_eq!(
+            projection_breach(&index, &none, &planted),
+            Some([1; 32]),
+            "NEGATIVE CONTROL: the law misses evidence dropped from the view"
+        );
+    }
 }

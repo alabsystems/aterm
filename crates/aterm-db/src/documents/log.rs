@@ -13,6 +13,9 @@ use crate::{
 use astream_wire::sync::{Actor, Digest, Header, Index};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Eligible causal-only merges as (writer, sequence) ([`Log::eligible_and_merges`]).
+pub(crate) type Merges = Vec<(Actor, u64)>;
+
 /// Provenance is evidence, not authority. Authored time is a signed clock claim;
 /// receipt time and offset describe only this replica's first durable retention.
 #[derive(Clone, Debug)]
@@ -177,6 +180,7 @@ impl Log {
     fn project(
         &self,
         before: Option<Digest>,
+        skip: &BTreeSet<Digest>,
     ) -> (Cells, BTreeMap<Digest, String>, BTreeSet<Digest>) {
         let mut cells = Cells::new();
         let mut refusals = BTreeMap::new();
@@ -230,6 +234,7 @@ impl Log {
                 || operation.duplicate_of.is_some()
                 || self.opaque_authors.contains(&operation.header.actor)
                 || before.is_some_and(|target| target == id || !self.index.observes(&target, &id))
+                || skip.contains(&id)
             {
                 continue;
             }
@@ -246,23 +251,44 @@ impl Log {
         }
         (cells, refusals, eligible)
     }
+    /// The cells without the operations in `skip`, as if they had never been applied: an
+    /// ATT/1 reader passes the automatic records past their writer's quota
+    /// (`typed::owned::quota`), which stay in history and dependencies but never project.
+    pub(crate) fn cells_without(&self, skip: &BTreeSet<Digest>) -> Cells {
+        self.project(None, skip).0
+    }
     /// Every eligible business record with its decoded command, in record-id order.
     /// Causal-only merges remain in snapshots and dependencies, not this list. An application
     /// whose records are append-only per writer reads these, never the cells, whose causal
     /// replacement would let one writer's record hide another's.
     pub(crate) fn eligible(&self) -> Vec<(Operation, Command)> {
-        let (_, _, eligible) = self.project(None);
-        self.records
+        self.eligible_and_merges().0
+    }
+    /// [`Self::eligible`], and each eligible causal-only merge as its writer and sequence: the
+    /// joins `application::append` writes before a record on a wide frontier, which a typed
+    /// reader charges to that record's writer (`typed::owned::quota`).
+    pub(crate) fn eligible_and_merges(&self) -> (Vec<(Operation, Command)>, Merges) {
+        let (_, _, eligible) = self.project(None, &BTreeSet::new());
+        let mut records = Vec::new();
+        let mut merges = Vec::new();
+        for (operation, command) in self
+            .records
             .iter()
             .filter(|(id, _)| eligible.contains(*id))
-            .filter_map(|(_, (operation, command))| match command {
-                Some(Command::Merge { .. }) | None => None,
-                Some(command) => Some((operation.clone(), command.clone())),
-            })
-            .collect()
+            .map(|(_, record)| record)
+        {
+            match command {
+                Some(Command::Merge { .. }) => {
+                    merges.push((operation.header.actor, operation.header.sequence));
+                }
+                Some(command) => records.push((operation.clone(), command.clone())),
+                None => {}
+            }
+        }
+        (records, merges)
     }
     pub(crate) fn snapshot(&self) -> Snapshot {
-        let (cells, refusals, eligible) = self.project(None);
+        let (cells, refusals, eligible) = self.project(None, &BTreeSet::new());
         let operations = self
             .records
             .iter()
@@ -291,6 +317,37 @@ impl Log {
             cells,
             operations,
         }
+    }
+    /// The retained records that could still become visible here, which a reader comparing
+    /// against the cells (an ATT/1 grid save, import or seed pass) waits for: a record whose
+    /// causal past has not all arrived, with its descendants, and a record of `own` (this
+    /// Mac's writer) that is withheld or unavailable. A record this build refuses, a cut-off
+    /// or forked writer's and a quarantined payload never project here, and a new append names
+    /// only the catalog projection's heads, so such records are inert rather than awaited.
+    pub(crate) fn awaited(&self, own: Actor) -> BTreeSet<Digest> {
+        let mut children = BTreeMap::<Digest, Vec<Digest>>::new();
+        let mut awaited = BTreeSet::new();
+        for (id, (operation, _)) in &self.records {
+            let header = &operation.header;
+            for parent in header.parents.iter().chain(header.previous.iter()) {
+                children.entry(*parent).or_default().push(*id);
+                if !self.records.contains_key(parent) {
+                    awaited.insert(*id);
+                }
+            }
+            if header.actor == own && (!operation.available || !operation.catalog_eligible) {
+                awaited.insert(*id);
+            }
+        }
+        let mut todo: Vec<Digest> = awaited.iter().copied().collect();
+        while let Some(id) = todo.pop() {
+            for child in children.get(&id).into_iter().flatten() {
+                if awaited.insert(*child) {
+                    todo.push(*child);
+                }
+            }
+        }
+        awaited
     }
     pub(crate) fn writable(&self, actor: Actor) -> Result<()> {
         if self.snapshot().operations.iter().any(|op| {
@@ -333,7 +390,7 @@ impl Log {
             }
         }
         if let Some((_, id)) = first {
-            if !self.project(None).2.contains(&id) {
+            if !self.project(None, &BTreeSet::new()).2.contains(&id) {
                 return Err(Error::new(
                     "the prior proposal receipt is not currently eligible",
                 ));
@@ -395,7 +452,7 @@ impl Log {
                 ));
             }
         }
-        let (past, _, _) = self.project(Some(target));
+        let (past, _, _) = self.project(Some(target), &BTreeSet::new());
         let mut restored = Vec::new();
         for change in changes {
             let old = past.get(&(change.collection.clone(), change.key.clone()));

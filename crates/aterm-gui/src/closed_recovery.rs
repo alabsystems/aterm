@@ -282,6 +282,9 @@ mod tests {
             lost: None,
             held: false,
             holds: Vec::new(),
+            claim_ended: false,
+            not_claim_worker: false,
+            claim_worker: None,
         })
     }
 

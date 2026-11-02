@@ -148,6 +148,7 @@ fn sight<'a>(r: &'a Real, told: &'a dyn Fn(u64) -> bool) -> WakeSight<'a> {
         wall_ms: r.now,
         told,
         ranked: true,
+        nudge_wake: true,
     }
 }
 

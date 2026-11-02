@@ -1499,7 +1499,7 @@ struct Round {
     /// visible too, and so every session's refill done.
     t_every_mail_seen: Option<u64>,
     /// When the kill window's posts were all answered: a backlog run posts one per session
-    /// there, and an entry shows they ended before the new pid ([`Round::t_pid`]).
+    /// there, and they can outlast the relaunch, so [`Round::t_pid`] is watched across them.
     t_posted: u64,
 }
 
@@ -1743,7 +1743,7 @@ const ATTACH_ROWS: [&str; 10] = [
     "**kill -> the first live mail visible**",
     "every row acked -> the live mail visible (the mirror's start, the refill, the drain)",
     "**kill -> every session's live mail visible** (the backlog's: every refill done)",
-    "kill -> the kill window's posts answered (the backlog's: before the new pid)",
+    "kill -> the kill window's posts answered (the backlog's)",
 ];
 
 /// The first of the backlog's own rows in [`ATTACH_ROWS`].
@@ -1836,6 +1836,15 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                         .expect("bound the presence subscription");
                     let t_kill = clock.us();
                     harness::kill(pid, 9);
+                    let new_pid = {
+                        let (world, killed) = (&w, pid);
+                        s.spawn(move || {
+                            let new_pid = aterm_spec::wait::within(DEADLINE, PID_POLL, || {
+                                read_pid(world).filter(|p| *p != killed)
+                            });
+                            (new_pid, clock.us())
+                        })
+                    };
                     let mail = format!("live-{}", rounds.len() + size_rounds.len());
                     post(&mut mail_ctl, clock, &mailer, &mailer, &mail);
                     if spec.backlog > 0 {
@@ -1850,11 +1859,10 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                         }
                     }
                     let t_posted = clock.us();
-                    let new_pid = aterm_spec::wait::within(DEADLINE, PID_POLL, || {
-                        read_pid(&w).filter(|p| *p != pid)
-                    })
-                    .unwrap_or_else(|| panic!("the bridge did not come back within {DEADLINE:?}"));
-                    let t_pid = clock.us();
+                    let (new_pid, t_pid) = new_pid.join().expect("the new pid's watcher");
+                    let new_pid = new_pid.unwrap_or_else(|| {
+                        panic!("the bridge did not come back within {DEADLINE:?}")
+                    });
                     pid = new_pid;
                     up_since = Instant::now();
                     let (woke_at, t_mail_seen) =
@@ -2027,8 +2035,11 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         ),
         served.clone(),
         format!(
-            "The bridge is SIGKILLed and aterm's supervisor relaunches it; the clock starts when \
-             the new bridge writes its pid (its aterm connection is up) and stops when its node \
+            "The bridge is SIGKILLed after a run past the supervisor's healthy mark, and the \
+             supervisor relaunches it at once, once the killed bridge's lanes have ended; the \
+             clock starts when the new bridge writes its pid (its aterm connection is up; a \
+             thread of its own watches for it from the kill on, past any post in the kill window) \
+             and stops when its node \
              row and every session's presence row — the rows under its own pid and incarnation, \
              whichever lands last — are acked again (on a strict broker, durable; \"pid -> every \
              row durable\" is the durable head's). Inside that window the bench asks the \

@@ -44,10 +44,14 @@ pub mod entries;
 mod eval;
 pub mod genesis;
 pub mod store;
+#[cfg(unix)]
+pub(crate) mod untaken;
 
 pub use admission::{Gap, Signer, admission_audiences};
 pub use astream_wire::sync::MAX_PARENTS;
-pub use entries::{CommonsEpochView, OpenedAudienceEntries, OpenedEntries, epoch_commitment};
+pub use entries::{
+    CommonsEpochView, Keyed, OpenedAudienceEntries, OpenedEntries, epoch_commitment,
+};
 pub use eval::{Member, Membership, NodeStanding, Quorum, Removal, Undo};
 pub use genesis::Proof;
 pub use store::{MAX_RECORDS_STREAM, Store, decode_records, encode_records};
@@ -101,6 +105,8 @@ pub type MemberId = astream_wire::sync::Actor;
 
 const MAGIC: &[u8; 4] = b"ALM1";
 const VERSION: u8 = 1;
+/// Where a record's kind byte sits: after the magic, the layout version and the network.
+const KIND_AT: usize = 4 + 1 + 32;
 const SIGNING_DOMAIN: &[u8] = b"aterm/members/record/1\0";
 /// The largest record [`Record::decode`] reads: a 1 MiB secret value (`Put`) plus headers fits
 /// with room.
@@ -619,14 +625,29 @@ impl Record {
             _ => &self.header.network,
         }
     }
-    /// The exact byte length of the first record at the start of `wire`, bounded by [`MAX_RECORD`].
+    /// The exact byte length of the first record at the start of `wire`, bounded by [`MAX_RECORD`],
+    /// refusing a kind this build does not know ([`Record::frame_prefix`] frames one).
     pub(super) fn wire_len_prefix(wire: &[u8]) -> Result<usize> {
+        let (len, _) = Self::frame_prefix(wire)?;
+        let code = wire
+            .get(KIND_AT)
+            .copied()
+            .ok_or_else(|| Error::new("membership record is truncated"))?;
+        Kind::from_code(code)?;
+        Ok(len)
+    }
+
+    /// [`Record::wire_len_prefix`] without judging the kind byte, with the parents the frame
+    /// names. The layout (`VERSION` 1) frames a record of a kind only a newer build writes as it
+    /// frames any other, so a stream holding one still splits into its records' ids
+    /// (`store::frames`). Nothing is verified: the parents are whatever the bytes say.
+    pub(super) fn frame_prefix(wire: &[u8]) -> Result<(usize, Vec<RecordId>)> {
         let mut reader = Reader::new(wire);
         if reader.take(4)? != MAGIC || reader.byte()? != VERSION {
             return Err(Error::new("not a membership record"));
         }
         let _network = reader.take(32)?;
-        let _kind = Kind::from_code(reader.byte()?)?;
+        let _kind = reader.byte()?;
         let _actor = reader.take(48)?;
         let _sequence = reader.take(8)?;
         let _previous = reader.take(32)?;
@@ -634,7 +655,10 @@ impl Record {
         if count > MAX_PARENTS {
             return Err(Error::new("membership record names too many parents"));
         }
-        let _parents = reader.take(count * 32)?;
+        let mut parents = Vec::with_capacity(count);
+        for _ in 0..count {
+            parents.push(reader.array::<32>()?);
+        }
         let _authored_ms = reader.take(8)?;
         let body_len = reader.len(4)?;
         let _body = reader.take(body_len)?;
@@ -642,7 +666,7 @@ impl Record {
         if reader.at > MAX_RECORD {
             return Err(Error::new("membership record is too long"));
         }
-        Ok(reader.at)
+        Ok((reader.at, parents))
     }
     /// The signing member; all zero for a genesis.
     pub fn actor(&self) -> &MemberId {
@@ -1241,6 +1265,14 @@ pub struct Log {
     order: Vec<Record>,
     held: BTreeMap<RecordId, usize>,
     waiting: BTreeMap<RecordId, Record>,
+    /// The bytes of `order`'s records, kept as they change: by [`Log::hold`] alone, since
+    /// `order` only grows.
+    held_bytes: usize,
+    /// The bytes of `waiting`'s records, kept by every change to `waiting`: the waiting insert,
+    /// [`Log::land_waiting`]'s remove and [`Log::drop_last_waiting`]. Summing either set on each
+    /// insert walked every record, and a store at its bound repeated that walk for each record
+    /// it let go (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rule 6).
+    waiting_bytes: usize,
     enforce_seats: bool,
     // Clones hold the same immutable prefix until `hold` extends one of them.
     // Its pure evaluation is shared too; no disk observation or grant is cached.
@@ -1258,10 +1290,13 @@ impl Log {
             return Err(Error::new("a membership log starts at a genesis"));
         }
         let held = BTreeMap::from([(genesis.id, 0)]);
+        let held_bytes = genesis.bytes().len();
         Ok(Self {
             order: vec![genesis],
             held,
             waiting: BTreeMap::new(),
+            held_bytes,
+            waiting_bytes: 0,
             enforce_seats: false,
             membership: Arc::default(),
             effective: Arc::default(),
@@ -1298,6 +1333,10 @@ impl Log {
     pub fn waiting(&self) -> usize {
         self.waiting.len()
     }
+    /// How many records it holds, each after its parents: the length of [`Log::records`].
+    pub fn held_count(&self) -> usize {
+        self.order.len()
+    }
     /// The held records no held record follows, sorted.
     pub fn heads(&self) -> Vec<RecordId> {
         let followed: BTreeSet<&RecordId> =
@@ -1317,6 +1356,20 @@ impl Log {
     /// follows the lowest heads, and the next draft takes up the rest. [`Draft::sign`] it with
     /// `actor`'s key.
     pub fn draft(&self, actor: &MemberId, authored_ms: u64, body: Body) -> Draft {
+        self.draft_following(actor, authored_ms, body, &[])
+    }
+
+    /// [`Log::draft`], with each held record of `follow` in the draft's causal past as well: it
+    /// pins the head that reaches each, as it pins a `Put`'s epoch (F21's reseal follows the
+    /// writes it retires). A record whose head finds no room among [`MAX_PARENTS`] pinned
+    /// parents is left out.
+    pub(crate) fn draft_following(
+        &self,
+        actor: &MemberId,
+        authored_ms: u64,
+        body: Body,
+        follow: &[RecordId],
+    ) -> Draft {
         let previous = self
             .order
             .iter()
@@ -1349,7 +1402,11 @@ impl Log {
             _ => None,
         };
         let mut pinned: Vec<RecordId> = previous.map(|r| r.id).into_iter().collect();
-        for needed in [seat, body_ref].into_iter().flatten() {
+        for needed in [seat, body_ref]
+            .into_iter()
+            .flatten()
+            .chain(follow.iter().copied())
+        {
             if self.held.contains_key(&needed) && !self.ancestors_of(&parents).contains(&needed) {
                 let target = self
                     .heads()
@@ -1361,6 +1418,9 @@ impl Log {
                         && let Some(pos) = parents.iter().rposition(|p| !pinned.contains(p))
                     {
                         parents.remove(pos);
+                    }
+                    if parents.len() >= MAX_PARENTS {
+                        continue;
                     }
                     parents.push(target);
                 }
@@ -1482,6 +1542,7 @@ impl Log {
                     "membership log holds its limit of waiting records",
                 ));
             }
+            self.waiting_bytes = self.waiting_bytes.saturating_add(record.bytes().len());
             self.waiting.insert(record.id, record);
             return Ok(Inserted::Waiting);
         }
@@ -1815,12 +1876,15 @@ impl Log {
         false
     }
 
-    pub(super) fn held_bytes(&self) -> usize {
-        self.order.iter().map(|r| r.bytes().len()).sum()
+    /// The bytes of every held record: what the records of `order` take on the wire, and what a
+    /// server's records file of complete records holds (`server::post_records`).
+    pub(crate) const fn held_bytes(&self) -> usize {
+        self.held_bytes
     }
 
-    pub(super) fn waiting_bytes(&self) -> usize {
-        self.waiting.values().map(|r| r.bytes().len()).sum()
+    /// The bytes of every record waiting on a parent.
+    pub(super) const fn waiting_bytes(&self) -> usize {
+        self.waiting_bytes
     }
 
     pub(super) fn total_bytes(&self) -> usize {
@@ -1829,6 +1893,7 @@ impl Log {
 
     fn hold(&mut self, record: Record) {
         self.held.insert(record.id, self.order.len());
+        self.held_bytes = self.held_bytes.saturating_add(record.bytes().len());
         self.order.push(record);
         self.membership = Arc::default();
         self.effective = Arc::default();
@@ -1857,6 +1922,7 @@ impl Log {
                 let Some(record) = self.waiting.remove(&id) else {
                     continue;
                 };
+                self.waiting_bytes = self.waiting_bytes.saturating_sub(record.bytes().len());
                 if self.held_bytes().saturating_add(record.bytes().len()) <= MAX_RECORDS_STREAM
                     && self.check_against_parents(&record).is_ok()
                 {
@@ -1864,6 +1930,16 @@ impl Log {
                 }
             }
         }
+    }
+
+    /// Let the waiting record with the highest id go, keeping [`Log::waiting_bytes`]; `false`
+    /// when none waits. A store at its bound calls it to make room (`store::make_room`).
+    pub(super) fn drop_last_waiting(&mut self) -> bool {
+        let Some((_, record)) = self.waiting.pop_last() else {
+            return false;
+        };
+        self.waiting_bytes = self.waiting_bytes.saturating_sub(record.bytes().len());
+        true
     }
 }
 
@@ -1918,8 +1994,26 @@ impl Log {
         reason = "Environment: a removed Mac alone signs a quorum share against its remover"
     )
 )]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "Membership",
+        action = "KeyedWrite",
+        reason = "Environment: a removed Mac mints an epoch past its cutoff and a member writes under it"
+    )
+)]
 #[doc(hidden)]
 pub fn membership_log_environment() {}
+
+/// `record`'s bytes with its kind byte set to `code`: a test's stand-in for a record of a kind
+/// only a newer build writes, which this build frames ([`Record::frame_prefix`]) and refuses to
+/// read ([`Record::decode`]).
+#[cfg(all(test, unix))]
+pub(crate) fn with_kind_code(record: &Record, code: u8) -> Vec<u8> {
+    let mut wire = record.bytes().to_vec();
+    wire[KIND_AT] = code;
+    wire
+}
 
 #[cfg(test)]
 mod tests;

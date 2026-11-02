@@ -183,6 +183,36 @@ pub(super) fn parse(body: &str) -> Result<Projection, String> {
     })
 }
 
+/// A fresh GUI observation from a different process owning the shared vault.
+pub(in crate::commons_startup) fn follows_owner(
+    body: &str,
+    owner: u32,
+    expected: &MachineIdentity,
+    wall_ms: Option<u64>,
+) -> Result<bool, String> {
+    let gui = parse(body)?;
+    let Some(now) = wall_ms else {
+        return Ok(false);
+    };
+    let recent = |stamp, max| stamp != 0 && now.checked_sub(stamp).is_some_and(|age| age <= max);
+    Ok(gui.source_present
+        && gui.network.visibility == Visibility::Active
+        && gui.network.history == HistoryState::Ready
+        && gui.network.via_local_process == Some(owner)
+        && gui
+            .network
+            .observer
+            .as_ref()
+            .is_some_and(|identity| same_identity(identity, expected))
+        && recent(gui.network.observed_at_ms, 15_000)
+        && gui.accounts.availability == ServiceAvailability::Cached
+        && recent(gui.accounts.observed_at_ms, 60_000)
+        && gui
+            .accounts
+            .last_success_ms
+            .is_none_or(|stamp| stamp <= gui.accounts.observed_at_ms))
+}
+
 pub(super) fn matches(
     gui: &Projection,
     backend: &StageEvidence,
@@ -314,6 +344,43 @@ mod tests {
             "app-inspection version=app/v1 revision=700 subject=network\n{}\n",
             aterm_json::to_string(value).unwrap()
         )
+    }
+
+    #[test]
+    fn follower_requires_the_current_owner_and_fresh_retained_samples() {
+        let backend = backend();
+        let expected = backend.network.observer.as_ref().unwrap();
+        let mut value = fixture(&backend);
+        *at_mut(&mut value, &["network", "via_local_process"]) = json!(42);
+        // A producer reading its next sample does not invalidate the retained one.
+        *at_mut(&mut value, &["reader_busy"]) = json!(true);
+        assert!(follows_owner(&body(&value), 42, expected, Some(100_100)).unwrap());
+        assert!(!follows_owner(&body(&value), 43, expected, Some(100_100)).unwrap());
+        assert!(!follows_owner(&body(&value), 42, expected, None).unwrap());
+        for (path, replacement) in [
+            (vec!["source_present"], json!(false)),
+            (vec!["network", "visibility"], json!("Waiting")),
+            (vec!["network", "history"], json!("Unavailable")),
+            (vec!["network", "observed_at_ms"], json!(1)),
+            (vec!["network", "observed_at_ms"], json!(100_101)),
+            (
+                vec!["network", "observer", "incarnation"],
+                json!("03".repeat(16)),
+            ),
+            (
+                vec!["services", "accounts", "availability"],
+                json!("Unknown"),
+            ),
+            (vec!["services", "accounts", "observed_at_ms"], json!(1)),
+            (
+                vec!["services", "accounts", "last_success_ms"],
+                json!(100_101),
+            ),
+        ] {
+            let mut refused = value.clone();
+            *at_mut(&mut refused, &path) = replacement;
+            assert!(!follows_owner(&body(&refused), 42, expected, Some(100_100)).unwrap());
+        }
     }
 
     #[test]

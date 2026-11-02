@@ -97,6 +97,42 @@ fn account_progress_gallery() {
             aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
         ),
         (
+            "activity-menu-observer-busy-prepared",
+            120,
+            ProgressPhase::Waiting,
+            0,
+            None,
+            Some(1_793_040_005),
+            aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
+        ),
+        (
+            "activity-menu-observer-busy-prepared-narrow",
+            60,
+            ProgressPhase::Waiting,
+            0,
+            None,
+            Some(1_793_040_005),
+            aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
+        ),
+        (
+            "activity-menu-autopilot-off",
+            120,
+            ProgressPhase::Paused,
+            0,
+            None,
+            None,
+            aterm_agent::harness::account_progress::SESSION_AUTOPILOT_OFF_FINDING,
+        ),
+        (
+            "activity-menu-autopilot-off-narrow",
+            60,
+            ProgressPhase::Paused,
+            0,
+            None,
+            None,
+            aterm_agent::harness::account_progress::SESSION_AUTOPILOT_OFF_FINDING,
+        ),
+        (
             "activity-menu-execution-roster-unread",
             120,
             ProgressPhase::Waiting,
@@ -325,6 +361,7 @@ fn account_progress_gallery() {
             wall: wall.map(str::to_owned),
             details: vec![detail.into()],
             next_at,
+            own_claim: None,
         };
         if name.contains("bindings-changed") {
             progress.eligible = None;
@@ -346,7 +383,22 @@ fn account_progress_gallery() {
                 progress.account = None;
             }
         }
-        if name.starts_with("activity-menu") && !name.contains("execution-") {
+        let observer_busy = name.contains("observer-busy");
+        let autopilot_off = name.contains("autopilot-off");
+        if autopilot_off {
+            // Already-derived synthetic reader output, not a policy or actor invocation.
+            progress.eligible = None;
+            progress.details.push(format!(
+                "{}{}",
+                aterm_agent::harness::account_progress::RECOVERY_HISTORY_PREFIX,
+                "Waiting for the account-switch limit to reset",
+            ));
+        }
+        if name.starts_with("activity-menu")
+            && !name.contains("execution-")
+            && !observer_busy
+            && !autopilot_off
+        {
             progress
                 .details
                 .push("Local sign-in activity: fixture-current".into());
@@ -355,10 +407,16 @@ fn account_progress_gallery() {
                 aterm_agent::harness::usage::rfc3339_utc(progress.observed_at - 30),
             ));
         }
+        let retained = (observer_busy || autopilot_off).then(|| progress.clone());
         let mut facts = probe::facts();
         facts.account = progress.account.clone();
         facts.account_progress = Some(progress);
-        if name == "transcript-wall" || name.contains("unobserved-recovery") {
+        facts.account_progress_busy = observer_busy;
+        if name == "transcript-wall"
+            || name.contains("unobserved-recovery")
+            || observer_busy
+            || autopilot_off
+        {
             facts.usage.get_or_insert_with(Default::default).wall =
                 Some(aterm_agent::harness::session_usage::Wall {
                     label: "7d",
@@ -376,8 +434,42 @@ fn account_progress_gallery() {
         let menu_progress = facts
             .account_progress_view()
             .map(std::borrow::Cow::into_owned);
+        if observer_busy {
+            let recorded = retained.as_ref().unwrap();
+            use aterm_agent::harness::account_progress::{
+                EXECUTION_PREPARED_FINDING, OBSERVER_BUSY_FINDING, RECOVERY_HISTORY_PREFIX,
+            };
+            let unavailable = menu_progress.as_ref().expect("busy recovery projection");
+            assert_eq!(facts.account_progress.as_ref(), Some(recorded));
+            assert_eq!(unavailable.phase, ProgressPhase::Unknown);
+            assert_eq!(unavailable.eligible, None);
+            assert_eq!(unavailable.next_at, None);
+            assert_eq!(unavailable.observed_at, recorded.observed_at);
+            assert_eq!(unavailable.account, recorded.account);
+            assert_eq!(unavailable.known, recorded.known);
+            assert_eq!(unavailable.own_claim, recorded.own_claim);
+            assert_eq!(recorded.wall, None);
+            assert!(unavailable.wall.is_some());
+            assert_eq!(unavailable.details[0], OBSERVER_BUSY_FINDING);
+            assert!(unavailable.details.contains(&format!(
+                "{RECOVERY_HISTORY_PREFIX}{EXECUTION_PREPARED_FINDING}"
+            )));
+        }
+        if autopilot_off {
+            let recorded = retained.as_ref().unwrap();
+            let paused = menu_progress.as_ref().expect("paused recovery projection");
+            assert_eq!(paused.phase, ProgressPhase::Paused);
+            assert_eq!(paused.eligible, None);
+            assert_eq!(paused.next_at, None);
+            assert_eq!(paused.observed_at, recorded.observed_at);
+            assert_eq!(paused.account, recorded.account);
+            assert_eq!(paused.known, recorded.known);
+            assert_eq!(paused.details, recorded.details);
+            assert_eq!(recorded.wall, None);
+            assert!(paused.wall.is_some());
+        }
         let live = probe::Live {
-            status: if wall.is_some() {
+            status: if wall.is_some() || observer_busy || autopilot_off {
                 "You've hit your limit · synthetic fixture"
             } else {
                 probe::DONE
@@ -385,6 +477,19 @@ fn account_progress_gallery() {
             ..probe::AT_REST
         };
         let (mut app, wid, session) = probe::glass_with(&live, facts);
+        if autopilot_off {
+            app.pool
+                .get(session)
+                .unwrap()
+                .ctx
+                .meta
+                .lock()
+                .unwrap()
+                .set_autopilot(
+                    Some(aterm_agent::supervise::Autopilot::Off.word().into()),
+                    None,
+                );
+        }
         app.config.serious_mode = Some(true);
         app.config.cursor_trail = Some(false);
         app.config.cursor_trail_style = Some("off".into());
@@ -402,6 +507,32 @@ fn account_progress_gallery() {
         probe::feed(&app, session, &screen);
         probe::refill(&mut app, wid);
         let _ = probe::pass(&mut app, wid);
+        if let Some(recorded) = retained.as_ref() {
+            let timeline = app.pool.get(session).unwrap().ctx.timeline.lock().unwrap();
+            let footer = timeline.claude_footer().expect("published footer");
+            assert_eq!(footer.account_progress_busy, observer_busy);
+            assert_eq!(footer.account_progress.as_ref(), Some(recorded));
+            let observed = crate::harness_recovery_verb::snapshot(&timeline);
+            assert_eq!(
+                observed, menu_progress,
+                "the actual owner-bound recovery and the menu show the same projection"
+            );
+            if autopilot_off {
+                let reply = crate::harness_recovery_verb::cmd("recovery", true, || Ok(observed));
+                for field in [
+                    "phase=paused",
+                    "eligible=-",
+                    "next_at=-",
+                    "target=-",
+                    "route=-",
+                ] {
+                    assert!(
+                        reply.split_whitespace().any(|word| word == field),
+                        "{reply}"
+                    );
+                }
+            }
+        }
         if name.starts_with("activity-menu") {
             let fact = crate::claude_lights::Fact::Account;
             let anchor = app.fact_anchor(wid, session, fact).expect("account anchor");
@@ -458,6 +589,136 @@ fn account_progress_gallery() {
         manifest.push_str(&format!("{name}\t{cols}\t{rows}\t{file}\n"));
     }
     std::fs::write(dir.join("manifest.tsv"), manifest).expect("fixture manifest");
+}
+
+#[test]
+fn lab_own_claim_gallery() {
+    use aterm_agent::harness::{
+        account_progress::enrich_inventory,
+        accounts::{Logins, Me, Point, Roster, Row, State},
+    };
+    let (dir, _gallery) =
+        crate::scripted_redraw_fixture::gallery_directory("ATERM_LAB_CLAIM_GALLERY");
+    let now = i64::try_from(aterm_time::unix_secs().expect("fixture clock")).unwrap();
+    let roster = Roster {
+        rows: ["fixture-current", "fixture-selected"]
+            .map(|label| Row {
+                label: label.into(),
+                dir: Some(format!("/synthetic/{label}")),
+                ..Default::default()
+            })
+            .into(),
+    };
+    let enrolled = ["fixture-current".to_owned(), "fixture-selected".to_owned()].into();
+    let me = Me {
+        account: Some("fixture-current"),
+        left: None,
+        default_home: true,
+        stored_login: true,
+    };
+    let mut manifest = String::from(
+        "# Synthetic retained claim decisions in the actual App Lab page; no provider or credential reads.\nscene\tcolumns\trows\tfile\n",
+    );
+    for (name, observed_at, until, pinned) in [
+        ("held-selected-pin", now - 60, now + 3600, true),
+        ("expired", now - 3600, now - 60, false),
+    ] {
+        let mut state = State {
+            machine: "0a0b".into(),
+            active: Some("fixture-selected".into()),
+            proven: true,
+            pinned,
+            ..Default::default()
+        };
+        state.note_lease("fixture-current", "fixture-peer", until, observed_at - 1);
+        let mut progress = AccountProgress::unknown(observed_at);
+        progress.account = Some("fixture-current".into());
+        progress.phase = ProgressPhase::Waiting;
+        enrich_inventory(
+            &mut progress,
+            &roster,
+            &state,
+            &Logins::default(),
+            &enrolled,
+            &me,
+            Some(&Point::TurnEnd),
+        );
+        assert_eq!(progress.own_claim.unwrap().pinned, pinned);
+        let mut facts = probe::facts();
+        facts.account_progress = Some(progress);
+        let (mut app, wid, session) = probe::glass_with(&probe::AT_REST, facts);
+        {
+            let entry = app.pool.get(session).unwrap();
+            entry
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .set_program(4242, Some("claude".into()));
+        }
+        assert!(
+            app.proxy.is_none(),
+            "the scene cannot start account collection"
+        );
+        let snapshot = app.harness_state();
+        let recovery = snapshot
+            .lab
+            .sessions
+            .iter()
+            .find(|entry| entry.local_id == session)
+            .expect("the private App publishes the synthetic session's recovery");
+        for name in ["Own account claim", "Claim recorded until", "Claim timing"] {
+            assert!(
+                recovery.facts.iter().any(|(key, _)| key == name),
+                "the source publication contains {name}"
+            );
+        }
+        // The compact/scaled fixture checks rows across pages. This positive
+        // image needs the adjacent claim rows on one page of the larger card.
+        assert!(app.apply_term_resize(wid, 80, probe::COLS));
+        app.config.serious_mode = Some(true);
+        assert!(app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Lab));
+        let key =
+            |row: &str| crate::native_ui::UiKey::new(format!("lab/session/{session}/row/{row}"));
+        let mut visible = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..512 {
+            let compiled = app.compiled_native_ui(wid).unwrap();
+            for row in [
+                "own-account-claim",
+                "claim-recorded-until",
+                "claim-timing",
+                "switch-blocker",
+            ] {
+                if compiled.semantic(&key(row)).is_some() {
+                    seen.insert(row);
+                }
+            }
+            if ["own-account-claim", "claim-recorded-until", "claim-timing"]
+                .iter()
+                .all(|row| compiled.semantic(&key(row)).is_some())
+                && (!pinned || compiled.semantic(&key("switch-blocker")).is_some())
+            {
+                visible = Some(compiled);
+                break;
+            }
+            app.dispatch_native_event(wid, crate::native_app::AppEvent::ScrollLines(1))
+                .unwrap();
+        }
+        let compiled = visible.unwrap_or_else(|| panic!(
+            "the finite Lab page walk reaches the claim rows together: viewport={:?} seen={seen:?}",
+            app.native_ui_viewport(wid),
+        ));
+        let timing = &compiled.semantic(&key("claim-timing")).unwrap().label;
+        assert_eq!(timing.contains("expired"), !pinned);
+        let file = format!("lab-own-claim-{name}.png");
+        std::fs::write(dir.join(&file), capture(&mut app, wid)).expect("Lab fixture PNG");
+        manifest.push_str(&format!(
+            "{name}\t{}\t{}\t{file}\n",
+            app.windows[&wid].cols, app.windows[&wid].rows
+        ));
+    }
+    std::fs::write(dir.join("manifest.tsv"), manifest).expect("Lab fixture manifest");
 }
 
 #[test]

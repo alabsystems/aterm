@@ -307,6 +307,10 @@ pub(crate) fn control_press(verb: &str, rest: &str) -> Option<InputEvent> {
         "paste" => Some(paste_event(rest)),
         "focus" => parse_focus(rest).map(InputEvent::Focus),
         "mouse" => parse_mouse(rest).ok(),
+        "resize" => parse_window_resize(rest).ok().filter(|event| match event {
+            InputEvent::ResizeWindowPx { width, height } => *width != 0 && *height != 0,
+            _ => true,
+        }),
         _ => None,
     }
 }
@@ -2149,6 +2153,54 @@ mod tests {
                 control_fence(input_of("focus"), "focus", body, false),
                 Some(true)
             );
+        }
+        for (body, event) in [
+            (
+                "14 80",
+                InputEvent::Resize {
+                    rows: 14,
+                    cols: 80,
+                    echo_to_window: true,
+                },
+            ),
+            (
+                "px 1144 378",
+                InputEvent::ResizeWindowPx {
+                    width: 1144,
+                    height: 378,
+                },
+            ),
+        ] {
+            assert_eq!(control_press("resize", body), Some(event));
+            for fenced_write in [false, true] {
+                assert_eq!(
+                    control_fence(input_of("resize"), "resize", body, fenced_write),
+                    Some(true),
+                    "the valid geometry request keeps the hand through its ingress fence"
+                );
+            }
+        }
+        for body in [
+            "".to_owned(),
+            "14".into(),
+            "bad 80".into(),
+            "0 80".into(),
+            format!("{} 80", u32::from(MAX_GRID_ROWS) + 1),
+            format!("14 {}", u32::from(MAX_GRID_COLS) + 1),
+            "px 0 378".into(),
+            "px 1144 0".into(),
+            "px 1144".into(),
+            "px nope 378".into(),
+            "px 4294967296 378".into(),
+        ] {
+            assert_eq!(control_press("resize", &body), None);
+            for fenced_write in [false, true] {
+                assert_eq!(
+                    control_fence(input_of("resize"), "resize", &body, fenced_write),
+                    Some(false),
+                    "malformed or range-invalid geometry retains the generic attempt fence"
+                );
+            }
         }
         for body in [
             "press left 2 4",

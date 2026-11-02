@@ -800,7 +800,8 @@ mod tests {
         if std::env::var_os(MARKED_CHILD_ENV).is_none() {
             return;
         }
-        println!("{MARKED_CHILD_RUNS}");
+        // Keep the readiness proof on its own line even after libtest's single-thread prefix.
+        println!("\n{MARKED_CHILD_RUNS}");
         let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
     }
 

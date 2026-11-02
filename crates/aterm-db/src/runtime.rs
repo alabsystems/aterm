@@ -31,6 +31,7 @@ mod discovery;
 mod isolation;
 mod lan;
 mod owner;
+mod place;
 mod report;
 mod transport;
 mod vault;
@@ -38,7 +39,7 @@ pub(crate) use discovery::MAX_UNVERIFIED_ENDPOINTS;
 #[cfg(test)]
 pub(crate) use discovery::Outcome;
 pub use lan::{LanGate, LanTurn};
-pub use report::RepairRound;
+pub use report::{AuthenticatedConnection, RepairRound};
 #[cfg(test)]
 pub(crate) use transport::test_worker;
 
@@ -122,6 +123,8 @@ struct Network {
     repairs: crate::control::PeerCache,
     /// What holds the owner before its observer and first LAN use ([`LanGate`]).
     lan: LanGate,
+    /// Authenticated contacts go to the machine's shared place; fixtures are inert.
+    place: place::Publisher,
     #[cfg(test)]
     isolated: Option<auto_sync_tests::Attachment>,
     /// Counts each transport this network opened (tests).
@@ -156,6 +159,7 @@ impl Network {
         Ok(Self {
             repairs: crate::control::PeerCache::default(),
             lan,
+            place: place::Publisher::live(),
             #[cfg(test)]
             isolated: None,
             #[cfg(test)]
@@ -307,14 +311,23 @@ pub enum Status {
     /// delay that doubles with each consecutive refusal, the background owner every [`POLL`]
     /// ([`Refusals`]).
     Refused(&'static str),
+    /// A local writer or changed authenticated snapshot requires fresh admission.
+    /// The owner retries after [`POLL`] without accumulating refusal backoff.
+    Retrying(&'static str),
     /// The owner waits before its first LAN use ([`LanGate`]): it opened no observer and no
     /// socket yet, or (its host deferred the use, [`LanGate::before_use`]) no LAN socket.
     LanHeld,
 }
 
-/// [`Status::Refused`] at the step `why`, whatever its error said.
-fn refusal<E>(why: &'static str) -> impl FnOnce(E) -> Status {
-    move |_| Status::Refused(why)
+/// Preserve the failed boundary and any typed local admission contention.
+fn refusal<E: Into<crate::Error>>(why: &'static str) -> impl FnOnce(E) -> Status {
+    move |error| {
+        if error.into().is_busy() {
+            Status::Retrying(why)
+        } else {
+            Status::Refused(why)
+        }
+    }
 }
 
 /// The longest wait between two tries of an owner that keeps being refused.
@@ -345,7 +358,8 @@ impl Refusals {
         }
     }
     /// The wait after a try that ended with `status` (`None`: it ended to rebuild), having served
-    /// for `served` (`None`: it never served).
+    /// for `served` (`None`: it never served). Typed local contention keeps [`POLL`]
+    /// rather than increasing the persistent-refusal streak.
     fn after(&mut self, status: Option<Status>, served: Option<Duration>) -> Duration {
         if self.background {
             return POLL;
@@ -354,9 +368,11 @@ impl Refusals {
         if status.is_none() || served.is_some_and(|served| served >= REFUSED_MAX) {
             self.streak = 0;
         }
-        let Some(Status::Refused(_)) = status else {
-            return base;
-        };
+        match status {
+            Some(Status::Retrying(_)) => return POLL,
+            Some(Status::Refused(_)) => {}
+            _ => return base,
+        }
         let wait = base
             .saturating_mul(1 << self.streak.min(16))
             .min(REFUSED_MAX);
@@ -778,15 +794,12 @@ impl Runtime {
                 while !worker.requested() {
                     if background && owner::window_claimed(&observer_dir) {
                         wait_relay.stop();
-                        let publication = crate::network_state::read_live_publication(&config)
-                            .unwrap_or_else(|_| {
-                                let mut retained =
-                                    crate::network_state::read_history(&config).unwrap_or_default();
-                                retained.visibility = Visibility::Waiting;
-                                retained.detail =
-                                    "An aterm window owns Commons repair while it runs".into();
-                                crate::network_state::Publication::new(retained, Instant::now())
-                            });
+                        let publication = waiting_publication(
+                            &paths,
+                            &config,
+                            Visibility::Waiting,
+                            "An aterm window owns Commons repair while it runs",
+                        );
                         published.replace_publication(publication);
                         report(Status::Waiting);
                         worker.wait(POLL);
@@ -799,8 +812,9 @@ impl Runtime {
                     // observation.
                     if let Some((visibility, detail, status)) = network.lan.held(&config) {
                         published.replace_publication(
-                            crate::network_state::read_owner_publication(&config)
-                                .unwrap_or_else(|_| held_publication(&config, visibility, detail)),
+                            transport_publication(&paths)
+                                .or_else(|| crate::network_state::read_owner_publication(&config).ok())
+                                .unwrap_or_else(|| held_publication(&config, visibility, detail)),
                         );
                         wait_relay.keep(&observer_config, &published);
                         report(status);
@@ -823,6 +837,7 @@ impl Runtime {
                         }
                         Err(crate::network_state::OpenFailure::Owned) => {
                             published.replace_publication(waiting_publication(
+                                &paths,
                                 &config,
                                 Visibility::Waiting,
                                 "Another local aterm owns network observation; its live snapshot is unavailable",
@@ -870,16 +885,28 @@ impl Runtime {
                                     Visibility::Waiting,
                                     "Another local process owns Commons repair",
                                 ),
+                                Status::Retrying(_) => (
+                                    Visibility::Waiting,
+                                    "Local Commons admission is busy or changed; retrying",
+                                ),
                                 Status::LanHeld => (Visibility::Waiting, network.waits.get()),
                                 _ => (Visibility::Unavailable, "Network observation unavailable"),
                             };
-                            history.observe(
-                                visibility,
-                                0,
-                                detail,
-                                aterm_time::unix_millis().unwrap_or(0),
-                                Instant::now(),
-                            );
+                            if status == Status::Waiting
+                                && let Some(publication) = transport_publication(&paths)
+                            {
+                                // Keep the owner's original sample time and kernel identity.
+                                // This process's config relay must not forward it recursively.
+                                published.replace_publication(publication);
+                            } else {
+                                history.observe(
+                                    visibility,
+                                    0,
+                                    detail,
+                                    aterm_time::unix_millis().unwrap_or(0),
+                                    Instant::now(),
+                                );
+                            }
                             report(status);
                             network.retry(&worker, wait);
                         }
@@ -950,16 +977,44 @@ fn held_publication(
 /// What an owner with no observer of its own publishes: the live owner's relayed snapshot when
 /// one answers, else the retained history with `visibility` and `detail`.
 fn waiting_publication(
+    paths: &Paths,
     config: &Path,
     visibility: Visibility,
     detail: &str,
 ) -> crate::network_state::Publication {
-    crate::network_state::read_live_publication(config).unwrap_or_else(|_| {
+    read_live_publication(paths, config).unwrap_or_else(|_| {
         let mut retained = crate::network_state::read_history(config).unwrap_or_default();
         retained.visibility = visibility;
         retained.detail = detail.into();
         crate::network_state::Publication::new(retained, Instant::now())
     })
+}
+
+/// Find the current generation's transport owner using read-only custody observation.
+/// No default configuration path or historical generation can stand in for that owner.
+fn transport_publication(paths: &Paths) -> Option<crate::network_state::Publication> {
+    let selected =
+        crate::generation::observed_paths_until(paths, Instant::now() + ADMISSION).ok()?;
+    crate::network_state::read_transport_publication(&selected.dir.join("commons")).ok()
+}
+
+/// Prefer the vault's active transport owner, including one with another GUI configuration.
+/// The configuration relay still supplies discovery-only and held-owner observations.
+/// This reads local custody and a same-user relay without starting repair or contacting peers.
+///
+/// # Errors
+///
+/// Neither the selected vault's transport owner nor the configuration's observer supplies an
+/// accepted live publication.
+pub fn read_live_publication(
+    paths: &Paths,
+    config: &Path,
+) -> std::io::Result<crate::network_state::Publication> {
+    if let Some(publication) = transport_publication(paths) {
+        Ok(publication)
+    } else {
+        crate::network_state::read_live_publication(config)
+    }
 }
 
 /// Whether `config`'s `[commons] enabled` lets this Mac take part in the shared data (on when
@@ -1095,7 +1150,8 @@ fn serve_selected(
             );
         }
     };
-    let lease = owner::Lease::acquire(&paths.dir.join("commons"))
+    let commons_dir = paths.dir.join("commons");
+    let lease = owner::Lease::acquire(&commons_dir)
         .map_err(refusal("owner lease"))?
         .ok_or(Status::Waiting)?;
     let lease = Arc::new(lease);
@@ -1144,6 +1200,9 @@ fn serve_selected(
     let mut transport = network
         .open(Some(endpoint), &candidates)
         .map_err(refusal("transport"))?;
+    // Created after the lease, dropped before it: only the actual transport owner
+    // publishes at the shared vault address, even with distinct GUI configurations.
+    let mut owner_relay = history.transport_relay(&commons_dir).ok();
     let vault_reader = if pending {
         None
     } else {
@@ -1172,6 +1231,10 @@ fn serve_selected(
                     refresh = now + Duration::from_secs(30);
                 }
                 lease.recheck().map_err(refusal("owner lease"))?;
+                if owner_relay.as_ref().is_none_or(|relay| !relay.is_running()) {
+                    drop(owner_relay.take());
+                    owner_relay = history.transport_relay(&commons_dir).ok();
+                }
                 custody.recheck().map_err(refusal("custody"))?;
                 if !enabled(config).map_err(refusal("configuration"))? {
                     return Err(Status::Disabled);
@@ -1250,6 +1313,7 @@ fn serve_selected(
                     .map(|contact| (contact.actor, contact.at))
                     .collect(),
                 &completed,
+                &network.place,
                 || (aterm_time::unix_millis().unwrap_or(0), Instant::now()),
             );
             for completed in completed {
@@ -1286,6 +1350,7 @@ fn serve_selected(
     for completed in transport.reports() {
         reports(completed);
     }
+    drop(owner_relay);
     result
 }
 
@@ -1368,13 +1433,15 @@ fn refresh(paths: &Paths, bootstrap: &Bootstrap, ledger: &mut Ledger, now_ms: u6
     }
 }
 
-/// Resolve authenticated contacts and successful outbound endpoints through current
-/// membership before publishing identity. Clock reads keep freshness tests independent of speed.
+/// Resolve authenticated contacts, their socket paths and successful outbound endpoints
+/// through current membership before publishing identity. Clock reads keep freshness tests
+/// independent of speed.
 fn observe_contacts(
     bootstrap: &Bootstrap,
     history: &mut Observer,
     contacts: Vec<(astream_wire::sync::Actor, Instant)>,
     completed: &[RepairRound],
+    place: &place::Publisher,
     clock: impl Fn() -> (u64, Instant),
 ) {
     let endpoints: Vec<_> = completed
@@ -1396,6 +1463,7 @@ fn observe_contacts(
         bootstrap.journal_dir(),
         bootstrap.trust(),
     );
+    let mut answers = Vec::new();
     if let Ok(journal) = journal
         && bootstrap.revalidate_custody().is_ok()
         && let Ok(Some(access)) = bootstrap.access_in(&journal)
@@ -1439,7 +1507,18 @@ fn observe_contacts(
                 history.accounts_exchange(candidate);
             }
         }
+        for round in completed {
+            if let Some(peer) = access
+                .members()
+                .iter()
+                .find(|member| Some(member.binding().actor()) == round.actor)
+                && let Some(answer) = place::answer(round, access.local().binding(), peer.binding())
+            {
+                answers.push(answer);
+            }
+        }
     }
+    place.note(answers);
 }
 
 /// Remap a completed immutable witness through this custody's current Commons binding.
@@ -1816,6 +1895,7 @@ mod accounts_exchange_tests {
             &mut history,
             Vec::new(),
             std::slice::from_ref(&completed),
+            &place::Publisher::default(),
             || panic!("historical evidence must use its own sample clock"),
         );
         history.observe(
@@ -1834,9 +1914,14 @@ mod accounts_exchange_tests {
         let mut refused =
             Observer::open(&lab._home.path().join("network-two/config"), handle.clone()).unwrap();
         refused.local(local, bootstrap.trust()).unwrap();
-        observe_contacts(&bootstrap, &mut refused, Vec::new(), &[completed], || {
-            panic!("custody refusal cannot become a new sample")
-        });
+        observe_contacts(
+            &bootstrap,
+            &mut refused,
+            Vec::new(),
+            &[completed],
+            &place::Publisher::default(),
+            || panic!("custody refusal cannot become a new sample"),
+        );
         refused.observe(
             Visibility::Active,
             0,
@@ -1873,6 +1958,7 @@ mod accounts_exchange_tests {
             &mut history,
             vec![(actor, at)],
             std::slice::from_ref(&failed),
+            &place::Publisher::default(),
             || (2000, at + Duration::from_secs(1)),
         );
         history.observe(
@@ -1906,13 +1992,19 @@ mod accounts_exchange_tests {
             &mut history,
             Vec::new(),
             &[failed.clone()],
+            &place::Publisher::default(),
             || panic!("an unbound peer must not establish a contact"),
         );
         std::fs::remove_file(lab.paths[0].dir.join("identity")).unwrap();
         failed.actor = Some(actor);
-        observe_contacts(&bootstrap, &mut history, Vec::new(), &[failed], || {
-            panic!("unavailable custody must not establish a contact")
-        });
+        observe_contacts(
+            &bootstrap,
+            &mut history,
+            Vec::new(),
+            &[failed],
+            &place::Publisher::default(),
+            || panic!("unavailable custody must not establish a contact"),
+        );
         history.observe(
             Visibility::Active,
             0,

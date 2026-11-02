@@ -333,3 +333,37 @@ fn a_survey_reply_reads_as_a_member() {
     assert_eq!(m.at_ms, None);
     assert_eq!(m.accounts, Some(vec![row("claude", "main", None, None)]));
 }
+
+/// An `unseen` row has no figures, which would rank it as the least used of all, though its login
+/// may stand at a sign-in screen where a worker stalls. Negative control: with nothing else, it
+/// still takes the worker.
+#[test]
+fn a_row_read_working_goes_before_an_unseen_one() {
+    let unseen = |host: &str| {
+        member(
+            host,
+            vec![Row {
+                condition: "unseen".to_owned(),
+                ..row("claude", "new", None, None)
+            }],
+        )
+    };
+    let read = member("m22", vec![row("claude", "used", Some(90), Some(40))]);
+    let members = [unseen("m1"), read.clone()];
+    assert_eq!(chosen("claude", &members), "m22.local");
+    let both = Member {
+        accounts: Some(vec![
+            Row {
+                condition: "unseen".to_owned(),
+                ..row("claude", "a-new", None, None)
+            },
+            row("claude", "z-used", Some(90), Some(40)),
+        ]),
+        ..member("m8", Vec::new())
+    };
+    assert_eq!(
+        both.best("claude").map(|row| row.label.as_str()),
+        Some("z-used")
+    );
+    assert_eq!(chosen("claude", &[unseen("m1")]), "m1.local");
+}

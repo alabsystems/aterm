@@ -48,8 +48,179 @@ pub(crate) const RECOVERIES: Ring = Ring {
     period_s: 86_400,
 };
 
+/// The lab journal's ring (docs/DESIGN-alab-lab-model-2026-11-01.md §4.17): one table a week
+/// of what each Mac sees while it uses an account anyway (sessions, sign-ins, quota readings),
+/// each writer in its fixed share ([`JOURNAL_SHARES`]). A Mac's window is the previous, current
+/// and next week; older weeks are deleted whole on each Mac's own clock.
+pub(crate) const JOURNAL: Ring = Ring {
+    application: "alab",
+    role: "journal",
+    period_s: 604_800,
+};
+
 /// Every ring the replica subscribes to.
-const RINGS: [&Ring; 2] = [&CLAIMS, &RECOVERIES];
+const RINGS: [&Ring; 3] = [&CLAIMS, &RECOVERIES, &JOURNAL];
+
+/// What one period table holds, in all and from one writer: records and wire bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Used {
+    pub records: usize,
+    pub bytes: usize,
+    pub writer_records: usize,
+    pub writer_bytes: usize,
+}
+
+/// How much of one period table a write may fill: the table's caps, and one writer's share of
+/// them. A write that would pass either spills into the next period (`place`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Shares {
+    pub records: usize,
+    pub bytes: usize,
+    pub writer_records: usize,
+    pub writer_bytes: usize,
+}
+
+/// The writer count a fixed share divides by (design §3.9): a constant of the ring, never the
+/// current membership, so writers that join mid-period cannot together pass the table.
+pub(crate) const SHARE_WRITERS: usize = 128;
+
+/// The journal ring's shares (design §3.9): at most 7,680 records and 115 MiB a period table,
+/// below the store's 8,192 records and 128 MiB so both sides of a split fit after a heal, and
+/// each writer a fixed 1/128 of a 6,912-record pool (54) and of a 108 MiB pool (864 KiB). 128
+/// writers fill at most the pools; even 151 fit the store, in records and in bytes.
+///
+/// The asserts below hold that at compile time. NEGATIVE CONTROL: with the byte pool the
+/// table's 115 MiB (920 KiB a writer), 151 writers hold 135.7 MiB and the build fails at the
+/// byte assert (E0080).
+pub(crate) const JOURNAL_SHARES: Shares = Shares::fixed(
+    (7_680, 115 * 1024 * 1024),
+    (6_912, 108 * 1024 * 1024),
+    SHARE_WRITERS,
+);
+// 128 writers' shares fill at most the pools, within the table's caps, and even 151 writers'
+// shares fit the store's records and bytes.
+const _: () = assert!(SHARE_WRITERS * JOURNAL_SHARES.writer_records <= JOURNAL_SHARES.records);
+const _: () = assert!(SHARE_WRITERS * JOURNAL_SHARES.writer_bytes <= JOURNAL_SHARES.bytes);
+const _: () = assert!(151 * JOURNAL_SHARES.writer_records <= crate::table::store::MAX_RECORDS);
+const _: () = assert!(151 * JOURNAL_SHARES.writer_bytes <= crate::table::store::MAX_BYTES);
+
+impl Shares {
+    /// A table of `table` records and bytes, whose writers each hold a fixed `1 / writers` of
+    /// `pool`'s records and of its bytes.
+    pub(crate) const fn fixed(
+        (table_records, table_bytes): (usize, usize),
+        (pool_records, pool_bytes): (usize, usize),
+        writers: usize,
+    ) -> Self {
+        Self {
+            records: table_records,
+            bytes: table_bytes,
+            writer_records: pool_records / writers,
+            writer_bytes: pool_bytes / writers,
+        }
+    }
+
+    /// Whether an append of `records` records and `bytes` wire bytes no longer fits beside
+    /// `used`, in the table or in this writer's share.
+    pub(crate) const fn full(&self, used: &Used, records: usize, bytes: usize) -> bool {
+        records > self.records.saturating_sub(used.records)
+            || bytes > self.bytes.saturating_sub(used.bytes)
+            || records > self.writer_records.saturating_sub(used.writer_records)
+            || bytes > self.writer_bytes.saturating_sub(used.writer_bytes)
+    }
+}
+
+/// Why an own-chain append was kept for later rather than written: no window table had room for
+/// it, or this Mac has no storage slot left for the one it goes into. The journal's spool keeps
+/// its events then (design §3.9, §3.10), so a cap or a full disk of tables costs latency, never
+/// events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kept {
+    Unplaced(Unplaced),
+    /// The table has no storage here and every slot is taken: an older build's catalog tables
+    /// past the shared slots, until the storage release frees them.
+    NoSlot,
+}
+
+impl Kept {
+    /// Why, in the words a Mac reports.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the journal publisher (lab model step 8) reports it"
+        )
+    )]
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::Unplaced(unplaced) => unplaced.reason(),
+            Self::NoSlot => "journal: no storage slot",
+        }
+    }
+}
+
+/// Why a write found no period table in its ring's window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unplaced {
+    /// The clock is behind this Mac's floor.
+    Behind,
+    /// The row lapses beyond the window's last period.
+    Beyond,
+    /// Every table from the first the row may go into to the window's last is full.
+    Full,
+}
+
+impl Unplaced {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Behind => {
+                "this Mac's clock is behind the ring tables it took up; writes resume when it reaches them"
+            }
+            Self::Beyond => "the row lapses beyond the ring tables' window",
+            Self::Full => "this writer's share of the ring tables is full; it resumes next period",
+        }
+    }
+}
+
+/// The period table a row that lapses at `until` goes into, by the clock `now` and this Mac's
+/// ring `state`: the current period's, this writer's own latest period's (`own`) where later,
+/// never below the floor, so never a table this Mac deleted (`RingState::outdated`), and never
+/// earlier than the period before the one `until` falls in, so `until < (epoch + 2) · period`
+/// and the row has lapsed on any clock that deletes its table. A `full` table spills into the
+/// next period's while that lies in the window.
+///
+/// No row is placed while the clock is behind the floor. Such a clock either ran ahead and came
+/// back or is set back, and no Mac can tell which: set back, its window (the clock's,
+/// `RingState::current`) leaves out the period after the floor, its peers' current one, where its
+/// own latest row and its peers' current rows can sit, so a row written at the floor would be
+/// read on a view without them and outranked by its own later one. Once the clock reaches the
+/// floor, the window reaches every table that holds a row of this Mac's: each write raises the
+/// floor to the period before the current one first and goes at most a period past the current
+/// one, so no row lies more than two periods past the floor.
+pub(crate) fn place(
+    ring: &Ring,
+    state: &RingState,
+    now: u64,
+    own: Option<u64>,
+    until: u64,
+    full: impl Fn(u64) -> bool,
+) -> std::result::Result<u64, Unplaced> {
+    let last = *state.window(ring, now).end();
+    let epoch = state
+        .current(ring, now)
+        .max(state.floor)
+        .max(own.unwrap_or(0))
+        .max(ring.epoch_of(until).saturating_sub(1));
+    if ring.epoch_of(now) < state.floor {
+        return Err(Unplaced::Behind);
+    }
+    if epoch > last {
+        return Err(Unplaced::Beyond);
+    }
+    (epoch..=last)
+        .find(|epoch| !full(*epoch))
+        .ok_or(Unplaced::Full)
+}
 
 const DOMAIN: &[u8] = b"aterm/commons/ring-table/1\0";
 const STATE_MAGIC: &[u8; 5] = b"ATRS1";
@@ -471,6 +642,97 @@ impl Directory {
             self.save_ring_state(session, ring, &state)?;
         }
         self.enroll(session, ring.scope(self.trust, epoch)?)
+    }
+
+    /// Append `payload` to `ring` on this writer's own chain (`Store::commit_own`), in the first
+    /// window table from `place`'s start where it fits this writer's fixed `shares`, by the
+    /// records and wire bytes each table retains. A full share spills into the next period while
+    /// that lies in the window, so the cap costs latency, never rows. Returns the period and the
+    /// receipt.
+    ///
+    /// # Errors
+    /// No control writer, a clock behind the floor, a row beyond the window, no table left with
+    /// room for this writer, no storage slot, or damaged storage.
+    #[cfg(test)]
+    pub(crate) fn append_own(
+        &self,
+        session: &Session<'_>,
+        ring: &Ring,
+        shares: Shares,
+        now: u64,
+        until: u64,
+        payload: &[u8],
+    ) -> Result<(u64, crate::table::store::Receipt)> {
+        self.append_within(session, ring, shares, now, until, payload)?
+            .map_err(|kept| Error::new(kept.reason()))
+    }
+
+    /// Append `payload` to the lab journal (`JOURNAL`) in this writer's fixed share
+    /// ([`JOURNAL_SHARES`]), as [`Self::append_own`] does, but keep it for later where it
+    /// cannot go now: every window table is full for this writer, the clock is behind the floor,
+    /// the row lapses beyond the window, or this Mac has no storage slot left for the table
+    /// (`journal: no storage slot`). The caller's spool keeps the events then.
+    ///
+    /// # Errors
+    /// No control writer, an unreadable ring state, or damaged storage.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the journal publisher (lab model step 8) appends with it"
+        )
+    )]
+    pub(crate) fn append_journal(
+        &self,
+        session: &Session<'_>,
+        now: u64,
+        until: u64,
+        payload: &[u8],
+    ) -> Result<std::result::Result<(u64, crate::table::store::Receipt), Kept>> {
+        self.append_within(session, &JOURNAL, JOURNAL_SHARES, now, until, payload)
+    }
+
+    /// The own-chain append both of the above share: the placement by fixed shares, then the
+    /// storage room, then the enrollment and the commit.
+    fn append_within(
+        &self,
+        session: &Session<'_>,
+        ring: &Ring,
+        shares: Shares,
+        now: u64,
+        until: u64,
+        payload: &[u8],
+    ) -> Result<std::result::Result<(u64, crate::table::store::Receipt), Kept>> {
+        let state = self.retire(session, ring, now)?;
+        let actor = session.actor();
+        let mut used = BTreeMap::new();
+        for epoch in state.window(ring, now) {
+            let scope = ring.scope(self.trust, epoch)?;
+            if let Some(store) = Store::observe_if_exists(session, &self.path(scope)?, scope)? {
+                used.insert(epoch, store.retained_use(session, actor)?);
+            }
+        }
+        let own = used
+            .iter()
+            .filter(|(_, used)| used.writer_records > 0)
+            .map(|(epoch, _)| *epoch)
+            .max();
+        // A sealed record is the payload and at most this much envelope: one parent, no merge.
+        let bytes = payload
+            .len()
+            .saturating_add(crate::crypto::MAX_OPERATION - crate::crypto::MAX_BODY);
+        let epoch = match place(ring, &state, now, own, until, |epoch| {
+            shares.full(&used.get(&epoch).copied().unwrap_or_default(), 1, bytes)
+        }) {
+            Ok(epoch) => epoch,
+            Err(unplaced) => return Ok(Err(Kept::Unplaced(unplaced))),
+        };
+        if !self.has_room(ring.scope(self.trust, epoch)?)? {
+            return Ok(Err(Kept::NoSlot));
+        }
+        let mut store = self.enroll_ring(session, ring, epoch, now)?;
+        let receipt = store.commit_own(session, payload)?;
+        Ok(Ok((epoch, receipt)))
     }
 
     /// Retire old ring tables and name the window's tables this Mac holds storage for, under the

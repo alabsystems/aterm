@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use aterm_core::scrollback::Line;
 use aterm_core::terminal::Terminal;
 
-use super::tests::{
-    ScratchEnv, child_proof_from, env_alone, pipe_pair, restore_env, run_in_children,
-};
+use super::tests::{ScratchEnv, child_proof_from, env_alone, pipe_pair, restore_env};
 use super::*;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/handoff");
@@ -932,6 +930,25 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.147.0", "stalled-sequence"),
     ("v0.147.0", "twelve-panes"),
     ("v0.147.0", "variants"),
+    ("v0.148.0", "carried-state"),
+    ("v0.148.0", "claude-code-1049"),
+    ("v0.148.0", "colour-and-shell"),
+    ("v0.148.0", "engine-state"),
+    ("v0.148.0", "fold"),
+    ("v0.148.0", "held-failed"),
+    ("v0.148.0", "held-pane"),
+    ("v0.148.0", "held-withheld"),
+    ("v0.148.0", "history"),
+    ("v0.148.0", "history-carry"),
+    ("v0.148.0", "incident-55x149"),
+    ("v0.148.0", "link-dense"),
+    ("v0.148.0", "link-dense-history"),
+    ("v0.148.0", "policy-repaint"),
+    ("v0.148.0", "policy-visible"),
+    ("v0.148.0", "shell-integration"),
+    ("v0.148.0", "stalled-sequence"),
+    ("v0.148.0", "twelve-panes"),
+    ("v0.148.0", "variants"),
 ];
 
 const REQUIRED_DESKS: &[(&str, &str)] = &[
@@ -1215,7 +1232,32 @@ fn unhex<const N: usize>(label: &str, text: &str) -> [u8; N] {
     out
 }
 
-fn every_desk() -> Vec<Desk> {
+struct DeskPath {
+    release: String,
+    name: String,
+    path: std::path::PathBuf,
+}
+
+impl DeskPath {
+    fn label(&self) -> String {
+        format!("{}/{}", self.release, self.name)
+    }
+
+    fn read(&self) -> Desk {
+        let text = std::fs::read_to_string(self.path.join("parent.toml"))
+            .unwrap_or_else(|error| panic!("{}: parent.toml: {error}", self.path.display()));
+        let parent: ParentRecord = aterm_toml::from_str(&text)
+            .unwrap_or_else(|error| panic!("{}: parent.toml: {error}", self.path.display()));
+        Desk {
+            release: self.release.clone(),
+            name: self.name.clone(),
+            path: self.path.clone(),
+            parent,
+        }
+    }
+}
+
+fn every_desk_path() -> Vec<DeskPath> {
     let mut releases = std::fs::read_dir(FIXTURES)
         .expect("the handoff fixture root exists")
         .flatten()
@@ -1224,11 +1266,17 @@ fn every_desk() -> Vec<Desk> {
     releases.sort_by_key(|entry| release_triple(&entry.file_name().to_string_lossy()));
     releases
         .iter()
-        .flat_map(|release| release_desks(&release.file_name().to_string_lossy(), &release.path()))
+        .flat_map(|release| {
+            release_desk_paths(&release.file_name().to_string_lossy(), &release.path())
+        })
         .collect()
 }
 
-fn release_desks(release: &str, dir: &std::path::Path) -> Vec<Desk> {
+fn every_desk() -> Vec<Desk> {
+    every_desk_path().iter().map(DeskPath::read).collect()
+}
+
+fn release_desk_paths(release: &str, dir: &std::path::Path) -> Vec<DeskPath> {
     let mut names = std::fs::read_dir(dir)
         .unwrap_or_else(|error| panic!("{}: a release fixture dir: {error}", dir.display()))
         .flatten()
@@ -1237,20 +1285,63 @@ fn release_desks(release: &str, dir: &std::path::Path) -> Vec<Desk> {
     names.sort_by_key(std::fs::DirEntry::file_name);
     names
         .into_iter()
-        .map(|desk| {
-            let path = desk.path();
-            let text = std::fs::read_to_string(path.join("parent.toml"))
-                .unwrap_or_else(|error| panic!("{}: parent.toml: {error}", path.display()));
-            let parent: ParentRecord = aterm_toml::from_str(&text)
-                .unwrap_or_else(|error| panic!("{}: parent.toml: {error}", path.display()));
-            Desk {
-                release: release.to_string(),
-                name: desk.file_name().to_string_lossy().into_owned(),
-                path,
-                parent,
-            }
+        .map(|desk| DeskPath {
+            release: release.to_string(),
+            name: desk.file_name().to_string_lossy().into_owned(),
+            path: desk.path(),
         })
         .collect()
+}
+
+fn release_desks(release: &str, dir: &std::path::Path) -> Vec<Desk> {
+    release_desk_paths(release, dir)
+        .iter()
+        .map(DeskPath::read)
+        .collect()
+}
+
+/// Keep each child's work bounded as new releases accumulate, without splitting a release
+/// unless it grows past the per-child ceiling. Only the selected child reads its manifests.
+fn shipped_desk_batches(paths: &[DeskPath]) -> Vec<&[DeskPath]> {
+    const MAX_DESKS: usize = 20;
+    let mut batches = Vec::new();
+    let mut start = 0;
+    while start < paths.len() {
+        let end = (start + 1..paths.len())
+            .find(|&index| paths[index].release != paths[start].release)
+            .unwrap_or(paths.len());
+        batches.extend(paths[start..end].chunks(MAX_DESKS));
+        start = end;
+    }
+    batches
+}
+
+#[test]
+fn shipped_desk_batches_bound_future_releases_without_omitting_desks() {
+    let paths: Vec<_> = [("v1.0.0", 3), ("v2.0.0", 43), ("v3.0.0", 2)]
+        .into_iter()
+        .flat_map(|(release, count)| {
+            (0..count).map(move |index| DeskPath {
+                release: release.to_owned(),
+                name: format!("desk-{index}"),
+                path: std::path::PathBuf::new(),
+            })
+        })
+        .collect();
+    let batches = shipped_desk_batches(&paths);
+    for batch in &batches {
+        assert!(!batch.is_empty() && batch.len() <= 20);
+        assert!(batch.iter().all(|desk| desk.release == batch[0].release));
+    }
+    assert_eq!(
+        batches
+            .into_iter()
+            .flatten()
+            .map(DeskPath::label)
+            .collect::<Vec<_>>(),
+        paths.iter().map(DeskPath::label).collect::<Vec<_>>(),
+        "every desk remains in release order exactly once"
+    );
 }
 
 fn assert_fixture_is_self_consistent(desk: &Desk) {
@@ -2303,42 +2394,101 @@ fn assert_settings_drafts_placed(desk: &Desk, incoming: &IncomingHandoff) -> usi
 
 #[test]
 fn every_shipped_producers_desk_adopts_exactly_and_proves() {
-    const SHARDS: usize = 4;
-    const SHARD: &str = "ATERM_SHIPPED_DESK_SHARD";
+    const ACTIVE_CHILDREN: usize = 4;
+    const BATCH: &str = "ATERM_SHIPPED_DESK_BATCH";
+    const STARTED: &str = "shipped desk started: ";
+    const COMPLETED: &str = "shipped desk completed: ";
     const DRAFTS: &str = "settings drafts placed: ";
-    let Some(shard) = std::env::var(SHARD)
-        .ok()
-        .map(|text| text.parse::<usize>().expect("the shard is a number"))
-    else {
-        let drafts_carried = run_in_children(SHARD, SHARDS)
-            .iter()
-            .map(|stdout| {
-                stdout
+    let paths = every_desk_path();
+    let batches = shipped_desk_batches(&paths);
+    let batch = crate::test_alone::in_child().then(|| {
+        std::env::var(BATCH)
+            .expect("the child has an assigned batch")
+            .parse::<usize>()
+            .expect("the batch is a number")
+    });
+    let Some(batch) = batch else {
+        let expected: std::collections::BTreeSet<_> = paths.iter().map(DeskPath::label).collect();
+        assert_eq!(
+            expected.len(),
+            paths.len(),
+            "every desk has a unique release/name"
+        );
+        for (release, name) in PINNED_DESKS {
+            assert!(
+                expected.contains(&format!("{release}/{name}")),
+                "the {release} fixture {name} is checked in"
+            );
+        }
+        let mut completed = std::collections::BTreeSet::new();
+        let mut drafts_carried = 0usize;
+        // Joining each wave before starting another bounds live children even on a failure;
+        // Running's Drop kills and reaps every still-owned child when an assertion unwinds.
+        for first in (0..batches.len()).step_by(ACTIVE_CHILDREN) {
+            let running: Vec<_> = (first..batches.len().min(first + ACTIVE_CHILDREN))
+                .map(|index| {
+                    let value = std::ffi::OsString::from(index.to_string());
+                    (
+                        index,
+                        crate::test_alone::spawn_alone_with(&[(BATCH, &value)]),
+                    )
+                })
+                .collect();
+            for (index, child) in running {
+                let stdout = child.passed().stdout;
+                let actual: Vec<_> = stdout
                     .lines()
-                    .find_map(|line| line.split_once(DRAFTS)?.1.trim().parse::<usize>().ok())
-                    .expect("every shard prints the drafts it placed")
-            })
-            .sum::<usize>();
+                    .filter_map(|line| {
+                        line.split_once(COMPLETED)
+                            .map(|(_, label)| label.to_owned())
+                    })
+                    .collect();
+                let wanted: Vec<_> = batches[index].iter().map(DeskPath::label).collect();
+                assert_eq!(
+                    actual, wanted,
+                    "batch {index} completed exactly its assigned desks"
+                );
+                for label in actual {
+                    assert!(completed.insert(label), "no desk runs in two batches");
+                }
+                let counts: Vec<_> = stdout
+                    .lines()
+                    .filter_map(|line| {
+                        line.split_once(DRAFTS).map(|(_, count)| {
+                            count
+                                .trim()
+                                .parse::<usize>()
+                                .expect("the draft count is a number")
+                        })
+                    })
+                    .collect();
+                let [count] = counts.as_slice() else {
+                    panic!("batch {index} reported no unique draft count");
+                };
+                drafts_carried += *count;
+            }
+        }
+        assert_eq!(
+            completed, expected,
+            "every checked-in desk was adopted and proved exactly once"
+        );
         assert!(
             drafts_carried > 0,
             "the guard reads at least one shipped Settings draft (v0.98.0/link-dense-history)"
         );
+        println!("shipped desks completed: {}", completed.len());
+        println!("{DRAFTS}{drafts_carried}");
         return;
     };
     let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
-    let desks = every_desk();
+    let desks = batches.get(batch).expect("the selected batch exists");
     let mut drafts_carried = 0usize;
-    for (release, name) in PINNED_DESKS {
-        assert!(
-            desks
-                .iter()
-                .any(|desk| desk.release == *release && desk.name == *name),
-            "the {release} fixture {name} is checked in"
-        );
-    }
-    for desk in desks.iter().skip(shard).step_by(SHARDS) {
-        drafts_carried += assert_desk_adopts_exactly_and_proves(desk);
+    for path in *desks {
+        println!("{STARTED}{}", path.label());
+        let desk = path.read();
+        drafts_carried += assert_desk_adopts_exactly_and_proves(&desk);
+        println!("{COMPLETED}{}", path.label());
     }
     println!("{DRAFTS}{drafts_carried}");
 }

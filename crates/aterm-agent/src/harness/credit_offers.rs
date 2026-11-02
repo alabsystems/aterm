@@ -46,7 +46,8 @@
 //! the site-wide grant) on a vendor page [`claim_page`] admits and that tool's own reads
 //! ([`CHROME_TOOL`]); it hands every question to a person and declines every other tool's box.
 //! Its task ends in the one reply Autopilot Land lands on (`Nothing left:`), and the window's
-//! host turns its Autopilot Off once it has run 30 minutes.
+//! host ends it 30 minutes after it started or a person last typed in its tab, and closes the
+//! tab 30 minutes after that unless it is its window's last tab.
 //!
 //! # What is never read
 //!

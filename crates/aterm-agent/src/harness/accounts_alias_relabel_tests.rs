@@ -40,12 +40,9 @@ fn fixture(case: i64) -> (Option<Roster>, FleetRoster, Option<&'static str>) {
                 hint = None;
             }
             if case == 10 {
-                old.rows.push(row(
-                    "m1-2",
-                    "other@example.test",
-                    None,
-                    Some("/tmp/other-login"),
-                ));
+                let other_login = crate::harness::host_path::abs("/tmp/other-login");
+                old.rows
+                    .push(row("m1-2", "other@example.test", None, Some(&other_login)));
             }
         }
         4 => {
@@ -71,6 +68,13 @@ fn fixture(case: i64) -> (Option<Roster>, FleetRoster, Option<&'static str>) {
         }
         11 => hint = Some("new@example.test"),
         12 => return (None, fleet, hint),
+        13 => {
+            let other_login = crate::harness::host_path::abs("/tmp/other-login");
+            fleet.accounts[0].email = "third@example.test".into();
+            fleet.accounts[1].email = ALIAS.into();
+            old.rows
+                .push(row("m1-2", "other@example.test", None, Some(&other_login)));
+        }
         _ => {}
     }
     (Some(old), fleet, hint)
@@ -159,14 +163,19 @@ pub(crate) fn alias_transition(
     });
     let decision = old
         .as_ref()
-        .map_or(Ok(None), |old| default_relocation(old, &built));
+        .map_or(Ok(Vec::new()), |old| default_relocation(old, &built));
     let mut saved = accounts::State::default();
     let mut logins = accounts::Logins::default();
     accounts::rename_tests::seed_reference(&mut saved, &mut logins, "m1", 0);
     let before = (saved.clone(), logins.clone());
     let (relocation, payload) = match decision {
-        Ok(Some((from, to))) => {
-            accounts::move_account(&mut saved, &mut logins, &from, &to).unwrap();
+        Ok(moves) if !moves.is_empty() => {
+            let to = moves[0].1.clone();
+            let pairs: Vec<(&str, &str)> = moves
+                .iter()
+                .map(|(from, to)| (from.as_str(), to.as_str()))
+                .collect();
+            accounts::move_accounts(&mut saved, &mut logins, &pairs).unwrap();
             (
                 1,
                 saved.to_json() == before.0.to_json().replace("\"m1\"", &format!("\"{to}\""))
@@ -174,7 +183,7 @@ pub(crate) fn alias_transition(
                         == before.1.to_json().replace("\"m1\"", &format!("\"{to}\"")),
             )
         }
-        Ok(None) => (0, (saved, logins) == before),
+        Ok(_) => (0, (saved, logins) == before),
         Err(_) => (2, (saved, logins) == before),
     };
     next.insert("phase", 1);
@@ -191,7 +200,7 @@ pub(crate) fn alias_transition(
 #[test]
 fn alias_relabel_native_conforms_to_identity_and_move_model() {
     let model = aterm_models_harness::account_alias_relabel_model();
-    assert_eq!(model.mutant_dials(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(model.mutant_dials(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let (mut builds, mut changes) = (0, 0);
     for state in aterm_spec::interp::reachable_states(&model) {
@@ -208,7 +217,7 @@ fn alias_relabel_native_conforms_to_identity_and_move_model() {
             }
         }
     }
-    assert_eq!((builds, changes), (12, 12));
+    assert_eq!((builds, changes), (13, 13));
     let accepted = alias_transition(&model.init_state(), "Build");
     for (field, bad_value, law) in [
         ("identity", 0, "IdentityBoundToLogin"),
@@ -234,11 +243,12 @@ fn alias_assertion_requires_one_exact_login_address_and_moves_never_use_only_can
         rows: vec![row("m1", ALIAS, Some(CANONICAL), None)],
     };
     assert!(retained_login_row(Some(&old), "alias+tag@example.test").is_none());
+    let other_login = crate::harness::host_path::abs("/tmp/other-login");
     old.rows.push(row(
         "m1-2",
         ALIAS,
         Some("other@example.test"),
-        Some("/tmp/other-login"),
+        Some(&other_login),
     ));
     assert!(retained_login_row(Some(&old), ALIAS).is_none());
     old.rows.pop();
@@ -250,7 +260,7 @@ fn alias_assertion_requires_one_exact_login_address_and_moves_never_use_only_can
             None,
         )],
     };
-    assert_eq!(default_relocation(&old, &next).unwrap(), None);
+    assert!(default_relocation(&old, &next).unwrap().is_empty());
     old.rows[0].email = Some(String::new());
     assert!(retained_login_row(Some(&old), "").is_none());
     assert!(default_identity_hint(Some(&old), None).is_none());

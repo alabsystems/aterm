@@ -483,7 +483,7 @@ impl Outcome {
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Self::NoCheckout(_) => 3,
+            Self::NoCheckout(_) | Self::NotDeployed | Self::LiveUnchecked { .. } => 3,
             Self::LiveDisagrees { .. } => 4,
             _ => 0,
         }

@@ -1664,6 +1664,34 @@ pub(super) fn window_carry(
     }
 }
 
+/// Obsolete join alerts cannot reach the first frame after restoring messages, even
+/// before the membership poll has run. Other carried warnings remain visible.
+#[test]
+fn restoring_messages_retires_obsolete_join_alerts_before_polling() {
+    let mut parent = App::headless_for_test();
+    for key in ["members.ask.1", "secrets.asking.ABCD", "unrelated.warning"] {
+        parent.post_message(warn("Carried warning").key(key));
+    }
+    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    for finishing in [None, Some("0.149.0")] {
+        let mut successor = App::headless_for_test();
+        successor.seed_carried_messages(&carry, finishing);
+        assert!(successor.messages.live_by_key("members.ask.1").is_none());
+        assert!(
+            successor
+                .messages
+                .live_by_key("secrets.asking.ABCD")
+                .is_none()
+        );
+        assert!(
+            successor
+                .messages
+                .live_by_key("unrelated.warning")
+                .is_some()
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn the_parents_record_is_its_own_to_the_end_and_the_successors_waits_for_commit() {

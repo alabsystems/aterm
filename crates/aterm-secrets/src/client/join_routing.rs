@@ -97,6 +97,13 @@ pub(super) fn post_discovering(
 }
 
 fn post_verified(config: &Config, url: &str, line: &str, until: Instant) -> crate::Result<()> {
+    verify_mirror(config, url, until)?;
+    transport::post_join_until(url, line, until)
+}
+
+/// Verify the mirror's vault before sending a public request or trusting a policy server's
+/// queue. The caller supplies one deadline across verification and its subsequent operation.
+pub(super) fn verify_mirror(config: &Config, url: &str, until: Instant) -> crate::Result<()> {
     let remaining = until
         .checked_duration_since(Instant::now())
         .filter(|left| !left.is_zero())
@@ -111,7 +118,7 @@ fn post_verified(config: &Config, url: &str, line: &str, until: Instant) -> crat
         _ => return Err(Error::new("join mirror did not supply a vault")),
     };
     envelope::verify_for_reader(&body, &config.name, &pin, &config.followed, None)?;
-    transport::post_join_until(url, line, until)
+    Ok(())
 }
 
 #[cfg(test)]

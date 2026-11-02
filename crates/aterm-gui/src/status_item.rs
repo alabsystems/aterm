@@ -1411,6 +1411,9 @@ pub(crate) struct Glance {
     pub peers: Vec<PeerRef>,
     /// The Fleet row.
     pub fleet: FleetLine,
+    /// The Network row above it: where this Mac is on the network, in the place's words
+    /// (`crate::net_place::menu_line`); `None` until a place was read.
+    pub network: Option<crate::net_place::MenuLine>,
     /// System State's one quiet signal (`docs/DESIGN-system-state-2026-10-21.md`
     /// §3.6): a row it manages needs a person or failed.
     pub system_state: Option<SystemStateLine>,
@@ -2720,10 +2723,19 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
             });
         }
     }
+    let network_row = |rows: &mut Vec<StatusRow>| {
+        if let Some(network) = &g.network {
+            rows.push(StatusRow::Info(fold_clip(&network.label, LINE_MAX)));
+        }
+    };
+    // Away from the ALab LAN (another network, offline), a member that does not answer is no
+    // Local Network privacy setting's doing: the Network row says where this Mac is instead.
+    let away = g.network.as_ref().is_some_and(|network| network.away);
     match &g.fleet {
         FleetLine::Off => {}
         FleetLine::NotInFleet => {
             rows.push(StatusRow::Separator);
+            network_row(&mut rows);
             rows.push(StatusRow::Info(
                 "Fleet \u{2014} not in a fleet (aterm fleet init or join)".to_string(),
             ));
@@ -2737,11 +2749,12 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
             unbound_issuer,
         } => {
             rows.push(StatusRow::Separator);
+            network_row(&mut rows);
             rows.push(StatusRow::FleetSubmenu {
                 label: fleet_line(read.as_ref(), *reading, failed.is_some(), now_unix),
             });
             rows.extend(degrade_rows(
-                *no_route,
+                *no_route && !away,
                 (member_of.as_deref(), unbound_issuer.as_deref()),
                 failed.as_deref(),
             ));

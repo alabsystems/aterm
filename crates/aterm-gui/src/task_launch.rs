@@ -20,8 +20,9 @@ use crate::task_record::{TaskMark, TaskState};
 /// The longest task a worker is given: 64 KiB, raw, the client's cap too.
 pub(crate) const TASK_MAX: usize = aterm_types::control_verbs::MAX_TASK_BYTES;
 
-/// How long a worker's shell has to draw its first prompt before its task is `stalled why=shell`.
-pub(crate) const FIRST_PROMPT_WAIT: Duration = Duration::from_secs(20);
+/// How long a launcher waiting for its worker's first prompt rests with no ring
+/// ([`await_first_prompt`]): a person's key rings nothing until it echoes.
+const FIRST_PROMPT_LOOK: Duration = Duration::from_secs(1);
 
 const VERSION_WAIT: Duration = Duration::from_secs(5);
 
@@ -742,7 +743,7 @@ fn run_worker_launch(work: &Launch) {
     let prompt = match await_first_prompt(work) {
         Ok(prompt) => prompt,
         Err(why) => {
-            stall(work, why);
+            stall(work, &why);
             return;
         }
     };
@@ -1066,8 +1067,12 @@ fn note_launch(ctx: &SessionCtx, note: String) {
         .note_worker_launch(note);
 }
 
-fn await_first_prompt(work: &Launch) -> Result<PromptFence, &'static str> {
-    let deadline = Instant::now() + FIRST_PROMPT_WAIT;
+/// The first input-ready prompt of `work`'s shell, waited for as long as its task is `working`.
+/// A shell that is slow to it (a loaded machine, a long rc file) has not failed, so this keeps no
+/// clock: the startup deadline ([`crate::harness_host::STARTUP_DEADLINE`]) judges every worker
+/// that has not started, whatever holds it, and its stall ends this wait as a lead's mark does
+/// ([`task_moved_on`]).
+pub(crate) fn await_first_prompt(work: &Launch) -> Result<PromptFence, String> {
     let sub = crate::session_watch::Subscription::single(&work.ctx.watchers);
     loop {
         let alive = work
@@ -1077,24 +1082,23 @@ fn await_first_prompt(work: &Launch) -> Result<PromptFence, &'static str> {
             .by_local(work.local)
             .is_some_and(|h| !matches!(h.state, SessionState::Exited));
         if !alive {
-            return Err("its shell ended before its first prompt");
+            return Err("its shell ended before its first prompt".to_string());
+        }
+        if let Some(why) = task_moved_on(&work.ctx) {
+            return Err(why);
         }
         let prompt = {
             let terminal = crate::term_lock(&work.term);
             let human = work.ctx.human_input.seq();
             if human != work.human {
-                return Err("a person used its session before the launch");
+                return Err("a person used its session before the launch".to_string());
             }
             prompt_fence(&terminal, human)
         };
         if let Some(prompt) = prompt {
             return Ok(prompt);
         }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err("its shell drew no prompt within 20 s");
-        }
-        let _ = sub.wait(deadline - now);
+        let _ = sub.wait(FIRST_PROMPT_LOOK);
     }
 }
 
@@ -1278,12 +1282,21 @@ pub(crate) fn stall_task(ctx: &SessionCtx, local: u64, why: &str) {
     stall_task_why(ctx, local, "shell", why);
 }
 
-/// [`stall_task`] with the task record's `why=` word `word`.
+/// [`stall_task`] with the task record's `why=` word `word`. Only a `working` record takes the
+/// mark: one that moved on already says what became of the task ([`task_moved_on`]), and a
+/// deadline's stall keeps its attention.
 pub(crate) fn stall_task_why(ctx: &SessionCtx, local: u64, word: &'static str, why: &str) {
-    aterm_log::warn!("worker session {local}: {why}; its task is stalled and nothing was typed");
+    aterm_log::warn!("worker session {local}: {why}; nothing was typed");
     let mut mark = TaskMark::new(TaskState::Stalled);
     mark.why = Some(word);
-    if crate::task_record::mark_session_task(ctx, local, &mark).is_err() {
+    let marked = crate::task_record::mark_session_task_if(
+        ctx,
+        local,
+        &mark,
+        ctx.fabric.fence_wait(),
+        |task| task.is_some_and(|task| task.state == TaskState::Working),
+    );
+    if marked.is_err() {
         aterm_log::warn!(
             "worker session {local}: the stall was not marked (an update was committing)"
         );

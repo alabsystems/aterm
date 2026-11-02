@@ -21,9 +21,22 @@
 //! the supervisor knows it by that trusted folder, and its approval rule (`claim-worker@v1`)
 //! approves only its Chrome actions on the vendor's claim pages, hands its questions and any
 //! other Chrome action to a person, and declines every other tool's box. It starts with every box
-//! raised (`--permission-mode default`, [`crate::task_launch::worker_fresh`]), its task ends in the
-//! reply Autopilot Land lands on, and a worker this process started that still runs
-//! [`WORKER_FOR`] after its start has its Autopilot turned Off ([`Running`]).
+//! raised (`--permission-mode default`, [`crate::task_launch::worker_fresh`]) and its task ends in
+//! the reply Autopilot Land lands on. A worker that has run [`WORKER_FOR`] since it started or a
+//! person last typed in its tab ends, whatever it is doing, while the program in front names
+//! itself the agent its record names; anything else running there, a tab on screen in a focused
+//! window, and one a hold or a driver has, is left alone ([`crate::App::end_claim_workers`]). Its
+//! tab closes [`WORKER_FOR`] after its task is marked `exited`, or after a program someone ran
+//! there since was last seen running in front, unless it is its window's last tab, which asks
+//! before it goes (a job left in the background or stopped there ends with the tab, as it does at
+//! a person's own close, whose guard also asks only for the program in front): a box nobody
+//! answered does not stand on, and the ledger says when the offer may be tried again. A seamless
+//! update carries the task record that clock reads and that last sighting; any other restore does
+//! not, so the layout names each worker's folder (and an agent in a claim folder that is no
+//! worker's) and a restore starts a new record for its tab: `working` for a worker it brings back
+//! or one in a shell the PTY keeper hands back, `exited` where the worker had ended or is not
+//! coming back (a plain quit forgets a running one), so a program found in that tab is not timed
+//! as it and the tab still closes ([`note_restored_worker`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -32,6 +45,8 @@ use std::time::{Duration, Instant};
 use aterm_agent::harness::credit_offers::{self, Offer, OfferKey, Stamp};
 use aterm_agent::harness::profile::NoProfile;
 use aterm_agent::supervise::Autopilot;
+
+use crate::task_record::{TaskRecord, TaskState};
 
 /// The least time between an offer's first try and its one retry.
 pub(crate) const RETRY_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -60,12 +75,14 @@ const LEDGER_MAX: usize = 4096;
 /// The most profiles [`ProfileCache`] keeps a reading of.
 const CACHE_ROWS: usize = 8;
 
-/// How long a claim worker runs under its Autopilot: past it, a worker this process started has
-/// its Autopilot turned Off ([`Running::expired`]), so Land types nothing more into it.
+/// How long a claim worker may run with nobody typing in its tab, and how long its tab then stays
+/// for its last reply to be read ([`crate::App::end_claim_workers`]).
 pub(crate) const WORKER_FOR: Duration = Duration::from_secs(30 * 60);
 
-/// The most claim workers [`Running`] keeps; past it the earliest started is taken as expired.
-const RUNNING_ROWS: usize = 16;
+/// How long a claim worker's program has to end after the first `SIGTERM` the look delivered to
+/// it ([`note_term`]): one still running then gets `SIGKILL`, a program that ignores the signal or
+/// stopped reading its terminal.
+pub(crate) const DEAF_FOR: Duration = Duration::from_secs(2 * 60);
 
 /// One offer's tries ([`Ledger`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -377,57 +394,104 @@ pub(crate) fn worker_folder_under(state: &Path) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// The claim workers this process started, each with when it started, until each ran out of its
-/// time ([`WORKER_FOR`]).
-#[derive(Default)]
-pub(crate) struct Running {
-    rows: Mutex<Vec<(String, Instant)>>,
+/// How long the task `record` has stood by `now`, `typed` after a person last typed in its tab:
+/// from its start while its program runs and from its exit once that ended. Monotonic time, so a
+/// Mac asleep spends none of it.
+pub(crate) fn stood(record: &TaskRecord, now: Instant, typed: Option<Duration>) -> Duration {
+    let from = if record.state == TaskState::Exited {
+        record.since
+    } else {
+        record.started
+    };
+    let stood = now.saturating_duration_since(from);
+    typed.map_or(stood, |typed| stood.min(typed))
 }
 
-impl Running {
-    pub(crate) const fn new() -> Self {
-        Self {
-            rows: Mutex::new(Vec::new()),
+/// Whether a task that trusted `folder` and has `stood` that long is a claim worker's that ran out
+/// of its time. All of it is the task record's, which a seamless update carries, so a worker an
+/// earlier process started is judged as this one's is.
+pub(crate) fn ran_out(folder: Option<&str>, stood: Duration) -> bool {
+    stood >= WORKER_FOR
+        && folder.is_some_and(|folder| credit_offers::is_claim_folder(Path::new(folder)))
+}
+
+/// What a look does with a claim worker that ran out of its time ([`ending`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ending {
+    /// Leave it for a later look.
+    Leave,
+    /// Ask its program to end.
+    Term,
+    /// End a program that did not.
+    Kill,
+    /// Mark its task `exited`, its program gone, which starts the time its tab stays open to be
+    /// read ([`stood`]).
+    MarkExited,
+    /// Close its pane.
+    ClosePane,
+}
+
+/// What a look reads of a claim worker that ran out of its time ([`ending`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stand {
+    /// Its tab is on screen in a focused window, or a hold or a driver has it.
+    pub(crate) in_hand: bool,
+    /// Its task is marked `exited`, so a job in its tab now is not the worker's.
+    pub(crate) exited: bool,
+    /// A foreground job runs in its tab.
+    pub(crate) job: bool,
+    /// The program in front names itself the agent the worker's record names (its own argv, as
+    /// a native, atpkg or `versions/<n>` install of Claude Code does), so a job there is the
+    /// worker's own; any other program is someone else's, a runtime such as `node` among them,
+    /// whatever its screen shows (an exited worker's last frame can stand on it).
+    pub(crate) worker: bool,
+    /// Closing its pane would close its window.
+    pub(crate) ends_window: bool,
+    /// A seamless update is under way, which a close would call off.
+    pub(crate) updating: bool,
+    /// The program in front, its process group, has had [`DEAF_FOR`] to end since the first
+    /// `SIGTERM` delivered to it ([`deaf`]).
+    pub(crate) deaf: bool,
+    /// A program ran in the tab since its task was marked `exited` (someone's, never the
+    /// worker's), seen by a look less than [`WORKER_FOR`] ago, so its output is still to be read.
+    pub(crate) reading: bool,
+}
+
+/// What to do with a worker that ran out of its time: nothing to a tab in someone's hand or to a
+/// job that is not the worker's (its task already `exited`, or another program in front); its
+/// program first, which leaves a pane that closes with no confirmation to raise; then its task
+/// marked `exited`, unless something already marked it, so
+/// its tab stays open [`WORKER_FOR`] more for its last reply to be read, whatever ended its
+/// program, and as long again after a program someone ran there since; and its pane only where
+/// that leaves its window standing, since a window's last tab asks before it goes. A seamless
+/// update under way gets neither a mark, which would wait on its fence, nor a close, which would
+/// call it off.
+pub(crate) const fn ending(stand: Stand) -> Ending {
+    if stand.in_hand || (stand.job && (stand.exited || !stand.worker)) {
+        Ending::Leave
+    } else if stand.job {
+        if stand.deaf {
+            Ending::Kill
+        } else {
+            Ending::Term
         }
-    }
-
-    /// The claim worker `sid` started at `at`.
-    pub(crate) fn started(&self, sid: &str, at: Instant) {
-        let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        rows.retain(|(s, _)| s != sid);
-        rows.push((sid.to_owned(), at));
-    }
-
-    /// The claim workers that have run [`WORKER_FOR`] by `now`, taken off the list, so each is
-    /// told once; past [`RUNNING_ROWS`] the earliest started are taken too, never dropped
-    /// untold. Whether each still runs is the window's to read.
-    pub(crate) fn expired(&self, now: Instant) -> Vec<String> {
-        let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        rows.sort_by_key(|(_, at)| *at);
-        let over = rows.len().saturating_sub(RUNNING_ROWS);
-        let mut out = Vec::new();
-        let mut k = 0;
-        rows.retain(|(sid, at)| {
-            let gone = k < over || now.saturating_duration_since(*at) >= WORKER_FOR;
-            k += 1;
-            if gone {
-                out.push(sid.clone());
-            }
-            !gone
-        });
-        out
+    } else if stand.updating {
+        Ending::Leave
+    } else if !stand.exited {
+        Ending::MarkExited
+    } else if stand.ends_window || stand.reading {
+        Ending::Leave
+    } else {
+        Ending::ClosePane
     }
 }
-
-/// The claim workers this process started ([`Running`]).
-pub(crate) static RUNNING: Running = Running::new();
 
 impl crate::App {
     /// Start a claim worker for `offer`, found by the supervised session `from`
     /// ([`super::HostNote::CreditClaim`]), the way the disk worker starts: a background Claude
     /// Code tab under Autopilot Land, trusted the claim folder ([`worker_folder_under`]), so the
     /// harness fences its boxes. The try is already recorded ([`step`]); the tab it opens, or
-    /// why none opened, is a fact for later in the digest, and the tab joins [`RUNNING`].
+    /// why none opened, is a fact for later in the digest.
     pub(crate) fn start_credit_claim(&mut self, from: &str, offer: Offer) {
         let folder = super::harness_state().and_then(|state| worker_folder_under(&state));
         let Some(folder) = folder else {
@@ -469,7 +533,6 @@ impl crate::App {
                 match spawned {
                     Ok(spawned) => {
                         let sid = app.start_spawned(spawned);
-                        RUNNING.started(&sid, Instant::now());
                         aterm_log::info!(
                             "harness @{from}: credit claim {}: worker runs as @{sid}",
                             offer.id.word()
@@ -493,22 +556,326 @@ impl crate::App {
         );
     }
 
-    /// The claim worker `sid` ran out of its time ([`HostNote::CreditClaimExpired`],
-    /// [`WORKER_FOR`]): its Autopilot goes Off, written by aterm, so Land types nothing more
-    /// into it.
+    /// The disk watch's look ([`HostNote::DiskLooked`], on a timer of its own, whatever any
+    /// session does): every live claim worker that ran out of its time ([`ran_out`]) is moved on
+    /// by one step of [`ending`], so its program ends at one look, its task is marked `exited` at
+    /// a later one, and its pane closes once that mark has stood [`WORKER_FOR`]. Nothing here
+    /// raises a confirmation: a pane closes only with no job in it and with its window left
+    /// standing. Returns each such worker's session and the step taken.
     ///
-    /// [`HostNote::CreditClaimExpired`]: super::HostNote::CreditClaimExpired
-    pub(crate) fn credit_claim_expired(&mut self, sid: &str) {
-        if self.worker_autopilot_off(sid) {
-            aterm_log::info!(
-                "harness: the credit claim worker @{sid} ran out of its time; its Autopilot is Off"
-            );
-        } else {
-            aterm_log::debug!(
-                "harness: the credit claim worker @{sid} ran out of its time and no longer runs \
-                 here"
-            );
+    /// [`HostNote::DiskLooked`]: super::HostNote::DiskLooked
+    pub(crate) fn end_claim_workers(&mut self, now: Instant) -> Vec<(u64, Ending)> {
+        let handles: Vec<_> = {
+            let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
+            store.live_handles().cloned().collect()
+        };
+        let now_us = crate::metrics::now_us();
+        let mut steps = Vec::new();
+        let mut ended = Vec::new();
+        for handle in handles {
+            // A program running in the tab of a worker that ended is someone's: seen at every
+            // look, not only once the tab's time is out, so its output keeps the tab open its
+            // reading time after it ends ([`Stand::reading`]).
+            if claim_worker(&handle.ctx).is_some_and(|(_, done)| done) {
+                ended.push(handle.local_id);
+                if self.session_foreground_busy(handle.local_id) {
+                    self.claim_job_seen.insert(handle.local_id, now);
+                }
+            }
+            // Typing alone, in awake time as `now` is, a seamless update's carried age too: a
+            // click or a scroll in the tab is no person taking it over.
+            let typed = handle.ctx.human_input.typed_awake_ms(now_us);
+            let over = {
+                let timeline = handle
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                timeline.task().and_then(|task| {
+                    let stood = stood(task, now, typed.map(Duration::from_millis));
+                    ran_out(task.trusted_cwd.as_deref(), stood).then(|| Look {
+                        worker: task.agent.is_some_and(|agent| {
+                            timeline
+                                .agent()
+                                .program
+                                .as_deref()
+                                .and_then(aterm_phase::program_of)
+                                == Some(agent)
+                        }),
+                        record: task.clone(),
+                    })
+                })
+            };
+            if let Some(look) = over {
+                steps.push((handle.local_id, self.end_claim_worker(&handle, &look, now)));
+            }
         }
+        // A worker typed back into its time, or gone, owes no signal: its next run out starts
+        // with `SIGTERM` again. (One marked `exited` is never signalled.)
+        self.claim_termed
+            .retain(|session, _| steps.iter().any(|(over, _)| over == session));
+        self.claim_job_seen
+            .retain(|session, _| ended.contains(session));
+        steps
+    }
+
+    /// One step of [`ending`] at `now` for the claim worker `handle`, read as `look`, with its
+    /// Autopilot Off first: Land would otherwise keep typing in a tab a person left in front, or
+    /// bring its program back.
+    fn end_claim_worker(
+        &mut self,
+        handle: &crate::session_store::SessionHandle,
+        look: &Look,
+        now: Instant,
+    ) -> Ending {
+        let (session, sid) = (handle.local_id, handle.sid.as_str());
+        let autopilot = handle
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .autopilot_word();
+        if autopilot != Some(Autopilot::Off) {
+            self.worker_autopilot_off(sid);
+        }
+        let looked_at = self.windows.iter().any(|(wid, ws)| {
+            crate::os_window_focused(ws) && self.visible_session_rect(*wid, session).is_some()
+        });
+        let driven = crate::input_stall::other_hand(&handle.ctx, crate::metrics::now_us());
+        let step = ending(Stand {
+            in_hand: looked_at || driven.is_some(),
+            exited: look.record.state == TaskState::Exited,
+            job: self.session_foreground_busy(session),
+            worker: look.worker,
+            ends_window: self.close_ends_window(session),
+            updating: self.update_handoff_in_flight(),
+            deaf: deaf(
+                self.claim_termed.get(&session),
+                look.record.started,
+                crate::quit_safety::foreground_pgrp(handle.master),
+                now,
+            ),
+            reading: look.record.state == TaskState::Exited
+                && self
+                    .claim_job_seen
+                    .get(&session)
+                    .is_some_and(|&seen| now.saturating_duration_since(seen) < WORKER_FOR),
+        });
+        match step {
+            Ending::Leave => {}
+            Ending::Term | Ending::Kill => {
+                let word = if step == Ending::Kill { "kill" } else { "term" };
+                let said = crate::control::control_input::signal_verb(
+                    handle.master,
+                    word,
+                    &handle.ctx,
+                    aterm_slog::Actor::Harness,
+                );
+                if step == Ending::Term {
+                    note_term(
+                        &mut self.claim_termed,
+                        session,
+                        look.record.started,
+                        now,
+                        &said,
+                    );
+                }
+                aterm_log::info!(
+                    "harness: the credit claim worker @{sid} ran out of its time; `signal {word}` \
+                     to its program: {}",
+                    said.trim_end()
+                );
+            }
+            Ending::MarkExited => {
+                let marked = mark_ended(&handle.ctx, session, &look.record);
+                if let Ok(Some(marked)) = &marked
+                    && marked.attention_moved
+                {
+                    crate::presence::post_meta_changed(session);
+                }
+                aterm_log::info!(
+                    "harness: the credit claim worker @{sid} ran out of its time; its program \
+                     ended, its task {}",
+                    match marked {
+                        Ok(Some(_)) => "marked exited: its tab closes after its reading time",
+                        Ok(None) => "moved since the look: a later look marks it",
+                        Err(crate::task_record::MarkFenced) => "waits for a later look to mark",
+                    }
+                );
+            }
+            Ending::ClosePane => {
+                let _closing = crate::session_store::CloseAttribution::enter(
+                    crate::session_store::ExitReason::CtlClose,
+                    crate::session_store::ExitActor::Harness,
+                );
+                match self.close_session_by_id(session) {
+                    Ok(_) => aterm_log::info!(
+                        "harness: the credit claim worker @{sid} ran out of its time; its tab \
+                         closed"
+                    ),
+                    Err(why) => aterm_log::info!(
+                        "harness: the credit claim worker @{sid} ran out of its time; its tab \
+                         stays for now: {why}"
+                    ),
+                }
+            }
+        }
+        step
+    }
+}
+
+/// What a look read of a claim worker that ran out of its time, under its timeline's lock.
+pub(crate) struct Look {
+    /// Its task record as the look read it.
+    pub(crate) record: TaskRecord,
+    /// The program in front names itself the agent its record names ([`Stand::worker`]).
+    pub(crate) worker: bool,
+}
+
+/// The first `SIGTERM` the look delivered to a claim worker's program ([`note_term`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Termed {
+    /// The start of the task record it was sent for.
+    pub(crate) record: Instant,
+    /// The process group it reached, the tab's foreground group then.
+    pub(crate) group: i32,
+    /// When.
+    pub(crate) at: Instant,
+}
+
+/// Each claim worker's [`Termed`], by session ([`crate::App::end_claim_workers`]).
+pub(crate) type TermedBySession = std::collections::HashMap<u64, Termed>;
+
+/// Whether the program in front of a claim worker's tab, foreground process group `group` now,
+/// for the task record that started at `started`, has had [`DEAF_FOR`] by `now` to end since the
+/// first `SIGTERM` delivered to it (`sent`, [`note_term`]). One never sent one, sent one for an
+/// earlier record, or another program that came to the front since, is not deaf, so `SIGKILL`
+/// is never a program's first signal.
+pub(crate) fn deaf(sent: Option<&Termed>, started: Instant, group: i32, now: Instant) -> bool {
+    sent.is_some_and(|sent| {
+        sent.record == started
+            && group > 0
+            && sent.group == group
+            && now.saturating_duration_since(sent.at) >= DEAF_FOR
+    })
+}
+
+/// Records in `termed` that session `session`'s claim worker, of the task record that started at
+/// `started`, was sent `SIGTERM` at `now`, where `said` (the `signal` verb's reply) says which
+/// process group it reached (`OK signalled pgrp <n>`): the first one delivered to that group for
+/// that record stands, so [`DEAF_FOR`] counts from it. A reply that refused (`ERR …`, such as no
+/// foreground process group) records nothing.
+pub(crate) fn note_term(
+    termed: &mut TermedBySession,
+    session: u64,
+    started: Instant,
+    now: Instant,
+    said: &str,
+) {
+    let Some(group) = said
+        .strip_prefix("OK signalled pgrp ")
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<i32>()
+                .ok()
+        })
+        .filter(|group| *group > 0)
+    else {
+        return;
+    };
+    let first = Termed {
+        record: started,
+        group,
+        at: now,
+    };
+    let stands = termed
+        .get(&session)
+        .is_some_and(|sent| sent.record == started && sent.group == group);
+    if !stands {
+        termed.insert(session, first);
+    }
+}
+
+/// Marks session `local`'s task `exited`, its claim worker's program gone, if its record is still
+/// `read`: as the harness's own exit mark does (`aterm_agent::supervise::mark_task_exited`), a
+/// landed task keeps its result, and the mark takes down the attention a deadline raised for the
+/// worker (the held or startup ask), which a program that ended no longer owes. It waits on no
+/// update's fence (`Err` until a later look). `Ok(None)` when the record moved since it was read.
+fn mark_ended(
+    ctx: &crate::SessionCtx,
+    local: u64,
+    read: &TaskRecord,
+) -> Result<Option<crate::task_record::MarkedWith>, crate::task_record::MarkFenced> {
+    let mut mark = crate::task_record::TaskMark::new(TaskState::Exited);
+    mark.why = Some("exit");
+    if read.state == TaskState::Done && read.result_path.is_some() {
+        mark.result_bytes = read.result_bytes;
+        mark.result_path.clone_from(&read.result_path);
+    }
+    crate::task_record::mark_session_task_with(
+        ctx,
+        local,
+        Some(&mark),
+        crate::task_record::AttentionEdit::TakeDown(crate::harness_host::deadline_attention_stands),
+        Duration::ZERO,
+        |record, _| {
+            record.is_some_and(|record| record.rev == read.rev && record.state != TaskState::Exited)
+        },
+    )
+}
+
+/// The claim folder of session `ctx`'s task where that task is a claim worker's (its folder is a
+/// claim folder), with whether it ended (marked `exited`). The layout carries both
+/// ([`crate::restore::TerminalLeafRestore::claim_worker`], `claim_ended`), so a restore gives
+/// that tab a record whether or not a program runs there, and times no program it brings back in
+/// an ended worker's tab as the worker ([`note_restored_worker`]).
+pub(crate) fn claim_worker(ctx: &crate::SessionCtx) -> Option<(String, bool)> {
+    let timeline = ctx.timeline.lock().unwrap_or_else(PoisonError::into_inner);
+    let task = timeline.task()?;
+    let folder = task
+        .trusted_cwd
+        .clone()
+        .filter(|folder| credit_offers::is_claim_folder(Path::new(folder)))?;
+    Some((folder, task.state == TaskState::Exited))
+}
+
+/// Names session `local` (`ctx`) a claim worker where a restore other than a seamless update
+/// brings back the agent that ran in folder `cwd`, or a tab whose worker is not coming back
+/// (`ended`: it had ended, or a quit forgot its agent; [`claim_worker`]), if `cwd` is a claim
+/// folder: the record that held its time did not cross, and a tab with none would never end
+/// ([`crate::App::end_claim_workers`]). A new record is marked where none stands, so its time
+/// counts from here; one already standing keeps its time and is named the worker. The new record
+/// is `working why=restored`, which no startup or held deadline reads as a worker just spawned,
+/// or, for a tab whose worker is not coming back, `exited why=exit`: a program found or brought
+/// back in that tab is then not the worker's, and the tab closes once that mark has stood
+/// [`WORKER_FOR`] and that program, if any, was last seen [`WORKER_FOR`] ago ([`Stand::reading`]).
+pub(crate) fn note_restored_worker(ctx: &crate::SessionCtx, local: u64, cwd: &str, ended: bool) {
+    if !credit_offers::is_claim_folder(Path::new(cwd)) {
+        return;
+    }
+    let mut mark = crate::task_record::TaskMark::new(if ended {
+        TaskState::Exited
+    } else {
+        TaskState::Working
+    });
+    mark.why = Some(if ended {
+        "exit"
+    } else {
+        crate::task_record::WHY_RESTORED
+    });
+    let marked = crate::task_record::mark_session_task_if(
+        ctx,
+        local,
+        &mark,
+        ctx.fabric.fence_wait(),
+        |record| record.is_none(),
+    );
+    if marked.is_ok() {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_task_worker(aterm_phase::Program::Claude, Some(cwd.to_owned()));
     }
 }
 

@@ -345,3 +345,37 @@ fn fire_halo_dirty_gate_marks_prev_and_cur_rows() {
         "a moved halo cell must mark exactly its prev∪cur rows"
     );
 }
+
+#[test]
+fn halo_sits_under_earlier_columns_ink() {
+    let mut rend = renderer();
+    let (cw, ch) = rend.cell_size();
+    let (rows, cols) = (3usize, 10usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b[?25l\x1b[2;4H\x1b[38;2;255;255;255m\xe2\x96\x88\xe2\x96\x88");
+
+    let fire = bright_fire(1, ch, cw, 8 * cw, 255);
+
+    let mut unhaloed = term.cell_frame(rows, cols);
+    unhaloed.fire_patch = vec![fire];
+    let baseline = rend.render_input(&unhaloed);
+
+    let mut haloed = term.cell_frame(rows, cols);
+    haloed.fire_patch = vec![fire];
+    haloed.fire_halo = vec![halo(1, 4, 255)];
+    let f = rend.render_input(&haloed);
+
+    let stride = f.width;
+    let pad = (f.width - cols * cw) / 2;
+    let col3_x0 = pad + 3 * cw;
+    let col3_x1 = col3_x0 + cw;
+    let row1_y0 = pad + ch;
+    let row1_y1 = row1_y0 + ch;
+    for y in row1_y0..row1_y1 {
+        assert_eq!(
+            &f.pixels[y * stride + col3_x0..y * stride + col3_x1],
+            &baseline.pixels[y * stride + col3_x0..y * stride + col3_x1],
+            "col 4's halo darkened col 3's already-drawn glyph ink on scanline y={y}"
+        );
+    }
+}

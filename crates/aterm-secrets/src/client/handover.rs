@@ -7,7 +7,7 @@
 //! admin's approver admits the request its stored [`Allowed`] rides on ([`request_join`]).
 
 use super::{
-    Config, Paths, StateLock, Stored, apply_entries, apply_failed, config, load_state,
+    Config, Paths, State, StateLock, Stored, apply_entries, apply_failed, config, load_state,
     machine_identity, read_identity, save_config, save_state, source_bound, source_identity,
 };
 use crate::envelope::{self, Floor, Pin, Verdict};
@@ -68,10 +68,21 @@ pub(super) fn keep_allowed(paths: &Paths, allowed: &Allowed) -> crate::Result<()
 /// This Mac holds no applied signed vault it reads from a URL, or its cache does not verify,
 /// or a vault pass here held this Mac's state for [`HANDOVER_LOCK_WAIT`].
 pub fn handover_bundle(paths: &Paths, allowed: &Allowed) -> crate::Result<Bundle> {
+    handover_bundle_held(paths, allowed, None)
+}
+
+/// [`handover_bundle`], under `held` where it holds this Mac's state for the run (a member's
+/// desk took it before the run touched its phrase), which it then takes no second time.
+pub(super) fn handover_bundle_held(
+    paths: &Paths,
+    allowed: &Allowed,
+    held: Option<&HandoverHold>,
+) -> crate::Result<Bundle> {
     handover_bundle_until(
         paths,
         allowed,
         std::time::Instant::now() + HANDOVER_LOCK_WAIT,
+        held,
     )
 }
 
@@ -81,27 +92,94 @@ pub fn handover_bundle(paths: &Paths, allowed: &Allowed) -> crate::Result<Bundle
 /// and the joining Mac reads each line within 5 s of its own; a wait past that bound ends the run
 /// unheard (relayed, it writes the bundle into the node job's socket after the joiner left). So
 /// this waits out a short pass and leaves the rest of the bound to the TLS handshake, CPace and
-/// the possession proof, and a longer pass ends the run with the refusal that says to Allow
-/// again, which reaches the new Mac. A run's phrase burns on any error.
+/// the possession proof. A member's desk waits before its run touches the phrase
+/// ([`take_handover_hold`]), so a longer pass answers the run busy, which reaches the new Mac,
+/// and the phrase stays live; a handover given no hold waits here itself, and a longer pass then
+/// ends the run with the refusal that says to Allow again (a run's phrase burns on any error once
+/// the run touched it).
 pub const HANDOVER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// [`handover_bundle`], waiting for this Mac's state until `deadline`.
+/// This Mac's vault state, held for one join run ([`take_handover_hold`]): a member's desk takes
+/// it before the run touches its phrase and hands it to [`super::hand_over`] through
+/// [`crate::members::desk::Handing::held`], so a vault pass cannot take the state between the
+/// two, and the handover takes it no second time. It is released when dropped.
+pub struct HandoverHold {
+    _lock: StateLock,
+    /// The lock file it holds, which [`HandoverHold::holds`] compares.
+    at: std::path::PathBuf,
+    /// The swarm policy's servers, read before the state was taken ([`policy_servers`]): the
+    /// bundle built under the hold names them.
+    pub(super) policy: Vec<String>,
+}
+
+impl HandoverHold {
+    /// Whether this holds the state at `paths`.
+    #[must_use]
+    pub fn holds(&self, paths: &Paths) -> bool {
+        self.at == paths.lock_file()
+    }
+}
+
+impl std::fmt::Debug for HandoverHold {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HandoverHold")
+            .field("at", &self.at)
+            .finish()
+    }
+}
+
+/// Take this Mac's vault state for a join run, waiting up to [`HANDOVER_LOCK_WAIT`] for a vault
+/// pass to let go of it: `None` while one still holds it.
+///
+/// # Errors
+/// The state directory or its lock file cannot be opened.
+pub fn take_handover_hold(paths: &Paths) -> crate::Result<Option<HandoverHold>> {
+    let policy = policy_servers(paths);
+    Ok(
+        StateLock::try_take_until(paths, std::time::Instant::now() + HANDOVER_LOCK_WAIT)?.map(
+            |lock| HandoverHold {
+                _lock: lock,
+                at: paths.lock_file(),
+                policy,
+            },
+        ),
+    )
+}
+
+/// The swarm policy's servers a bundle names, read while this process holds none of this Mac's
+/// state: an entry read takes the state shared on a descriptor of its own, which a hold this
+/// process has on it refuses, so a read under the hold finds no policy and the bundle named the
+/// primary server alone.
+pub(super) fn policy_servers(paths: &Paths) -> Vec<String> {
+    config(paths)
+        .ok()
+        .flatten()
+        .map(|config| super::policy_peer_urls(paths, &config))
+        .unwrap_or_default()
+}
+
+/// [`handover_bundle`], waiting for this Mac's state until `deadline` unless `held` holds it.
 fn handover_bundle_until(
     paths: &Paths,
     allowed: &Allowed,
     deadline: std::time::Instant,
+    held: Option<&HandoverHold>,
 ) -> crate::Result<Bundle> {
     let none = || Error::new("this Mac holds no applied vault to hand a new Mac");
-    let Some(_observation) = StateLock::observe_until(paths, deadline)? else {
-        // `observe_until` gives up at once when there is no lock file: no vault was ever
-        // joined here. With one, a pass still held the state at the deadline.
-        return Err(if paths.lock_file().exists() {
-            Error::new(
-                "a vault pass on this Mac still holds its state; Allow the new Mac again once it ends",
-            )
-        } else {
-            none()
-        });
+    let _observation = match held.filter(|held| held.holds(paths)) {
+        Some(_) => None,
+        None => match StateLock::observe_until(paths, deadline)? {
+            Some(observation) => Some(observation),
+            // `observe_until` gives up at once when there is no lock file: no vault was ever
+            // joined here. With one, a pass still held the state at the deadline.
+            None if paths.lock_file().exists() => {
+                return Err(Error::new(
+                    "a vault pass on this Mac still holds its state; Allow the new Mac again once it ends",
+                ));
+            }
+            None => return Err(none()),
+        },
     };
     let config = config(paths)?.ok_or_else(none)?;
     let pin = config.signer.ok_or_else(none)?;
@@ -291,16 +369,23 @@ fn handover_bundle_until(
         vault: config.name.clone(),
         signer: pin,
         followed: config.followed.clone(),
-        servers: bundle_servers(paths, &config, url),
+        servers: bundle_servers(
+            url,
+            held.filter(|held| held.holds(paths)).map_or_else(
+                || super::policy_peer_urls(paths, &config),
+                |held| held.policy.clone(),
+            ),
+        ),
         allowed: allowed.clone(),
         handed: Handed::Files(text::render_everyone_locker(&everyone)),
     })
 }
 
-/// The servers a bundle names: `url`, this Mac's source, first, then the policy's, at most 8.
-pub(super) fn bundle_servers(paths: &Paths, config: &Config, url: &str) -> Vec<String> {
+/// The servers a bundle names: `url`, this Mac's source, first, then `policy`'s (the swarm policy's,
+/// [`policy_servers`]), at most 8.
+pub(super) fn bundle_servers(url: &str, policy: Vec<String>) -> Vec<String> {
     let mut servers = vec![url.to_owned()];
-    for cand in super::policy_peer_urls(paths, config) {
+    for cand in policy {
         if servers.len() >= 8 {
             break;
         }
@@ -376,14 +461,33 @@ pub fn ask_allowed(paths: &Paths) -> crate::Result<String> {
 /// This Mac is already in a vault, its key is not the one the bundle allows, the bundle's files
 /// are not one `[everyone]` locker, or a write failed.
 pub fn write_from_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report> {
+    let _lock = StateLock::take(paths)?;
+    let (config, mut state, entries) = checked_files_bundle(paths, bundle)?;
+    save_config(paths, &config)?;
+    let report = apply_entries(paths, &mut state, &entries)?;
+    state.membership = Stored::Pending;
+    state.failed = apply_failed(&report);
+    state.proof = None;
+    state.refused = None;
+    state.source_identity = Some(source_identity(&config));
+    save_state(paths, &state)?;
+    keep_allowed(paths, &bundle.allowed)?;
+    Ok(report)
+}
+
+/// [`write_from_bundle`]'s checks, writing nothing: the configuration it would save, this Mac's
+/// state and the bundle's files (`client::accepts_bundle`).
+pub(super) fn checked_files_bundle(
+    paths: &Paths,
+    bundle: &Bundle,
+) -> crate::Result<(Config, State, Vec<Entry>)> {
     let Handed::Files(files) = &bundle.handed else {
         return Err(Error::new(
             "the member's bundle carries no [everyone] files",
         ));
     };
-    let _lock = StateLock::take(paths)?;
     let current = config(paths)?;
-    let mut state = load_state(paths)?;
+    let state = load_state(paths)?;
     if current.is_some() && state.membership == Stored::In {
         return Err(Error::new(
             "this Mac is already in a vault; leave it first (aterm secrets leave)",
@@ -430,16 +534,7 @@ pub fn write_from_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report
             "the member's bundle pins a retired vault signer",
         ));
     }
-    save_config(paths, &config)?;
-    let report = apply_entries(paths, &mut state, &entries)?;
-    state.membership = Stored::Pending;
-    state.failed = apply_failed(&report);
-    state.proof = None;
-    state.refused = None;
-    state.source_identity = Some(source_identity(&config));
-    save_state(paths, &state)?;
-    keep_allowed(paths, &bundle.allowed)?;
-    Ok(report)
+    Ok((config, state, entries))
 }
 
 /// Hand the Mac at `joiner` the Allow `member` signs for it under `host`, as a run does, so its
@@ -497,7 +592,7 @@ mod tests {
         let allowed = synthetic_allowed(root.path());
         let member = Paths::for_home(&root.path().join("member"));
 
-        let never = handover_bundle_until(&member, &allowed, std::time::Instant::now())
+        let never = handover_bundle_until(&member, &allowed, std::time::Instant::now(), None)
             .expect_err("a Mac that never joined has nothing to hand");
         assert!(
             never.to_string().contains("holds no applied vault"),
@@ -505,7 +600,7 @@ mod tests {
         );
 
         let pass = StateLock::take(&member).expect("a pass holds the state");
-        let busy = handover_bundle_until(&member, &allowed, std::time::Instant::now())
+        let busy = handover_bundle_until(&member, &allowed, std::time::Instant::now(), None)
             .expect_err("the pass still holds the state at the deadline");
         assert!(busy.to_string().contains("still holds its state"), "{busy}");
         assert!(!busy.to_string().contains("no applied vault"), "{busy}");

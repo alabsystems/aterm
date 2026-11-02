@@ -104,10 +104,10 @@ fn a_join_reaches_the_verified_mirror_even_when_the_configured_queue_accepted_it
 fn a_listing_names_the_server_that_answered_it() {
     let root = aterm_tempfile::tempdir().unwrap();
     let queue = server(&root.path().join("queue"));
-    let (_, config) = create_vault(&root.path().join("admin"), &queue);
+    let (paths, config) = create_vault(&root.path().join("admin"), &queue);
     let line = request(&root.path().join("joining"));
     post_discovering(&config, &line, None, |_| Vec::new()).unwrap();
-    let (pending, from) = requests_from(&config).unwrap();
+    let (pending, from, _) = requests_from(&paths, &config).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(from, Some(std::net::Ipv4Addr::LOCALHOST.into()));
     let Source::Url(url) = &config.source else {

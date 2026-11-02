@@ -161,9 +161,6 @@ pub enum CliHarness {
     Muse,
 }
 
-/// The harness lane every CLI harness shares: a change under it moves every harness.
-pub const SHARED_LANE: &str = "crates/aterm-agent/src/harness/";
-
 impl CliHarness {
     /// Every CLI harness in declaration order.
     pub const ALL: [CliHarness; 5] = [
@@ -240,12 +237,47 @@ impl CliHarness {
     }
 
     /// What this harness is made of, as repository paths (a trailing `/` names a directory): its
-    /// screen reader and the lane every harness shares ([`SHARED_LANE`]). A change under any of
-    /// them in a release window moves [`Self::version`]'s minor once.
+    /// screen reader ([`Self::version_file`]) and its own harness files under
+    /// `crates/aterm-agent/src/harness/`. Every CLI harness owns a disjoint source set; a change
+    /// under any of them in a release window moves [`Self::version`]'s minor once without bumping
+    /// any other harness.
     #[inline]
     #[must_use]
-    pub const fn sources(self) -> [&'static str; 2] {
-        [self.version_file(), SHARED_LANE]
+    pub const fn sources(self) -> &'static [&'static str] {
+        match self {
+            CliHarness::ClaudeCode => &[
+                "crates/aterm-phase/src/phase.rs",
+                "crates/aterm-agent/src/harness/cli_shared_claude.rs",
+                "crates/aterm-agent/src/harness/upgrade.rs",
+                "crates/aterm-agent/src/harness/upgrade_drive.rs",
+            ],
+            CliHarness::Agy => &[
+                "crates/aterm-phase/src/agy.rs",
+                "crates/aterm-agent/src/harness/agy_quota.rs",
+                "crates/aterm-agent/src/harness/agy_quota_store.rs",
+                "crates/aterm-agent/src/harness/upgrade_agy.rs",
+                "crates/aterm-agent/src/harness/upgrade_agy_drive.rs",
+                "crates/aterm-agent/src/harness/upgrade_agy_live.rs",
+                "crates/aterm-agent/src/harness/upgrade_agy_live_drive.rs",
+            ],
+            CliHarness::Grok => &[
+                "crates/aterm-phase/src/grok.rs",
+                "crates/aterm-agent/src/harness/grok_signin.rs",
+                "crates/aterm-agent/src/harness/worker_grok.rs",
+            ],
+            CliHarness::Kimi => &[
+                "crates/aterm-phase/src/kimi.rs",
+                "crates/aterm-agent/src/harness/cli_shared_kimi.rs",
+            ],
+            CliHarness::Muse => &[
+                "crates/aterm-phase/src/muse.rs",
+                "crates/aterm-agent/src/harness/muse_usage.rs",
+                "crates/aterm-agent/src/harness/upgrade_muse.rs",
+                "crates/aterm-agent/src/harness/upgrade_muse_drive.rs",
+                "crates/aterm-agent/src/harness/upgrade_muse_live.rs",
+                "crates/aterm-agent/src/harness/upgrade_muse_live_drive.rs",
+            ],
+        }
     }
 
     /// Canonical version string (`"0.4"`) of this CLI harness.
@@ -420,9 +452,31 @@ mod tests {
             assert_eq!(CliHarness::for_name(harness.id()), Some(harness));
             assert_eq!(CliHarness::for_name(harness.cli()), Some(harness));
             assert_eq!(CliHarness::for_name(harness.product()), Some(harness));
-            let [reader, lane] = harness.sources();
-            assert_eq!(reader, harness.version_file());
-            assert_eq!(lane, SHARED_LANE);
+            let sources = harness.sources();
+            assert_eq!(sources.first().copied(), Some(harness.version_file()));
+            assert!(
+                sources.len() >= 2,
+                "{harness:?}: owns its reader and its harness files"
+            );
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for (i, a) in CliHarness::ALL.iter().enumerate() {
+            for &src in a.sources() {
+                assert!(
+                    dir.join(src).is_file(),
+                    "{a:?}: source path {src} must exist as a file"
+                );
+            }
+            for b in &CliHarness::ALL[i + 1..] {
+                for &sa in a.sources() {
+                    for &sb in b.sources() {
+                        assert!(
+                            sa != sb && !sa.starts_with(sb) && !sb.starts_with(sa),
+                            "{a:?} and {b:?} must have disjoint sources, shared {sa:?} / {sb:?}"
+                        );
+                    }
+                }
+            }
         }
         for (name, harness) in [
             ("grok build", CliHarness::Grok),

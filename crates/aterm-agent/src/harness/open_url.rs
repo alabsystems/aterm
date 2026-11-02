@@ -3,10 +3,11 @@
 
 //! Profile-aware URL opener and headless mailbox OAuth flow for `aterm-open-url`.
 
+use super::auth_deadline::Deadline;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -38,13 +39,17 @@ pub const DEFAULT_MAILBOX_DIR: &str = "mailbox";
 
 /// Environment variable naming the file a renewal reads what its opener's headless sign-in met
 /// from ([`Met`]): an absolute path in a private directory the renewal made for its one run.
-/// The opener writes it only where its sign-in ended without the callback on a page it can
-/// name, one line of one closed word and the host, never the URL, the page's text or a code.
+/// The opener writes one closed word and, for a page outcome, its host. Browser-start and
+/// browser-control failures have no host. It never writes a URL, page text, executable path or code.
 pub const OUTCOME_ENV: &str = "ATERM_OPEN_URL_OUTCOME";
 
-/// What a headless sign-in met where it ended without the callback ([`Met`]).
+/// Why a headless sign-in ended without the callback ([`Met`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetWord {
+    /// The headless browser was unavailable or could not be started; no page was observed.
+    BrowserStart,
+    /// Browser initialization or a terminal DevTools operation failed.
+    BrowserControl,
     /// Cloudflare's bot check, which did not clear
     /// ([`super::headless_oauth::BOT_CHECK_UNCLEARED`]).
     BotCheck,
@@ -59,16 +64,21 @@ impl MetWord {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            MetWord::BrowserStart => "browser-start",
+            MetWord::BrowserControl => "browser-control",
             MetWord::BotCheck => "bot-check",
             MetWord::BlockPage => "block-page",
             MetWord::Stall => "stall",
         }
     }
+
+    const fn has_page_host(self) -> bool {
+        matches!(self, Self::BotCheck | Self::BlockPage | Self::Stall)
+    }
 }
 
-/// What a headless sign-in met where it ended without the callback, and the host of the page it
-/// was last on, as the opener writes it to [`OUTCOME_ENV`]'s file (`bot-check claude.ai`) and a
-/// renewal's record names it ([`Met::words`]).
+/// Why a headless sign-in ended without the callback, with a page host only when one was
+/// observed, as the opener writes it to [`OUTCOME_ENV`] and a renewal names it ([`Met::words`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Met {
     /// What it met.
@@ -86,7 +96,8 @@ impl Met {
     #[must_use]
     pub fn new(word: MetWord, host: Option<&str>) -> Met {
         let host = host.filter(|h| {
-            !h.is_empty()
+            word.has_page_host()
+                && !h.is_empty()
                 && h.len() <= Met::HOST_MAX
                 && h.bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
@@ -100,6 +111,9 @@ impl Met {
     /// Its outcome file's line: the word, then the host where there is one.
     #[must_use]
     pub fn line(&self) -> String {
+        if !self.word.has_page_host() {
+            return self.word.as_str().to_owned();
+        }
         match &self.host {
             Some(host) => format!("{} {host}", self.word.as_str()),
             None => self.word.as_str().to_owned(),
@@ -118,9 +132,15 @@ impl Met {
             Some((word, host)) => (word, Some(host)),
             None => (line, None),
         };
-        let word = [MetWord::BotCheck, MetWord::BlockPage, MetWord::Stall]
-            .into_iter()
-            .find(|w| w.as_str() == word)?;
+        let word = [
+            MetWord::BrowserStart,
+            MetWord::BrowserControl,
+            MetWord::BotCheck,
+            MetWord::BlockPage,
+            MetWord::Stall,
+        ]
+        .into_iter()
+        .find(|w| w.as_str() == word)?;
         let met = Met::new(word, host);
         (met.host.as_deref() == host).then_some(met)
     }
@@ -132,8 +152,8 @@ impl Met {
         matches!(self.word, MetWord::BotCheck | MetWord::BlockPage)
     }
 
-    /// Its words in a renewal's record: what the page met, naming Cloudflare where it was
-    /// Cloudflare's.
+    /// Its words in a renewal's record: a local browser failure or what the page met,
+    /// naming Cloudflare where it was Cloudflare's.
     #[must_use]
     pub fn words(&self) -> String {
         let on = self
@@ -141,11 +161,21 @@ impl Met {
             .as_deref()
             .map_or_else(String::new, |host| format!(" on {host}"));
         match self.word {
+            MetWord::BrowserStart => "its headless browser could not start".to_owned(),
+            MetWord::BrowserControl => {
+                "it could not communicate with its headless browser".to_owned()
+            }
             MetWord::BotCheck => {
                 format!("it met Cloudflare's bot check{on}, which aterm never tries to pass")
             }
             MetWord::BlockPage => format!("it met Cloudflare's block page{on}"),
-            MetWord::Stall => format!("its page{on} reached no callback in time"),
+            MetWord::Stall => {
+                if self.host.is_some() {
+                    format!("its page{on} reached no callback in time")
+                } else {
+                    "its authorization reached no callback in time".to_owned()
+                }
+            }
         }
     }
 }
@@ -3317,11 +3347,22 @@ pub(super) fn parse_raw_http_response(
     None
 }
 
+#[cfg(test)]
 pub(super) fn loopback_http_exchange(
     method: &str,
     url: &str,
     cookies: &mut BTreeMap<String, String>,
     form_body: Option<&str>,
+) -> Result<HttpResponse, &'static str> {
+    loopback_http_exchange_by(method, url, cookies, form_body, None)
+}
+
+fn loopback_http_exchange_by(
+    method: &str,
+    url: &str,
+    cookies: &mut BTreeMap<String, String>,
+    form_body: Option<&str>,
+    deadline: Option<Deadline<'_>>,
 ) -> Result<HttpResponse, &'static str> {
     if !matches!(method, "GET" | "POST") {
         return Err("loopback client takes GET or POST only");
@@ -3355,10 +3396,13 @@ pub(super) fn loopback_http_exchange(
         .filter(|p| *p > 0)
         .ok_or("loopback URL port is invalid")?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|_| "could not connect to local OAuth / callback server")?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let mut stream = super::auth_deadline::Stream::connect(
+        &addr,
+        deadline,
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    )
+    .map_err(|_| "could not connect to local OAuth / callback server")?;
 
     let mut req =
         format!("{method} {path_and_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
@@ -3496,18 +3540,84 @@ fn curl_output_with(
     options: &[(&'static str, &str)],
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> std::io::Result<std::process::Output> {
-    let (mut cmd, input) = curl_command(program, args, options, var)?;
-    let input = aterm_uds::secret::Secret::from_vec(input.into_bytes());
     let now = Instant::now();
     let deadline = now.checked_add(CURL_WAIT_BUDGET).unwrap_or(now);
+    curl_output_with_until(program, args, options, var, deadline)
+}
+
+fn curl_output_with_until(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    options: &[(&'static str, &str)],
+    var: &dyn Fn(&str) -> Option<OsString>,
+    deadline: Instant,
+) -> std::io::Result<std::process::Output> {
+    let (mut cmd, input) = curl_command(program, args, options, var)?;
+    let input = aterm_uds::secret::Secret::from_vec(input.into_bytes());
     aterm_uds::deadline::output_with_input_until(&mut cmd, input, deadline, CURL_MAX_OUTPUT_BYTES)
 }
 
-fn https_curl_exchange(
+fn curl_args_until(
+    args: &[&str],
+    ceiling: Duration,
+    deadline: Deadline<'_>,
+) -> std::io::Result<Vec<String>> {
+    let millis = deadline
+        .capped(ceiling)
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, super::auth_deadline::EXPIRED)
+        })?
+        .as_millis();
+    if millis == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            super::auth_deadline::EXPIRED,
+        ));
+    }
+    let mut selected = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--max-time" {
+            i += 2;
+        } else {
+            selected.push(args[i].to_owned());
+            i += 1;
+        }
+    }
+    selected.extend([
+        "--max-time".into(),
+        format!("{}.{:03}", millis / 1000, millis % 1000),
+    ]);
+    Ok(selected)
+}
+
+pub(super) fn curl_output_until(
+    args: &[&str],
+    options: &[(&'static str, &str)],
+    ceiling: Duration,
+    deadline: Deadline<'_>,
+) -> std::io::Result<std::process::Output> {
+    let args = curl_args_until(args, ceiling, deadline)?;
+    let refs: Vec<_> = args.iter().map(String::as_str).collect();
+    let output = curl_output_with_until(
+        aterm_uds::os_path!("curl"),
+        &refs,
+        options,
+        &|name| std::env::var_os(name),
+        deadline.limited(CURL_WAIT_BUDGET).end(),
+    )?;
+    deadline.remaining().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, super::auth_deadline::EXPIRED)
+    })?;
+    Ok(output)
+}
+
+fn https_curl_exchange_by(
     method: &str,
     url: &str,
     cookies: &mut BTreeMap<String, String>,
     form_body: Option<&str>,
+    deadline: Option<Deadline<'_>>,
 ) -> Result<HttpResponse, &'static str> {
     let cookie_hdr = cookies
         .iter()
@@ -3521,21 +3631,22 @@ fn https_curl_exchange(
     if let Some(body) = form_body {
         options.push(("data-raw", body));
     }
-    let out = curl_output(
-        &[
-            "--disable",
-            "--globoff",
-            "--proto",
-            "=https",
-            "-sS",
-            "-i",
-            "--max-time",
-            "15",
-            "-X",
-            method,
-        ],
-        &options,
-    )
+    let args = [
+        "--disable",
+        "--globoff",
+        "--proto",
+        "=https",
+        "-sS",
+        "-i",
+        "--max-time",
+        "15",
+        "-X",
+        method,
+    ];
+    let out = match deadline {
+        Some(deadline) => curl_output_until(&args, &options, Duration::from_secs(15), deadline),
+        None => curl_output(&args, &options),
+    }
     .map_err(|_| "failed running curl")?;
     if !out.status.success() {
         return Err("HTTPS request failed");
@@ -3544,19 +3655,37 @@ fn https_curl_exchange(
     parse_raw_http_response(&raw, cookies).ok_or("malformed HTTPS response")
 }
 
-fn http_exchange(
+fn http_exchange_until(
     method: &str,
     url: &str,
     cookies: &mut BTreeMap<String, String>,
     form_body: Option<&str>,
+    deadline: Deadline<'_>,
 ) -> Result<HttpResponse, &'static str> {
-    if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
-        loopback_http_exchange(method, url, cookies, form_body)
+    deadline.left()?;
+    let result = if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
+        loopback_http_exchange_by(method, url, cookies, form_body, Some(deadline))
     } else if url.starts_with("https://") {
-        https_curl_exchange(method, url, cookies, form_body)
+        https_curl_exchange_by(method, url, cookies, form_body, Some(deadline))
     } else {
         Err("unsupported URL scheme")
-    }
+    };
+    deadline.left()?;
+    result
+}
+
+#[cfg(unix)]
+pub(super) fn loopback_http_exchange_until(
+    method: &str,
+    url: &str,
+    cookies: &mut BTreeMap<String, String>,
+    form_body: Option<&str>,
+    deadline: Deadline<'_>,
+) -> Result<HttpResponse, &'static str> {
+    deadline.left()?;
+    let result = loopback_http_exchange_by(method, url, cookies, form_body, Some(deadline));
+    deadline.left()?;
+    result
 }
 
 fn provider_url(url: &str) -> bool {
@@ -3724,6 +3853,7 @@ enum StepOutcome {
     Page { url: String, body: String },
 }
 
+#[cfg(test)]
 fn follow_until_page_or_callback(
     flow: &MailboxFlow,
     exchange: &mut impl FnMut(
@@ -3737,12 +3867,41 @@ fn follow_until_page_or_callback(
     cookies: &mut BTreeMap<String, String>,
     initial_body: Option<&str>,
 ) -> Result<StepOutcome, &'static str> {
+    let clock = Instant::now;
+    let deadline = Deadline::new(AUTHORIZE_TIMEOUT, &clock);
+    follow_until_page_or_callback_until(
+        flow,
+        exchange,
+        initial_method,
+        initial_url,
+        cookies,
+        initial_body,
+        deadline,
+    )
+}
+
+fn follow_until_page_or_callback_until(
+    flow: &MailboxFlow,
+    exchange: &mut impl FnMut(
+        &str,
+        &str,
+        &mut BTreeMap<String, String>,
+        Option<&str>,
+    ) -> Result<HttpResponse, &'static str>,
+    initial_method: &str,
+    initial_url: &str,
+    cookies: &mut BTreeMap<String, String>,
+    initial_body: Option<&str>,
+    deadline: Deadline<'_>,
+) -> Result<StepOutcome, &'static str> {
     let mut method = initial_method.to_owned();
     let mut current_url = initial_url.to_owned();
     let mut body = initial_body.map(str::to_owned);
     for _ in 0..8 {
+        deadline.left()?;
         if flow.is_callback(&current_url) {
             let cb_resp = exchange("GET", &current_url, &mut BTreeMap::new(), None)?;
+            deadline.left()?;
             if (200..400).contains(&cb_resp.status) {
                 return Ok(StepOutcome::CallbackDelivered);
             }
@@ -3752,6 +3911,7 @@ fn follow_until_page_or_callback(
             return Err("this OAuth destination needs the manual browser");
         }
         let resp = exchange(&method, &current_url, cookies, body.as_deref())?;
+        deadline.left()?;
         if matches!(resp.status, 301..=303 | 307 | 308) {
             let Some(loc) = resp.location else {
                 return Err("redirect response omitted Location header");
@@ -3903,6 +4063,7 @@ fn poll_http_mailbox_credential(
     )
 }
 
+#[cfg(all(test, unix))]
 fn poll_http_mailbox_credential_with_seen_otps(
     mailbox_cfg: &super::headless_oauth::MailboxConfig,
     email: Option<&str>,
@@ -3911,13 +4072,39 @@ fn poll_http_mailbox_credential_with_seen_otps(
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<String, &'static str> {
     use super::headless_oauth::MailboxCredential;
-
     let credential = super::headless_oauth::poll_mailbox_config_for_credential_with_seen_otps(
         mailbox_cfg,
         email,
         timeout,
         seen_otps,
     )?;
+    *pending = Some(credential.clone());
+    match credential {
+        MailboxCredential::MagicLink(url) => Ok(url),
+        MailboxCredential::Otp(_) => {
+            Err("verification email contained a 6-digit OTP requiring headless browser")
+        }
+    }
+}
+
+fn poll_http_mailbox_credential_until(
+    mailbox_cfg: &super::headless_oauth::MailboxConfig,
+    email: Option<&str>,
+    deadline: Deadline<'_>,
+    pending: &mut Option<super::headless_oauth::MailboxCredential>,
+    seen_otps: &mut BTreeSet<String>,
+    once: bool,
+) -> Result<String, &'static str> {
+    use super::headless_oauth::MailboxCredential;
+
+    let credential = super::headless_oauth::poll_mailbox_config_until(
+        mailbox_cfg,
+        email,
+        deadline,
+        once,
+        seen_otps,
+    )?;
+    deadline.left()?;
     *pending = Some(credential.clone());
     match credential {
         MailboxCredential::MagicLink(url) => Ok(url),
@@ -3939,12 +4126,37 @@ pub fn authorize_with_mailbox_config(
     target_email: Option<&str>,
     timeout: Duration,
 ) -> Result<(), &'static str> {
+    let _ = super::headless_oauth::take_met();
+    let _flow = MailboxFlow::new(authorize_url)?;
+    let clock = Instant::now;
+    let deadline = Deadline::new(timeout, &clock);
+    let result = authorize_with_mailbox_until(
+        authorize_url,
+        mailbox_cfg,
+        store_dir,
+        target_email,
+        deadline,
+    );
+    super::headless_oauth::finish_deadline(result, deadline)
+}
+
+fn authorize_with_mailbox_until(
+    authorize_url: &str,
+    mailbox_cfg: &super::headless_oauth::MailboxConfig,
+    store_dir: Option<&Path>,
+    target_email: Option<&str>,
+    deadline: Deadline<'_>,
+) -> Result<(), &'static str> {
+    // A fresh HTTP attempt, including its possible CDP continuation, owns this outcome.
+    let _ = super::headless_oauth::take_met();
+    let _flow = MailboxFlow::new(authorize_url)?;
+    deadline.left()?;
     let force_headless = std::env::var(super::headless_oauth::HEADLESS_ENV)
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let has_headless_browser =
         super::headless_oauth::find_headless_browser(home.as_deref()).is_some();
-    let t0 = Instant::now();
+    deadline.left()?;
     let resolved_email = target_email
         .filter(|e| !e.trim().is_empty())
         .map(str::to_owned)
@@ -3960,29 +4172,35 @@ pub fn authorize_with_mailbox_config(
         let mut pending_credential = None;
         let mut seen_otps = BTreeSet::new();
         let mut attempt = 0usize;
-        let first_res = authorize_using_with_page(
+        let first_res = authorize_using_with_page_until(
             authorize_url,
             target_email,
             |email, initial_body| {
                 let poll_timeout = if attempt > 0 {
                     Duration::ZERO
                 } else if has_headless_browser && page_needs_browser_before_email(initial_body) {
-                    timeout
-                        .saturating_sub(t0.elapsed())
-                        .min(Duration::from_millis(200))
+                    deadline.left()?.min(Duration::from_millis(200))
                 } else {
-                    timeout.saturating_sub(t0.elapsed())
+                    deadline.left()?
                 };
                 attempt += 1;
-                poll_http_mailbox_credential_with_seen_otps(
+                poll_http_mailbox_credential_until(
                     mailbox_cfg,
                     email,
-                    poll_timeout,
+                    if attempt > 1 {
+                        deadline
+                    } else {
+                        deadline.limited(poll_timeout)
+                    },
                     &mut pending_credential,
                     &mut seen_otps,
+                    attempt > 1,
                 )
             },
-            &mut http_exchange,
+            &mut |method, url, cookies, body| {
+                http_exchange_until(method, url, cookies, body, deadline)
+            },
+            deadline,
         );
         match first_res {
             Ok(()) => return Ok(()),
@@ -3995,16 +4213,13 @@ pub fn authorize_with_mailbox_config(
                 {
                     return Err(first_err);
                 }
-                let remaining = timeout.saturating_sub(t0.elapsed());
-                if remaining.is_zero() {
-                    return Err(first_err);
-                }
-                return super::headless_oauth::authorize_with_headless_browser_config_and_credential(
+                deadline.left()?;
+                return super::headless_oauth::authorize_with_headless_browser_until(
                     authorize_url,
                     store_dir,
                     Some(mailbox_cfg),
                     target_email,
-                    remaining,
+                    deadline,
                     pending_credential,
                 )
                 .map_err(|cdp_err| {
@@ -4019,12 +4234,13 @@ pub fn authorize_with_mailbox_config(
             }
         }
     }
-    super::headless_oauth::authorize_with_headless_browser_config(
+    super::headless_oauth::authorize_with_headless_browser_until(
         authorize_url,
         store_dir,
         Some(mailbox_cfg),
         target_email,
-        timeout,
+        deadline,
+        None,
     )
 }
 
@@ -4072,7 +4288,29 @@ pub(super) fn authorize_using(
     )
 }
 
+#[cfg(test)]
 fn authorize_using_with_page(
+    authorize_url: &str,
+    target_email: Option<&str>,
+    magic_link: impl FnMut(Option<&str>, &str) -> Result<String, &'static str>,
+    exchange: &mut impl FnMut(
+        &str,
+        &str,
+        &mut BTreeMap<String, String>,
+        Option<&str>,
+    ) -> Result<HttpResponse, &'static str>,
+) -> Result<(), &'static str> {
+    let clock = Instant::now;
+    authorize_using_with_page_until(
+        authorize_url,
+        target_email,
+        magic_link,
+        exchange,
+        Deadline::new(AUTHORIZE_TIMEOUT, &clock),
+    )
+}
+
+fn authorize_using_with_page_until(
     authorize_url: &str,
     target_email: Option<&str>,
     mut magic_link: impl FnMut(Option<&str>, &str) -> Result<String, &'static str>,
@@ -4082,7 +4320,9 @@ fn authorize_using_with_page(
         &mut BTreeMap<String, String>,
         Option<&str>,
     ) -> Result<HttpResponse, &'static str>,
+    deadline: Deadline<'_>,
 ) -> Result<(), &'static str> {
+    deadline.left()?;
     let flow = MailboxFlow::new(authorize_url)?;
     let email = target_email
         .filter(|e| !e.trim().is_empty())
@@ -4090,13 +4330,14 @@ fn authorize_using_with_page(
         .or_else(|| extract_login_hint(authorize_url));
     let mut cookies = BTreeMap::new();
 
-    let initial_body = match follow_until_page_or_callback(
+    let initial_body = match follow_until_page_or_callback_until(
         &flow,
         exchange,
         "GET",
         authorize_url,
         &mut cookies,
         None,
+        deadline,
     )? {
         StepOutcome::CallbackDelivered => return Ok(()),
         StepOutcome::Page { body, .. } => body,
@@ -4104,18 +4345,21 @@ fn authorize_using_with_page(
 
     let mut last_err = "magic-link response contained no OAuth approval action";
     for attempt in 0..3 {
+        deadline.left()?;
         let magic_url = match magic_link(email.as_deref(), &initial_body) {
             Ok(url) => url,
             Err(err) => return Err(if attempt == 0 { err } else { last_err }),
         };
 
-        let mut page = match follow_until_page_or_callback(
+        deadline.left()?;
+        let mut page = match follow_until_page_or_callback_until(
             &flow,
             exchange,
             "GET",
             &magic_url,
             &mut cookies,
             None,
+            deadline,
         ) {
             Ok(StepOutcome::CallbackDelivered) => return Ok(()),
             Ok(StepOutcome::Page { url, body }) => (url, body),
@@ -4130,6 +4374,7 @@ fn authorize_using_with_page(
 
         let mut step_failed = false;
         for step in 0..4 {
+            deadline.left()?;
             let Some((method, action_url, form_body)) =
                 parse_html_approval_action(&page.1, &page.0)
             else {
@@ -4141,13 +4386,14 @@ fn authorize_using_with_page(
                 step_failed = true;
                 break;
             };
-            match follow_until_page_or_callback(
+            match follow_until_page_or_callback_until(
                 &flow,
                 exchange,
                 &method,
                 &action_url,
                 &mut cookies,
                 form_body.as_deref(),
+                deadline,
             ) {
                 Ok(StepOutcome::CallbackDelivered) => return Ok(()),
                 Ok(StepOutcome::Page { url, body }) => {
@@ -4258,6 +4504,7 @@ fn with_approved_mailbox<T>(
 /// Entry point for the `aterm-open-url` argv0 alias.
 #[must_use = "return or inspect the command exit status"]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
+    let _ = super::headless_oauth::take_met();
     let args: Vec<String> = args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -4387,6 +4634,10 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
 #[cfg(test)]
 #[path = "open_url_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "auth_flow_deadline_tests.rs"]
+mod deadline_tests;
 
 #[cfg(all(test, unix))]
 #[path = "open_url_approved_tests.rs"]

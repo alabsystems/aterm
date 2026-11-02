@@ -8939,17 +8939,151 @@ fn shows_name_of(compiled: &crate::native_ui::CompiledUi, setting: &str) -> bool
     })
 }
 
+/// A TAB LANDS ON A CONTROL WITH A LINE OF ITS NAME WHERE A SCREEN HOLDS BOTH
+/// ([`scroll::ScrollPlan::land_named`]), above the least view: Tab and Shift-Tab to Harness's
+/// Question priority, split from its two-line name, showed its segments and the note under them,
+/// "With Answer questions on,", and no word of what they set (1× at 248x222 and 248x278, 0.85×
+/// at 220x222), where a screen holds the name's last line over the segments; Shift-Tab to
+/// Sound's Music effects at 0.85× in 234x418 kept a screen seated into the row, its name cut
+/// off over the switch.
+#[test]
+fn a_tab_lands_with_a_line_of_the_controls_name_where_a_screen_holds_both() {
+    let priority = (
+        SettingsRoute::Harness,
+        prefs::EDIT_HARNESS_QUESTION_PRIORITY,
+    );
+    let music = (SettingsRoute::Sound, prefs::EDIT_TRAIL_SOUNDS);
+    let both: &[bool] = &[false, true];
+    let cases = [
+        (1.0, priority, (248.0, 222.0), both),
+        (1.0, priority, (248.0, 278.0), both),
+        (0.85, priority, (220.0, 222.0), both),
+        (0.85, music, (234.0, 418.0), &[true]),
+    ];
+    at_each_text_scale(&[0.85, 1.0], "a tab lands with its name", |scale| {
+        for &(_, (route, setting), (width, height), directions) in
+            cases.iter().filter(|(at, ..)| (at - scale).abs() < 0.01)
+        {
+            for &backwards in directions {
+                let context = format!(
+                    "{route:?} {width}x{height} at {scale}x, {} to {setting}",
+                    if backwards { "Shift-Tab" } else { "Tab" }
+                );
+                let mut lab = Lab::new("");
+                lab.state_mut().navigate(route);
+                let mut seen = std::collections::HashSet::new();
+                let landed = std::iter::from_fn(|| tab(&mut lab, backwards, width, height))
+                    .take_while(|target| seen.insert(target.clone()))
+                    .any(|target| {
+                        target.as_str() == format!("settings/control/{setting}")
+                            || target
+                                .as_str()
+                                .starts_with(&format!("settings/segment/{setting}/"))
+                    });
+                assert!(landed, "{context}: the keyboard reaches it");
+                let screen = lab.compile(width, height);
+                assert!(
+                    shows_name_of(&screen, setting),
+                    "{context}: lands with no whole line of its name: {:?}",
+                    screen
+                        .paint
+                        .iter()
+                        .filter(|node| drawn_whole(node))
+                        .filter_map(|node| match &node.content {
+                            UiContent::Text(text) if !text.text.trim().is_empty() =>
+                                Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    });
+}
+
+/// A TAB LANDS ON THE NEAREST SCREEN THAT SHOWS THE CONTROL WITH ITS NAME
+/// ([`scroll::ScrollPlan::land_named`]): Tab down from a switch to the next row's, where a screen
+/// shows the next row's name, control and words under the row tabbed from, lands there. Judged
+/// by the room under the strip a status's bar takes rather than by what the screen draws, the
+/// landing passed that screen and put the next row first under its card's heading, the row
+/// tabbed from gone: Security at 304x420, Allow programs to show desktop notifications 134pt
+/// further; Harness at 1095x696 with 2× text, Land at 264pt further; Appearance at 1095x696 with
+/// 2× text, Background opacity 188pt further.
+#[test]
+fn a_tab_lands_on_the_nearest_screen_that_shows_the_control_with_its_name() {
+    let cases = [
+        (
+            1.0,
+            SettingsRoute::Security,
+            (
+                prefs::EDIT_ALLOW_WINDOW_OPS,
+                prefs::EDIT_ALLOW_NOTIFICATIONS,
+            ),
+            (304.0, 420.0),
+        ),
+        (
+            2.0,
+            SettingsRoute::Harness,
+            (prefs::EDIT_HARNESS_AUTOPILOT, prefs::EDIT_HARNESS_LAND_AT),
+            (1_095.0, 696.0),
+        ),
+        (
+            2.0,
+            SettingsRoute::Appearance,
+            (prefs::EDIT_FAINT_OPACITY, prefs::EDIT_BACKGROUND_OPACITY),
+            (1_095.0, 696.0),
+        ),
+    ];
+    at_each_text_scale(&[1.0, 2.0], "a tab lands nearest", |scale| {
+        for &(_, route, (from, to), (width, height)) in
+            cases.iter().filter(|(at, ..)| (at - scale).abs() < 0.01)
+        {
+            let context =
+                format!("{route:?} {width}x{height} at {scale}x, Tab from {from} to {to}");
+            let mut lab = Lab::new("");
+            lab.state_mut().navigate(route);
+            let control = |setting: &str| UiKey::new(format!("settings/control/{setting}"));
+            let mut seen = std::collections::HashSet::new();
+            let reached = std::iter::from_fn(|| tab(&mut lab, false, width, height))
+                .take_while(|target| seen.insert(target.clone()))
+                .any(|target| target == control(from));
+            assert!(reached, "{context}: the keyboard reaches {from}");
+            assert_eq!(
+                tab(&mut lab, false, width, height),
+                Some(control(to)),
+                "{context}: the next Tab goes to {to}"
+            );
+            let screen = lab.compile(width, height);
+            let whole = |key: &UiKey| {
+                screen
+                    .paint
+                    .iter()
+                    .any(|node| node.key == *key && drawn_whole(node))
+            };
+            assert!(
+                whole(&control(to)) && shows_name_of(&screen, to),
+                "{context}: lands with {to} whole under its name"
+            );
+            assert!(
+                whole(&control(from)),
+                "{context}: a screen shows {to} with its name under {from}, yet the landing \
+                 scrolled {from} away"
+            );
+        }
+    });
+}
+
 /// THE LEAST VIEW HOLDS EVERY CONTROL WHOLE WITH A LINE OF ITS NAME, AT EVERY TEXT SCALE
-/// ([`least_view`], the view the least window gives a window's Settings): at 1×, 1.25×, 1.5×,
-/// 1.75× and 2× text, on every page but the themes chooser's grid, each Tab and Shift-Tab to a
-/// switch or a segmented control lands on a screen showing a whole line of its name, every
+/// ([`least_view`], the view the least window gives a window's Settings): at 0.85×, 1×, 1.25×,
+/// 1.5×, 1.75× and 2× text, on every page but the themes chooser's grid, each Tab and Shift-Tab
+/// to a switch or a segmented control lands on a screen showing a whole line of its name, every
 /// control is whole with a line of its name on some screen a Page Down or a Tab shows, and every
 /// Messages entry is whole on a screen. In the 164x96 view the window's fixed least gave
 /// Settings, 2× text left 127 of 282 Tab landings with no line of the control's name and 41
 /// controls never whole; 1× text, 58 landings.
 #[test]
 fn the_least_view_holds_every_control_whole_with_its_name_at_every_text_scale() {
-    at_each_text_scale(&[1.0, 1.25, 1.5, 1.75, 2.0], "least view", |scale| {
+    at_each_text_scale(&[0.85, 1.0, 1.25, 1.5, 1.75, 2.0], "least view", |scale| {
         let (width, height) = least_view(scale);
         let routes: Vec<SettingsRoute> = SettingsRoute::ALL
             .into_iter()
@@ -9087,16 +9221,97 @@ fn the_least_view_holds_every_control_whole_with_its_name_at_every_text_scale() 
     });
 }
 
+/// A PRESS MOVES WHAT IT PRESSED BY NO FRACTION OF A POINT: a segment pressed stays where it was
+/// while its status comes up and once its write lands, where the list's room under the status's
+/// bar or the screen its landing seats would move it by less than half a point. Taken for no
+/// move, 0.4pt was let through: with 1.6× text in 255x264, Terminal's Bidirectional text, Off,
+/// went up 0.4pt as the bar came under the list, which then covered that much of it; with 1.4×
+/// text in 246x264, Cursor & Motion's Motion, Animate, went up 0.4pt as its write landed.
+#[test]
+fn a_press_moves_what_it_pressed_by_no_fraction_of_a_point() {
+    let cases = [
+        (
+            1.6,
+            SettingsRoute::Terminal,
+            "settings/segment/bidi/1",
+            (255.0, 264.0),
+        ),
+        (
+            1.4,
+            SettingsRoute::CursorMotion,
+            "settings/segment/motion/1",
+            (246.0, 264.0),
+        ),
+    ];
+    at_each_text_scale(&[1.4, 1.6], "a press moves nothing", |scale| {
+        for &(_, route, segment, (width, height)) in
+            cases.iter().filter(|(at, ..)| (at - scale).abs() < 0.01)
+        {
+            let key = UiKey::new(segment);
+            let context = format!("{route:?} {width}x{height} at {scale}x, {segment}");
+            let mut lab = Lab::new("");
+            lab.state_mut().navigate(route);
+            let whole_and_live = |screen: &crate::native_ui::CompiledUi| {
+                screen
+                    .paint
+                    .iter()
+                    .find(|node| node.key == key && node.clip == node.rect)
+                    .map(|node| node.rect)
+                    .filter(|rect| screen.semantic(&key).is_some_and(|live| live.rect == *rect))
+            };
+            let mut was = None;
+            for _ in 0..80 {
+                let screen = lab.compile(width, height);
+                was = whole_and_live(&screen);
+                if was.is_some() {
+                    break;
+                }
+                lab.dispatch(AppEvent::ScrollPage(1));
+            }
+            let was = was.unwrap_or_else(|| panic!("{context}: a screen shows it whole"));
+            lab.state_mut().common.last_focus = Some(key.clone());
+            let (patch, operation) = lab
+                .invoke(segment, None)
+                .unwrap_or_else(|| panic!("{context}: the press writes"));
+            let applying = lab.compile(width, height);
+            lab.carry(patch, operation);
+            let landed = lab.compile(width, height);
+            let control = UiKey::new(format!(
+                "settings/control/{}",
+                segment
+                    .trim_start_matches("settings/segment/")
+                    .rsplit_once('/')
+                    .map_or("", |(setting, _)| setting)
+            ));
+            for (frame, after) in [("applying", &applying), ("landed", &landed)] {
+                let now = after
+                    .paint
+                    .iter()
+                    .find(|node| node.key == control)
+                    .map(|node| (node.rect, node.clip));
+                assert!(
+                    now.is_some_and(|(rect, clip)| (rect.y - was.y).abs() < 0.01
+                        && (rect.x - was.x).abs() < 0.01
+                        && (clip.height - rect.height).abs() < 0.01),
+                    "{context} {frame}: moved from {was:?} to {now:?}"
+                );
+            }
+        }
+    });
+}
+
 /// A PRESS IN THE LEAST VIEW NEITHER COVERS NOR MOVES WHAT IT PRESSED, AT EVERY TEXT SCALE: in
-/// the least view ([`least_view`]) at 1×, 1.25×, 1.5×, 1.75× and 2× text, in a dark and a light
-/// theme, every switch and segment drawn whole and live on a screen a Page Down shows, pressed,
-/// stays where it was, whole, while its status comes up and once its write lands, and the
-/// status's bar covers none of it. In the views the window's fixed least gave Settings, a
-/// press's bar covered or moved the control in 84 of 356 presses.
+/// the least view ([`least_view`]) at 0.85×, 1×, 1.25×, 1.5×, 1.75× and 2× text, in a dark and a
+/// light theme, every switch and segment drawn whole and live on a screen a Page Down shows,
+/// pressed, stays where it was, whole, while its status comes up and once its write lands, and
+/// the status's bar covers none of it. Where it was is to a hundredth of a point: the same place
+/// reached by two sums of fractions differs by a hundred-thousandth (Cursor & Motion's Reduce at
+/// 0.85×, 114.4 and 114.40001). In the views the window's fixed least gave Settings, a press's
+/// bar covered or moved the control in 84 of 356 presses.
 #[test]
 fn a_press_in_the_least_view_neither_covers_nor_moves_what_it_pressed() {
     at_each_text_scale(
-        &[1.0, 1.25, 1.5, 1.75, 2.0],
+        &[0.85, 1.0, 1.25, 1.5, 1.75, 2.0],
         "least view presses",
         |scale| {
             let (width, height) = least_view(scale);
@@ -9215,9 +9430,13 @@ fn a_press_in_the_least_view_neither_covers_nor_moves_what_it_pressed() {
                         let bar = after
                             .semantic(&UiKey::new("settings/feedback"))
                             .map(|node| node.rect);
-                        let fault = if now.map(|(rect, _)| (rect.x, rect.y)) != Some((was.x, was.y))
-                            || now.is_some_and(|(rect, clip)| rect != clip)
-                        {
+                        // A move is one past the float noise of one layout reached by two sums.
+                        let fault = if now.is_none_or(|(rect, clip)| {
+                            (rect.x - was.x).abs() > 0.01
+                                || (rect.y - was.y).abs() > 0.01
+                                || (clip.y - rect.y).abs() > 0.01
+                                || (clip.height - rect.height).abs() > 0.01
+                        }) {
                             Some(format!(
                                 "{context} {frame}: moved from {was:?} to {now:?}, the bar at {bar:?}"
                             ))
@@ -9327,9 +9546,112 @@ fn words_without_their_row(compiled: &crate::native_ui::CompiledUi) -> Vec<Strin
     words.difference(&rows).cloned().collect()
 }
 
+/// Each screen Page Down shows of `route` in a `width` x `height` view that draws a row's words
+/// without a line of its name or one of its controls ([`words_without_their_row`]).
+fn words_alone_on_page_down(route: SettingsRoute, width: f32, height: f32) -> Vec<String> {
+    let mut lab = Lab::new("");
+    lab.state_mut().navigate(route);
+    let mut before: Option<Vec<(UiKey, LogicalRect)>> = None;
+    let mut found = Vec::new();
+    for page in 0..300 {
+        let screen = lab.compile(width, height);
+        let place: Vec<(UiKey, LogicalRect)> = screen
+            .paint
+            .iter()
+            .map(|node| (node.key.clone(), node.rect))
+            .collect();
+        if before.as_ref() == Some(&place) {
+            break;
+        }
+        for setting in words_without_their_row(&screen) {
+            found.push(format!("screen {page}: {setting}'s words without its name"));
+        }
+        before = Some(place);
+        lab.dispatch(AppEvent::ScrollPage(1));
+    }
+    found
+}
+
+/// A STOP OF A ROW'S WORDS JOINS THE ROWS AFTER IT ONLY AS FAR AS THEY FIT UNDER THE ROW'S NAME
+/// ([`scroll::SplitCard::stops`]): two parts of a note, each cut to fit under its row's name,
+/// were joined into one stop as far as the card's head left room, so a screen that started with
+/// it could not hold the name too and drew the words alone at its top: Ai at 2× in 335x306,
+/// Fleet document's note ("One document for every machine"); Harness at 1.9× in 328x320, Approve
+/// permission boxes' ("All says yes").
+#[test]
+fn a_stop_of_a_rows_words_holds_no_more_than_fits_under_its_name() {
+    let cases = [
+        (2.0, SettingsRoute::Ai, (335.0, 306.0)),
+        (1.9, SettingsRoute::Harness, (328.0, 320.0)),
+    ];
+    at_each_text_scale(&[1.9, 2.0], "a stop of words under its name", |scale| {
+        for &(_, route, (width, height)) in
+            cases.iter().filter(|(at, ..)| (at - scale).abs() < 0.01)
+        {
+            let found = words_alone_on_page_down(route, width, height);
+            assert!(
+                found.is_empty(),
+                "{route:?} {width}x{height} at {scale}x:\n{}",
+                found.join("\n")
+            );
+        }
+    });
+}
+
+/// THE LAST SCREEN STARTS IN NO CONTROL THE LIST CANNOT DRAW ([`scroll::ScrollPlan::cut_unseen`]):
+/// seated with the list's end on the room's edge, the last screen's top fell in a stacked row's
+/// control, its name scrolled off over it; the list draws a control its edge cuts only with its
+/// row's words whole on screen, or a button that names itself with its own, so the control was
+/// drawn not at all and the note under it stood alone: Security at 0.85× in 372x320, "Secure
+/// Keyboard Entry hides what you type from other apps." under Secure Keyboard Entry's unseen
+/// switch; Appearance at 490x460, "GPU only: CPU window stays opaque" under Background
+/// material's unseen menu.
+#[test]
+fn the_last_screen_starts_in_no_control_the_list_cannot_draw() {
+    let cases = [
+        (0.85, SettingsRoute::Security, (372.0, 320.0)),
+        (1.0, SettingsRoute::Appearance, (490.0, 460.0)),
+    ];
+    at_each_text_scale(
+        &[0.85, 1.0],
+        "the last screen draws its controls",
+        |scale| {
+            for &(_, route, (width, height)) in
+                cases.iter().filter(|(at, ..)| (at - scale).abs() < 0.01)
+            {
+                let found = words_alone_on_page_down(route, width, height);
+                assert!(
+                    found.is_empty(),
+                    "{route:?} {width}x{height} at {scale}x:\n{}",
+                    found.join("\n")
+                );
+            }
+        },
+    );
+}
+
+/// THE LAST SCREEN STARTS WITH A ROW'S WORDS ONLY UNDER THE ROW'S NAME
+/// ([`scroll::ScrollPlan::ends_on_at`]): where a stop of a row's words, its name and every stop
+/// after it do not fit one screen, the screen before the last shows the stop under its name and
+/// the last starts after it. Taken for the last screen with its name seated off, the stop drew
+/// the words alone at the top: Terminal at 2× in a 288x236 view, Rewind's "Applies to new" under
+/// no word of its three-line name.
+#[test]
+fn the_last_screen_starts_with_a_rows_words_only_under_its_name() {
+    at_each_text_scale(&[2.0], "the last screen keeps a row's name", |scale| {
+        let (width, height) = (288.0, 236.0);
+        let found = words_alone_on_page_down(SettingsRoute::Terminal, width, height);
+        assert!(
+            found.is_empty(),
+            "Terminal {width}x{height} at {scale}x:\n{}",
+            found.join("\n")
+        );
+    });
+}
+
 /// A ROW'S WORDS PARTED FROM ITS NAME ARE LED BY IT ON A SCREEN THAT STARTS WITH THEM, AND THE
 /// NAME IS SAID ONCE ([`scroll::words_caption_marker`]): on every page but the themes chooser's
-/// and Messages, in the least view at 1×, 1.5× and 2× text ([`least_view`]), at 220x348 with 1×
+/// and Messages, in the least view at every text scale ([`least_view`]), at 220x348 with 1×
 /// text and at 584x348 (80x24) with 2× text, no screen Page Down shows draws a row's words
 /// without a line of the row's name or one of its controls, and none says a row's name twice.
 /// A screen that started with a row's parted words drew them alone under the card's repeated
@@ -9340,8 +9662,11 @@ fn words_without_their_row(compiled: &crate::native_ui::CompiledUi) -> Vec<Strin
 #[test]
 fn a_rows_words_parted_from_its_name_are_led_by_it() {
     for (scale, sizes) in [
+        (0.85, vec![least_view(0.85)]),
         (1.0, vec![least_view(1.0), (220.0, 348.0)]),
+        (1.25, vec![least_view(1.25)]),
         (1.5, vec![least_view(1.5)]),
+        (1.75, vec![least_view(1.75)]),
         (2.0, vec![least_view(2.0), (584.0, 348.0)]),
     ] {
         at_each_text_scale(&[scale], "a row's words led by its name", |_| {

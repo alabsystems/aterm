@@ -28,7 +28,8 @@ path = "src/main.rs"
 cells = ["linux-arm"]
 
 [dependencies]
-# The SHA-256 of the agent's own executable, which its Hello reports. Its one
+# The SHA-256 of the agent's own executable, which its Hello reports, and the
+# constant-time compare of a boot's key (`ct_eq`). Its one
 # dependency (astream-digest) has none, so it builds for musl, where aterm-libc
 # has no cell and so nothing that reaches aterm-uds does (the design's fact 50).
 aterm-digest = { workspace = true }

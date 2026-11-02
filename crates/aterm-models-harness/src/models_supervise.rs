@@ -2773,6 +2773,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             const Credits = 1;
             const Tapped = 1;
             const CutAt = 4;
+            const Dialog = 1;
             var wall = 0;
             var bg = 0;
             var due = 2;
@@ -2790,6 +2791,9 @@ pub fn supervisor_usage_wall_model() -> Model {
             var credits = 0;
             var cut = 0;
             var tap = 0;
+            var dialog = 0;
+            var unused = 0;
+            var opened = 0;
 
             action BackgroundStarts when (bg == 0 && wall <= 5) {
                 bg = 1;
@@ -2837,13 +2841,15 @@ pub fn supervisor_usage_wall_model() -> Model {
                 unread = 0;
             }
 
-            action WallHides when (Hidden == 1 && wall == 1 && bg == 1) {
+            action WallHides when (Hidden == 1 && wall == 1 && bg == 1 && dialog == 0) {
                 wall = 5;
             }
             action WallShows when (wall == 5) {
                 wall = 1;
             }
-            action NoticeLeaves when (Leaves == 1 && wall == 1 && bg == 0 && cut == 0) {
+            action NoticeLeaves when (
+                Leaves == 1 && wall == 1 && bg == 0 && cut == 0 && dialog == 0
+            ) {
                 wall = 6;
             }
             action PersonTurnServed when (wall == 6 && due <= clock && other == 0) {
@@ -2866,7 +2872,7 @@ pub fn supervisor_usage_wall_model() -> Model {
                 other = 1;
             }
             action ArmedConversationResumed when (
-                Leaves == 1 && wall == 1 && bg == 0 && other == 0 && cut == 0
+                Leaves == 1 && wall == 1 && bg == 0 && other == 0 && cut == 0 && dialog == 0
             ) {
                 wall = 6;
                 other = 2;
@@ -2947,8 +2953,37 @@ pub fn supervisor_usage_wall_model() -> Model {
             action OwnActTyped when (OwnAct == 1 && wall == 0 && held == 0 && credits == 0) {
                 held = 1;
             }
+
+            // A PERSON'S OWN `/login` over the shown wall (`dialog = 1`), once (`opened`): its
+            // panel covers the composer, so nothing the harness types, and no continue of the
+            // vendor's, reaches the tab while it stands, and nothing under it moves (its wall
+            // neither hides nor leaves: measured, 55 h unchanged). It goes unused once nobody
+            // keys it (`unused = 1`, weakly fair: a browser sign-in nobody finishes is
+            // abandoned), and the harness closes it with its Esc once it is unused and the
+            // wall's act is due (`LoginClosed`); a person may close it any time.
+            action PersonOpensLogin when (
+                Dialog == 1 && opened == 0 && dialog == 0 && wall == 1 && cut == 0 && held == 0
+            ) {
+                dialog = 1;
+                unused = 0;
+                opened = 1;
+            }
+            action DialogUnused when (dialog == 1 && unused == 0) {
+                unused = 1;
+            }
+            action PersonClosesLogin when (dialog == 1) {
+                dialog = 0;
+                unused = 0;
+            }
+            action LoginClosed when (
+                dialog == 1 && unused == 1 && held == 0 && wall == 1 &&
+                ((view == 0 && ResetAt + Grace <= clock) || view == 1)
+            ) {
+                dialog = 0;
+                unused = 0;
+            }
             action Act when (
-                held == 0 &&
+                held == 0 && dialog == 0 &&
                 (wall == 1 || ((wall == 5 || wall == 6) && mem == 1)) &&
                 (
                     (cut == 0 && ((view == 0 && ResetAt + Grace <= clock) || view == 1)) ||
@@ -3114,6 +3149,12 @@ pub fn supervisor_usage_wall_model() -> Model {
                 held = OwnAct;
             }
 
+            // THE 2026-10-31 LOOP: a person's own `/login` over the wall is theirs whatever the
+            // wall owes, so the dialog stands past the reset and the wall never ends.
+            action LoginLeftOpen when (Buggy == 1 && dialog == 1) {
+                dialog = 2;
+            }
+
             action CreditsReadAsWall when (Buggy == 1 && credits == 1 && wall == 0) {
                 wall = 1;
                 sitting = 0;
@@ -3132,6 +3173,10 @@ pub fn supervisor_usage_wall_model() -> Model {
             invariant WallRemembered: mem == 1;
             invariant NoWaitOverAServedTurn: ran == 0;
             invariant NoDayWait: view <= 1;
+            // The 2026-10-31 loop's dialog left for good (`LoginLeftOpen`) is no state the harness
+            // reaches: it closes a person's own `/login` once unused and the act is due
+            // (`LoginClosed`), and the person may close it any time.
+            invariant NoLoginLeftForGood: dialog <= 1;
         }
     }
 }
@@ -3148,13 +3193,14 @@ pub fn supervisor_usage_wall_liveness() -> Liveness {
             eq(var("wall"), int(0)),
             le(var("clock"), sub(var("due"), int(1))),
         ),
-        weak: vec!["Tick", "Act", "Taken"],
+        weak: vec!["Tick", "Act", "Taken", "DialogUnused", "LoginClosed"],
         strong: vec![],
         mutants: vec![
             "WallMasked",
             "GivesUp",
             "MemoryLost",
             "OlderLeftPlacedTomorrow",
+            "LoginLeftOpen",
         ],
     }
 }

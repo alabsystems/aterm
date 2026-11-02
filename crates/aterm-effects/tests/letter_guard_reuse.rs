@@ -323,13 +323,8 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
 const GUARDED_FOLD_AT_THE_PARENT: u64 = 0x651f_3de5_5468_2007;
 
 /// FNV-1a over `words`, from `h`.
-fn fold_words(mut h: u64, words: impl IntoIterator<Item = u64>) -> u64 {
-    for w in words {
-        for b in w.to_le_bytes() {
-            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
-        }
-    }
-    h
+fn fold_words(h: u64, words: impl IntoIterator<Item = u64>) -> u64 {
+    words.into_iter().fold(h, aterm_hash::fnv1a_64_u64_le)
 }
 
 /// Every quad of a published stream as its words.
@@ -360,7 +355,7 @@ fn guarded_fold(guard: bool) -> u64 {
         "sparkle",
         "aurora",
     ];
-    let mut h = 0xCBF2_9CE4_8422_2325_u64;
+    let mut h = aterm_hash::FNV64_OFFSET;
     for style in styles {
         for look in [DARK, LIGHT, DIM] {
             let mut r = Replay::new(style, look, true);
@@ -381,18 +376,30 @@ fn guarded_fold(guard: bool) -> u64 {
 
 /// The guard's output on main is its parent's (§15.2 1.9 "One owner"): with no light-owned range
 /// noted, as on every frame of these grounds, the streams every frame publishes fold to the
-/// constant captured at the parent. The negative control, the guard off, folds otherwise, so the
-/// fold weighed the guard's cuts.
+/// constant captured at the parent on `GOLDEN_TRACE_TARGET` (whose system libm computes the glow's
+/// `exp` and `ln`; off it, another target's libm folds deterministically to its own digest). The
+/// negative control, the guard off, folds otherwise on every target, so the fold weighed the
+/// guard's cuts.
 #[test]
 fn the_guarded_streams_fold_as_at_the_parent() {
+    use aterm_effects::aos_momentum::{corpus::GOLDEN_TRACE_TARGET, target_name};
     let fold = guarded_fold(true);
-    assert_eq!(
-        fold, GUARDED_FOLD_AT_THE_PARENT,
-        "the guarded streams fold to {fold:#018x}"
-    );
     assert_ne!(
         guarded_fold(false),
         fold,
         "control: the streams with the guard off fold alike"
     );
+    if target_name() == GOLDEN_TRACE_TARGET {
+        assert_eq!(
+            fold, GUARDED_FOLD_AT_THE_PARENT,
+            "the guarded streams fold to {fold:#018x}"
+        );
+    } else {
+        assert_eq!(
+            guarded_fold(true),
+            fold,
+            "the guarded streams fold deterministically on {}",
+            target_name()
+        );
+    }
 }

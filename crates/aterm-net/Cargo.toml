@@ -42,6 +42,9 @@ aterm-spec-anchor = { workspace = true }
 # no-follow open. `libc` is already
 # present in every native aterm binary; this adds no package to that graph.
 libc = { workspace = true }
+# This Mac's network place: a heartbeat round notes each member that answered, the round and
+# the book's members into its evidence (`fleet_member::note_place`). It depends on no aterm-net.
+aterm-netplace = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # `WSAPoll` is Winsock's readiness primitive: aterm-win32's declaration,

@@ -561,6 +561,89 @@ fn a_same_grid_window_resize_keeps_the_first_echo_owned_without_relaxing_control
 
 #[cfg(unix)]
 #[test]
+fn a_valid_control_resize_keeps_the_first_echo_owned_through_its_published_fence() {
+    for busy_owner in [false, true] {
+        for window_px in [false, true] {
+            let (mut app, pipe, cfg) = if busy_owner {
+                preedit_agent()
+            } else {
+                rainbow_app()
+            };
+            let wid = WindowId(0);
+            let tape = Tape::new();
+            assert_eq!(app.boundary_keeps_hand(wid), busy_owner);
+            let term = app.front_terminal(wid).unwrap().term.clone();
+            let ctx = app
+                .pool
+                .get(app.front_terminal(wid).unwrap().session)
+                .unwrap()
+                .ctx
+                .clone();
+            app.reconcile_licence(wid);
+            let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+            let size = app.window_frame_px_for(wid, rows, cols);
+            assert_eq!(app.grid_dims_for(wid, size), (rows, cols));
+            let body = if window_px {
+                format!("px {} {}", size.width, size.height)
+            } else {
+                format!("{rows} {cols}")
+            };
+            tape.step();
+            let keep_hand = crate::control::control_fence(
+                aterm_types::control_verbs::input_of("resize"),
+                "resize",
+                &body,
+                false,
+            )
+            .expect("the authorized resize attempt publishes a fence");
+            ctx.licence.fence(keep_hand);
+            {
+                let _reader = busy_owner.then(|| ctx.timeline.lock().unwrap());
+                app.reconcile_licence(wid);
+            }
+            let event = crate::control::parse_window_resize(&body).unwrap();
+            assert_eq!(
+                app.input(wid, event, Source::Controller),
+                crate::input::InputOutcome::Ok,
+            );
+            assert_eq!(
+                (app.windows[&wid].rows, app.windows[&wid].cols),
+                (rows, cols)
+            );
+            term_lock(&term).process(b"\x1b[2;1Hstatus\x1b[1;1H");
+            preedit_frame(&mut app, &cfg, tape.step());
+            let glow = &app.windows[&wid].fx.cursor().glow;
+            assert!(!glow.caret_row_parked());
+            assert_eq!(
+                glow.spawns(),
+                0,
+                "geometry and unrelated output earn no light"
+            );
+            assert!(drain(pipe).is_empty(), "the resize types no input");
+            tape.step();
+            human_press(&mut app, Key::Character('x'), Modifiers::empty());
+            assert_eq!(drain(pipe), b"x");
+            term_lock(&term).process(b"x");
+            preedit_frame(&mut app, &cfg, tape.step());
+            let glow = &app.windows[&wid].fx.cursor().glow;
+            assert_eq!(glow.spawns(), 1);
+            let record = glow.admission_log().last().unwrap();
+            assert_eq!(record.phase, crate::cursor_glow::AdmissionPhase::Licensed);
+            assert_eq!(
+                record.licence,
+                crate::cursor_glow::AdmissionRecord::LICENCE_KEY
+            );
+            assert_eq!(record.parked_boundary, None);
+            drop(app);
+            unsafe {
+                libc::close(pipe);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn a_same_grid_resize_retires_hints_without_replacing_an_existing_parked_boundary() {
     let (mut app, pipe, cfg) = rainbow_app();
     let wid = WindowId(0);

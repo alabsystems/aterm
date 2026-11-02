@@ -218,12 +218,12 @@ fn read_park(turn_said: &str, tail: &str) -> Option<Park> {
     let view = needs::go_ahead_view(&text);
     let units: Vec<Unit> = sentences(&view.prose)
         .iter()
-        .map(|(s, code)| Unit::coded(s, false, code))
+        .map(|(s, code, prior_clause)| Unit::clause(s, false, code, *prior_clause))
         .collect();
     if kept(Part::Outward) && units.iter().any(planned) {
         return None;
     }
-    let mut park: Option<(Unit, Option<String>)> = None;
+    let mut park: Option<(Option<usize>, Unit, Option<String>)> = None;
     let mut others = false;
     let mut room = false;
     // The lines the go-ahead answers ([`Park::needs`]): each parking need as `needs_you` cleans
@@ -258,7 +258,7 @@ fn read_park(turn_said: &str, tail: &str) -> Option<Park> {
                     }
                 }
                 if park.is_none() {
-                    park = Some((unit, token));
+                    park = Some((None, unit, token));
                 }
             }
             None => {
@@ -278,26 +278,33 @@ fn read_park(turn_said: &str, tail: &str) -> Option<Park> {
                 .flatten()
                 .any(names_room);
             match &mut park {
-                None => park = Some((unit.clone(), token)),
-                Some((_, held)) if held.is_none() => *held = token,
+                None => park = Some((Some(i), unit.clone(), token)),
+                Some((_, _, held)) if held.is_none() => *held = token,
                 Some(_) => {}
             }
         } else {
             withhold(unit);
         }
     }
-    let (unit, token) = park?;
+    let (at, unit, token) = park?;
     // A word another need or sentence asks for an act the go-ahead does not cover is never said:
     // the answer quotes the park instead.
     let token = token
         .map(|t| needs::sanitized(&t))
         .filter(|t| !t.is_empty() && !withheld.contains(&token_mark(t)));
     let names_where = |u: &Unit| u.any(&["branch", "branches", "worktree", "worktrees", "main"]);
-    let lands = names_where(&unit)
-        || unit
-            .words
+    let names_landing = |u: &Unit| {
+        u.words
             .iter()
             .any(|(_, w)| w.split('-').any(|part| inflects_any(part, LANDING)))
+    };
+    let prior = at
+        .filter(|_| unit.prior_clause)
+        .and_then(|i| i.checked_sub(1))
+        .map(|b| &units[b]);
+    let lands = names_where(&unit)
+        || names_landing(&unit)
+        || prior.is_some_and(names_landing)
         || units.iter().any(names_where);
     Some(Park {
         quote: fit_units(&needs::sanitized(&unit.said), QUOTE_UNITS).into_owned(),
@@ -368,9 +375,10 @@ fn planned(unit: &Unit) -> bool {
 }
 
 /// Whether `token`, a run of text between spaces, names code rather than words: an identifier
-/// (`tap_of`, `Self::plan`, `plan()`) or a path of two slashes or one naming a file
-/// (`crates/aterm-cli/src`, `ship/release.rs`). A URL (`https://…`) and a pair of words
-/// (`tag/release`, `upstream/main`) are words.
+/// (`tap_of`, `Self::plan`, `plan()`), a path of two slashes or one naming a file
+/// (`crates/aterm-cli/src`, `ship/release.rs`), or a bare file name with a source or config
+/// extension (`release.rs`, `deploy.toml`). A URL (`https://…`), a domain (`crates.io`) and a pair
+/// of words (`tag/release`, `upstream/main`) are words.
 fn names_code(token: &str) -> bool {
     let t = token.trim_matches(|c: char| {
         !(c.is_alphanumeric() || matches!(c, '_' | '/' | ':' | '(' | ')' | '.'))
@@ -379,7 +387,37 @@ fn names_code(token: &str) -> bool {
         && (t.matches('/').count() >= 2 || t.split('/').any(|part| part.contains('.')));
     t.chars().any(char::is_alphanumeric)
         && !t.contains("://")
-        && (t.contains('_') || t.contains("::") || t.contains("()") || path)
+        && (t.contains('_')
+            || t.contains("::")
+            || t.contains("()")
+            || path
+            || bare_code_file(token))
+}
+
+fn bare_code_file(token: &str) -> bool {
+    const CODE_EXTS: &[&str] = &[
+        "rs", "toml", "lock", "json", "jsonl", "yaml", "yml", "md", "txt", "sh", "bash", "zsh",
+        "fish", "ps1", "py", "rb", "go", "js", "mjs", "cjs", "ts", "mts", "cts", "tsx", "jsx", "c",
+        "h", "cc", "cpp", "cxx", "hpp", "swift", "m", "mm", "java", "kt", "kts", "zig", "lua",
+        "sql", "html", "css", "scss", "xml", "plist", "proto", "wgsl", "metal", "glsl", "hlsl",
+        "nix", "cmake", "mk", "cfg", "ini", "conf",
+    ];
+    const HOSTS: &[&str] = &["docs.rs", "lib.rs", "platform.sh", "surge.sh"];
+    let f = token.trim_matches(|c: char| !c.is_alphanumeric());
+    let f = f.strip_suffix("'s").unwrap_or(f);
+    if HOSTS.iter().any(|h| f.eq_ignore_ascii_case(h)) {
+        return false;
+    }
+    let Some((stem, ext)) = f.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !stem.contains(['/', ':'])
+        && stem.chars().any(char::is_alphabetic)
+        && stem
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        && CODE_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e))
 }
 
 /// Whether `word` is an outward verb in the present tense of a third person (`releases`, `sends`,
@@ -506,6 +544,7 @@ struct Unit {
     words: Vec<(usize, String)>,
     need: bool,
     code: String,
+    prior_clause: bool,
 }
 
 impl Unit {
@@ -514,6 +553,10 @@ impl Unit {
     }
 
     fn coded(said: &str, need: bool, code: &str) -> Self {
+        Self::clause(said, need, code, false)
+    }
+
+    fn clause(said: &str, need: bool, code: &str, prior_clause: bool) -> Self {
         let said: String = said.chars().map(folded).collect();
         let lower: String = said.chars().map(lowered).collect();
         let words = words_of(&lower);
@@ -523,6 +566,7 @@ impl Unit {
             words,
             need,
             code: code.to_string(),
+            prior_clause,
         }
     }
 
@@ -560,7 +604,7 @@ impl Unit {
             .split(' ')
             .map(|token| if names_code(token) { "" } else { token })
             .collect();
-        Self::coded(&words.join(" "), self.need, &self.code)
+        Self::clause(&words.join(" "), self.need, &self.code, self.prior_clause)
     }
 
     /// Whether the unit is negated (`not`, `never`, `won't`, `no longer`, `refuse`).
@@ -679,11 +723,12 @@ fn inflects_any(word: &str, bases: &[&str]) -> bool {
 
 const QUOTE_ROW_MARKS: [char; 4] = ['>', '▎', '│', '┃'];
 
-/// The sentences `prose` reads as, each with the code its words carried: quoted rows dropped,
-/// wrapped rows of a paragraph joined, inline code and attributed quotes dropped, split at `. !
-/// ? ;` and a space. The inline code goes beside its sentence and a fenced block beside the last
-/// sentence of the paragraph before it, where only the exclusions read them.
-fn sentences(prose: &str) -> Vec<(String, String)> {
+/// The sentences `prose` reads as, each with the code its words carried and whether a semicolon
+/// in the same paragraph joins it to the clause before it: quoted rows dropped, wrapped rows of a
+/// paragraph joined, inline code and attributed quotes dropped, split at `. ! ? ;` and a space.
+/// The inline code goes beside its sentence and a fenced block beside the last sentence of the
+/// paragraph before it, where only the exclusions read them.
+fn sentences(prose: &str) -> Vec<(String, String, bool)> {
     let mut paragraphs: Vec<(String, String)> = Vec::new();
     let mut open = String::new();
     let mut fence = None;
@@ -719,7 +764,7 @@ fn sentences(prose: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (paragraph, fenced) in &paragraphs {
         let (words, spans) = uncoded(paragraph);
-        let mut said: Vec<(String, String)> = split_sentences(&words)
+        let mut said: Vec<(String, String, bool)> = split_sentences(&words)
             .into_iter()
             .map(|(range, sentence)| {
                 let code: Vec<&str> = spans
@@ -727,10 +772,13 @@ fn sentences(prose: &str) -> Vec<(String, String)> {
                     .filter(|(at, _)| range.contains(at))
                     .map(|(_, c)| c.as_str())
                     .collect();
-                (sentence, code.join(" "))
+                (sentence, code.join(" "), false)
             })
             .collect();
-        if let Some((_, code)) = said.last_mut()
+        for k in 1..said.len() {
+            said[k].2 = said[k - 1].0.ends_with(';');
+        }
+        if let Some((_, code, _)) = said.last_mut()
             && !fenced.is_empty()
         {
             code.push(' ');
@@ -1398,8 +1446,8 @@ const RESTARTED: &[&str] = &[
 
 /// Whether `unit` names own reversible work from the allow list: a [`WORK`] verb, a merge of
 /// main or a branch, a push (a tag, a release or upstream is an exclusion's), a rebase onto
-/// main, its own cleanup, or a restart of a stopped build (`stop_note`, or a [`RESTARTED`] word
-/// in it or `before`).
+/// main, its own cleanup, a restart of a stopped build (`stop_note`, or a [`RESTARTED`] word
+/// in it or `before`), or pending own work in a semicolon-joined prior clause ([`prior_clause_works`]).
 fn works(unit: &Unit, before: Option<&Unit>, stop_note: bool) -> bool {
     let names = |u: &Unit, bases: &[&str]| u.words.iter().any(|(_, w)| inflects_any(w, bases));
     let worked = (0..unit.len()).any(|i| {
@@ -1418,8 +1466,89 @@ fn works(unit: &Unit, before: Option<&Unit>, stop_note: bool) -> bool {
     }) {
         return true;
     }
-    restarts(unit)
-        && (stop_note || names(unit, RESTARTED) || before.is_some_and(|b| names(b, RESTARTED)))
+    (restarts(unit)
+        && (stop_note || names(unit, RESTARTED) || before.is_some_and(|b| names(b, RESTARTED))))
+        || before.is_some_and(|b| prior_clause_works(unit, b))
+}
+
+/// Whether `b`, joined to `unit` by a semicolon in the same paragraph (`Ready to commit and
+/// push; waiting on your sign-off.`), names pending own reversible work that `unit` waits on.
+/// Past completed work (`I built and tested the fix; waiting on your sign-off.`) and bare
+/// stage/phase asks (`waiting for your go-ahead on the next stage`) stay plain.
+fn prior_clause_works(unit: &Unit, b: &Unit) -> bool {
+    const PENDING_WORDS: &[&str] = &["ready", "pending", "remaining", "queued"];
+    const UNDONE_WORK: &[&str] = &["uncommitted", "unpushed", "unmerged", "untested", "unbuilt"];
+    const PENDING_PHRASES: &[&[&str]] = &[
+        &["left", "to"],
+        &["what's", "left"],
+        &["was", "stopped"],
+        &["were", "stopped"],
+        &["is", "stopped"],
+        &["is", "paused"],
+        &["on", "hold"],
+    ];
+    const MODAL_WORDS: &[&str] = &["will", "i'll", "we'll", "can"];
+    const INFINITIVE_LEADS: &[&str] = &["need", "needs", "going", "about", "set", "prepared"];
+    const STAGED: &[&str] = &["stage", "stages", "phase", "phases"];
+    if !unit.prior_clause
+        || asks(b).is_some()
+        || (kept(Part::Echoes) && echoes(b))
+        || unit.any(STAGED)
+        || (0..unit.len())
+            .any(|i| inflects_any(unit.word(i), GENERIC_WORK) && !generic_own(unit, i))
+        || !works(b, None, false)
+    {
+        return false;
+    }
+    let pending_state = (0..b.len()).any(|i| PENDING_WORDS.contains(&b.word(i)) && !b.undone(i))
+        || b.any(UNDONE_WORK)
+        || PENDING_PHRASES
+            .iter()
+            .any(|p| (0..b.len()).any(|i| b.at(i, p) && !b.undone(i)));
+    if pending_state {
+        return true;
+    }
+    let cleanup = own_cleanup(b);
+    let restarts_known = b.words.iter().any(|(_, rw)| inflects_any(rw, RESTARTED));
+    let work_verb_at = |i: usize| {
+        let w = b.word(i);
+        (inflects_any(w, WORK) && (!inflects_any(w, GENERIC_WORK) || generic_own(b, i)))
+            || cleanup.contains(&i)
+            || (inflects(w, "merge") && b.any(&["main", "branch"]))
+            || (inflects(w, "rebase") && b.any(&["main"]))
+            || inflects(w, "push")
+            || (inflects(w, "restart") && restarts_known)
+    };
+    let same_clause = |from: usize, to: usize| {
+        let (Some((a, aw)), Some((z, _))) = (b.words.get(from), b.words.get(to)) else {
+            return false;
+        };
+        !b.lower[a + aw.len()..*z].contains([',', ';', ':', '('])
+    };
+    (0..b.len()).any(|i| {
+        if !(work_verb_at(i) || WORK_IRREGULAR.contains(&b.word(i))) {
+            return false;
+        }
+        let negated_verb = (1..=3).any(|back| {
+            i.checked_sub(back).is_some_and(|k| {
+                let w = b.word(k);
+                (matches!(w, "not" | "never") || w.ends_with("n't")) && same_clause(k, i)
+            })
+        });
+        if negated_verb {
+            return true;
+        }
+        if !work_verb_at(i) || WORK_IRREGULAR.contains(&b.word(i)) || b.word(i).ends_with("ed") {
+            return false;
+        }
+        (1..=4).any(|back| {
+            i.checked_sub(back).is_some_and(|k| {
+                same_clause(k, i)
+                    && (MODAL_WORDS.contains(&b.word(k))
+                        || (INFINITIVE_LEADS.contains(&b.word(k)) && b.word(k + 1) == "to"))
+            })
+        })
+    })
 }
 
 /// The branches the agent's own cleanup deletes (`delete my merged branch`).
@@ -2388,7 +2517,11 @@ fn someone_else(unit: &Unit) -> bool {
         "worker",
         "workers",
     ];
-    if possessed(unit) || unclaimed_request(unit) || consent_owned_elsewhere(unit) {
+    if possessed(unit)
+        || unclaimed_request(unit)
+        || bot_branch(unit)
+        || consent_owned_elsewhere(unit)
+    {
         return true;
     }
     const PHRASES: &[&[&str]] = &[
@@ -2473,6 +2606,48 @@ fn unclaimed_request(unit: &Unit) -> bool {
             || unit.at(i, &["pull", "requests"]);
         request && !(1..=2).any(|back| matches!(unit.before(i, back), "my" | "our"))
     })
+}
+
+/// Whether `unit` (in its words or in the inline/fenced code it carries) names a bot-prefixed
+/// branch (`renovate/lodash-4.x`, `dependabot/cargo/serde-1.0`, `snyk-fix-…`), optionally behind
+/// `origin/`.
+fn bot_branch(unit: &Unit) -> bool {
+    const BOT_BRANCHES: &[&str] = &[
+        "renovate/",
+        "dependabot/",
+        "depfu/",
+        "snyk/",
+        "snyk-fix-",
+        "snyk-upgrade-",
+        "greenkeeper/",
+        "github-actions/",
+        "allcontributors/",
+        "imgbot/",
+        "mergify/",
+        "scala-steward/",
+        "changeset-release/",
+        "release-please--",
+    ];
+    let has_bot_ref = |text: &str| {
+        text.split(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | ';' | ':' | '(' | ')' | '[' | ']' | '"' | '\'')
+        })
+        .any(|tok| {
+            let r = tok.trim_matches(|c: char| matches!(c, '.' | '+' | '-' | '`'));
+            let r = r
+                .strip_prefix("refs/heads/")
+                .or_else(|| r.strip_prefix("refs/remotes/"))
+                .unwrap_or(r);
+            let r = r.strip_prefix("remotes/").unwrap_or(r);
+            let r = r.strip_prefix("origin/").unwrap_or(r);
+            BOT_BRANCHES.iter().any(|p| {
+                r.strip_prefix(p)
+                    .is_some_and(|rest| rest.chars().any(char::is_alphanumeric))
+            })
+        })
+    };
+    let code_lower: String = unit.code.chars().map(lowered).collect();
+    has_bot_ref(&unit.lower) || has_bot_ref(&code_lower)
 }
 
 fn session_id(word: &str) -> bool {

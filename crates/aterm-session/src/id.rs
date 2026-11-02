@@ -5,7 +5,7 @@
 //! per-launch [`LaunchNonce`] an edge binds to so it fails closed if the target
 //! restarts under the same name/pid.
 
-use crate::{ct_eq, fill_random, from_hex, hex};
+use crate::{fill_random, from_hex, hex};
 
 /// A stable session identity, `s-<20 hex>` (80 bits of entropy), minted once at
 /// launch and recorded in `<id>/meta`. Not derived from a pid: pids are reused,
@@ -123,7 +123,7 @@ impl LaunchNonce {
     /// Constant-time equality (used by the gate so nonce comparison is uniform).
     #[must_use]
     pub fn ct_eq(&self, other: &Self) -> bool {
-        ct_eq(&self.0, &other.0)
+        aterm_digest::ct_eq(&self.0, &other.0)
     }
 }
 

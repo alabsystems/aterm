@@ -23,6 +23,16 @@
 //! ranked so one Mac mints at once and the next a gap step (60 s) later; the lab runs the
 //! tender's pass itself at a clock [`TEND_AHEAD`] gap steps on, so the rank spread does not hold
 //! the lane, round the Macs until none finds a rotation due ([`TEND_ROUNDS`] rounds at most).
+//!
+//! Then F21's split (§4.1 F21): the lab holds a split of its own, carrying records only within
+//! island A (a1, a2, a3) and within island B (b1, b2, b3). On A, a1 removes b3 and a3; on B, b3,
+//! not yet told, removes a3, which mints its epoch, and b1 puts a value under it. Both sides'
+//! acts are kept on their Macs ([`client::test_remove_unposted`], [`client::test_put_everyone`]),
+//! since the Macs' subscribers would carry a post across. Then the lab heals (every Mac takes
+//! every other's records) and runs the tender's pass as before: every member reads b1's value, a
+//! write sealed under an epoch b3 minted past its cutoff; b3's epoch is keyed and covered by a
+//! reseal; and no Mac wraps a newest epoch to b3. b3 plays F21's removed Mac because b2 is out
+//! by F16's quorum by then.
 
 use std::time::Instant;
 
@@ -47,6 +57,16 @@ const TEND_AHEAD: u64 = 10;
 const TEND_ROUNDS: usize = 4;
 /// The tender's gap step (`aterm_secrets::client::log_entries::GAP_STEP_MS`, 60 s).
 const GAP_STEP_MS: u64 = 60_000;
+/// F21's removed Mac: removed by a1 on island A while it mints an epoch on island B.
+pub const CUT: &str = "b3";
+/// The Mac on b3's island that writes under b3's epoch.
+const WRITER: &str = "b1";
+/// The Mac b3 removes on island B, which mints its epoch; a1 removes it too.
+const ALSO: &str = "a3";
+/// F21's value's `[everyone]` entry name.
+pub const KEPT_NAME: &str = "f21-written-while-out";
+/// F21's value: synthetic.
+const KEPT_VALUE: &[u8] = b"f21 lab value b1 put under b3's epoch while a1 removed b3";
 
 /// One act a person typed: `aterm members remove|undo` on a Mac.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,8 +127,53 @@ pub struct Evidence {
     pub remover_row: Option<String>,
     /// Each Mac at the end.
     pub ends: Vec<MacEnd>,
+    /// F21's split, where the plane got that far.
+    pub kept: Option<Kept>,
     /// Milliseconds the plane took.
     pub ms: u64,
+}
+
+/// One Mac at the end of F21's split, read from its own records.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeptEnd {
+    /// The Mac.
+    pub mac: String,
+    /// Its records hold a membership log.
+    pub has_log: bool,
+    /// Its log has it as a member.
+    pub member: bool,
+    /// Its log has b3 as a member.
+    pub cut_member: bool,
+    /// It reads b1's value, as it was put.
+    pub reads_value: bool,
+    /// Its log finds b3's epoch keyed: cut, with an honest write relying on it.
+    pub keyed: bool,
+    /// Its log finds b3's epoch covered by a full reseal.
+    pub covered: bool,
+    /// It finds a rotation or a reseal due.
+    pub rotation_due: bool,
+}
+
+/// F21's split's evidence.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Kept {
+    /// Why it did not run, where it did not.
+    pub skipped: Option<String>,
+    /// The removals in the split, in order.
+    pub removals: Vec<Act>,
+    /// b1's put: `Err` with why it failed.
+    pub put: Option<Result<(), String>>,
+    /// b1 held a1's removal of b3 before it wrote: the split leaked, and the run measured no
+    /// write on the removed Mac's side.
+    pub leaked: bool,
+    /// b1's value went under an epoch b3 minted.
+    pub under_cut_epoch: bool,
+    /// What the tender's passes minted: `<mac> minted <n> records in round <k>`.
+    pub minted: Vec<String>,
+    /// The Macs whose records wrap a newest `[everyone]` epoch to b3.
+    pub wrapped_to_cut: Vec<String>,
+    /// Each Mac at the end.
+    pub ends: Vec<KeptEnd>,
 }
 
 /// The plane's check that b2's removals were undone.
@@ -116,6 +181,8 @@ pub const UNDONE: &str = "removals: the Macs one member removed undo its removal
 /// The plane's check named in the design: `removed_macs_that_reach_a_quorum_are_back_in_and_read_new_values`.
 pub const BACK_IN: &str =
     "removals: removed Macs that reach a quorum are back in and read new values";
+/// F21's check (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F21, build step 11).
+pub const KEPT: &str = "removals: a write on the removed Mac's side survives the heal";
 
 /// One named check of the plane.
 pub type Check = super::Check;
@@ -236,7 +303,103 @@ pub fn judge(ev: &Evidence) -> Vec<Check> {
             wrong.join("; ")
         },
     });
+    out.push(judge_kept(ev.kept.as_ref()));
     out
+}
+
+/// [`KEPT`]: b1's write under the epoch b3 minted while a1 removed it is read after the heal by
+/// every member, b3's epoch is keyed and covered once the tender's pass is done, nothing is due,
+/// b3 is out everywhere, and no Mac wraps a newest `[everyone]` epoch to b3.
+///
+/// Its negative controls are the judge tests' (`swarm_partition_removals_tests.rs`). A lane run
+/// with `reseal_ready` answering `false` would leave b3's epoch uncovered and a reseal due; it is
+/// not run, since every Mac's aterm and the lab would need that mutant.
+fn judge_kept(kept: Option<&Kept>) -> Check {
+    let fail = |detail: String| Check {
+        name: KEPT,
+        pass: false,
+        detail,
+    };
+    let Some(k) = kept else {
+        return fail("the split did not run".to_owned());
+    };
+    if let Some(why) = &k.skipped {
+        return fail(format!("the split did not run: {why}"));
+    }
+    let mut wrong: Vec<String> = k
+        .removals
+        .iter()
+        .filter(|a| !a.ok)
+        .map(|a| format!("{} could not remove {}: {}", a.on, a.names, a.said))
+        .collect();
+    match &k.put {
+        None => wrong.push(format!("{WRITER} put no value")),
+        Some(Err(why)) => wrong.push(format!("{WRITER} could not put the value: {why}")),
+        Some(Ok(())) => {}
+    }
+    if k.leaked {
+        wrong.push(format!(
+            "the split leaked: {WRITER} held a1's removal of {CUT} before it wrote"
+        ));
+    }
+    if k.put == Some(Ok(())) && !k.under_cut_epoch {
+        wrong.push(format!("{WRITER} wrote under an epoch {CUT} did not mint"));
+    }
+    for name in ["a1", "a2", WRITER] {
+        if !k.ends.iter().any(|e| e.mac == name && e.member) {
+            wrong.push(format!("{name} is no member at the end"));
+        }
+    }
+    for e in k.ends.iter().filter(|e| e.has_log) {
+        if e.member && !e.reads_value {
+            wrong.push(format!("{} does not read {KEPT_NAME}", e.mac));
+        }
+        if e.cut_member {
+            wrong.push(format!("{}'s records keep {CUT} in", e.mac));
+        }
+        if !e.keyed {
+            wrong.push(format!(
+                "{}'s records do not find {CUT}'s epoch keyed",
+                e.mac
+            ));
+        } else if !e.covered {
+            wrong.push(format!("{}'s records leave {CUT}'s epoch uncovered", e.mac));
+        }
+        if e.rotation_due {
+            wrong.push(format!("{} still finds a rotation due", e.mac));
+        }
+    }
+    if !k.wrapped_to_cut.is_empty() {
+        wrong.push(format!(
+            "{} wrap a newest epoch to {CUT}",
+            k.wrapped_to_cut.join(", ")
+        ));
+    }
+    let readers: Vec<&str> = k
+        .ends
+        .iter()
+        .filter(|e| e.reads_value)
+        .map(|e| e.mac.as_str())
+        .collect();
+    Check {
+        name: KEPT,
+        pass: wrong.is_empty(),
+        detail: if wrong.is_empty() {
+            format!(
+                "{WRITER} put {KEPT_NAME} under {CUT}'s epoch while a1 removed {CUT}; {} read it \
+                 after the heal; {CUT}'s epoch is keyed and covered and no newest epoch is \
+                 wrapped to it; {}",
+                readers.join(", "),
+                if k.minted.is_empty() {
+                    "the tender minted nothing".to_owned()
+                } else {
+                    k.minted.join(", ")
+                }
+            )
+        } else {
+            wrong.join("; ")
+        },
+    }
 }
 
 /// The plane's report section.
@@ -310,10 +473,89 @@ pub fn report(ev: &Evidence) -> String {
             if e.rotation_due { ", rotation due" } else { "" }
         );
     }
+    if let Some(k) = &ev.kept {
+        report_kept(&mut out, k);
+    }
     for f in &ev.carry_failures {
         let _ = writeln!(out, "- carrying records {f}");
     }
     out
+}
+
+/// F21's split's lines in the plane's report section.
+fn report_kept(out: &mut String, k: &Kept) {
+    use std::fmt::Write as _;
+    if let Some(why) = &k.skipped {
+        let _ = writeln!(out, "- F21's split: not run: {why}");
+        return;
+    }
+    for a in &k.removals {
+        let _ = writeln!(
+            out,
+            "- in the split, {} removes {}: {}",
+            a.on,
+            a.names,
+            if a.ok {
+                a.said.clone()
+            } else {
+                format!("refused: {}", a.said)
+            }
+        );
+    }
+    match &k.put {
+        Some(Ok(())) => {
+            let _ = writeln!(
+                out,
+                "- in the split, {WRITER} puts {KEPT_NAME} under {}",
+                if k.under_cut_epoch {
+                    format!("{CUT}'s epoch")
+                } else {
+                    format!("an epoch {CUT} did not mint")
+                }
+            );
+        }
+        Some(Err(why)) => {
+            let _ = writeln!(
+                out,
+                "- in the split, {WRITER} could not put {KEPT_NAME}: {why}"
+            );
+        }
+        None => {}
+    }
+    if k.leaked {
+        let _ = writeln!(
+            out,
+            "- the split leaked: {WRITER} held a1's removal of {CUT} before it wrote"
+        );
+    }
+    for m in &k.minted {
+        let _ = writeln!(out, "- after the split's heal, the tender: {m}");
+    }
+    for e in &k.ends {
+        let _ = writeln!(
+            out,
+            "- after the split, {}: {}{}{}{}",
+            e.mac,
+            if !e.has_log {
+                "no membership log".to_owned()
+            } else if e.member {
+                "member".to_owned()
+            } else {
+                "out".to_owned()
+            },
+            if e.reads_value {
+                format!(", reads {KEPT_NAME}")
+            } else {
+                String::new()
+            },
+            match (e.keyed, e.covered) {
+                (true, true) => format!(", {CUT}'s epoch keyed and covered"),
+                (true, false) => format!(", {CUT}'s epoch keyed, uncovered"),
+                (false, _) => format!(", {CUT}'s epoch not keyed"),
+            },
+            if e.rotation_due { ", rotation due" } else { "" }
+        );
+    }
 }
 
 fn log_of(paths: &Paths) -> Option<Log> {
@@ -329,6 +571,11 @@ fn recipient_of(paths: &Paths) -> Option<Recipient> {
 
 /// Carry every Mac's records to every other, noting each failure.
 fn carry(macs: &[Mac], ev: &mut Evidence) {
+    carry_among(&macs.iter().collect::<Vec<_>>(), ev);
+}
+
+/// Carry each of `macs`' records to each other of them, noting each failure.
+fn carry_among(macs: &[&Mac], ev: &mut Evidence) {
     let wires: Vec<(String, Vec<u8>)> = macs
         .iter()
         .filter_map(|m| {
@@ -516,6 +763,167 @@ fn drive(macs: &[Mac], act: &dyn Fn(&str, &[&str]) -> super::world::Out, ev: &mu
             .and_then(|row| row.removed.as_ref())
             .map(client::RemovedNote::title);
     }
+    let kept = keyed_write(macs, ev);
+    ev.kept = Some(kept);
+}
+
+/// F21's split on `macs` (see the module doc).
+fn keyed_write(macs: &[Mac], ev: &mut Evidence) -> Kept {
+    let mut k = Kept::default();
+    let mac = |name: &str| macs.iter().find(|m| m.name == name);
+    let (Some(a1), Some(cut), Some(writer)) = (mac("a1"), mac(CUT), mac(WRITER)) else {
+        k.skipped = Some(format!("no a1, {CUT} or {WRITER}"));
+        return k;
+    };
+    carry(macs, ev);
+    let listed = match client::member_list(&a1.paths) {
+        Ok(Some(listed)) => listed,
+        Ok(None) => {
+            k.skipped = Some("a1 lists no members".to_owned());
+            return k;
+        }
+        Err(e) => {
+            k.skipped = Some(format!("a1 lists no members: {e}"));
+            return k;
+        }
+    };
+    let code = |name: &str| {
+        listed
+            .iter()
+            .find(|row| row.name == name && row.removed.is_none())
+            .map(|row| row.code.clone())
+    };
+    let (Some(cut_code), Some(also_code)) = (code(CUT), code(ALSO)) else {
+        k.skipped = Some(format!("{CUT} or {ALSO} is no member on a1's list"));
+        return k;
+    };
+    let (Some(log), Some(cut_recipient)) = (log_of(&cut.paths), recipient_of(&cut.paths)) else {
+        k.skipped = Some(format!("{CUT} holds no log or no identity"));
+        return k;
+    };
+    let Some(cut_actor): Option<MemberId> = log
+        .membership()
+        .members()
+        .iter()
+        .find(|(_, m)| m.binding.recipient() == cut_recipient)
+        .map(|(actor, _)| *actor)
+    else {
+        k.skipped = Some(format!("{CUT} is no member of its own log"));
+        return k;
+    };
+    let island_a: Vec<&Mac> = macs.iter().filter(|m| m.name.starts_with('a')).collect();
+    let island_b: Vec<&Mac> = macs.iter().filter(|m| m.name.starts_with('b')).collect();
+    let mut remove = |on: &Mac, name: &str, code: &str| {
+        let (ok, said) = match remove_unposted(&on.paths, code) {
+            Ok(n) => (true, format!("signed {n} records, kept on {}", on.name)),
+            Err(e) => (false, e.to_string()),
+        };
+        k.removals.push(Act {
+            on: on.name.clone(),
+            names: name.to_owned(),
+            ok,
+            said,
+        });
+    };
+
+    // Island A: a1 removes b3 and a3.
+    remove(a1, CUT, &cut_code);
+    remove(a1, ALSO, &also_code);
+    carry_among(&island_a, ev);
+    // Island B: b3, not yet told, removes a3 (its epoch), and b1 writes under that epoch.
+    remove(cut, ALSO, &also_code);
+    carry_among(&island_b, ev);
+    k.leaked =
+        log_of(&writer.paths).is_some_and(|log| log.membership().removal(&cut_actor).is_some());
+    let put = put_kept(&writer.paths);
+    k.put = Some(match &put {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    });
+    k.under_cut_epoch = put.as_ref().is_ok_and(|epoch| {
+        log_of(&writer.paths)
+            .and_then(|log| log.get(epoch).map(|r| *r.actor()))
+            .is_some_and(|actor| actor == cut_actor)
+    });
+    let epoch = put.ok();
+    carry_among(&island_b, ev);
+
+    // The heal, then the tender's pass, each round further on, until no Mac finds one due.
+    carry(macs, ev);
+    let base = aterm_time::unix_millis()
+        .unwrap_or(0)
+        .saturating_add(TEND_AHEAD * GAP_STEP_MS);
+    for round in 1..=TEND_ROUNDS {
+        if !macs.iter().any(|m| rotation_due(&m.paths)) {
+            break;
+        }
+        let steps = u64::try_from(round).unwrap_or(u64::MAX) * TEND_AHEAD;
+        let at = base.saturating_add(steps.saturating_mul(GAP_STEP_MS));
+        for m in macs {
+            if let Ok(signed) = client::tend_epochs_at(&m.paths, at)
+                && !signed.is_empty()
+            {
+                k.minted.push(format!(
+                    "{} minted {} records in round {round}",
+                    m.name,
+                    signed.len()
+                ));
+                carry(macs, ev);
+            }
+        }
+    }
+
+    for m in macs {
+        let mut end = KeptEnd {
+            mac: m.name.clone(),
+            ..KeptEnd::default()
+        };
+        if let (Some(log), Some(identity)) = (
+            log_of(&m.paths),
+            client::read_machine_identity(&m.paths).ok().flatten(),
+        ) {
+            end.has_log = true;
+            let membership = log.membership();
+            let me = identity.recipient();
+            let active: std::collections::BTreeSet<Recipient> = membership
+                .members()
+                .values()
+                .map(|member| member.binding.recipient())
+                .collect();
+            end.member = active.contains(&me);
+            end.cut_member = membership.contains(&cut_actor);
+            end.rotation_due = end.member && log.rotation_due(&me, &active);
+            let keyed = log
+                .keyed_epochs()
+                .into_iter()
+                .find(|keyed| Some(keyed.epoch) == epoch);
+            end.keyed = keyed.is_some();
+            end.covered = keyed.is_some_and(|keyed| keyed.covered);
+            if let Ok(Some(opened)) = log.open_audience_entries(&identity) {
+                end.reads_value = opened
+                    .by_audience
+                    .get(&Audience::Everyone)
+                    .and_then(|entries| entries.get(KEPT_NAME))
+                    .is_some_and(|entry| entry.value.as_slice() == KEPT_VALUE);
+                let wraps_cut = opened
+                    .maximal_epochs
+                    .get(&aterm_secrets::membership_log::EpochAudience::Everyone)
+                    .into_iter()
+                    .flatten()
+                    .any(|newest| {
+                        opened
+                            .wrapped_recipients
+                            .get(newest)
+                            .is_some_and(|set| set.contains(&cut_recipient))
+                    });
+                if wraps_cut {
+                    k.wrapped_to_cut.push(m.name.clone());
+                }
+            }
+        }
+        k.ends.push(end);
+    }
+    k
 }
 
 /// The putter's `[everyone]` value: `client::test_put_everyone`, a test seam that only a build with
@@ -530,6 +938,33 @@ fn put_everyone(paths: &Paths) -> aterm_secrets::Result<RecordId> {
 fn put_everyone(_paths: &Paths) -> aterm_secrets::Result<RecordId> {
     Err(aterm_secrets::Error::new(
         "a release lab has no test seam to put the [everyone] value; run the removals plane from a debug lab",
+    ))
+}
+
+/// b1's value under the one newest `[everyone]` epoch it holds: [`put_everyone`]'s seam.
+#[cfg(any(test, debug_assertions))]
+fn put_kept(paths: &Paths) -> aterm_secrets::Result<RecordId> {
+    client::test_put_everyone(paths, KEPT_NAME, KEPT_VALUE)
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn put_kept(_paths: &Paths) -> aterm_secrets::Result<RecordId> {
+    Err(aterm_secrets::Error::new(
+        "a release lab has no test seam to put the [everyone] value; run the removals plane from a debug lab",
+    ))
+}
+
+/// A removal kept on the Mac at `paths` ([`client::test_remove_unposted`]), a test seam as
+/// [`put_everyone`]'s is.
+#[cfg(any(test, debug_assertions))]
+fn remove_unposted(paths: &Paths, who: &str) -> aterm_secrets::Result<usize> {
+    client::test_remove_unposted(paths, who)
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn remove_unposted(_paths: &Paths, _who: &str) -> aterm_secrets::Result<usize> {
+    Err(aterm_secrets::Error::new(
+        "a release lab has no test seam to remove a Mac on one side of a split; run the removals plane from a debug lab",
     ))
 }
 

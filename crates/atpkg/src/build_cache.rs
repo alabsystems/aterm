@@ -590,6 +590,9 @@ pub fn release_reads_build_dir(release: &str) -> bool {
 /// WHY A BUILD DIRECTORY GOES ([`reclaim`], [`reclaim_watched`]): what its intent row, its removal row and the watch's account of it say — each rule [`reclaim`] takes one by, with the figures it was taken on; and, returned after an intent, what became of it when it did not go whole ([`Unused::Stayed`], [`Unused::Revoked`], [`Unused::Refused`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unused {
+    /// An explicit request names this genuine registered ordinary cache. Its current
+    /// identity, complete Cargo locks and process-use gates still hold before retirement.
+    Requested,
     /// Its workspace is seen gone ([`checkout::gone_placed`]) and nothing wrote it for `idle`, at least the pass's window `after` ([`RECLAIM_GONE`], or [`RECLAIM_GONE_UNDER_PRESSURE`] below the disk watch's floor).
     Gone { idle: Duration, after: Duration },
     /// Nothing wrote it for `idle`, [`RECLAIM_IDLE`] or more: it goes whatever its workspace's state, which was not looked at — it may still be there.

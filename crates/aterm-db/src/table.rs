@@ -31,7 +31,7 @@ const DOMAIN: &[u8] = b"aterm/commons/table-operation/1\0";
 const SCOPE_LEN: usize = 16 + 32 + 32 + 16 + 8;
 
 pub(crate) fn failure(error: aterm_secrets::Error) -> Error {
-    Error::new(&error.to_string())
+    error.into()
 }
 
 /// Immutable table/audience identity. Display names do not enter key derivation.
@@ -303,19 +303,30 @@ impl<'a> Session<'a> {
     }
 
     pub(crate) fn historical_writer_in(&self, roster: &Digest, actor: &Actor) -> bool {
+        self.historical_binding(roster, actor).is_some()
+    }
+
+    /// The binding `actor` held as a Writer in the roster `roster`, the one a record names,
+    /// whether or not it is a member now: what attributes a removed Mac's signed rows to its
+    /// machine (docs/DESIGN-alab-lab-model-2026-11-01.md §3.7). The current members alone would
+    /// blank them.
+    pub(crate) fn historical_binding(
+        &self,
+        roster: &Digest,
+        actor: &Actor,
+    ) -> Option<aterm_secrets::commons::binding::Binding> {
         if !self.history.borrow().contains_key(roster) {
-            let Ok(history) = self
+            let history = self
                 .bootstrap
                 .historical(&self.journal, &self.access, *roster)
-            else {
-                return false;
-            };
+                .ok()?;
             self.history.borrow_mut().insert(*roster, history);
         }
         self.history.borrow()[roster]
             .members()
             .iter()
-            .any(|m| m.binding().actor() == *actor && m.role() == Role::Writer)
+            .find(|m| m.binding().actor() == *actor && m.role() == Role::Writer)
+            .map(|m| m.binding().clone())
     }
 
     pub(crate) fn observation(&self) -> Result<[u8; 64]> {
@@ -384,9 +395,10 @@ impl<'a> Session<'a> {
         if !self.access.is_current(&self.journal) {
             return Err(Error::new("Commons membership changed during table repair"));
         }
-        let roster = aterm_secrets::client::swarm_roster(self.bootstrap.paths())
-            .ok()
-            .flatten();
+        // A roster this device cannot read now could name this peer: the last one it read is
+        // used, and while it never read one the peer is refused.
+        let roster = crate::control::roster_or_last(self.bootstrap.paths())
+            .ok_or_else(|| Error::new("this device has not read its roster yet"))?;
         self.access
             .members()
             .iter()

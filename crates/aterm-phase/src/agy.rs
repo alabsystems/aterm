@@ -16,7 +16,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 7, "0.7");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 8, "0.8");
 
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
@@ -1238,8 +1238,9 @@ fn approval_role(label: &str) -> Role {
     if ONCE.contains(&label) {
         Role::Once
     } else if label.contains(const { crate::anchor!("agy.box.persisted") }) {
-        // agy's own suffix on every answer it saves to settings.json, grant or
-        // refusal (its binary's labels), whatever the words before it say.
+        // agy's own suffix on every answer it saves, grant or refusal, drawn from its
+        // binary's `(Persist to %s)` label templates (1.4.12; 1.4.0 drew the target out,
+        // `(Persist to settings.json)`), whatever the words before it say.
         Role::Persist
     } else if label.starts_with(const { crate::anchor!("agy.box.session") })
         || label.contains(const { crate::anchor!("agy.box.conversation") })
@@ -1819,7 +1820,7 @@ fn is_agy_footer_meta_segment(seg: &str) -> bool {
         || seg.ends_with(const { crate::anchor!("agy.footer.subagents") })
 }
 
-fn parse_agy_footer_model(row: &str) -> Option<(String, Option<String>)> {
+fn parse_agy_footer_model(row: &str, rule_width: usize) -> Option<(String, Option<String>)> {
     let t = crate::text::trim_end(row);
     let right_col = leading_spaces(row) > 2 || crate::text::trim_start(row).contains("  ");
     let right = t.rsplit("  ").next().map(crate::text::trim)?;
@@ -1844,7 +1845,9 @@ fn parse_agy_footer_model(row: &str) -> Option<(String, Option<String>)> {
                 None
             }
         }
-        None if right_col => Some((model.to_owned(), None)),
+        None if right_col && t.chars().count().saturating_add(1) >= rule_width => {
+            Some((model.to_owned(), None))
+        }
         None => None,
     }
 }
@@ -1897,11 +1900,13 @@ pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
 /// THE MODEL AGY'S LIVE FOOTER NAMES (`Gemini 3.1 Pro` of `Gemini 3.1 Pro · low`), never the launch
 /// card's, which names the model the session started on: `None` where the footer names none, as at
 /// a pane under about 40 columns at idle ([`fixtures::lab::NARROW_36_END`], whose draft beside it
-/// names one: [`fixtures::lab::NARROW_36_DRAFT`]).
+/// names one: [`fixtures::lab::NARROW_36_DRAFT`]), or where a right-column read cut short
+/// mid-repaint carries no ` · ` segment after it and stops short of the bottom rule's right edge.
 #[must_use]
 pub fn footer_model(rows: &[String]) -> Option<String> {
     let f = frame(rows)?;
-    parse_agy_footer_model(rows.get(f.footer?)?).map(|(model, _)| model)
+    let rule_width = plain_rule_width(rows.get(f.bottom)?)?;
+    parse_agy_footer_model(rows.get(f.footer?)?, rule_width).map(|(model, _)| model)
 }
 
 /// [`launch_card`] with the rows it was read from ([`crate::LaunchCardRead`]): the banner row for
@@ -1910,9 +1915,10 @@ pub fn footer_model(rows: &[String]) -> Option<String> {
 #[must_use]
 pub fn launch_card_read(rows: &[String]) -> Option<crate::LaunchCardRead> {
     let f = frame(rows)?;
+    let rule_width = plain_rule_width(rows.get(f.bottom)?)?;
     let footer_model = f
         .footer
-        .and_then(|r| Some((r, parse_agy_footer_model(rows.get(r)?)?)));
+        .and_then(|r| Some((r, parse_agy_footer_model(rows.get(r)?, rule_width)?)));
     let (_, place) = launch_card_scan(&rows[..f.top]);
     let card_info = place.and_then(|p| {
         let ver = launch_card_version(rows, &p)?.to_owned();

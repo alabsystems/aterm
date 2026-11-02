@@ -553,7 +553,7 @@ pub fn node_plist_text(
          \t<key>KeepAlive</key>\n\
          \t<true/>\n\
          \t<key>ProcessType</key>\n\
-         \t<string>Background</string>\n\
+         \t<string>Standard</string>\n\
          {associated}\
          \t<key>StandardOutPath</key>\n\
          \t{}\n\

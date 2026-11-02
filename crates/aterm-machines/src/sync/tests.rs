@@ -138,6 +138,10 @@ pub(crate) struct Inert {
     awake_done: Mutex<Result<String, String>>,
     /// Whether the person turned aCaffiene's Enable at Startup off ([`Ports::awake_startup_off`]).
     awake_startup_off: AtomicBool,
+    /// Old `aterm caffeine` login jobs no aterm will run again ([`Ports::awake_retired_jobs`]).
+    awake_retired: Mutex<Vec<String>>,
+    /// What retiring old `aterm caffeine` login jobs answers ([`Ports::retire_awake_old_jobs`]).
+    retire_awake_done: Mutex<Result<String, String>>,
     /// What a renewal of the broker ends in ([`Ports::renew_broker`]).
     renewed: Mutex<Result<String, String>>,
     peers: Mutex<PeersRead>,
@@ -219,6 +223,10 @@ impl Inert {
             awake: Mutex::new(AwakeRead::Current("the mug (pid 9) holds".to_owned())),
             awake_done: Mutex::new(Ok("launchd was asked to start the mug".to_owned())),
             awake_startup_off: AtomicBool::new(false),
+            awake_retired: Mutex::new(Vec::new()),
+            retire_awake_done: Mutex::new(Ok(
+                "retired old `aterm caffeine` login item: com.aterm.aterm.caffeine".to_owned(),
+            )),
             renewed: Mutex::new(Ok("renewed".to_owned())),
             peers: Mutex::new(PeersRead::Joined("in vault alab".to_owned())),
             peer_looks: Mutex::new(Vec::new()),
@@ -495,10 +503,22 @@ impl Ports for Inert {
     fn awake_startup_off(&self) -> bool {
         self.awake_startup_off.load(Ordering::SeqCst)
     }
+    fn awake_retired_jobs(&self) -> Vec<String> {
+        self.read(&self.awake_retired).unwrap()
+    }
+    fn retire_awake_old_jobs(&self) -> Result<String, String> {
+        self.applied("awake-retire");
+        let done = self.retire_awake_done.lock().unwrap().clone();
+        if done.is_ok() {
+            self.awake_retired.lock().unwrap().clear();
+        }
+        done
+    }
     fn keep_awake(&self) -> Result<String, String> {
         self.applied("awake");
         let done = self.awake_done.lock().unwrap().clone();
         if done.is_ok() {
+            self.awake_retired.lock().unwrap().clear();
             *self.awake.lock().unwrap() = AwakeRead::Current("the mug (pid 9) holds".to_owned());
         }
         done
@@ -1622,6 +1642,78 @@ fn the_subscribers_pass_keeps_a_persons_startup_off() {
     assert!(ports.applies().contains(&"awake"));
 }
 
+/// After a restart with no window open, `Enable at Startup` starts the installed app's mug before
+/// the subscriber's pass runs (`AwakeRead::Current`), so an old `com.aterm.aterm.caffeine` login
+/// item whose `aterm` is gone or 0.145.0 would otherwise keep failing every ten seconds until a
+/// window opens (`ATERM-KI-1027-7`). `sync.awake` now retires those dead or post-rename jobs
+/// without starting a mug, including over the person's keep-awake or Enable at Startup off, while
+/// a plan (`--check`) writes nothing and a window's pass leaves retirement to the window's tidy.
+#[test]
+fn the_subscribers_pass_retires_old_caffeine_login_items_without_starting_a_mug() {
+    // 1. Mug already running (`AwakeRead::Current`): plan reports `Planned` without retiring;
+    //    apply retires without calling `keep_awake`, and the next pass reads `Ok`.
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.awake_retired.lock().unwrap() = vec!["com.aterm.aterm.caffeine".to_owned()];
+    let plan = ran(ports.pass(Trigger::Subscriber, Mode::Plan));
+    assert_eq!(row(&plan.rows, AWAKE).outcome, Outcome::Planned);
+    assert!(!ports.applies().contains(&"awake-retire"));
+    assert!(!ports.applies().contains(&"awake"));
+
+    let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    let retired = row(&pass.rows, AWAKE);
+    assert_eq!(retired.outcome, Outcome::Changed, "{retired:?}");
+    assert!(ports.applies().contains(&"awake-retire"));
+    assert!(!ports.applies().contains(&"awake"), "mug already runs");
+    ports.now.fetch_add(31 * 60 * 1000, Ordering::SeqCst);
+    let next = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&next.rows, AWAKE).outcome, Outcome::Ok);
+
+    // 2. Enable at Startup off or keep-awake off: retires old jobs without starting any mug, then
+    //    returns to `NotApplicable` on the next pass.
+    for startup_off in [true, false] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        ports.awake_startup_off.store(startup_off, Ordering::SeqCst);
+        if !startup_off {
+            *ports.awake.lock().unwrap() =
+                AwakeRead::NotApplicable("aCaffiene is off by your choice".to_owned());
+        }
+        *ports.awake_retired.lock().unwrap() = vec!["com.aterm.aterm.caffeine".to_owned()];
+        let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        assert_eq!(
+            row(&pass.rows, AWAKE).outcome,
+            Outcome::Changed,
+            "startup_off={startup_off}"
+        );
+        assert!(ports.applies().contains(&"awake-retire"));
+        assert!(!ports.applies().contains(&"awake"));
+        ports.now.fetch_add(31 * 60 * 1000, Ordering::SeqCst);
+        let next = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        assert_eq!(
+            row(&next.rows, AWAKE).outcome,
+            Outcome::NotApplicable,
+            "startup_off={startup_off}"
+        );
+    }
+
+    // 3. A retirement failure marks `sync.awake` `Failed` so the next pass retries.
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.awake_retired.lock().unwrap() = vec!["com.aterm.aterm.caffeine".to_owned()];
+    *ports.retire_awake_done.lock().unwrap() = Err("LaunchAgents: permission denied".to_owned());
+    let failed = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&failed.rows, AWAKE).outcome, Outcome::Failed);
+
+    // 4. NEGATIVE CONTROL: `Trigger::Window` leaves retirement to the window's own `TIDY`.
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.awake_retired.lock().unwrap() = vec!["com.aterm.aterm.caffeine".to_owned()];
+    let in_win = ran(ports.pass(Trigger::Window, Mode::Apply));
+    assert_eq!(row(&in_win.rows, AWAKE).outcome, Outcome::NotApplicable);
+    assert!(!ports.applies().contains(&"awake-retire"));
+}
+
 #[test]
 fn the_ledger_line_names_the_build_the_trigger_a_tally_and_what_is_left() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -2499,6 +2591,12 @@ pub(crate) mod owed_clone {
         }
         fn awake_startup_off(&self) -> bool {
             self.inner.awake_startup_off()
+        }
+        fn awake_retired_jobs(&self) -> Vec<String> {
+            self.inner.awake_retired_jobs()
+        }
+        fn retire_awake_old_jobs(&self) -> Result<String, String> {
+            self.inner.retire_awake_old_jobs()
         }
         fn peers(&self, look: bool) -> Result<PeersRead, String> {
             self.inner.peers(look)

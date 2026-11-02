@@ -5,8 +5,9 @@ use super::*;
 use crate::prompt::fixtures::{
     API_RETRYING_401_2_1_310, FOOTER_NOT_LOGGED_IN_2_1_310, FOOTER_NOT_LOGGED_IN_MEASURED,
     LOGIN_CONSOLE_MENU, LOGIN_ERROR, LOGIN_EXPIRED, LOGIN_EXPIRED_2_1_310, LOGIN_HANDOFF,
-    LOGIN_INTERRUPTED, LOGIN_INTERRUPTED_2_1_310, LOGIN_INTERRUPTED_AT_EXPIRED_2_1_310,
-    LOGIN_INTERRUPTED_AT_WALL_2_1_310, LOGIN_INTERRUPTED_FULLSCREEN_AT_EXPIRED_2_1_310,
+    LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302, LOGIN_INTERRUPTED, LOGIN_INTERRUPTED_2_1_310,
+    LOGIN_INTERRUPTED_AT_EXPIRED_2_1_310, LOGIN_INTERRUPTED_AT_WALL_2_1_310,
+    LOGIN_INTERRUPTED_FULLSCREEN_AT_EXPIRED_2_1_310, LOGIN_INTERRUPTED_OVER_WEEKLY_LIMIT_2_1_302,
     LOGIN_OPENING, LOGIN_PICKER, LOGIN_PICKER_2_1_310, LOGIN_PICKER_AT_EXPIRED_2_1_310,
     LOGIN_PICKER_CONSOLE, LOGIN_PICKER_CONSOLE_2_1_310,
     LOGIN_PICKER_FULLSCREEN_AGAIN_AT_EXPIRED_2_1_310, LOGIN_PICKER_FULLSCREEN_AT_EXPIRED_2_1_310,
@@ -14,7 +15,7 @@ use crate::prompt::fixtures::{
     LOGIN_PICKER_PLATFORM_2_1_310, LOGIN_PICKER_WARNED, LOGIN_PICKER_WARNED_2_1_310,
     LOGIN_RELOOPED, LOGIN_SUCCESS, WALL_401_RUN_LOGIN_2_1_310, WALL_INVALID_API_KEY_2_1_310,
     WALL_NOT_LOGGED_IN_2_1_310, WALL_NOT_LOGGED_IN_NO_LOGIN_2_1_310, WALL_OAUTH_REVOKED_2_1_310,
-    WALL_SUBSCRIPTION_DISABLED_2_1_310, screen,
+    WALL_SUBSCRIPTION_DISABLED_2_1_310, login_over_weekly_limit, screen,
 };
 use crate::wall::{Placement, WallKind};
 
@@ -484,5 +485,96 @@ fn every_measured_lost_login_is_read_as_its_wall() {
     assert_eq!(
         crate::read(Some("claude"), &retrying, None).phase,
         crate::phase::Phase::Busy
+    );
+}
+
+/// A PERSON'S OWN HAND-OFF LEFT OVER A WEEKLY LIMIT (2.1.302, MEASURED): the fullscreen panel's
+/// hand-off, drawn under a transcript of usage walls, reads as the browser state and no lost
+/// login (no `/login` at a sign-in wall), at rest (the transcript's waiting rows ended turns'),
+/// and the first frame after its Esc reads as `Login interrupted` with no dialog standing, under
+/// the composer's top rule that carries the effort word.
+#[test]
+fn a_hand_off_left_over_a_weekly_limit_reads_as_the_browser_state() {
+    let over = screen(LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302);
+    assert_eq!(login_screen(&over), Some(LoginScreen::Browser));
+    assert_eq!(login_at_wall(&over), None);
+    // The transcript's `✻ Waiting for 4 dynamic workflows to finish` is an ended turn's: the
+    // screen rests. CONTROL: a waiting row said right above the panel, the status row's place,
+    // is live.
+    assert!(
+        over.iter()
+            .any(|r| r.starts_with("✻ Waiting for 4 dynamic workflows")),
+        "the measured premise"
+    );
+    assert_eq!(crate::phase::busy_signal(&over), None);
+    assert_eq!(crate::phase::worker_phase(&over), crate::phase::Phase::Idle);
+    let rule = over
+        .iter()
+        .rposition(|r| r.starts_with('▔'))
+        .expect("the panel's rule");
+    let mut waiting = over.clone();
+    waiting.insert(
+        rule,
+        "✻ Waiting for 2 dynamic workflows to finish".to_string(),
+    );
+    assert_eq!(login_screen(&waiting), Some(LoginScreen::Browser));
+    assert!(
+        crate::phase::busy_signal(&waiting).is_some_and(|b| !b.soft),
+        "{:?}",
+        crate::phase::busy_signal(&waiting)
+    );
+    let after = screen(LOGIN_INTERRUPTED_OVER_WEEKLY_LIMIT_2_1_302);
+    assert_eq!(login_screen(&after), None);
+    assert!(login_interrupted(&after));
+}
+
+/// A `/login` DIALOG STANDING OVER A LIMIT (`login_over_limit`): reads the limit notice above the
+/// fullscreen hand-off (`LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302`), the inline picker and the
+/// inline error state (`login_over_weekly_limit`), stepping past any earlier interrupted `/login`
+/// at the same wall. CONTROLS: a dialog over an auth wall, a dialog over no wall and a closed
+/// (`Login interrupted`) dialog return `None`.
+#[test]
+fn a_login_dialog_over_a_usage_limit_reads_the_limit_above_it() {
+    for (what, rows) in [
+        ("hand-off", screen(LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302)),
+        (
+            "picker",
+            screen(&login_over_weekly_limit(LOGIN_PICKER_2_1_310)),
+        ),
+        ("error", screen(&login_over_weekly_limit(LOGIN_ERROR))),
+    ] {
+        let wall = login_over_limit(&rows).unwrap_or_else(|| panic!("{what}"));
+        assert_eq!(wall.kind, WallKind::UsageWeekly, "{what}");
+        assert_eq!(
+            wall.reset.as_deref(),
+            Some("Oct 31 at 12am (America/Los_Angeles)"),
+            "{what}"
+        );
+    }
+    let mut relooped = screen(&login_over_weekly_limit(LOGIN_PICKER_2_1_310));
+    let login_idx = relooped
+        .iter()
+        .rposition(|r| r.trim_end() == "❯ /login")
+        .expect("echoed /login");
+    relooped.splice(
+        login_idx..login_idx,
+        [
+            "❯ /login".to_string(),
+            "  ⎿ \u{a0}Login interrupted".to_string(),
+            String::new(),
+        ],
+    );
+    assert_eq!(
+        login_over_limit(&relooped).map(|w| w.kind),
+        Some(WallKind::UsageWeekly)
+    );
+    assert_eq!(login_over_limit(&screen(LOGIN_PICKER_2_1_310)), None);
+    assert_eq!(
+        login_over_limit(&screen(LOGIN_PICKER_NO_LOGIN_2_1_310)),
+        None
+    );
+    assert_eq!(
+        login_over_limit(&screen(LOGIN_INTERRUPTED_OVER_WEEKLY_LIMIT_2_1_302)),
+        None
     );
 }

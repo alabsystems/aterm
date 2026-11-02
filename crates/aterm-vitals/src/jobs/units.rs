@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use super::step::{self, Cx, Evidence, Fault, Progress, Track};
 use super::wait::{self, JobFacts, Scene};
@@ -82,6 +83,89 @@ struct Key {
     block: Option<u64>,
 }
 
+/// The explicit job or task a naming request selects within one tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamingSelector<'a> {
+    /// One engine job id.
+    Job(&'a str),
+    /// One agent task id; more than one matching live job is ambiguous.
+    Task(&'a str),
+}
+
+/// Why explicit naming cannot start or cannot attach its result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamingError {
+    /// No live job matches the selection in that tab.
+    Gone,
+    /// More than one live job matches the selection.
+    Ambiguous,
+    /// The current job is not a quiet or stuck waiting/polling job.
+    NotWaiting,
+    /// The selected leaf's current detailed identity was not read.
+    Unread,
+    /// A name was already accepted for this episode and invalidation revision.
+    AlreadyNamed,
+    /// Another fresh pass, the job, its leaf or its progress no longer matches the ticket.
+    Stale,
+}
+
+/// The exact waiting process the last probe read, for the host's identity checks and sampler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamingWaiter {
+    /// The waiting leaf's pid.
+    pub pid: u32,
+    /// Its known process start identity.
+    pub start: u64,
+    /// Its exec identity, where the host read one.
+    pub exec_version: Option<u64>,
+    /// Its observed executable basename, or the observed short name where unavailable.
+    pub exe: String,
+}
+
+impl NamingWaiter {
+    fn read(p: &JobProc) -> Option<Self> {
+        Some(Self {
+            pid: p.pid,
+            start: p.start?,
+            exec_version: p.exec_version,
+            exe: p.exe.clone().unwrap_or_else(|| p.name.clone()),
+        })
+    }
+}
+
+/// An engine-issued naming admission, bound to one live job, waiting leaf and progress epoch.
+/// The host samples outside the engine and must obtain another fresh probe before acceptance.
+#[derive(Clone, Debug)]
+pub struct NamingTicket {
+    key: Key,
+    generation: Arc<()>,
+    job: String,
+    waiter: NamingWaiter,
+    progress: u64,
+    episode: u32,
+    read: u64,
+}
+
+impl NamingTicket {
+    /// The waiting process to sample; no holder is implied.
+    #[must_use]
+    pub fn waiter(&self) -> &NamingWaiter {
+        &self.waiter
+    }
+
+    /// The engine job id selected by this request.
+    #[must_use]
+    pub fn job(&self) -> &str {
+        &self.job
+    }
+
+    /// The tab whose job was selected.
+    #[must_use]
+    pub const fn tab(&self) -> u64 {
+        self.key.tab
+    }
+}
+
 impl Key {
     fn same(&self, o: &Self) -> bool {
         if self.tab != o.tab {
@@ -102,6 +186,8 @@ impl Key {
 #[derive(Clone, Debug)]
 struct Job {
     key: Key,
+    /// Allocation identity of this opening, distinct even when a later job reuses its key.
+    generation: Arc<()>,
     id: String,
     kind: JobKind,
     /// An orphan unit's: the kind of the job it outlived ([`Self::named_kind`]).
@@ -168,6 +254,16 @@ struct Job {
     exit: Option<i32>,
     named: Option<NamedWait>,
     named_progress: Option<u64>,
+    /// The selected raw wait's detailed process identity in the last pass.
+    naming_waiter: Option<NamingWaiter>,
+    /// The sampled leaf of an accepted production name; fixtures keep their old intake.
+    named_waiter: Option<NamingWaiter>,
+    /// The key at the last naming observation; a key that changes and returns cannot revive a ticket.
+    naming_key: Key,
+    /// Advances on observed progress (even at an equal clock), key or leaf changes; overflow disables naming.
+    progress_revision: Option<u64>,
+    /// A successful explicit request is made once per episode and invalidation revision.
+    named_epoch: Option<(u32, u64)>,
     busy_since: Option<u64>,
     /// This tick it held the foreground at the person's own terminal read (`tty-raw` or
     /// `tty-password` from a mode word stamped after its last output, no key queued), whatever its
@@ -655,6 +751,8 @@ struct TabFacts {
 #[derive(Clone, Debug, Default)]
 pub struct Jobs {
     jobs: Vec<Job>,
+    /// A pass identity independent of its clock, so acceptance requires another actual probe.
+    read_revision: u64,
     classes: ClassTable,
     zombies: HashMap<u32, (u64, u32)>,
     zombie_parents: HashMap<u32, u64>,
@@ -941,6 +1039,107 @@ impl Jobs {
         self.classes.learn(class, median_ms);
     }
 
+    /// Admit an explicit naming request against the last probe's live job and waiting leaf.
+    /// The host checks uid and kernel identity separately; this ticket grants no process access.
+    ///
+    /// # Errors
+    /// The selection is gone or ambiguous, not currently eligible, already named, or its leaf
+    /// identity was not read.
+    pub fn naming_target(
+        &self,
+        tab: u64,
+        selector: NamingSelector<'_>,
+    ) -> Result<NamingTicket, NamingError> {
+        let mut matches = self.jobs.iter().filter(|job| {
+            job.key.tab == tab
+                && job.exited_ms.is_none()
+                && match selector {
+                    NamingSelector::Job(id) => job.id == id,
+                    NamingSelector::Task(task) => job.task.as_deref() == Some(task),
+                }
+        });
+        let job = matches.next().ok_or(NamingError::Gone)?;
+        if matches.next().is_some() {
+            return Err(NamingError::Ambiguous);
+        }
+        if !job.naming_eligible() {
+            return Err(NamingError::NotWaiting);
+        }
+        let row = job.row.as_ref().ok_or(NamingError::NotWaiting)?;
+        if job.named.is_some()
+            || job
+                .progress_revision
+                .is_some_and(|revision| job.named_epoch == Some((row.episode, revision)))
+        {
+            return Err(NamingError::AlreadyNamed);
+        }
+        Ok(NamingTicket {
+            key: job.key.clone(),
+            generation: Arc::clone(&job.generation),
+            job: job.id.clone(),
+            waiter: job.naming_waiter.clone().ok_or(NamingError::Unread)?,
+            progress: job.progress_revision.ok_or(NamingError::Unread)?,
+            episode: row.episode,
+            read: self.read_revision,
+        })
+    }
+
+    /// Attach a fixed naming word only after a later probe still matches the ticket.
+    /// No holder is asserted. The next probe publishes the resulting row without inventing progress.
+    ///
+    /// # Errors
+    /// The ticket is stale or this episode and invalidation revision already accepted a name.
+    pub fn accept_name(&mut self, ticket: &NamingTicket, word: TierB) -> Result<(), NamingError> {
+        let job = self
+            .jobs
+            .iter_mut()
+            .find(|job| {
+                job.key == ticket.key
+                    && Arc::ptr_eq(&job.generation, &ticket.generation)
+                    && job.id == ticket.job
+            })
+            .ok_or(NamingError::Stale)?;
+        if self.read_revision <= ticket.read
+            || !job.naming_eligible()
+            || job.row.as_ref().is_none_or(|r| r.episode != ticket.episode)
+            || job.progress_revision != Some(ticket.progress)
+            || job.naming_waiter.as_ref() != Some(&ticket.waiter)
+        {
+            return Err(NamingError::Stale);
+        }
+        if job.named.is_some() || job.named_epoch == Some((ticket.episode, ticket.progress)) {
+            return Err(NamingError::AlreadyNamed);
+        }
+        job.named = Some(NamedWait {
+            leader: ticket.waiter.pid,
+            word,
+            holder: None,
+        });
+        job.named_progress = job.track.last_progress_ms;
+        job.named_waiter = Some(ticket.waiter.clone());
+        job.named_epoch = Some((ticket.episode, ticket.progress));
+        Ok(())
+    }
+
+    /// Whether a later published row still carries this ticket's accepted word and identity.
+    /// A successful acceptance alone does not mean the next probe has published the name.
+    #[must_use]
+    pub fn name_is_shown(&self, ticket: &NamingTicket, word: TierB) -> bool {
+        self.jobs.iter().any(|job| {
+            job.key == ticket.key
+                && Arc::ptr_eq(&job.generation, &ticket.generation)
+                && job.progress_revision == Some(ticket.progress)
+                && job.named_epoch == Some((ticket.episode, ticket.progress))
+                && job.naming_waiter.as_ref() == Some(&ticket.waiter)
+                && job.named_waiter.as_ref() == Some(&ticket.waiter)
+                && job.row.as_ref().is_some_and(|row| {
+                    row.named
+                        .as_ref()
+                        .is_some_and(|name| name.word == word && name.holder.is_none())
+                })
+        })
+    }
+
     /// Plans which processes require detailed and descriptor readings this tick.
     #[must_use]
     pub fn plan(&self, sweep: &[SweepProc], tabs: &[JobTab]) -> Vec<Want> {
@@ -1002,6 +1201,7 @@ impl Jobs {
         reason = "one pass over the tick, in the order the design states it"
     )]
     pub fn absorb(&mut self, tick: &JobTick) -> JobsView {
+        self.read_revision = self.read_revision.saturating_add(1);
         let at = tick.at_ms;
         let fault = self.fault();
         let sweep: HashMap<u32, &SweepProc> = tick.sweep.iter().map(|p| (p.pid, p)).collect();
@@ -1457,6 +1657,7 @@ impl Jobs {
                 }) {
                     j.named = Some(n.clone());
                     j.named_progress = j.track.last_progress_ms;
+                    j.named_waiter = None;
                 }
             }
         }
@@ -2415,11 +2616,34 @@ impl Jobs {
             });
             job.person_read = matches!(wait.name, WaitName::TtyRaw | WaitName::TtyPassword);
 
-            if job.named.is_some() && job.track.last_progress_ms != job.named_progress {
+            let naming_waiter = (!refused
+                && !adopted_incomplete.contains(&i)
+                && !exited
+                && live.contains(&wait.leaf))
+            .then(|| facts.get(&wait.leaf).and_then(|p| NamingWaiter::read(p)))
+            .flatten();
+            if progress.is_some() || job.naming_waiter != naming_waiter || job.naming_key != job.key
+            {
+                job.progress_revision = job.progress_revision.and_then(|r| r.checked_add(1));
+            }
+            job.naming_waiter = naming_waiter;
+            job.naming_key = job.key.clone();
+
+            if job.named.is_some()
+                && (job.track.last_progress_ms != job.named_progress
+                    || job.named_waiter.as_ref().is_some_and(|waiter| {
+                        Some(waiter) != job.naming_waiter.as_ref()
+                            || job
+                                .named_epoch
+                                .is_none_or(|(_, revision)| job.progress_revision != Some(revision))
+                    }))
+            {
                 job.named = None;
+                job.named_waiter = None;
             }
             if progress.is_some() {
                 job.named = None;
+                job.named_waiter = None;
             }
             let named = job
                 .named
@@ -2428,7 +2652,7 @@ impl Jobs {
             let named_standing = job
                 .named
                 .as_ref()
-                .and_then(|n| named_standing(n, holds_fg, &holders, &elsewhere_all));
+                .and_then(|n| named_standing(n, &holders, &elsewhere_all));
 
             // Unknown adopted-tree coverage cannot certify a zero-CPU quiet run.
             refused |= adopted_incomplete.contains(&i);
@@ -2452,6 +2676,7 @@ impl Jobs {
                 zombie_parent_waits,
                 wait,
                 named: named_standing,
+                named_kind: job.named.as_ref().map(|n| n.word),
             };
             let cx = Cx {
                 consumer: job.consumer,
@@ -2461,7 +2686,14 @@ impl Jobs {
                 class_mu,
                 fault,
             };
+            let was_naming_eligible = job.naming_eligible();
             let out = step::classify_tick(&mut job.track, &ev, &cx);
+            let naming_eligible = matches!(out.class, Class::Waiting | Class::Polling)
+                && matches!(out.verdict, Verdict::Quiet | Verdict::Stuck)
+                && out.stop.is_none();
+            if job.named_waiter.is_none() && was_naming_eligible != naming_eligible {
+                job.progress_revision = job.progress_revision.and_then(|r| r.checked_add(1));
+            }
             let leader_name = match now_name(job, &live, &sweep, &facts) {
                 Some(n) if !exited || job.last_name.is_empty() => n,
                 _ if !job.member_name.is_empty() => job.member_name.clone(),
@@ -2508,7 +2740,7 @@ impl Jobs {
                 members: live.len(),
                 class,
                 wait: out.wait,
-                named: named.filter(|_| class == Class::Waiting),
+                named: named.filter(|_| matches!(class, Class::Waiting | Class::Polling)),
                 stop: out.stop,
                 input: (class == Class::UnreadInput).then_some(gate),
                 cpu_mc: cpu_mc.filter(|_| matches!(class, Class::UnreadInput | Class::BusySilent)),
@@ -2889,9 +3121,20 @@ impl Jobs {
 }
 
 impl Job {
+    fn naming_eligible(&self) -> bool {
+        self.exited_ms.is_none()
+            && self.row.as_ref().is_some_and(|row| {
+                matches!(row.class, Class::Waiting | Class::Polling)
+                    && matches!(row.verdict, Verdict::Quiet | Verdict::Stuck)
+                    && row.stop.is_none()
+                    && row.input.is_none()
+            })
+    }
+
     fn open(u: &Unit, at: u64) -> Self {
         Self {
             key: u.key.clone(),
+            generation: Arc::new(()),
             id: u.id.clone(),
             kind: u.kind,
             outlived: None,
@@ -2925,6 +3168,11 @@ impl Job {
             exit: None,
             named: None,
             named_progress: None,
+            naming_waiter: None,
+            named_waiter: None,
+            naming_key: u.key.clone(),
+            progress_revision: Some(0),
+            named_epoch: None,
             busy_since: None,
             person_read: false,
             row: None,
@@ -2953,6 +3201,7 @@ impl Job {
                 start: m.start,
                 block: None,
             },
+            generation: Arc::new(()),
             id: format!("o{leader}"),
             kind: JobKind::Orphan,
             outlived: Some(outlived),
@@ -2986,6 +3235,16 @@ impl Job {
             exit: None,
             named: None,
             named_progress: None,
+            naming_waiter: None,
+            named_waiter: None,
+            naming_key: Key {
+                tab,
+                leader,
+                start: m.start,
+                block: None,
+            },
+            progress_revision: Some(0),
+            named_epoch: None,
             busy_since: None,
             person_read: false,
             row: None,
@@ -3996,19 +4255,17 @@ fn named_row(
     }
 }
 
-/// How a Tier B naming counts: `None` leaves the Tier A standing (an event
-/// wait is cross-checked by Tier A).
+/// How a Tier B naming counts: a generic read names no descriptor, an event wait still needs
+/// Tier A, and an unparsed stack establishes no new cause. All three retain Tier A standing.
 fn named_standing(
     n: &NamedWait,
-    holds_fg: bool,
     holders: &HashMap<u32, (Class, u64)>,
     elsewhere: &HashMap<u32, (usize, Standing)>,
 ) -> Option<Standing> {
     Some(match n.word {
         TierB::Timer => Standing::Legit,
-        TierB::Read if holds_fg => Standing::Legit,
-        TierB::Read | TierB::Children | TierB::Unparsed => Standing::Capped,
-        TierB::Event => return None,
+        TierB::Children => Standing::Capped,
+        TierB::Read | TierB::Event | TierB::Unparsed => return None,
         TierB::Ipc | TierB::Mutex => Standing::Capable,
         TierB::Lock => match n.holder {
             Some(h) if holders.get(&h).is_some_and(|(c, _)| *c == Class::Running) => {

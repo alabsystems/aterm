@@ -963,13 +963,18 @@ impl ScreenReader for GrokReader {
     fn program(&self) -> Program {
         Program::Grok
     }
-    /// No evidence: its busy row and idle composer are unmeasured, so every reading is a
-    /// non-authoritative `idle`.
+    /// No evidence: its busy row is unmeasured, so every reading is a non-authoritative `idle`
+    /// (its composer's box is read for the point cut, [`grok::composer_rows`], never its words).
     fn phase(&self, _rows: &[String]) -> Phase {
         Phase::Idle
     }
     fn wall(&self, rows: &[String]) -> Option<Wall> {
         grok::wall(rows)
+    }
+    /// The context its header's token counts leave ([`grok::context_left`]), for the window's
+    /// displays: the header names no compaction, so the watch does not take it.
+    fn context_shown(&self, rows: &[String]) -> Option<u8> {
+        grok::context_left(rows)
     }
 }
 
@@ -991,13 +996,9 @@ impl ScreenReader for KimiReader {
     fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
         kimi::composer(rows)
     }
-    /// What its footer's `context: N%` leaves: the share it says is used, from 100.
+    /// What its footer's `context: N%` leaves ([`kimi::context_left`]).
     fn context_shown(&self, rows: &[String]) -> Option<u8> {
-        let (_, _, bottom) = kimi::composer_rows(rows)?;
-        let used = rows[bottom + 1..]
-            .iter()
-            .find_map(|r| kimi::context_row(r))?;
-        Some(100u8.saturating_sub(used.min(100)))
+        kimi::context_left(rows)
     }
 }
 
@@ -1057,8 +1058,8 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
     let names_claude = |p: PromptV2| p.kind != PromptKind::Other || p.footer.is_some();
     // Claude Code's own frames (its composer under a rule at the screen's left edge, its boxes,
     // its `/login` dialog) are read before Kimi Code's and Grok Build's sniffs: those match a
-    // welcome row or a sign-in screen anywhere on the screen, which a Claude Code transcript
-    // shows wherever its tool output or its reply quotes the other CLI's screen.
+    // welcome row, a sign-in screen or a composer box anywhere on the screen, which a Claude
+    // Code transcript shows wherever its tool output or its reply quotes the other CLI's screen.
     if muse::is_muse_screen(rows) {
         &MuseReader
     } else if agy::is_agy_screen(rows) {

@@ -693,15 +693,17 @@ fn rebase_host_chrome(
     any
 }
 
+/// FNV-1a over the row's scalars, 0 for a blank row and at least 1 otherwise. The step stays
+/// spelled out for the Trust lane, as in `aos_momentum::lane`'s `fnv1a`.
 #[inline]
 const fn row_signature(row: &[aterm_core::terminal::RenderCell]) -> u64 {
     let mut blank = true;
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut h = aterm_hash::FNV64_OFFSET;
     let mut i = 0;
     while i < row.len() {
         let ch = row[i].ch;
         blank &= matches!(ch, ' ' | '\0');
-        h = (h ^ (ch as u32 as u64)).wrapping_mul(0x0100_0000_01b3);
+        h = (h ^ (ch as u32 as u64)).wrapping_mul(aterm_hash::FNV64_PRIME);
         i += 1;
     }
     if blank {
@@ -5393,6 +5395,25 @@ mod tests {
     use crate::pet_world::PetCell;
     use aterm_core::selection::{SelectionSide, SelectionType};
     use aterm_core::terminal::Terminal;
+
+    /// `row_signature` spells FNV-1a's word step out for the Trust lane, over each cell's scalar:
+    /// the same fold as `aterm_hash`'s, with 0 kept for a blank row and 1 for a fold that lands on
+    /// 0 or 1.
+    #[test]
+    fn a_rows_signature_folds_its_scalars_with_aterm_hashs_step() {
+        let cell = |ch| aterm_core::terminal::RenderCell {
+            ch,
+            ..aterm_core::terminal::RenderCell::default()
+        };
+        let row: Vec<_> = "ab \u{1F600}\0z".chars().map(cell).collect();
+        let want = row.iter().fold(aterm_hash::FNV64_OFFSET, |h, c| {
+            aterm_hash::fnv_mix_u64(h, u64::from(u32::from(c.ch)))
+        });
+        assert!(want > 1);
+        assert_eq!(row_signature(&row), want);
+        assert_eq!(row_signature(&[cell(' '), cell('\0')]), 0);
+        assert_eq!(row_signature(&[]), 0);
+    }
 
     struct Scene {
         term: Terminal,

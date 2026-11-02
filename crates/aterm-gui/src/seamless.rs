@@ -821,6 +821,14 @@ pub(crate) enum PersonStamp {
     /// This writer knows the session has no typing stamp: `t<id> -`, distinguished from an
     /// older writer that recorded gestures alone. Older readers ignore its nonnumeric id.
     Untyped,
+    /// The carried typing age in awake time, without the sleep [`Self::Typed`] counts
+    /// (`human_input::HumanInputStamp::typed_awake_ms`): `a<id> <age>`, whose nonnumeric id
+    /// older readers ignore.
+    TypedAwake(u64),
+    /// The claim look last saw a program running in the session's tab, whose claim worker had
+    /// ended, this many milliseconds ago in awake time (`App::claim_job_seen`), which the tab's
+    /// reading time counts from: `j<id> <age>`, whose nonnumeric id older readers ignore.
+    JobSeen(u64),
 }
 
 /// Write the person-stamps sidecar at `path`.
@@ -833,6 +841,8 @@ pub(crate) fn write_person_stamps(path: &std::path::Path, stamps: &[(u64, Person
             PersonStamp::Unkeyed(age_ms) => format!("{local_id} -{age_ms}\n"),
             PersonStamp::Typed(age_ms) => format!("t{local_id} {age_ms}\n"),
             PersonStamp::Untyped => format!("t{local_id} -\n"),
+            PersonStamp::TypedAwake(age_ms) => format!("a{local_id} {age_ms}\n"),
+            PersonStamp::JobSeen(age_ms) => format!("j{local_id} {age_ms}\n"),
         })
         .collect();
     write_private_new(path, body.as_bytes()).is_some()
@@ -864,6 +874,12 @@ pub(crate) fn take_person_stamps(
                     PersonStamp::Typed(uint(age)?)
                 };
                 return Some((uint(typed)?, stamp));
+            }
+            if let Some(awake) = local_id.strip_prefix('a') {
+                return Some((uint(awake)?, PersonStamp::TypedAwake(uint(age)?)));
+            }
+            if let Some(seen) = local_id.strip_prefix('j') {
+                return Some((uint(seen)?, PersonStamp::JobSeen(uint(age)?)));
             }
             let stamp = match age.strip_prefix('-') {
                 Some(unkeyed) => PersonStamp::Unkeyed(uint(unkeyed)?),

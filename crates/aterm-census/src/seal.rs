@@ -105,13 +105,14 @@ fn locate(text: &str) -> Option<(usize, Range<usize>)> {
     None
 }
 
-/// FNV-1a 64 of `text` with the bytes at `digits` read as `0`.
+/// FNV-1a 64 of `text` with the bytes at `digits` read as `0`: `aterm_hash`'s fold with a mask, so
+/// its step stays spelled out here. A file's seal holds this value, so it must not move.
 fn digest(text: &str, digits: &Range<usize>) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hash = aterm_hash::FNV64_OFFSET;
     for (at, byte) in text.bytes().enumerate() {
         let byte = if digits.contains(&at) { b'0' } else { byte };
         hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash = hash.wrapping_mul(aterm_hash::FNV64_PRIME);
     }
     hash
 }
@@ -119,6 +120,16 @@ fn digest(text: &str, digits: &Range<usize>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seal is `aterm_hash`'s FNV-1a of the text with its digits zeroed, and its value does not
+    /// move: every generated file's head holds one (`verify census` reads them).
+    #[test]
+    fn a_seals_digest_is_aterm_hashs_fold_and_a_stored_seal_does_not_move() {
+        assert_eq!(digest("", &(0..0)), aterm_hash::FNV64_OFFSET);
+        assert_eq!(digest("foobar", &(0..0)), aterm_hash::fnv1a_64(b"foobar"));
+        assert_eq!(digest("foobar", &(0..0)), 0x8594_4171_f739_67e8);
+        assert_eq!(digest("ab123c", &(2..5)), aterm_hash::fnv1a_64(b"ab000c"));
+    }
 
     fn generated() -> String {
         format!(

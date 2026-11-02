@@ -408,6 +408,7 @@ mod clt_install;
 mod clt_shim;
 mod converge_lane;
 mod default_editor;
+mod net_place;
 mod network_moved;
 pub use network_moved::hear_commons;
 #[cfg(unix)]
@@ -984,6 +985,7 @@ mod subscribe;
 mod summarize;
 mod survey;
 mod sys_host;
+mod sys_naming;
 mod system_quit;
 mod tab_bar;
 mod tab_label;
@@ -10388,6 +10390,15 @@ struct App {
     need_rechecks: std::collections::HashMap<u64, i64>,
     grok_looks: app_presence::GrokLooks,
     api_outage: std::collections::BTreeMap<u64, i64>,
+    /// The first `SIGTERM` the claim look delivered to each worker it asked to end, which its time
+    /// to end counts from ([`harness_host::credit_claim::DEAF_FOR`]).
+    claim_termed: harness_host::credit_claim::TermedBySession,
+    /// The last claim look that saw a program running in front in the tab of a claim worker that
+    /// ended, which holds that tab's close (never its time, [`harness_host::credit_claim::stood`])
+    /// until [`harness_host::credit_claim::WORKER_FOR`] after it
+    /// ([`harness_host::credit_claim::Stand::reading`]); a seamless update carries it in the
+    /// person-stamps sidecar (`seamless::PersonStamp::JobSeen`, unix).
+    claim_job_seen: std::collections::HashMap<u64, std::time::Instant>,
     status_dirty: bool,
     harness_glass: std::collections::HashMap<u64, harness_glass::SessionGlass>,
     /// The Land holds' own words beside their glass ([`harness_glass::on_land_said`], slice 4b):
@@ -16310,6 +16321,8 @@ impl App {
             need_rechecks: std::collections::HashMap::new(),
             grok_looks: app_presence::GrokLooks::default(),
             api_outage: std::collections::BTreeMap::new(),
+            claim_termed: std::collections::HashMap::new(),
+            claim_job_seen: std::collections::HashMap::new(),
             status_dirty: false,
             harness_glass: std::collections::HashMap::new(),
             hold_said: std::collections::HashMap::new(),
@@ -28840,6 +28853,8 @@ pub fn main_entry_with_network(
         need_rechecks: std::collections::HashMap::new(),
         grok_looks: app_presence::GrokLooks::default(),
         api_outage: std::collections::BTreeMap::new(),
+        claim_termed: std::collections::HashMap::new(),
+        claim_job_seen: std::collections::HashMap::new(),
         status_dirty: false,
         harness_glass: std::collections::HashMap::new(),
         hold_said: std::collections::HashMap::new(),

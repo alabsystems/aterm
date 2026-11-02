@@ -82,6 +82,60 @@ fn round(lab: &Lab, permits: bool) -> (Repair, Repair, [crate::control::Report; 
 }
 
 #[test]
+fn fresh_vaults_with_no_requests_complete_an_empty_handoff() {
+    for foundation in [false, true] {
+        let roles = [Role::Writer, Role::Writer];
+        let lab = if foundation {
+            Lab::with_foundation(&roles)
+        } else {
+            Lab::new(&roles)
+        };
+        let request_paths: Vec<_> = lab
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(n, paths)| {
+                let bootstrap = lab.bootstrap(n);
+                crate::catalog::Directory::new(paths, bootstrap.trust())
+                    .path(descriptor(&bootstrap).unwrap().scope)
+                    .unwrap()
+            })
+            .collect();
+        assert!(request_paths.iter().all(|path| !path.exists()));
+        let (left, right, _) = round(&lab, true);
+        for repair in [&left, &right] {
+            assert_eq!(repair.handoff(), Some(&Ok(0)), "foundation={foundation}");
+        }
+        assert!(request_paths.iter().all(|path| !path.exists()));
+    }
+}
+
+#[test]
+fn declared_missing_or_incompatible_requests_do_not_look_empty() {
+    for version in [1, 2] {
+        let lab = Lab::new(&[Role::Writer]);
+        let bootstrap = lab.bootstrap(0);
+        let directory = crate::catalog::Directory::new(&lab.paths[0], bootstrap.trust());
+        let mut declared = descriptor(&bootstrap).unwrap();
+        declared.version = version;
+        {
+            let session = Session::open(&bootstrap).unwrap();
+            directory.publish(&session, &declared).unwrap();
+        }
+        let store = directory.path(declared.scope).unwrap();
+        if version == 1 {
+            std::fs::rename(&store, store.with_extension("preserved")).unwrap();
+        }
+        let observed = crate::documents::application::observe_store_if_declared(
+            &lab.paths[0],
+            descriptor,
+            |_, _, _| -> Result<()> { panic!("unavailable request data must not be read") },
+        );
+        assert!(observed.is_err(), "declared version {version}");
+    }
+}
+
+#[test]
 fn a_private_give_crosses_native_authenticated_runtime_transport_and_never_enters_the_log() {
     use std::os::unix::fs::PermissionsExt as _;
     let lab = fixture();

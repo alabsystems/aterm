@@ -320,7 +320,8 @@ impl Cols<'_> {
     }
 }
 
-/// FNV-1a over `text`'s bytes.
+/// FNV-1a over `text`'s bytes: `aterm_hash::fnv1a_64`, spelled out because this library takes only
+/// the name table (`Cargo.toml` says why). `a_text_hash_is_aterm_hashs_fold` holds it to that.
 #[must_use]
 pub const fn text_hash(text: &str) -> u64 {
     let b = text.as_bytes();

@@ -5122,6 +5122,63 @@ mod worker_start_app_tests {
         }
     }
 
+    /// A launcher waiting for its worker's first prompt keeps no clock, so a mark on the task is
+    /// what ends the wait, and the stall it then reports leaves that mark standing: a deadline's
+    /// word and attention, or a lead's, are the record of what became of the task.
+    #[cfg(unix)]
+    #[test]
+    fn a_task_that_moves_on_ends_its_launchers_wait_and_keeps_its_mark() {
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-moved-on")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            app.push_stub_tab(WindowId(0), crate::stub_session(1));
+            let sid = sid_of(&app, 1);
+            let ctx = ctx_of(&app, 1);
+            let (seed, _path) = seeded(&sid);
+            let launch = app.ready_worker(&sid, worker(), seed).expect("a worker");
+            let launch = launch.launch;
+            let record = || {
+                let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+                (record.state, record.why)
+            };
+
+            let (said, heard) = std::sync::mpsc::channel();
+            let waiting = std::thread::spawn(move || {
+                let _ = said.send(crate::task_launch::await_first_prompt(&launch).map(|_| ()));
+                launch
+            });
+            let mut stalled = crate::task_record::TaskMark::new(TaskState::Stalled);
+            stalled.why = Some("startup");
+            crate::task_record::mark_session_task(&ctx, 1, &stalled).expect("unfenced");
+            let why = heard
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the mark ended its wait")
+                .expect_err("no prompt was drawn");
+            assert!(why.contains("stalled why=startup now"), "{why}");
+            let launch = waiting.join().expect("the launcher's wait");
+
+            crate::task_launch::stall_task_why(&ctx, 1, "shell", &why);
+            assert_eq!(record(), (TaskState::Stalled, Some("startup")));
+
+            let working = crate::task_record::TaskMark::new(TaskState::Working);
+            crate::task_record::mark_session_task(&ctx, 1, &working).expect("unfenced");
+            crate::feed_session_for_test(&app, 1, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            assert!(
+                crate::task_launch::await_first_prompt(&launch).is_ok(),
+                "CONTROL: a working task's prompt takes its line"
+            );
+            crate::task_launch::stall_task_why(&ctx, 1, "shell", "CONTROL");
+            assert_eq!(
+                record(),
+                (TaskState::Stalled, Some("shell")),
+                "CONTROL: a working task takes the launcher's stall"
+            );
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_workers_launcher_starts_only_once_its_reply_is_taken() {

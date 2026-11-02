@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-netplace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm's network place: one per-Mac answer to where this Mac is on the network (the ALab LAN, a remote network, offline), whether the internet answers and how that is known, and how much of the ALab LAN it reaches; its evidence file, its keeper, and the one wording every reporter prints."
+
+[lints]
+workspace = true
+
+# Low in the graph on purpose: aterm-secrets, aterm-db, aterm-agent, aterm-ctl, aterm-cli and
+# aterm-gui all read the place, and aterm-secrets may not depend on aterm-net, so this crate
+# depends on neither. aterm-vitals stays dependency-free: its `sys` view prints a plain
+# `PlaceView` the host fills from this crate's words.
+[dependencies]
+# The kernel's routing and ARP tables (`network::default_routes`, `interfaces`,
+# `route_source_ipv4`), the route-change socket the keeper waits on, owner-only files and their
+# locks (`private_file`), pid liveness and the local zone for clock words.
+aterm-uds = { workspace = true }
+# The keeper's lines in aterm.log.
+aterm-log = { workspace = true }
+# FNV-1a/64 (astream-wire's) for a network's id and a member's key in the evidence file.
+aterm-hash = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The keeper thread's background QoS class.
+libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Network.framework's path monitor: satisfied or not, Low Data Mode, Personal Hotspot
+# (`expensive`) and the link type, read with no permission and no packet.
+aterm-objc = { workspace = true }
+
+[dev-dependencies]
+aterm-tempfile = { workspace = true }

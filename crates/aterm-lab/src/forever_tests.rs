@@ -8210,6 +8210,47 @@ fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {
     assert!(!waits_on_the_wall(&seen(&muse)));
 }
 
+/// A STARTING TAB'S COMPOSER IS READ AS EVERY EMPTY-COMPOSER GATE READS ONE (review R3): the start
+/// gate read its composer by `ctl text` alone, so a placeholder no one typed (Muse Code 1.4.10's
+/// prompt hint, drawn in its hint colour, 676c74, as measured) was a draft and ended the wait as
+/// one. Read by [`crate::composer_turn::stand_of`], the hint is an empty composer, still starting
+/// over unread input; a glyph drawn as typed text is a draft; a cell with no reply is no evidence.
+#[test]
+fn a_starting_tab_s_placeholder_is_an_empty_composer_as_every_gate_reads_it() {
+    let hint = include_str!(
+        "../../aterm-phase/src/fixtures/muse-1.4.10-R6427.1-end-of-turn-footnotes-hint.txt"
+    )
+    .lines()
+    .skip_while(|l| l.starts_with("# "))
+    .collect::<Vec<_>>()
+    .join("\n");
+    let input = |word: &str, bytes: &str| Input {
+        word: word.into(),
+        bytes: bytes.into(),
+        wait_ms: "0".into(),
+    };
+    let (pending, clear) = (input("pending", "3"), input("clear", "0"));
+    let hint_cell = |_: usize, _: usize| Some("OK / 676c74 111318 none".to_string());
+    assert_eq!(
+        start_look("muse", &hint, &clear, hint_cell),
+        Stand::Composer(String::new())
+    );
+    assert_eq!(
+        start_look("muse", &hint, &pending, hint_cell),
+        Stand::Starting
+    );
+    assert_eq!(
+        start_look("muse", &hint, &clear, |_, _| Some(
+            "OK / ccd3db 111318 none".into()
+        )),
+        Stand::Composer("/export saves the conversation to a text file".into())
+    );
+    assert_eq!(
+        start_look("muse", &hint, &clear, |_, _| None),
+        Stand::Unknown
+    );
+}
+
 /// A PROGRAM IS PROMPTED ONLY ONCE IT HAS FINISHED STARTING (slice at1): an empty composer drawn
 /// over input the program has not read is still starting (rv1-l2: Claude Code's composer stood
 /// over 56 bytes of its terminal's replies unread for 26.9 s and more), and the same composer
@@ -8228,29 +8269,26 @@ fn a_program_is_ready_for_its_prompt_once_its_input_is_read_too() {
     let (pending, clear) = (input("pending", "56"), input("clear", "0"));
     let unmeasured = Input::of("OK schema=1 sid=4 phase=quiet");
     assert!(!unmeasured.unread(), "{unmeasured:?}");
-    let empty = || Some(String::new());
-    assert_eq!(start_stand(empty(), None, &pending), Stand::Starting);
+    let empty = || Stand::Composer(String::new());
+    assert_eq!(start_stand(empty(), &pending), Stand::Starting);
     assert_eq!(
-        start_stand(empty(), None, &input("typeahead", "3")),
+        start_stand(empty(), &input("typeahead", "3")),
         Stand::Starting
     );
+    assert_eq!(start_stand(empty(), &clear), Stand::Composer(String::new()));
     assert_eq!(
-        start_stand(empty(), None, &clear),
+        start_stand(empty(), &unmeasured),
         Stand::Composer(String::new())
     );
     assert_eq!(
-        start_stand(empty(), None, &unmeasured),
-        Stand::Composer(String::new())
-    );
-    assert_eq!(
-        start_stand(Some("]10;rgb".into()), None, &pending),
+        start_stand(Stand::Composer("]10;rgb".into()), &pending),
         Stand::Composer("]10;rgb".into())
     );
     assert_eq!(
-        start_stand(None, Some("\"x.md\" 1L".into()), &clear),
+        start_stand(Stand::Editor("\"x.md\" 1L".into()), &clear),
         Stand::Editor("\"x.md\" 1L".into())
     );
-    assert_eq!(start_stand(None, None, &clear), Stand::Starting);
+    assert_eq!(start_stand(Stand::Starting, &clear), Stand::Starting);
 
     let t0 = Instant::now();
     let clock = std::cell::Cell::new(0u64);
@@ -8267,10 +8305,7 @@ fn a_program_is_ready_for_its_prompt_once_its_input_is_read_too() {
     let looked = composer_wait(
         || {
             let i = read_in_parts();
-            (
-                (i.word.clone(), i.bytes.clone()),
-                start_stand(empty(), None, &i),
-            )
+            ((i.word.clone(), i.bytes.clone()), start_stand(empty(), &i))
         },
         COMPOSER_HANG,
         t0,
@@ -8283,7 +8318,7 @@ fn a_program_is_ready_for_its_prompt_once_its_input_is_read_too() {
         || {
             (
                 (pending.word.clone(), pending.bytes.clone()),
-                start_stand(empty(), None, &pending),
+                start_stand(empty(), &pending),
             )
         },
         COMPOSER_HANG,

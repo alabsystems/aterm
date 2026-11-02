@@ -17,11 +17,14 @@ fn direct_peer_selection_survives_process_restarts() {
         let paths = Paths::for_home(Path::new(&home));
         let config = configured(&paths).unwrap();
         let found = PeerDiscovery::direct(None);
-        let mut peers = [PeerUse::Records, PeerUse::Envelope, PeerUse::Reader]
-            .map(|purpose| {
-                collect_sync_peer_urls(&paths, &config, PRIMARY, &[], Some(&found), purpose)
-            })
-            .to_vec();
+        let mut peers = [
+            PeerUse::Records,
+            PeerUse::Envelope,
+            PeerUse::Reader,
+            PeerUse::Queue,
+        ]
+        .map(|purpose| collect_sync_peer_urls(&paths, &config, PRIMARY, &[], Some(&found), purpose))
+        .to_vec();
         peers.push(join_routing::targets(&paths, &config, PRIMARY, &found));
         println!("{PREFIX}{}", aterm_json::to_string(&peers).unwrap());
         return;
@@ -46,7 +49,7 @@ fn direct_peer_selection_survives_process_restarts() {
     )
     .unwrap();
     admin_publish(&paths, &admin, &doc).unwrap();
-    let mut reached: [BTreeSet<String>; 4] = std::array::from_fn(|_| BTreeSet::new());
+    let mut reached: [BTreeSet<String>; 5] = std::array::from_fn(|_| BTreeSet::new());
     for _ in 0..policy.servers.len().div_ceil(MAX_CANDIDATES) {
         // Each invocation has fresh process statics, as the account sign-in
         // ladder's separate `aterm secrets sync` command does.
@@ -69,7 +72,7 @@ fn direct_peer_selection_survives_process_restarts() {
             .lines()
             .find_map(|line| line.strip_prefix(PREFIX))
             .unwrap();
-        let batches: [Vec<String>; 4] = aterm_json::from_str(selected).unwrap();
+        let batches: [Vec<String>; 5] = aterm_json::from_str(selected).unwrap();
         for (seen, batch) in reached.iter_mut().zip(batches) {
             assert!(batch.len() <= MAX_CANDIDATES);
             seen.extend(batch);

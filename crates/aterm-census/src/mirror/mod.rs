@@ -223,12 +223,14 @@ pub fn render(rows: &[Row]) -> String {
     seal::stamp(&out).unwrap_or(out)
 }
 
-/// FNV-1a 64 of `text`, as 16 hex digits.
+/// FNV-1a 64 of `text`, as 16 hex digits. The fold stays spelled out: to the Trust lane a call to
+/// `aterm_hash::fnv1a_64` is an unproved callee. `a_mirrors_digest_is_aterm_hashs_fold` holds it to
+/// that.
 fn fnv(text: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hash = aterm_hash::FNV64_OFFSET;
     for byte in text.bytes() {
         hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash = hash.wrapping_mul(aterm_hash::FNV64_PRIME);
     }
     format!("{hash:016x}")
 }
@@ -583,6 +585,17 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mirror table holds these digests, so the fold must not move.
+    #[test]
+    fn a_mirrors_digest_is_aterm_hashs_fold() {
+        assert_eq!(fnv(""), format!("{:016x}", aterm_hash::FNV64_OFFSET));
+        assert_eq!(fnv("foobar"), "85944171f73967e8");
+        assert_eq!(
+            fnv("foobar"),
+            format!("{:016x}", aterm_hash::fnv1a_64(b"foobar"))
+        );
+    }
 
     fn row() -> Row {
         Row {

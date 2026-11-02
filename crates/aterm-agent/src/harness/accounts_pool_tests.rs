@@ -1627,6 +1627,9 @@ fn an_overlay_row_is_never_started_on_where_aterm_makes_no_links() {
     assert_eq!(why.kind(), std::io::ErrorKind::Unsupported, "{why}");
     assert!(why.to_string().ends_with("only on Unix"), "{why}");
     wall(&world, Cli::Kimi, "main", NOW + HOUR);
+    let refused = super::launch_env(&world.seat(), Cli::Kimi, &no_usage)
+        .expect_err("a managed Kimi launch refuses rather than starting unmanaged");
+    assert!(refused.ends_with("only on Unix"), "{refused}");
     assert_eq!(launch_env(&world.seat(), Cli::Kimi, &no_usage), None);
     assert!(!work.join("sessions").exists(), "nothing is linked");
 }

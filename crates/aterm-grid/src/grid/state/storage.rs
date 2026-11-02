@@ -83,6 +83,8 @@ pub struct GridStorage {
     pub(crate) detached_reader_aim: Option<DetachedReaderAim>,
     /// Whether an off-thread compression worker owns `lazy_buffer` draining.
     pub(crate) compress_offload_active: bool,
+    /// History rows a replay keeps between input slices ([`Grid::trim_replay_history`](crate::Grid::trim_replay_history)), so a drain may hold the rows that trim discards first instead of storing them; 0 on every other grid.
+    pub(crate) replay_trim: usize,
     /// Staged history lines dropped by flood backpressure caps.
     pub(crate) flood_truncated_lines: u64,
     /// Lines dropped by the detached-reflow-window cap in the current window.

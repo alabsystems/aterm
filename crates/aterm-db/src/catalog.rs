@@ -25,9 +25,30 @@ use policy::Policy;
 
 /// The catalog has its own slot; applications cannot displace it.
 pub(crate) const MAX_TABLES: usize = 63;
-/// The slots of [`MAX_TABLES`] the catalog's tables may take: the rest stay for the rings
-/// (`ring::RING_SLOTS`), whose storage never counts against these.
-pub(crate) const CATALOG_SLOTS: usize = MAX_TABLES - ring::RING_SLOTS;
+/// The slots of [`MAX_TABLES`] kept for the compiled reserved tables ([`reserved`]), which take
+/// them before any declaration in causal order (docs/DESIGN-alab-lab-model-2026-11-01.md
+/// §3.10).
+pub(crate) const RESERVED_SLOTS: usize = 1;
+/// The slots of [`MAX_TABLES`] the catalog's declared tables share: the rest stay for the rings
+/// (`ring::RING_SLOTS`) and the reserved tables ([`RESERVED_SLOTS`]), whose storage never
+/// counts against these.
+pub(crate) const CATALOG_SLOTS: usize = MAX_TABLES - ring::RING_SLOTS - RESERVED_SLOTS;
+
+/// The compiled tables that take the reserved slots: the lab registry (`alab/registry` at
+/// version 1). Catalog slots otherwise go to declarations in causal order, so a new Mac that
+/// meets more subscribable declarations ahead of the registry than there are slots could never
+/// hold it, and the owner keeps adding Macs; a reserved table is subscribed whatever its causal
+/// order and whoever declared it, while there is storage room at all. Its descriptor is matched
+/// exactly: any other declaration at its identity conflicts as for every table.
+pub(crate) fn reserved(trust: Trust) -> [Descriptor; RESERVED_SLOTS] {
+    [Descriptor::application(
+        trust,
+        crate::alab::registry::APPLICATION,
+        crate::alab::registry::ROLE,
+        crate::alab::registry::VERSION,
+    )
+    .expect("the registry's declaration is valid")]
+}
 pub(crate) const PER_CREATOR: usize = 8;
 pub(crate) const RECORDS_PER_CREATOR: usize = 64;
 pub(crate) const MAX_PAYLOAD: usize = 4096;
@@ -210,6 +231,17 @@ impl Directory {
     pub fn catalog_scope(&self) -> Scope {
         scope(self.trust)
     }
+    /// The identities of this lab's reserved tables ([`reserved`]).
+    fn reserved_ids(&self) -> BTreeSet<Digest> {
+        reserved(self.trust)
+            .iter()
+            .map(|descriptor| descriptor.scope.digest())
+            .collect()
+    }
+    /// Whether `descriptor` is one of this lab's reserved tables, exactly.
+    fn is_reserved(&self, descriptor: &Descriptor) -> bool {
+        reserved(self.trust).contains(descriptor)
+    }
     /// The lab this directory's tables belong to.
     pub(crate) const fn trust(&self) -> Trust {
         self.trust
@@ -235,7 +267,8 @@ impl Directory {
     }
     /// The storage directories counted against the catalog's slots ([`CATALOG_SLOTS`], and the
     /// catalog's own): every retained one but the ring tables this Mac holds
-    /// (`ring_storage`), out of `retained`'s `count`.
+    /// (`ring_storage`) and the reserved tables' ([`RESERVED_SLOTS`]), out of `retained`'s
+    /// `count`.
     fn catalog_count(
         &self,
         session: &Session<'_>,
@@ -243,7 +276,13 @@ impl Directory {
         count: usize,
     ) -> usize {
         let rings = self.ring_storage(session);
-        count.saturating_sub(retained.intersection(&rings).count())
+        let reserved = self.reserved_ids();
+        count.saturating_sub(
+            retained
+                .iter()
+                .filter(|id| rings.contains(*id) || reserved.contains(*id))
+                .count(),
+        )
     }
     fn retained(&self) -> Result<(BTreeSet<Digest>, usize)> {
         let mut retained = BTreeSet::new();
@@ -275,19 +314,27 @@ impl Directory {
         }
         Ok((retained, count))
     }
-    fn room(&self, scope: Scope) -> Result<PathBuf> {
+    /// Whether `scope`'s storage exists or one more directory fits beside every retained one
+    /// (all of them, where the storage root is not made yet).
+    fn has_room(&self, scope: Scope) -> Result<bool> {
         let path = self.path(scope)?;
-        if !path.try_exists()? {
+        if !path.try_exists()? && self.root.try_exists()? {
             // Count every retained directory, not merely the current selection.
             // Repeated catalog churn cannot accumulate unbounded old stores.
             for (count, entry) in std::fs::read_dir(&self.root)?.enumerate() {
                 entry?;
                 if count >= MAX_TABLES {
-                    return Err(Error::new("retained table storage limit reached"));
+                    return Ok(false);
                 }
             }
         }
-        Ok(path)
+        Ok(true)
+    }
+    fn room(&self, scope: Scope) -> Result<PathBuf> {
+        if !self.has_room(scope)? {
+            return Err(Error::new("retained table storage limit reached"));
+        }
+        self.path(scope)
     }
     pub(crate) fn enroll(&self, session: &Session<'_>, scope: Scope) -> Result<Store> {
         let path = self.room(scope)?;
@@ -309,6 +356,9 @@ impl Directory {
         let mut catalog = self.catalog(session)?;
         let snapshot = self.project(session, catalog.catalog(session)?, &Policy::default())?;
         let id = descriptor.scope.digest();
+        // A reserved table takes its own slot: neither this creator's budget of tables nor the
+        // shared slots others' declarations hold can keep it out.
+        let reserved = self.is_reserved(descriptor);
         if let Some(entry) = snapshot.entries.get(&id) {
             if entry.state == State::Conflict
                 || entry
@@ -342,7 +392,7 @@ impl Directory {
                     .any(|d| d.actor == session.actor())
             })
             .count();
-        if count >= PER_CREATOR {
+        if count >= PER_CREATOR && !reserved {
             return Err(Error::new("table creator subscription limit reached"));
         }
         if catalog.retained_by(session, session.actor())? >= RECORDS_PER_CREATOR {
@@ -350,12 +400,17 @@ impl Directory {
         }
         let (retained, count) = self.retained()?;
         let count = self.catalog_count(session, &retained, count);
+        let reserved_ids = self.reserved_ids();
         let awaiting = snapshot
             .entries
             .iter()
-            .filter(|(id, entry)| entry.state == State::Subscribed && !retained.contains(*id))
+            .filter(|(id, entry)| {
+                entry.state == State::Subscribed
+                    && !retained.contains(*id)
+                    && !reserved_ids.contains(*id)
+            })
             .count();
-        if count + awaiting > CATALOG_SLOTS {
+        if count + awaiting > CATALOG_SLOTS && !reserved {
             return Err(Error::new("subscription capacity is already assigned"));
         }
         self.room(descriptor.scope)?;
@@ -782,12 +837,18 @@ impl Directory {
         }
         // Already enrolled tables retain their storage slots. A later low
         // digest cannot evict one, nor can exclusion silently reclaim custody.
-        // The rings' slots stay theirs: their storage counts against none of these.
-        let (retained, count) = self.retained()?;
-        let count = self.catalog_count(session, &retained, count);
+        // The rings' and the reserved tables' slots stay theirs: their storage counts against
+        // none of these.
+        let (retained, mut total) = self.retained()?;
+        let count = self.catalog_count(session, &retained, total);
         let mut free = (CATALOG_SLOTS + 1).saturating_sub(count);
+        let compiled = reserved(self.trust);
+        let mut reserved = BTreeSet::new();
         for (id, entry) in &mut snapshot.entries {
             let first = &entry.declarations[0].descriptor;
+            if compiled.contains(first) {
+                reserved.insert(*id);
+            }
             entry.state = if entry.declarations.iter().any(|d| &d.descriptor != first) {
                 State::Conflict
             } else if !policy.enabled
@@ -796,6 +857,7 @@ impl Directory {
             {
                 State::Excluded
             } else if !retained.contains(id)
+                && !reserved.contains(id)
                 && !entry
                     .declarations
                     .iter()
@@ -806,12 +868,31 @@ impl Directory {
                 State::Subscribed
             };
         }
+        // The reserved tables first, whatever their causal order: each takes its own slot while
+        // storage has room for one more directory at all, which it lacks only on a Mac whose
+        // retained tables already fill every slot (`room`).
+        for id in &order {
+            let entry = snapshot
+                .entries
+                .get_mut(id)
+                .expect("ordered declaration exists");
+            if reserved.contains(id) && entry.state == State::Subscribed && !retained.contains(id) {
+                if total > MAX_TABLES {
+                    entry.state = State::Capacity;
+                } else {
+                    total += 1;
+                }
+            }
+        }
         for id in order {
             let entry = snapshot
                 .entries
                 .get_mut(&id)
                 .expect("ordered declaration exists");
-            if entry.state == State::Subscribed && !retained.contains(&id) {
+            if !reserved.contains(&id)
+                && entry.state == State::Subscribed
+                && !retained.contains(&id)
+            {
                 if free == 0 {
                     entry.state = State::Capacity;
                 } else {

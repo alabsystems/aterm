@@ -80,12 +80,18 @@ fn a_shell_s_xdg_config_home_launchd_lacks_is_a_split_said_plainly() {
     assert!(
         command.ends_with(&format!(
             "ln -s {} {}",
-            dots.join("aterm").display(),
-            h.join(".config/aterm").display()
+            super::shell_word(&dots.join("aterm")),
+            super::shell_word(&h.join(".config/aterm"))
         )),
         "{command}"
     );
-    assert!(said.contains(&format!("(undo: rm {})", h.join(".config/aterm").display())));
+    assert!(
+        said.contains(&format!(
+            "(undo: rm {})",
+            super::shell_word(&h.join(".config/aterm"))
+        )),
+        "{said}"
+    );
 
     let home = self::home();
     let h = home.as_path();

@@ -400,6 +400,7 @@ fn an_expired_retry_keeps_its_owner_when_another_sign_in_is_running() {
     assert!(guard.ladder_owners.contains_key("w3"));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_published_alternate_keeps_the_requested_retry_and_the_actual_login() {
     let desk = Desk::new("m30");
@@ -579,6 +580,7 @@ fn a_roster_identity_edit_reconsiders_the_row_without_roster_rewrite_noise() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_changed_account_does_not_receive_an_earlier_attempts_failure() {
     for changed in ["same", "other", "email", "identity", "browser", "directory"] {
@@ -669,6 +671,7 @@ fn a_changed_account_does_not_receive_an_earlier_attempts_failure() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_replaced_login_stops_the_automatic_retry_and_failure_summary() {
     let desk = Desk::new("m30");
@@ -812,14 +815,10 @@ fn an_unattended_run_is_handed_nothing_where_aterm_links_no_opener() {
         Some(accounts::AttemptOutcome::SignedIn)
     );
     let lines = bench.logged();
-    let failed: Vec<&String> = lines
-        .iter()
-        .filter(|l| {
-            l.contains(
-                "account w3: automatic sign-in failed: profile: no opener link could be made",
-            )
-        })
-        .collect();
+    let cause = crate::harness::cli::opener_link(&desk.store(), &crate::harness::cli::LiveAccounts)
+        .unwrap_err()
+        .to_string();
+    let failed: Vec<&String> = lines.iter().filter(|l| l.contains(&cause)).collect();
     assert_eq!(failed.len(), 1, "{lines:?}");
 
     bench.cool();

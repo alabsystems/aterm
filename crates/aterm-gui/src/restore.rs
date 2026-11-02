@@ -122,6 +122,25 @@ pub(crate) struct TerminalLeafRestore {
     pub lost: Option<Box<LostRestore>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held: bool,
+    /// The claim folder of the tab's claim worker (its task record's folder, the worker running or
+    /// ended), so a restore other than a seamless update, which the record does not cross, gives
+    /// the tab a record again whether or not an agent rides the leaf: `working` for a worker it
+    /// brings back or a shell the PTY keeper hands back, else `exited`, a tab whose worker is not
+    /// coming back (it had ended, or a quit forgot its agent), which closes once that mark has
+    /// stood its time and any program run there since has had as long
+    /// (`harness_host::credit_claim::note_restored_worker`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_worker: Option<String>,
+    /// The tab's claim worker had ended (its task marked `exited` in [`Self::claim_worker`]), so a
+    /// restore times no program found or relaunched there as the worker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claim_ended: bool,
+    /// The agent this leaf carries runs in a claim folder but is no claim worker (the leaf names
+    /// none, [`Self::mark_claim_bystander`]): someone's own, which a restore must not time as the
+    /// worker. A writer before [`Self::claim_worker`] left both out, so a reader takes an agent in
+    /// a claim folder with neither for the worker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_claim_worker: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holds: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -827,6 +846,20 @@ pub(crate) fn agent_resumes(session: Option<&str>, argv: &[String]) -> bool {
 }
 
 impl TerminalLeafRestore {
+    /// Set [`Self::not_claim_worker`] from the agent this leaf carries now: one in a claim folder
+    /// on a leaf that names no claim worker is someone's own, where this run wrote the leaf from
+    /// its live session (this writer names every claim worker it has a record of). Run once the
+    /// leaf carries its last agent ([`RestoreManifest::mark_claim_bystanders`]), never on a leaf
+    /// carried from an older layout, which may name a worker only by its agent.
+    pub(crate) fn mark_claim_bystander(&mut self) {
+        self.not_claim_worker = self.claim_worker.is_none()
+            && self.agent.as_ref().is_some_and(|agent| {
+                aterm_agent::harness::credit_offers::is_claim_folder(std::path::Path::new(
+                    &agent.cwd,
+                ))
+            });
+    }
+
     /// The standing holds this leaf's tab carried, read fail-closed.
     pub(crate) fn carried_holds(&self) -> crate::fabric::Holds {
         crate::fabric::parse_holds(self.holds.iter().map(String::as_str))
@@ -1928,6 +1961,9 @@ impl RestoredTab {
                         lost: None,
                         held: false,
                         holds: Vec::new(),
+                        claim_ended: false,
+                        not_claim_worker: false,
+                        claim_worker: None,
                     }))
                 }
                 PaneLayout::Split {
@@ -2257,6 +2293,19 @@ impl RestoreManifest {
         });
     }
 
+    /// [`TerminalLeafRestore::mark_claim_bystander`] on every terminal leaf this run wrote from a
+    /// live session, once the agents are filled and carried forward.
+    pub(crate) fn mark_claim_bystanders(&mut self) {
+        self.fill_terminals(&mut |terminal| {
+            // A leaf with no session of this run is one a restore still owed, carried as its
+            // own writer left it (`RestoreDrain::carry_owed`), whose verdict stands: a layout
+            // before `claim_worker` names a running worker only by its agent.
+            if terminal.local_id.is_some() {
+                terminal.mark_claim_bystander();
+            }
+        });
+    }
+
     /// Populate each terminal leaf with the holds reported by `holds`.
     pub(crate) fn fill_holds(&mut self, holds: &dyn Fn(u64) -> Vec<String>) {
         self.fill_terminals(&mut |terminal| {
@@ -2415,6 +2464,9 @@ impl RestoreManifest {
                     lost: None,
                     held: false,
                     holds: Vec::new(),
+                    claim_ended: false,
+                    not_claim_worker: false,
+                    claim_worker: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -4294,6 +4346,9 @@ mod tests {
             lost: None,
             held: false,
             holds: Vec::new(),
+            claim_ended: false,
+            not_claim_worker: false,
+            claim_worker: None,
         }))
     }
 
@@ -5704,6 +5759,9 @@ metadata = "opaque=copy-me"
                     lost: None,
                     held: false,
                     holds: Vec::new(),
+                    claim_ended: false,
+                    not_claim_worker: false,
+                    claim_worker: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,

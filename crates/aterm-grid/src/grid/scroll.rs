@@ -249,6 +249,8 @@ impl Grid {
                 if over > 0 {
                     self.drop_flood_overflow(over);
                 }
+            } else if self.holds_replay_history() {
+                self.storage.lazy_buffer.hold();
             } else {
                 self.drain_lazy_buffer();
             }
@@ -396,6 +398,30 @@ impl Grid {
 
     /// Minimum lazy-backlog line capacity before flood overflow drops oldest staged rows.
     pub(crate) const ASYNC_COMPRESS_BACKPRESSURE: usize = 20_000;
+
+    /// Whether a drain due now on a grid a replay trims between input slices
+    /// ([`Grid::trim_replay_history`]) may hold the staged rows instead
+    /// ([`LazyBuffer::hold`](super::scroll_convert::LazyBuffer::hold)), so the
+    /// trim discards them unstored. It may only where storing them would drop no
+    /// row the trim keeps, so the trimmed history is the same either way: a store
+    /// is attached (a grid without one clears what it drains), its line limit
+    /// keeps at least the trim's rows, and its memory headroom covers the staged
+    /// rows' weight as the flood path weighs it ([`Self::flood_overflow`]), so
+    /// storing them would not evict stored rows by memory.
+    fn holds_replay_history(&self) -> bool {
+        let trim = self.storage.replay_trim;
+        if trim == 0 {
+            return false;
+        }
+        let Some(store) = self.storage.scrollback.as_ref() else {
+            return false;
+        };
+        let headroom = store
+            .memory_budget()
+            .saturating_sub(store.budgeted_memory_used());
+        store.line_limit().is_none_or(|limit| limit >= trim)
+            && self.storage.lazy_buffer.may_hold(trim, headroom)
+    }
 
     /// Number of oldest staged rows that exceed the lazy-backlog line or byte limits.
     pub(crate) fn flood_overflow(&self) -> usize {

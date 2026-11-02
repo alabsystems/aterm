@@ -29,7 +29,7 @@ pub(super) fn join_host(paths: &Paths, source: &str, host: &str) {
     .expect("join host");
 }
 
-fn start_loopback_server(store: &Path) -> crate::server::Running {
+pub(super) fn start_loopback_server(store: &Path) -> crate::server::Running {
     start_loopback_server_at(store, None)
 }
 
@@ -50,7 +50,7 @@ fn start_loopback_server_at(store: &Path, clock: Option<fn() -> u64>) -> crate::
     .expect("start server")
 }
 
-fn enroll_commons(owner_paths: &Paths, member_paths: &Paths) {
+pub(super) fn enroll_commons(owner_paths: &Paths, member_paths: &Paths) {
     sync(member_paths, None).expect("sync member before commons enroll");
     let owner = Bootstrap::required(owner_paths).expect("owner bootstrap");
     let peer = Bootstrap::required(member_paths).expect("peer bootstrap");
@@ -680,7 +680,9 @@ fn an_entry_edited_on_the_lower_seq_side_of_a_split_survives_the_heal() {
     s2.stop();
 }
 
-fn copy_private_tree(src: &Path, dst: &Path) {
+/// Copy the tree at `src` to `dst`, each directory private and each file `0600`: a home or a
+/// journal a replay starts from.
+pub(super) fn copy_private_tree(src: &Path, dst: &Path) {
     fsx::ensure_private_dir(dst).expect("ensure dst dir");
     for entry in std::fs::read_dir(src).expect("read src dir") {
         let entry = entry.expect("dir entry");
@@ -1549,19 +1551,19 @@ fn a_mac_the_envelope_admits_stays_in_while_the_log_holds_no_wrap_for_it() {
 /// Two admins on two loopback servers, before a split: `st1` (`m22`, on `s1`) and `st2` (`m7`,
 /// on `s2`), with member `m8` (`m_v2`, on `s1`), a `0.145` member `m9` that reads only the
 /// envelope, `split-key` and `other-key` at `v0`, Commons enrolled and Genesis v2 synced.
-struct SplitAdmins {
-    root: aterm_tempfile::TempDir,
-    s1: crate::server::Running,
-    s2: crate::server::Running,
-    url1: String,
-    url2: String,
-    st1: Paths,
-    st2: Paths,
-    m_v2: Paths,
-    m_0145_id: Identity,
+pub(super) struct SplitAdmins {
+    pub(super) root: aterm_tempfile::TempDir,
+    pub(super) s1: crate::server::Running,
+    pub(super) s2: crate::server::Running,
+    pub(super) url1: String,
+    pub(super) url2: String,
+    pub(super) st1: Paths,
+    pub(super) st2: Paths,
+    pub(super) m_v2: Paths,
+    pub(super) m_0145_id: Identity,
 }
 
-fn split_admins() -> SplitAdmins {
+pub(super) fn split_admins() -> SplitAdmins {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s1 = start_loopback_server(&root.path().join("s1"));
     let s2 = start_loopback_server(&root.path().join("s2"));
@@ -1629,7 +1631,7 @@ fn split_admins() -> SplitAdmins {
 }
 
 /// What a `0.145` Mac holding `id` reads from the envelope `url` serves: entry name to value.
-fn envelope_view(url: &str, id: &Identity) -> (u64, BTreeMap<String, Vec<u8>>) {
+pub(super) fn envelope_view(url: &str, id: &Identity) -> (u64, BTreeMap<String, Vec<u8>>) {
     envelope_view_as(url, id, None)
 }
 
@@ -1727,7 +1729,11 @@ fn approve(admin_paths: &Paths, name: &str, id: &Identity) {
 
 /// Both `ids` read the Commons control entry from the envelope every one of `urls` serves, and
 /// from `admin_paths`' log.
-fn assert_in_commons_control(admin_paths: &Paths, urls: &[String], ids: &[(&str, &Identity)]) {
+pub(super) fn assert_in_commons_control(
+    admin_paths: &Paths,
+    urls: &[String],
+    ids: &[(&str, &Identity)],
+) {
     for url in urls {
         for (name, id) in ids {
             let (_, view) = envelope_view(url, id);
@@ -1976,6 +1982,7 @@ fn an_admin_outside_a_host_list_that_drops_its_section_deletes_every_entry_there
         log_entries::Base {
             doc: Some(&admin.doc),
             resolve: None,
+            readmit: None,
         },
     )
     .unwrap()
@@ -2686,7 +2693,8 @@ fn log_witness_skips_inert_admit_concurrent_remove_excludes_epoch_writer_and_adm
     // before falling back to `member.label` ("m8").
     let id22 = read_identity(m22).unwrap().unwrap();
     let mut doc = admin_open(m22).unwrap().doc.clone();
-    let changed = log_entries::overlay_log_onto_document(&removed_m7_log, &id22, &mut doc).unwrap();
+    let changed =
+        log_entries::overlay_log_onto_document(&removed_m7_log, &id22, &mut doc, None).unwrap();
     assert!(changed);
     assert!(
         doc.machines().iter().any(|m| m.name == "b3"),
@@ -2861,6 +2869,7 @@ pub(super) fn hand(
             allowed,
             reads_log,
             restore: false,
+            held: None,
         },
     )
     .expect("hand over");
@@ -2868,6 +2877,63 @@ pub(super) fn hand(
         crate::members::Bundle::decode(handout.bundle.as_slice()).expect("bundle"),
         handout.logged,
     )
+}
+
+/// A member's desk takes this Mac's state before a run touches its phrase, and the bundle built
+/// under that hold still names the swarm policy's servers after the source, on the log path and
+/// on F10's. Read under the hold, an entry read takes the state shared on a descriptor of its own,
+/// which the hold refuses: the policy was not found, and the bundle named the source alone.
+///
+/// NEGATIVE CONTROL: the hold read no policy before it took the state (`policy: Vec::new()` in
+/// `take_handover_hold`), so the bundle reads it under the hold: fails with "a bundle built under
+/// the hold (log: true) names the policy's server: [\"http://127.0.0.1:…/v1/alab\"]".
+#[test]
+fn a_bundle_built_under_the_desks_hold_names_the_policys_servers() {
+    let policy_url = "http://policy-a.local:7484/v1/alab".to_owned();
+    let policy = crate::swarm_roster::SwarmPolicy {
+        servers: vec![policy_url.clone()],
+        ..crate::swarm_roster::SwarmPolicy::default()
+    };
+    let toml = policy.to_toml();
+    let macs = two_macs(&[
+        (Audience::Everyone, "shared", b"everyone-v1".as_slice()),
+        (
+            Audience::Everyone,
+            crate::SWARM_POLICY_ENTRY,
+            toml.as_bytes(),
+        ),
+    ]);
+    let m7 = &macs.m7;
+    assert!(
+        policy_peer_urls(m7, &configured(m7).unwrap()).contains(&policy_url),
+        "CONTROL: m7 reads the policy's server"
+    );
+    for (reads_log, name) in [(true, "m40"), (false, "m41")] {
+        let (_, request, allowed) = newcomer(macs.root.path(), m7, name);
+        let hold = take_handover_hold(m7).unwrap().expect("m7's state");
+        let handout = hand_over(
+            m7,
+            &crate::members::desk::Handing {
+                request: &request,
+                node: request.binding().recipient().0,
+                name: allowed.name(),
+                allowed: &allowed,
+                reads_log,
+                restore: false,
+                held: Some(&hold),
+            },
+        )
+        .expect("hand over");
+        drop(hold);
+        assert_eq!(handout.logged, reads_log, "CONTROL: the path taken");
+        let bundle = crate::members::Bundle::decode(handout.bundle.as_slice()).expect("bundle");
+        assert!(
+            bundle.servers.contains(&policy_url),
+            "a bundle built under the hold (log: {reads_log}) names the policy's server: {:?}",
+            bundle.servers
+        );
+    }
+    macs.server.stop();
 }
 
 #[test]
@@ -3173,6 +3239,7 @@ pub(super) fn hand_result(
             allowed,
             reads_log,
             restore: false,
+            held: None,
         },
     )
 }
@@ -3254,6 +3321,7 @@ fn a_mac_the_log_removed_is_not_let_back_in_by_a_members_allow() {
             allowed: &allowed3,
             reads_log: true,
             restore: false,
+            held: None,
         },
     )
     .expect("hand over m41");
@@ -3520,7 +3588,7 @@ fn a_mac_the_log_admits_posts_its_allowed_until_an_admins_approver_names_it() {
 
     let recipient = request.binding().recipient().to_bech32();
     let queued = || {
-        requests_for(&config(m22).unwrap().unwrap(), None)
+        requests_for(m22, &config(m22).unwrap().unwrap(), None)
             .unwrap()
             .into_iter()
             .any(|asked| asked.recipient == recipient && asked.allowed.is_some())
@@ -4001,7 +4069,8 @@ fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_en
     assert!(!log_initial.wraps_maximal_audience_to(&EpochAudience::Commons, &v1_rec));
     let id22 = read_identity(&m22).unwrap().unwrap();
     let mut doc_overlay = admin_open(&m22).unwrap().doc.clone();
-    let _ = log_entries::overlay_log_onto_document(&log_initial, &id22, &mut doc_overlay).unwrap();
+    let _ = log_entries::overlay_log_onto_document(&log_initial, &id22, &mut doc_overlay, None)
+        .unwrap();
     let ctrl_aud = doc_overlay
         .entries()
         .into_iter()
@@ -4482,6 +4551,7 @@ fn a_busy_member_ends_a_log_run_with_the_refusal_inside_the_ask_exchanges_bound(
                 allowed: &allowed,
                 reads_log: true,
                 restore: false,
+                held: None,
             },
         );
         let _ = tx.send(handed.map(|handout| handout.logged));
@@ -6256,4 +6326,20 @@ fn every_server_must_answer_before_the_mirror_can_stop() {
     assert!(log_entries::mirror_still_needed(&log, Some(&heard), now));
     peer.stop();
     macs.server.stop();
+}
+
+#[test]
+fn pending_request_members_are_verified_without_admin_credentials() {
+    let macs = two_macs(&[]);
+    assert!(admin_open(&macs.m7).is_err());
+    let config = config(&macs.m7).unwrap().unwrap();
+    let members = request_members(&macs.m7, &config, None).unwrap().unwrap();
+    let member = machine_identity(&macs.m7).unwrap().recipient().to_bech32();
+    assert!(members.contains(&member));
+    let stranger = crate::age::Identity::from_secret_bytes([79; 32])
+        .recipient()
+        .to_bech32();
+    assert!(!members.contains(&stranger));
+    let empty = Paths::for_home(&macs.root.path().join("untrusted-reader"));
+    assert!(request_members(&empty, &config, None).unwrap().is_none());
 }

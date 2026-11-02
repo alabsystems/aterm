@@ -97,6 +97,7 @@ impl<C: Ctl> Session<'_, C> {
             wall_ms: self.hold_wall_ms(now_ms),
             told: &told,
             ranked: true,
+            nudge_wake: self.setup.occupancy_nudge_wake,
         };
         let (verdict, wake) = rules::at_point(&self.hold.door.books, guards, now_ms, &sight);
         let wake = wake.filter(|_| matches!(verdict, Verdict::Due(_)))?;

@@ -358,10 +358,32 @@ fn mid_walk_custody(ancestor: bool, rename: bool, custody_marker: &str) {
             PathBuf::from("release/incremental/lay-1x2y3z/s-abc-def/query-cache.bin"),
             PathBuf::from("release/incremental/remaining/session/query-cache.bin"),
         ];
-        for rel in [&payloads[1], &payloads[3]] {
-            let second = target.join(rel);
-            std::fs::create_dir_all(second.parent().unwrap()).unwrap();
-            std::fs::write(&second, vec![17u8; 8192]).unwrap();
+        for rel in &payloads {
+            use std::io::Write as _;
+            let payload = target.join(rel);
+            std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&payload)
+                .unwrap();
+            file.write_all(&[17u8; 8192]).unwrap();
+            // These scratch payloads may be recreated after a power loss.
+            aterm_durable::ordered(&file).unwrap();
+            assert!(
+                blocks(&payload) > 0,
+                "method {method}: {rel:?} must release allocated bytes when removed first"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                assert_eq!(
+                    file.metadata().unwrap().nlink(),
+                    1,
+                    "method {method}: {rel:?} must have no retained hard link"
+                );
+            }
         }
         let allocated: Vec<_> = snapshot(&target, &|_| false)
             .into_iter()

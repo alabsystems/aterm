@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Publish a fully marked cache, never an empty unowned target at its public name.
+//!
+//! Fresh creation supplies the standard cache tag before exposure. Completed caches keep
+//! their existing contents; admission never repairs an older missing or invalid tag.
 
 use std::path::PathBuf;
 
@@ -52,25 +55,97 @@ pub(super) fn named(
 }
 
 #[cfg(unix)]
-fn only_marker(root: &aterm_dirfd::OwnedFd) -> Option<bool> {
+fn only_creation_files(root: &aterm_dirfd::OwnedFd) -> Option<bool> {
     let mut entries = aterm_dirfd::Dir::read_from(root).ok()?;
-    let mut found = false;
+    let mut marker = false;
+    let mut tag = false;
     for entry in &mut entries {
         let entry = entry.ok()?;
         match entry.file_name().to_bytes() {
             b"." | b".." => {}
-            name if name == MARKER.as_bytes() => found = true,
+            name if name == MARKER.as_bytes() => marker = true,
+            b"CACHEDIR.TAG" => tag = true,
             _ => return None,
         }
     }
-    Some(found)
+    Some(marker && tag && valid_cache_tag(root)?)
+}
+
+#[cfg(unix)]
+fn cache_tag_bytes() -> String {
+    format!("{}\n", aterm_toolchain::lasting::CACHEDIR_TAG_SIGNATURE)
+}
+
+/// The tag describes generated cache output; only the separate identity receipt grants custody.
+#[cfg(unix)]
+fn write_cache_tag(root: &aterm_dirfd::OwnedFd) -> Option<()> {
+    use std::io::Write as _;
+    let file = aterm_dirfd::openat(
+        root,
+        "CACHEDIR.TAG",
+        aterm_dirfd::OFlags::WRONLY
+            | aterm_dirfd::OFlags::CREATE
+            | aterm_dirfd::OFlags::EXCL
+            | aterm_dirfd::OFlags::NOFOLLOW
+            | aterm_dirfd::OFlags::CLOEXEC,
+        aterm_dirfd::Mode::from_bits(0o600),
+    )
+    .ok()?;
+    let mut file = std::fs::File::from(file);
+    file.write_all(cache_tag_bytes().as_bytes()).ok()?;
+    aterm_durable::ordered(&file).ok()?;
+    sync_directory(root, Point::Tag)
+}
+
+#[cfg(unix)]
+fn valid_cache_tag(root: &aterm_dirfd::OwnedFd) -> Option<bool> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let file = aterm_dirfd::openat(
+        root,
+        "CACHEDIR.TAG",
+        aterm_dirfd::OFlags::RDONLY
+            | aterm_dirfd::OFlags::NOFOLLOW
+            | aterm_dirfd::OFlags::NONBLOCK
+            | aterm_dirfd::OFlags::CLOEXEC,
+        aterm_dirfd::Mode::empty(),
+    )
+    .ok()?;
+    let file = std::fs::File::from(file);
+    let before = file.metadata().ok()?;
+    let expected = cache_tag_bytes();
+    if !before.is_file()
+        || before.uid() != super::euid()
+        || before.mode() & 0o022 != 0
+        || before.nlink() != 1
+        || before.len() != expected.len() as u64
+        || !retention::private_metadata(&file)
+    {
+        return Some(false);
+    }
+    let mut actual = Vec::with_capacity(expected.len() + 1);
+    (&file)
+        .take(expected.len() as u64 + 1)
+        .read_to_end(&mut actual)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    let named =
+        aterm_dirfd::fstatat(root, "CACHEDIR.TAG", aterm_dirfd::AtFlags::SYMLINK_NOFOLLOW).ok()?;
+    Some(
+        actual == expected.as_bytes()
+            && before.len() == after.len()
+            && before.modified().ok() == after.modified().ok()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+            && after.nlink() == 1
+            && retention::private_metadata(&file)
+            && named.st_dev == after.dev()
+            && named.st_ino == after.ino(),
+    )
 }
 
 #[cfg(unix)]
 fn ensure_parent(home: &Path, parent: &Path) -> Option<aterm_dirfd::OwnedFd> {
-    if let Some(held) = pin(parent) {
-        return Some(held);
-    }
     let relative = parent.strip_prefix(home).ok()?;
     let mut held = pin(home)?;
     let mut at = home.to_path_buf();
@@ -79,28 +154,7 @@ fn ensure_parent(home: &Path, parent: &Path) -> Option<aterm_dirfd::OwnedFd> {
             return None;
         };
         at.push(name);
-        let made = match aterm_dirfd::mkdirat(&held, name, aterm_dirfd::Mode::from_bits(0o700)) {
-            Ok(()) => true,
-            Err(error) if error.raw_os_error() == libc::EEXIST => false,
-            Err(_) => return None,
-        };
-        let child = pin(&at)?;
-        let captured = aterm_dirfd::fstat(&child).ok()?;
-        if !named(
-            &held,
-            name,
-            &Identity {
-                device: captured.st_dev,
-                inode: captured.st_ino,
-            },
-        ) {
-            return None;
-        }
-        if made {
-            aterm_dirfd::fsync(&child).ok()?;
-            aterm_dirfd::fsync(&held).ok()?;
-        }
-        held = child;
+        held = super::directory_child(&held, name, &at, Point::Parent)?;
     }
     Some(held)
 }
@@ -144,13 +198,15 @@ pub(super) fn begin(
     step(Point::Created)?;
     // Before durable intent a crash can leave only private bookkeeping, never build output.
     // The marker is complete before intent, so recovery never repairs an unproved marker.
+    write_cache_tag(&held_stage)?;
     retention::write_marker(&held_stage, &complete(&receipt)).ok()?;
     step(Point::Marker)?;
     if !named(
         &held_parent,
         receipt.creating.as_ref()?.directory.file_name()?,
         &receipt.identity,
-    ) {
+    ) || !only_creation_files(&held_stage)?
+    {
         return None;
     }
     aterm_dirfd::fsync(&held_parent).ok()?;
@@ -203,7 +259,7 @@ pub(super) fn finish(home: &Path, record: &Path, receipt: &Receipt) -> Option<Re
             if !named(&held_parent, stage_name, &receipt.identity) {
                 return None;
             }
-            match (only_marker(&stage)?, retention::receipt_at(&stage)) {
+            match (only_creation_files(&stage)?, retention::receipt_at(&stage)) {
                 (true, Some(marker)) if marker_binds(&marker, &published) => {}
                 _ => return None,
             }
@@ -235,7 +291,7 @@ pub(super) fn finish(home: &Path, record: &Path, receipt: &Receipt) -> Option<Re
     }
     let target = pin(&receipt.root)?;
     if !named(&held_parent, root_name, &receipt.identity)
-        || !only_marker(&target)?
+        || !only_creation_files(&target)?
         || !retention::receipt_at(&target).is_some_and(|marker| marker_binds(&marker, &published))
         || read(record).as_ref() != Some(receipt)
         || !receipt
@@ -257,7 +313,9 @@ pub(super) fn finish(home: &Path, record: &Path, receipt: &Receipt) -> Option<Re
 pub(super) enum Point {
     Index,
     Gate,
+    Parent,
     Created,
+    Tag,
     Intent,
     Marker,
     Publishing,

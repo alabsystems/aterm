@@ -14,13 +14,14 @@
 //! * The lab lifts it, the stub's scripted mode again, once [`TRIES`] acts met it and the loop
 //!   decided a wait after the last; [`hold_at_most_ms`] past its meeting, a hang detector lifts it
 //!   from under a loop that never tried ([`outage_move`]).
-//! * Both modes run the loop's ladders at three eighths ([`SCALE`], [`env`]), so the outage's
-//!   rungs ([`rung_ms`]) are 45 s, 90 s, 180 s and 360 s.
+//! * Both modes run the loop's ladders at three eighths ([`SCALE`], [`env`](fn@env)), so the
+//!   outage's rungs ([`rung_ms`]) are 45 s, 90 s, 180 s and 360 s.
 //! * [`judge`] wants:
 //!   - every act typed while the outage stood a try ([`RULE_OUTAGE_RESUME`]), each its one line
-//!     ([`line`]) or, as Land's first, the instruction never given before it (12a's rule), each on
-//!     its rung counted from its own wall: the wait on the outage journaled where the outage met
-//!     the agent again names the rung as its due, and the try comes at it ([`try_faults`]);
+//!     ([`line`](fn@line)) or, as Land's first, the instruction never given before it (12a's
+//!     rule), each on its rung counted from its own wall: the wait on the outage journaled where
+//!     the outage met the agent again names the rung as its due, and the try comes at it
+//!     ([`try_faults`]);
 //!   - nothing else typed into it, nothing escalated, needed or landed while it stood, and
 //!     nothing held while it stood or on the resume's answer;
 //!   - `aterm ctl status` saying `waiting=overload` while it stood, and no longer once the agent

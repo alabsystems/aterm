@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod activation;
-mod gui;
+pub(super) mod gui;
 mod history;
 mod lens;
 mod reopen;

@@ -3208,6 +3208,7 @@ impl App {
             .map(|entry| (entry.id.raw(), entry.title))
             .collect();
         glance.system_state = self.system_state_menu_line();
+        glance.network = crate::net_place::menu_line();
         glance
     }
 
@@ -3774,12 +3775,7 @@ impl App {
             return Err("no such session".to_string());
         };
         let split = location.terminal_only && self.tab_has_sibling_panes(wid, location.tab_id);
-        let exits_window = location.terminal_only
-            && !split
-            && self
-                .windows
-                .get(&wid)
-                .is_some_and(|ws| ws.tab_set.len() <= 1);
+        let exits_window = self.close_exits_window(wid, location);
         if !exits_window && !self.pane_close_allowed(self.pane_close_hangs_up_a_job(session)) {
             return Err(WIRE_PANE_CLOSE_REFUSED.to_string());
         }
@@ -3805,6 +3801,24 @@ impl App {
         } else {
             Err(crate::app_window::WIRE_CLOSE_REFUSED.to_string())
         }
+    }
+
+    /// Whether closing the pane showing `session` would end its window: the only pane of that
+    /// window's only tab, which asks before it goes. A session no window shows ends none.
+    pub(crate) fn close_ends_window(&self, session: u64) -> bool {
+        self.windows.keys().any(|wid| {
+            self.terminal_view_location(*wid, session)
+                .is_some_and(|location| self.close_exits_window(*wid, location))
+        })
+    }
+
+    fn close_exits_window(&self, wid: WindowId, location: TerminalViewLocation) -> bool {
+        location.terminal_only
+            && !self.tab_has_sibling_panes(wid, location.tab_id)
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.tab_set.len() <= 1)
     }
 
     fn tab_has_sibling_panes(&self, wid: WindowId, tab_id: crate::tab_model::TabId) -> bool {
@@ -10305,7 +10319,7 @@ mod status_glance_tests {
             .unwrap()
             .task()
             .expect("the task")
-            .carry_row();
+            .carry_row(std::time::Instant::now());
 
         let successor = |carried: bool| {
             let mut app = App::headless_for_test();

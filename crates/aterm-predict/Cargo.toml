@@ -25,6 +25,8 @@ aterm-time = { workspace = true }
 # is that crate's question. Dependency-free, and already in the wasm closure
 # through aterm-core.
 aterm-bidi = { workspace = true }
+# FNV-1a/64 (astream-wire's) for a context's nonce. Wasm-clean.
+aterm-hash = { workspace = true }
 
 [dev-dependencies]
 # The headless engine the safety theorem (`tests/reconciled_view_safety.rs`) folds

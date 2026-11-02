@@ -21,8 +21,8 @@ enum SuccessorLane {
 pub(crate) fn settle_incoming_descriptor_limit(env: &crate::handoff_env::HandoffEnv) {
     if let Some(limit) = adopt_carried_launcher_limit(env) {
         aterm_log::info!(
-            "overlap handoff: new shells get the launcher's soft descriptor limit {limit}, \
-             carried by the outgoing process"
+            "descriptor limit: new shells get the launcher's soft descriptor limit {limit}, \
+             carried by the process that started this one"
         );
     }
     let lane = if env.present(crate::seamless::ENV_RENDEZVOUS)
@@ -170,7 +170,8 @@ fn carried_launcher_limit(carried: Option<&str>, soft: u64) -> Option<u64> {
     s.parse::<u64>().ok().filter(|carried| *carried <= soft)
 }
 
-/// Record the launcher limit a fork-lane parent carried ([`ENV_LAUNCHER_NOFILE`]).
+/// Record the launcher limit a fork-lane parent ([`ENV_LAUNCHER_NOFILE`]) or the node job
+/// ([`ENV_NODE_LAUNCHER_NOFILE`]) carried.
 pub(crate) fn adopt_carried_launcher_limit(env: &crate::handoff_env::HandoffEnv) -> Option<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -185,8 +186,10 @@ pub(crate) fn adopt_carried_launcher_limit(env: &crate::handoff_env::HandoffEnv)
     {
         PARK_RAISED_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
     }
-    let carried =
-        carried_launcher_limit(env.string(ENV_LAUNCHER_NOFILE).as_deref(), limit.rlim_cur)?;
+    let named = env
+        .string(ENV_LAUNCHER_NOFILE)
+        .or_else(|| env.string(ENV_NODE_LAUNCHER_NOFILE));
+    let carried = carried_launcher_limit(named.as_deref(), limit.rlim_cur)?;
     LAUNCHER_SOFT_NOFILE.set(carried).ok()?;
     Some(carried)
 }
@@ -216,6 +219,36 @@ pub(crate) fn raise_descriptor_limit_for_claim() -> std::io::Result<Option<(u64,
     }
     let _ = LAUNCHER_SOFT_NOFILE.set(soft);
     Ok(Some((soft, target)))
+}
+
+/// The node job starts at launchd's soft limit of 256, which [`crate::fleet_listen`] shares out as
+/// half the fleet slots a window serves: the job that answers every member's reads needs the room
+/// no less than a window does.
+pub(crate) fn raise_descriptor_limit_for_node() {
+    match raise_descriptor_limit_for_claim() {
+        Ok(Some((from, to))) => aterm_log::info!(
+            "node: raised the soft descriptor limit from {from} to {to} for its fleet slots"
+        ),
+        Ok(None) => {}
+        Err(error) => aterm_log::warn!(
+            "node: could not raise the soft descriptor limit ({error}); it serves the fleet slots \
+             the launcher's limit holds"
+        ),
+    }
+}
+
+/// The launch variable with which the node job tells a window it launches directly the launcher's
+/// soft limit: the window inherits the job's raise ([`raise_descriptor_limit_for_node`]), so it has
+/// none of its own to record, and its shells would keep the raise. Unlike
+/// [`ENV_LAUNCHER_NOFILE`], which only an update's successor may read, it is meant for a launch that
+/// is no update's; the window takes it before any shell can see it.
+pub(crate) const ENV_NODE_LAUNCHER_NOFILE: HandoffName =
+    HandoffName::new("ATERM_NODE_LAUNCHER_NOFILE");
+
+/// [`ENV_NODE_LAUNCHER_NOFILE`] for a window this process launches directly, where it raised its
+/// limit.
+pub(crate) fn window_launcher_limit() -> Option<(std::ffi::OsString, std::ffi::OsString)> {
+    launcher_soft_descriptor_limit().map(|soft| ENV_NODE_LAUNCHER_NOFILE.pair(soft.to_string()))
 }
 
 /// The keeper's recovery needs the same room.

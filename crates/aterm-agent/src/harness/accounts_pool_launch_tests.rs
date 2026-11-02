@@ -281,6 +281,12 @@ fn managed_launch_refusals_do_not_become_unmanaged_starters() {
     assert_eq!(aterm_spec::interp::prove_and_catch(&model), 23);
     for state in aterm_spec::interp::reachable_states(&model) {
         if model.action_enabled("Choose", &state) {
+            // Case 6 checks Kimi overlay drift (`accounts_overlay::make_link`), which runs only
+            // on Unix; `an_overlay_row_is_never_started_on_where_aterm_makes_no_links` holds the
+            // off-Unix refusal.
+            if state["case"] == 6 && !cfg!(unix) {
+                continue;
+            }
             let next = launch_transition(&state, "Choose");
             assert!(
                 model.successors("Choose", &state).contains(&next),

@@ -353,7 +353,8 @@ const ECHO_PERSON: &str = "the original person count changed or is unavailable";
 /// The composer shows something the text never begins as.
 const ECHO_OTHER: &str = "the composer does not show it as written";
 /// The echo did not finish within [`ECHO_HANG`].
-const ECHO_HUNG: &str = "the composer had not shown it whole a minute after it was written";
+pub(super) const ECHO_HUNG: &str =
+    "the composer had not shown it whole a minute after it was written";
 
 /// What `screen` shows of `text` written into the composer `reader` reads.
 pub(super) fn echo_of(reader: &dyn ScreenReader, screen: &Screen, text: &str) -> Echo {
@@ -405,17 +406,41 @@ pub(super) struct LeftLine {
 }
 
 /// A LINE THIS LOOP WROTE THAT STANDS UNSENT, KEPT AS ITS OWN ([`Session::left_line_look`]): the
-/// text and the act that wrote it, until the loop writes again or a turn runs. Drawn late, it is
-/// no person's draft ([`Session::person_at`]), so no person's grace waits on it; and the Enter a
-/// later decision gives it is that act's, booked as typed, so an instruction its program drew
-/// past the echo's hang counts as given once and is never typed a second time.
+/// text and who wrote it ([`OwnBy`]), until the loop writes again or a turn runs (the accounts
+/// probe's, until the probe ends). Drawn late, it is no person's draft ([`Session::person_at`]), so
+/// no person's grace waits on it; and the Enter a later decision gives it is its writer's: an act's
+/// booked as typed, so an instruction its program drew past the echo's hang counts as given once
+/// and is never typed a second time, and the probe's `/usage` its own.
 #[derive(Debug, Clone)]
 pub(super) struct OwnLine {
     text: String,
-    act: TurnEndAction,
+    by: OwnBy,
+}
+
+/// Who wrote a line this loop left ([`OwnLine`]), and so whose its Enter is.
+#[derive(Debug, Clone)]
+pub(super) enum OwnBy {
+    /// A point's act: the Enter a later decision gives the line is that act's.
+    Act(TurnEndAction),
+    /// The accounts probe's `/usage` ([`Session::probe_type`]): its Enter is the probe's own
+    /// ([`Session::probe_left_enter`]), no act of the policy's, and the line is the loop's only
+    /// while the probe that wrote it lasts ([`Session::probe_closed`]).
+    Probe,
+    /// Any other write's line (Cruise's carry at a break, a door's fact): its Enter is the
+    /// policy's draft step's, as before, and a door's line is settled by the facts' look.
+    Line,
 }
 
 impl OwnLine {
+    /// The line `text` that `by` left, for a test.
+    #[cfg(test)]
+    pub(super) fn of(text: &str, by: OwnBy) -> Self {
+        Self {
+            text: text.to_string(),
+            by,
+        }
+    }
+
     /// Whether `shown` (a composer's text, or a draft a read saw) is this line, whitespace aside.
     pub(super) fn is(&self, shown: &str) -> bool {
         squashed(shown) == squashed(&self.text)
@@ -524,12 +549,10 @@ pub(super) fn resume_jitter(sid: &str, reset_unix: i64, span: Duration) -> Durat
     if span_s == 0 {
         return Duration::ZERO;
     }
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in sid.bytes().chain(reset_unix.to_le_bytes()) {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    Duration::from_secs(h % span_s)
+    let mut h = aterm_hash::Fnv1a64::new();
+    h.write(sid.as_bytes());
+    h.write(&reset_unix.to_le_bytes());
+    Duration::from_secs(h.finish() % span_s)
 }
 
 /// The standing rules of `policy` ([`RULES_CAP`]).
@@ -757,7 +780,11 @@ impl<C: Ctl> Session<'_, C> {
         standing_rules_in(&self.fx.read_text(path)?)
     }
 
-    /// A wall's `reset=` text on the loop's clock ([`Self::refresh_reset`]).
+    /// A wall's `reset=` text on the loop's clock ([`Self::refresh_reset`]). `shortly`: the wall
+    /// draws Claude Code's own continue at hand ([`limit::continues_shortly`]), so a reset placed
+    /// later than [`limit::SHORTLY`] from now is placed there: the bare clock time beside it may be
+    /// a day old (a `12am` read late on the day it named, with only a done row of the day before
+    /// to place it by, is placed at the coming midnight).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn wall_reset_at(
         &mut self,
@@ -767,6 +794,7 @@ impl<C: Ctl> Session<'_, C> {
         live: bool,
         answered: bool,
         undated: bool,
+        shortly: bool,
         rows: &[String],
     ) -> Option<Instant> {
         let key = remember_reset_key(
@@ -802,6 +830,11 @@ impl<C: Ctl> Session<'_, C> {
                 }
                 u = u.map(|at| self.on_reset_clock(at));
                 let now_unix = self.now_unix();
+                if shortly {
+                    let soon = i64::try_from(limit::SHORTLY.as_secs())
+                        .map_or(now_unix, |s| now_unix.saturating_add(s));
+                    u = u.map(|at| at.min(soon));
+                }
                 match (reprint, same, u) {
                     (true, Some(old), Some(new))
                         if new > old.saturating_add(REPRINT_JUMP_MAX_S)
@@ -1268,6 +1301,88 @@ impl<C: Ctl> Session<'_, C> {
             })
     }
 
+    /// Seed the usage or model limit drawn above a person's own `/login` dialog
+    /// ([`aterm_phase::login_over_limit`]) when neither the reading nor an open ledger row yet
+    /// tracks a named limit ([`TurnEndState::waited_limit`]), so a loop that attaches with no
+    /// ledger or past [`wall_memory::MEMORY_TTL`] still waits for the reset and closes the dialog
+    /// once due.
+    fn seed_login_over_limit(
+        &mut self,
+        rows: &[String],
+        program: Program,
+        host: Option<&Arc<dyn IdleHost>>,
+        seq: u64,
+    ) {
+        if self.turn_end.waited_limit().is_some()
+            || !super::super::policy::login::carried(program)
+            || !aterm_phase::login_screen(rows).is_some_and(|screen| {
+                super::super::policy::login::over_limit_screen(&self.turn_end, &screen)
+            })
+        {
+            return;
+        }
+        let Some(over) = aterm_phase::login_over_limit(rows) else {
+            return;
+        };
+        let session_window = over.kind == aterm_phase::WallKind::UsageSession
+            && limit::names_a_session_window(&over.message);
+        let notice = self.wall_reset_at(
+            over.reset.as_deref(),
+            over.kind,
+            session_window,
+            false,
+            false,
+            false,
+            limit::continues_shortly(&over.message),
+            rows,
+        );
+        let reset_at = match self.tap_reset(
+            host,
+            over.kind,
+            &over.message,
+            over.reset.as_deref(),
+            program,
+            Check::Decide,
+            seq,
+        ) {
+            Some(at) => at.map(|unix| self.instant_of(unix)),
+            None => notice,
+        };
+        if let Some(at) = reset_at {
+            let unix = self
+                .tap_unix()
+                .or_else(|| self.wall_reset_unix())
+                .unwrap_or(0);
+            let jitter = self.setup.sid.as_deref().map_or(Duration::ZERO, |sid| {
+                resume_jitter(sid, unix, self.turn_end.timing.reset_jitter)
+            });
+            self.turn_end.seed_named_reset(
+                over.kind,
+                &over.message,
+                at,
+                jitter,
+                limit::resumes_by_itself(&over.message),
+                limit::ResetClock::of(over.reset.as_deref()),
+                self.fx.mono(),
+            );
+            let conv = self
+                .wall_conversation
+                .as_ref()
+                .filter(|(s, _)| *s == seq)
+                .map_or_else(
+                    || Conversation::unread(host.is_some(), program),
+                    |(_, c)| c.clone(),
+                );
+            self.turn_end.seed_limit_conversation(conv, Some(program));
+            self.remember_wall(&over, program, seq);
+            self.scope_limit_conversation(program, host.is_some(), seq);
+            self.persist_wall(seq);
+        } else {
+            self.turn_end
+                .seed_unnamed_wall(over.kind, &over.message, self.fx.mono());
+        }
+    }
+
     fn turn_end_reading_as(
         &mut self,
         screen: &Screen,
@@ -1278,6 +1393,11 @@ impl<C: Ctl> Session<'_, C> {
     ) -> TurnEndReading {
         let reader = self.reader(&screen.rows);
         if check == Check::Decide {
+            self.adopt_stale_wall_on_login_dialog(
+                reader.program(),
+                &screen.rows,
+                opts.idle_host.is_some(),
+            );
             self.scope_limit_conversation(reader.program(), opts.idle_host.is_some(), screen.seq);
         }
         let mut reading = reader.read(&screen.rows, Some(screen.cursor_col));
@@ -1347,6 +1467,7 @@ impl<C: Ctl> Session<'_, C> {
                     worked.is_some(),
                     answered,
                     undated,
+                    limit::continues_shortly(&w.message),
                     &screen.rows,
                 );
                 let notice = match self.standing_until(screen.seq) {
@@ -1420,6 +1541,13 @@ impl<C: Ctl> Session<'_, C> {
                 if worked.is_some() {
                     self.wall_reset = None;
                     self.reprint_jumps = 0;
+                } else if check == Check::Decide {
+                    self.seed_login_over_limit(
+                        &screen.rows,
+                        reading.program,
+                        opts.idle_host.as_ref(),
+                        screen.seq,
+                    );
                 }
                 // The limit the policy still tracks with its notice gone keeps its tap clock and
                 // the account it was met under, so a move of the login before the tap times it is
@@ -2460,6 +2588,25 @@ impl<C: Ctl> Session<'_, C> {
         ComposerRead { typed, menu_fg }
     }
 
+    /// THE LINE THIS LOOP LEFT AT `point`, WRITTEN BY `by` ([`LeftLine`], [`OwnLine`]): looked at
+    /// again as its program draws it ([`Self::left_line_look`]), and the loop's own, no person's
+    /// draft. A read that cannot say is no text seen yet: the line's draw is still a move.
+    fn left_own(&mut self, point: &Turn, text: &str, by: OwnBy) {
+        let last = self.last.clone();
+        let human = last.as_ref().and_then(|screen| screen.human_seq);
+        let stands = last.and_then(|screen| self.left_stands(&screen, text));
+        self.left_line = Some(LeftLine {
+            text: text.to_string(),
+            point_key: self.review_key(point),
+            stands: stands.unwrap_or(LeftStands::Nothing),
+            human,
+        });
+        self.own_line = Some(OwnLine {
+            text: text.to_string(),
+            by,
+        });
+    }
+
     /// A LINE THIS LOOP LEFT, LOOKED AT AGAIN ([`LeftStands`]): under a program whose composer is no
     /// part of the point's key, a line drawn late or cleared by a person is the same point, and only
     /// this look decides it again. It decides when the line stands whole (past the paste guard's hold
@@ -2679,6 +2826,20 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<TurnEndAction, Fail> {
         if !self.held {
             self.turn_end_due = None;
+            self.edge_moved = false;
+        }
+        // A `/login` DIALOG'S ERROR STATE NAMES NO PROGRAM (`aterm_phase::identify` knows Claude
+        // Code's dialog by its own words, which the failure lacks): where no `status` named the
+        // agent yet, as at a loop's first point, it is read first, so a person's own `/login` left
+        // failed over a limit is read as the agent's dialog (`policy::login::over_limit_act`), not
+        // as no program's screen held for good.
+        if self.program.is_none()
+            && matches!(
+                aterm_phase::login_screen(&point.screen.rows),
+                Some(aterm_phase::LoginScreen::Failed)
+            )
+        {
+            self.program = self.foreground_program()?;
         }
         self.draft_held = None;
         self.unauthoritative_held = false;
@@ -3111,8 +3272,14 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         self.stall_withheld = false;
+        self.edge_moved = false;
         let standing = self.turn_end_due.take();
         let decided = self.turn_end_again(seen, opts, review);
+        if matches!(&decided, Ok(Again::Moved))
+            && standing.as_ref().is_none_or(|due| due.at > self.fx.mono())
+        {
+            self.edge_moved = true;
+        }
         let same = match (&decided, &standing) {
             (Ok(Again::Decided(_, TurnEndAction::WaitUntil { until, wait, .. })), Some(due)) => {
                 due.at == *until && due.wait == *wait
@@ -3120,8 +3287,8 @@ impl<C: Ctl> Session<'_, C> {
             // THE POINT'S SCREEN MOVED AS IT WAS DECIDED (a frame torn mid-redraw, a row or a
             // model drawn for one read): the due stands, so the next look decides the new point
             // there (which clears it, `Self::turn_end_at_point`), or this one again once its
-            // screen is back, which no look of the same point would. An edge's due that falls
-            // later stands to it.
+            // screen is back (`Self::edge_moved` when no due had yet run out), which no look of
+            // the same point would.
             (Ok(Again::Moved), Some(_)) => true,
             _ => false,
         };
@@ -3461,7 +3628,10 @@ impl<C: Ctl> Session<'_, C> {
         self.say_wall_refused(review);
         self.say_sleep_unknown(seq, review);
         self.say_repo_unread(seq, review);
-        let backing_out = matches!(action, TurnEndAction::Cancel { .. });
+        let backing_out = matches!(
+            action,
+            TurnEndAction::Cancel { rule_id } if rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT
+        );
         self.sync_exception(seq, backing_out, review);
         self.task_edge(&point.screen, opts, review)?;
         if self.turn_end.exchange_at_wall() {
@@ -3723,20 +3893,7 @@ impl<C: Ctl> Session<'_, C> {
             if let Some(ride) = ride {
                 self.point_left(ride, seq, review);
             }
-            // A read that cannot say is no text seen yet: the line's draw is still a move.
-            let last = self.last.clone();
-            let human = last.as_ref().and_then(|screen| screen.human_seq);
-            let stands = last.and_then(|screen| self.left_stands(&screen, &text));
-            self.left_line = Some(LeftLine {
-                text: text.clone(),
-                point_key: self.review_key(point),
-                stands: stands.unwrap_or(LeftStands::Nothing),
-                human,
-            });
-            self.own_line = Some(OwnLine {
-                text: text.clone(),
-                act: action.clone(),
-            });
+            self.left_own(point, &text, OwnBy::Act(action.clone()));
             return Ok(());
         }
         if !typed {
@@ -3756,11 +3913,14 @@ impl<C: Ctl> Session<'_, C> {
         // The loop's own line, drawn late and sent now, is booked as the act that wrote it: Land's
         // instruction given, never owed again at the next point.
         let (action, rule) = match own {
-            Some(own) => {
-                let rule = own.act.rule_id().unwrap_or(rule);
-                (own.act, rule)
+            Some(OwnLine {
+                by: OwnBy::Act(act),
+                ..
+            }) => {
+                let rule = act.rule_id().unwrap_or(rule);
+                (act, rule)
             }
-            None => {
+            _ => {
                 self.own_line = None;
                 (action, rule)
             }
@@ -4514,10 +4674,28 @@ impl<C: Ctl> Session<'_, C> {
         rule: &str,
         review: &mut dyn Review,
     ) -> Result<Written, Fail> {
-        self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
+        let written = self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
             Some(written) => Ok(written),
             None => s.type_guarded(point, text, rule, review),
-        })
+        })?;
+        self.wrote_own(text, written);
+        Ok(written)
+    }
+
+    /// THE LINE A WRITE LEFT IS THE LOOP'S OWN ([`OwnLine`], [`OwnBy::Line`]): written and not
+    /// submitted, `text` is no person's draft until the loop's next write, as a write submitted
+    /// is. A point's act claims its own line after this ([`Self::left_own`]).
+    fn wrote_own(&mut self, text: &str, written: Written) {
+        match written {
+            Written::Left => {
+                self.own_line = Some(OwnLine {
+                    text: text.to_string(),
+                    by: OwnBy::Line,
+                });
+            }
+            Written::Submitted => self.own_line = None,
+            Written::Not => {}
+        }
     }
 
     /// Type a fact line at a break (the door's under `prompt`, or the stuck fact's under `stuck_break_note`: `grant` names whose) using [`Self::type_fenced`] under
@@ -4540,13 +4718,17 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<Option<Written>, Fail> {
         let _duty = self.duty_guard(Scope::TurnEnd);
         use crate::supervise::occupancy::fault::{Fault, armed};
-        self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
+        let written = self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
             Some(written) => Ok(Some(written)),
             None if armed(Fault::DoorGuardedFallback) => {
                 s.type_guarded(point, text, rule, review).map(Some)
             }
             None => Ok(None),
-        })
+        })?;
+        if let Some(written) = written {
+            self.wrote_own(text, written);
+        }
+        Ok(written)
     }
 
     /// Run `act` while holding the session's hand lease when `types_under_hand` is enabled.
@@ -5178,10 +5360,18 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
-    /// Clear `self.probe` once the `/usage` panel is gone.
-    fn probe_closed(&mut self, seq: u64, review: &mut dyn Review) {
+    /// Clear `self.probe` once the `/usage` panel is gone, and with it the probe's claim on the
+    /// line it left ([`OwnBy::Probe`]).
+    pub(super) fn probe_closed(&mut self, seq: u64, review: &mut dyn Review) {
         let was = std::mem::replace(&mut self.probe, UsageProbe::Idle);
         self.probe_hold = None;
+        if self
+            .own_line
+            .as_ref()
+            .is_some_and(|own| matches!(own.by, OwnBy::Probe))
+        {
+            self.own_line = None;
+        }
         if was == UsageProbe::Idle {
             return;
         }
@@ -5203,10 +5393,34 @@ impl<C: Ctl> Session<'_, C> {
         if self.reader(&screen.rows).composer(&screen.rows).is_none() {
             return false;
         }
-        if !self.holds_probe_draft(screen) {
+        // A composer that shows nothing of the probe's `/usage` while its program may still draw
+        // it is no text cleared: the probe lasts on a screen that has not moved since the write
+        // was given up on unechoed ([`Self::input_undrawn`]), and while the line it left has not
+        // been seen whole with no person's key since, however the screen moved meanwhile
+        // ([`Self::probe_line_unseen`]).
+        if !self.holds_probe_draft(screen)
+            && !self.input_undrawn(screen.seq, self.fx.mono())
+            && !self.probe_line_unseen(screen)
+        {
             self.probe_closed(screen.seq, review);
         }
         true
+    }
+
+    /// Whether the probe's own `/usage` left typed ([`OwnBy::Probe`], [`LeftLine`]) is yet to be
+    /// seen whole, with no person's key on `screen` since it was left: a program that holds its
+    /// input may draw it after any repaint, so the probe and its claim last. The loop's next write
+    /// (which takes the line), a turn and a person's key each end that.
+    fn probe_line_unseen(&self, screen: &Screen) -> bool {
+        self.own_line
+            .as_ref()
+            .zip(self.left_line.as_ref())
+            .is_some_and(|(own, line)| {
+                matches!(own.by, OwnBy::Probe)
+                    && own.is(&line.text)
+                    && line.stands != LeftStands::Whole
+                    && line.human == screen.human_seq
+            })
     }
 
     /// The pause between two of the probe's reads ([`PROBE_STILL_MS`], [`ProbeWaits::step`]).
@@ -5239,6 +5453,10 @@ impl<C: Ctl> Session<'_, C> {
                 tell.tell(Err(miss));
                 review.note(&format!("SKIPPED seq={seq} rule={RULE_USAGE_PROBE} {why}"));
                 if left {
+                    // The `/usage` left typed is this loop's own line, drawn now or late: looked
+                    // at again as it draws, no person's draft while the probe lasts, and its
+                    // Enter the probe's.
+                    self.left_own(point, USAGE_COMMAND, OwnBy::Probe);
                     tell.host.inform(USAGE_LEFT);
                 }
                 if then == Probed::Again && self.turn_end_due.is_none() {
@@ -5532,6 +5750,14 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
+    /// The probe's `/usage` written at `point` and left typed ([`Self::probe_step`]'s path where
+    /// its echo or its Enter missed), for a test.
+    #[cfg(test)]
+    pub(super) fn probe_left_seen(&mut self, point: &Turn) {
+        self.probe_owes(point.screen.seq);
+        self.left_own(point, USAGE_COMMAND, OwnBy::Probe);
+    }
+
     /// [`Self::probe_gates`] for a test, at a point whose policy decided nothing.
     #[cfg(test)]
     pub(super) fn probe_gate_seen(
@@ -5543,9 +5769,17 @@ impl<C: Ctl> Session<'_, C> {
         self.probe_gates(point, &TurnEndAction::Nothing, host, opts)
     }
 
-    /// Whether the probe's own `/usage` stands typed and unsent on `screen`.
+    /// Whether the probe's own `/usage` stands typed and unsent on `screen`: the line this
+    /// process's probe left ([`OwnBy::Probe`]). A `/usage` no write of this process left (a
+    /// person's, or one a probe the ledger seeded after a restart finds) is no line the probe's
+    /// Enter sends.
     fn probe_left_stands(&self, screen: &Screen) -> bool {
-        self.probe != UsageProbe::Idle && self.holds_probe_draft(screen)
+        self.probe != UsageProbe::Idle
+            && self.holds_probe_draft(screen)
+            && self
+                .own_line
+                .as_ref()
+                .is_some_and(|own| matches!(own.by, OwnBy::Probe) && own.is(USAGE_COMMAND))
     }
 
     /// The probe's own `/usage` ([`Self::probe_type`], [`TurnEndAction::Submit`]).
@@ -5569,6 +5803,14 @@ impl<C: Ctl> Session<'_, C> {
         let (r, args) = self.fenced_key(&guard, "enter", &generation, person.as_deref())?;
         match self.refused_press(&r, &args)? {
             None if !r.skipped() => {
+                // The line goes: no look at it again, so no draw of the panel reads it as gone.
+                if self
+                    .left_line
+                    .as_ref()
+                    .is_some_and(|line| squashed(&line.text) == squashed(USAGE_COMMAND))
+                {
+                    self.left_line = None;
+                }
                 review.note(&format!(
                     "TYPED seq={seq} rule={RULE_USAGE_PROBE} {USAGE_COMMAND} left typed, its \
                      Enter written now: no act of the policy's, and the panel it opens is closed \
@@ -5634,6 +5876,15 @@ impl<C: Ctl> Session<'_, C> {
                     clip(row)
                 ))?;
                 self.ledger_row(rule, approvals::Outcome::Typed, key, row.trim(), seq);
+                // A PERSON'S OWN `/login` ATERM CLOSED OVER A USAGE LIMIT is decided again once its
+                // Esc's pause is over (`login-over-limit@v1`'s pacing): a dialog the Esc left
+                // drawn is the point already handed, which no look decides again, so without this
+                // due the tab would stand on it with no second Esc and no one told.
+                if rule == super::super::policy::login::RULE_LOGIN_OVER_LIMIT
+                    && let Some(until) = self.turn_end.login_over_limit_closing(self.fx.mono())
+                {
+                    self.set_due(until, "the /login dialog aterm closed to close");
+                }
             }
             None if r.skipped_person() || r.skipped_changed() => {
                 skipped("a person keyed or the screen moved before the key", review);
@@ -5747,7 +5998,12 @@ impl<C: Ctl> Session<'_, C> {
         }
         let grid = self.grid()?;
         let Some(panel) = aterm_phase::settings_panel(&grid.rows) else {
-            self.probe_closed(seq, review);
+            // A read that drew no composer (a torn frame) says nothing of the probe's line: the
+            // fresh grid's composer settles it where one is drawn, and the probe ends only where
+            // neither shows.
+            if !self.composer_settles(&grid, review) {
+                self.probe_closed(seq, review);
+            }
             return Ok(!off && turn.phase != Phase::Prompt);
         };
         let grace = Duration::from_secs(u64::from(opts.policy.human_grace_s));

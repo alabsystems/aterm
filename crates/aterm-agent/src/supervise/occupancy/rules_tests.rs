@@ -517,6 +517,7 @@ fn at_break(
         wall_ms: T0 + HOUR,
         told,
         ranked: true,
+        nudge_wake: true,
     };
     decide(
         &OccupancyReading::default(),
@@ -696,6 +697,7 @@ fn the_rank_puts_a_wake_first_and_the_nudge_before_hold_room() {
             wall_ms: T0 + HOUR,
             told: &untold,
             ranked,
+            nudge_wake: ranked,
         };
         let mut books = Books::default();
         books.hold(0);

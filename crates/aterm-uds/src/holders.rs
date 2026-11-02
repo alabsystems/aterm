@@ -2003,6 +2003,17 @@ mod hook {
 
 #[cfg(test)]
 mod listing_tests {
+    /// Leave a socket file after closing its listener. On Apple, exclude a parallel test's
+    /// spawn across bind and drop, even on a kernel without close-on-fork.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    fn stale_socket(path: &std::path::Path) {
+        crate::spawn_lock::creating(
+            || std::os::unix::net::UnixListener::bind(path).map(drop),
+            |()| Ok(()),
+        )
+        .expect("a listener closed, its file left");
+    }
+
     /// A listing that still fills its buffer at the cap is refused, never cut short; one that
     /// leaves a slot free is read whole, a non-positive slot dropped.
     #[test]
@@ -2663,7 +2674,7 @@ mod listing_tests {
             "d.sock",
             "a sibling's name removed beside a datagram socket",
         );
-        drop(UnixListener::bind(at("f.sock")).expect("a listener closed, its file left"));
+        stale_socket(&at("f.sock"));
         let stale = sibling("f.sock");
         unnamed("f.sock");
         free(
@@ -2802,7 +2813,7 @@ mod listing_tests {
         let at = |name: &str| dir.path().join(name);
         let bound = |name: &str| super::bound_at(&at(name)).expect("the probe answers");
         std::fs::write(at("plain"), b"").expect("a plain file");
-        drop(UnixListener::bind(at("stale.sock")).expect("a listener closed, its file left"));
+        stale_socket(&at("stale.sock"));
         for (name, what) in [
             ("none.sock", "no file"),
             ("missing/x.sock", "a missing folder"),

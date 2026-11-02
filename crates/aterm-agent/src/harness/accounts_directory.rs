@@ -140,6 +140,24 @@ pub(in crate::harness) fn retained_directory_owner<'a>(
     Ok(None)
 }
 
+/// The label of a row of `rows`, whatever its label, whose explicit directory is this one, as
+/// [`retained_directory_owner`] compares directories.
+/// Unknown filesystem ownership refuses instead of treating a failed lookup as separation.
+pub(in crate::harness) fn naming_row<'a>(
+    rows: impl IntoIterator<Item = &'a Row>,
+    dir: &str,
+) -> Result<Option<&'a str>, String> {
+    let wanted = Location::of(Some(dir), None)?;
+    for row in rows {
+        if let Some(kept) = row.dir.as_deref()
+            && wanted.conflicts(&Location::of(Some(kept), None)?)
+        {
+            return Ok(Some(row.label.as_str()));
+        }
+    }
+    Ok(None)
+}
+
 /// Whether this checkpoint uses a directory retained by shared preparation custody.
 pub(in crate::harness) fn shared_staging_retained(
     logins: &Logins,

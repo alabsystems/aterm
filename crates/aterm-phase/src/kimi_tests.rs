@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 use super::fixtures::{
-    AUTH_401_240, CONCURRENT_LIMIT, DRAFT, IDLE, LIMIT_429_FINAL_240, LIMIT_429_RETRYING_240,
-    SIGNED_OUT_TURN, WALL_QUOTA,
+    AUTH_401_240, BOX_SHELL_240, CONCURRENT_LIMIT, DRAFT, IDLE, LIMIT_429_FINAL_240,
+    LIMIT_429_RETRYING_240, QUESTION_240, SIGNED_OUT_TURN, WALL_QUOTA,
 };
 use super::*;
 use crate::prompt::fixtures::{bash_one_row, composer as claude_composer, rows, screen};
@@ -175,12 +175,24 @@ fn the_composer_reads_its_draft_and_the_footer_its_context() {
 fn kimi_s_screens_are_its_own_by_name_and_by_sight() {
     assert_eq!(program_of("kimi"), Some(Program::Kimi));
     assert_eq!(program_of("kimi-code"), Some(Program::Kimi));
-    for fixture in [IDLE, DRAFT, SIGNED_OUT_TURN, WALL_QUOTA] {
+    for fixture in [
+        IDLE,
+        DRAFT,
+        SIGNED_OUT_TURN,
+        WALL_QUOTA,
+        BOX_SHELL_240,
+        QUESTION_240,
+    ] {
         let rows = screen(fixture);
         assert!(is_kimi_screen(&rows));
         assert_eq!(identify(None, &rows).program(), Program::Kimi);
         assert_eq!(identify(Some("node"), &rows).program(), Program::Kimi);
     }
+    // A box in the composer's place still stands over the footer, and its context reads.
+    let boxed = screen(BOX_SHELL_240);
+    assert_eq!(composer_rows(&boxed), None, "no composer under the box");
+    assert_eq!(context_left(&boxed), Some(78), "context: 22% used");
+    assert_eq!(read(None, &boxed, None).context_left, Some(78));
     // Negative: a shell's own screen stays generic, and a pager showing Kimi Code's screen is
     // no Kimi Code.
     let shell = screen("$ ls\nCargo.toml  src\n$ ");
@@ -252,4 +264,48 @@ fn a_claude_code_screen_quoting_kimi_codes_welcome_is_still_claude_codes() {
         unquoted.prompt.is_some(),
         "CONTROL: Claude Code's box alone"
     );
+}
+
+/// ITS FOOTER CLAIMS NO OTHER PROGRAM'S SCREEN: over the whole measured fixture corpus, the
+/// `context: N%` footer stands on Kimi Code's frames alone, so a frame whose composer a box
+/// replaced identifies by the footer at its foot, and no other program's fixture is read as a
+/// Kimi Code screen. NEGATIVE CONTROL: Kimi Code frames that draw neither composer, footer
+/// nor welcome (its trust box, its exits) are claimed by nothing, and the corpus holds such
+/// frames and over a thousand of the other programs'.
+#[test]
+fn its_footer_claims_no_other_programs_screen() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the fixtures")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".txt"))
+        .collect();
+    names.sort();
+    assert!(names.len() > 1000, "{} fixtures", names.len());
+    let (mut footer_only, mut unclaimed, mut others) = (0usize, 0usize, 0usize);
+    for name in &names {
+        let rows = screen(&std::fs::read_to_string(dir.join(name)).expect("a fixture"));
+        if name.starts_with("kimi-") {
+            if composer_rows(&rows).is_none() && context_left(&rows).is_some() {
+                footer_only += 1;
+                assert_eq!(
+                    identify(None, &rows).program(),
+                    Program::Kimi,
+                    "{name}: its footer names it"
+                );
+            } else if identify(None, &rows).program() != Program::Kimi {
+                unclaimed += 1;
+            }
+        } else {
+            others += 1;
+            assert!(!is_kimi_screen(&rows), "{name}: no other program's screen");
+        }
+    }
+    assert_eq!(
+        footer_only, 6,
+        "the approval, question and session-picker frames with no composer"
+    );
+    assert!(unclaimed > 0, "frames with nothing to tell them by stand");
+    assert!(others > 1000, "{others} other programs' frames");
 }

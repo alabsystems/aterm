@@ -867,6 +867,7 @@ impl App {
     pub(crate) fn drain_message_inbox(&mut self) {
         #[cfg(unix)]
         self.follow_member_requests();
+        self.follow_network_place();
         let queued = crate::message_inbox::take_queued();
         let exceptions = crate::message_inbox::take_queued_exceptions();
         let folders = crate::spawn_folder::take_noted();
@@ -2487,6 +2488,12 @@ impl App {
         }
     }
 
+    /// Retire join alerts whose producers were replaced by the current Join entries.
+    pub(crate) fn retire_obsolete_join_alerts(&mut self, now: Instant) -> usize {
+        self.messages.withdraw_key_prefix("members.ask.", now)
+            + self.messages.withdraw_key_prefix("secrets.asking.", now)
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2535,6 +2542,7 @@ impl App {
             return;
         }
         self.messages.seed_carried(&carried, wall_stamp_now(), now);
+        self.retire_obsolete_join_alerts(now);
         let old_process: Vec<MessageId> = self
             .messages
             .live_rows()

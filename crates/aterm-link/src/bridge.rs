@@ -13820,8 +13820,13 @@ mod tests {
                 "{bye:?}: a handoff leaves the run open"
             );
             if !proof {
-                std::fs::remove_file(bridge.state.root().join(crate::state::RUN_PROOF))
-                    .expect("the proof the bridge's start in full made");
+                std::fs::remove_file(
+                    bridge
+                        .state
+                        .proof_of_what_reads("run")
+                        .expect("the record reads"),
+                )
+                .expect("the proof the bridge's start in full made");
             }
             let successor = StateDir::open(bridge.state.root()).unwrap();
             successor.set_inc_seam(crate::state::IncSeam {

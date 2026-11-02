@@ -9,8 +9,8 @@ use std::process::ExitCode;
 
 /// Run `matrix` on the quiet machine: alone among quiet claims once the load is low, at once
 /// under `--admit now`, and at once under `verify measure`, whose own claim covers this process.
-/// A ledger that cannot be used is said, and the rows run unadmitted: the instrument still refuses
-/// a starved take. A bad `--admit` is a usage error (2); an interrupt that ends the wait is
+/// A ledger that cannot be used refuses the run before any row opens a window.
+/// A bad `--admit` is a usage error (2); an interrupt that ends the wait is
 /// COULD NOT RUN (3), no row taken.
 pub fn run(target: &str, matrix: impl FnOnce() -> ExitCode) -> ExitCode {
     let mode = match admit_mode(std::env::args().skip(1)) {
@@ -20,6 +20,9 @@ pub fn run(target: &str, matrix: impl FnOnce() -> ExitCode) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if std::env::args().any(|arg| arg == "--list") {
+        return matrix();
+    }
     let need = aterm_capacity::Need::timing(format!("measure {target}"));
     let _quiet = match aterm_capacity::admit(need, mode) {
         Ok(claim) => Some(claim),
@@ -30,8 +33,10 @@ pub fn run(target: &str, matrix: impl FnOnce() -> ExitCode) -> ExitCode {
             return ExitCode::from(3);
         }
         Err(e) => {
-            eprintln!("measure {target}: {e}; the rows run unadmitted");
-            None
+            eprintln!(
+                "measure {target}: COULD NOT RUN — cannot acquire its exclusive timing claim: {e}"
+            );
+            return ExitCode::from(3);
         }
     };
     matrix()

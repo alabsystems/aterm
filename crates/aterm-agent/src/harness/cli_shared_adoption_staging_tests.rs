@@ -260,6 +260,11 @@ fn missing_shared_staging_conforms_and_catches_replay_or_lost_recovery() {
     let model = aterm_models_harness::shared_staging_recovery_model();
     assert_eq!(model.mutant_dials(), (1..=11).collect::<Vec<_>>());
     assert!(aterm_spec::interp::prove_and_catch(&model) > 0);
+    // Automatic Claude adoption links a headless opener (`cli::opener_link`) only on Unix; off
+    // Unix `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+    if !cfg!(unix) {
+        return;
+    }
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

@@ -817,6 +817,7 @@ crates/aterm-render/tests/fallback_symbol_placement.rs	an_italic_fallback_symbol
 crates/aterm-render/tests/fire_halo.rs	fire_halo_dirty_gate_marks_prev_and_cur_rows	dirty-rows-exact	
 crates/aterm-render/tests/fire_halo.rs	halo_alpha_scales_with_engulfment_strength	fire-halo	
 crates/aterm-render/tests/fire_halo.rs	halo_separates_engulfed_glyph_from_bright_fire	fire-halo	
+crates/aterm-render/tests/fire_halo.rs	halo_sits_under_earlier_columns_ink	fire-halo	layer-z-order
 crates/aterm-render/tests/fire_halo.rs	no_halo_without_fire_and_untouched_rows_byte_identical	fire-halo	
 crates/aterm-render/tests/font_chain_conservation.rs	a_genuine_miss_still_gives_up	glyph-resolution-order	
 crates/aterm-render/tests/font_chain_conservation.rs	a_private_use_point_prefers_the_symbol_face_over_the_broad_chain	font-chain-laws	

@@ -17,8 +17,9 @@ use aterm_sysprobe::procs::ProcessReading;
 use aterm_sysprobe::volumes::Table;
 use aterm_vitals::jobs::{
     Block, Class, Consumer, Demand, Fd, FdKind, HeldProc, JobCounters, JobKind, JobProc, JobRow,
-    JobTab, JobTick, Jobs, JobsView, Knote, KnoteFilter, LanesSeen, Machine, ProcState, Standing,
-    StartWait, SweepProc, TcpState, TermWord, ThreadState, TtyMode,
+    JobTab, JobTick, Jobs, JobsView, Knote, KnoteFilter, LanesSeen, Machine, NamingError,
+    NamingSelector, NamingTicket, ProcState, Standing, StartWait, SweepProc, TcpState, TermWord,
+    ThreadState, TierB, TtyMode,
 };
 use aterm_vitals::left::LeftView;
 use aterm_vitals::model::TabRoot;
@@ -57,6 +58,9 @@ impl HeldReaders {
     pub(crate) const KERNEL: Self = Self {
         start: probe::read_start_in,
         exec: |pid| {
+            if !aterm_uds::process::KEEPS_PID_VERSIONS {
+                return None;
+            }
             i32::try_from(pid)
                 .ok()
                 .and_then(aterm_uds::process::read_identity)
@@ -261,6 +265,8 @@ pub(crate) struct JobsPass {
     /// When the next pass is due, host ms (`None`: at the next reading).
     next_ms: Option<u64>,
     view: Option<Arc<JobsView>>,
+    /// The last requested jobs pass read a sweep rather than returning its cached view.
+    naming_fresh: bool,
     /// The tab a session-mate's environment ties each program outside every job that has not
     /// started to, by pid, as the leftover pass last judged it ([`Self::tie_held`]).
     ties: BTreeMap<u32, u64>,
@@ -284,6 +290,7 @@ impl JobsPass {
             process_limit: probe::process_limit(),
             next_ms: None,
             view: None,
+            naming_fresh: false,
             ties: BTreeMap::new(),
         }
     }
@@ -293,6 +300,39 @@ impl JobsPass {
     /// tab, which its job's tab, where it has one, overrides in the engine.
     pub(crate) fn tie_held(&mut self, ties: BTreeMap<u32, u64>) {
         self.ties = ties;
+    }
+
+    /// Captures a naming ticket only from the jobs pass the host just forced.
+    pub(crate) fn capture_name(
+        &self,
+        session: u64,
+        target: &aterm_vitals::sys::query::NameTarget,
+    ) -> Result<NamingTicket, NamingError> {
+        if !self.naming_fresh {
+            return Err(NamingError::Unread);
+        }
+        let selector = match target {
+            aterm_vitals::sys::query::NameTarget::Job(id) => NamingSelector::Job(id),
+            aterm_vitals::sys::query::NameTarget::Task(id) => NamingSelector::Task(id),
+        };
+        self.jobs.naming_target(session, selector)
+    }
+
+    /// Applies a sampled word after another actual jobs pass, never a cached reading.
+    pub(crate) fn apply_name(
+        &mut self,
+        ticket: &NamingTicket,
+        word: TierB,
+    ) -> Result<(), NamingError> {
+        if !self.naming_fresh {
+            return Err(NamingError::Unread);
+        }
+        self.jobs.accept_name(ticket, word)
+    }
+
+    /// The final jobs pass still publishes this ticket's accepted name.
+    pub(crate) fn name_is_shown(&self, ticket: &NamingTicket, word: TierB) -> bool {
+        self.naming_fresh && self.jobs.name_is_shown(ticket, word)
     }
 
     /// One reading's pass: runs the engine when it is due, or whenever `now` (an edge's reading:
@@ -313,6 +353,7 @@ impl JobsPass {
         thrashing: bool,
         now: bool,
     ) -> Option<Arc<JobsView>> {
+        self.naming_fresh = false;
         let Some(sweep) = sweep else {
             return self.view.clone();
         };
@@ -385,6 +426,7 @@ impl JobsPass {
             grant_ms: grant.grant_ms,
         };
         let view = self.jobs.absorb(&tick);
+        self.naming_fresh = true;
         self.next_ms = Some(at_ms + next_pass_ms(view.demand));
         self.view = Some(Arc::new(view));
         self.view.clone()
@@ -1365,9 +1407,11 @@ fn fd(f: &probe::FdReading) -> Fd {
 }
 
 /// The engine's readings of `read` ([`job_proc`]), each of a tab's root (`roots`) with its pid
-/// version (`exec`, asked of those roots alone): it tells the engine the root ran a program anew
+/// version (`exec`): it tells the engine the root ran a program anew
 /// (`exec zsh`); and each member that [`ran`] with the build it becomes and the claims ahead of
 /// it where it is a build's front (`front`, asked of those members alone: [`Fronts::front`]).
+/// Only roots and members that ran are asked their exec version; an ordinary member carries it
+/// as naming identity, separate from the root's program-change version.
 fn job_procs(
     read: &[ProcFacts],
     roots: &BTreeSet<u32>,
@@ -1381,8 +1425,12 @@ fn job_procs(
                 .then(|| front(p))
                 .flatten()
                 .map_or((None, None), |(becomes, ahead)| (Some(becomes), ahead));
+            let exec_version = (roots.contains(&p.pid) || ran(p, stand_in))
+                .then(|| exec(p.pid))
+                .flatten();
             JobProc {
-                version: roots.contains(&p.pid).then(|| exec(p.pid)).flatten(),
+                version: roots.contains(&p.pid).then_some(exec_version).flatten(),
+                exec_version: ran(p, stand_in).then_some(exec_version).flatten(),
                 becomes,
                 claims_ahead,
                 ..job_proc(p, stand_in)
@@ -1438,6 +1486,7 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
         blocked_fd: p.blocked_fd,
         start_wait: member_start(p, stand_in).and_then(start_wait),
         version: None,
+        exec_version: None,
         becomes: None,
         claims_ahead: None,
     }
@@ -2601,9 +2650,10 @@ pub(crate) mod tests {
         assert_eq!(view.findings.program_check_aterm.0, 0, "not aterm's");
     }
 
-    /// Only a tab's root is asked its pid version, and only its reading carries one.
+    /// A root's program-change version stays separate from a running member's naming identity.
+    /// Unread, held and stand-in members are never asked their exec version.
     #[test]
-    fn only_a_tabs_root_is_asked_its_pid_version() {
+    fn root_program_versions_and_running_member_identities_are_read_separately() {
         use std::cell::RefCell;
         let read = [
             ProcFacts {
@@ -2614,12 +2664,27 @@ pub(crate) mod tests {
                 pid: 11,
                 ..ProcFacts::default()
             },
+            ProcFacts {
+                pid: 12,
+                start_facts: Some(judged(AtStart::Started)),
+                ..ProcFacts::default()
+            },
+            ProcFacts {
+                pid: 13,
+                start_facts: Some(judged(AtStart::Held)),
+                ..ProcFacts::default()
+            },
+            ProcFacts {
+                pid: 14,
+                start_facts: Some(judged(AtStart::Started)),
+                ..ProcFacts::default()
+            },
         ];
         let asked = RefCell::new(Vec::new());
         let procs = job_procs(
             &read,
             &BTreeSet::from([10]),
-            None,
+            Some(14),
             |pid| {
                 asked.borrow_mut().push(pid);
                 Some(u64::from(pid) * 100 + 7)
@@ -2627,10 +2692,48 @@ pub(crate) mod tests {
             |_| None,
         );
         assert_eq!(
-            procs.iter().map(|p| (p.pid, p.version)).collect::<Vec<_>>(),
-            [(10, Some(1007)), (11, None)]
+            procs
+                .iter()
+                .map(|p| (p.pid, p.version, p.exec_version))
+                .collect::<Vec<_>>(),
+            [
+                (10, Some(1007), None),
+                (11, None, None),
+                (12, None, Some(1207)),
+                (13, None, None),
+                (14, None, None)
+            ]
         );
-        assert_eq!(asked.into_inner(), [10]);
+        assert_eq!(asked.into_inner(), [10, 12]);
+    }
+
+    /// A forced reading without a sweep cannot authorize naming from its cached jobs view.
+    #[test]
+    fn naming_needs_an_actual_jobs_pass_instead_of_a_carried_view() {
+        let mut pass = JobsPass::new();
+        let target = aterm_vitals::sys::query::NameTarget::Job("missing".into());
+        for (at_ms, sweep, now, expected) in [
+            (1, Some(&[][..]), true, NamingError::Gone),
+            (2, Some(&[][..]), false, NamingError::Unread),
+            (3, None, true, NamingError::Unread),
+        ] {
+            assert!(
+                pass.tick(
+                    at_ms,
+                    || at_ms,
+                    sweep,
+                    &[],
+                    &[],
+                    &[],
+                    &GrantFacts::default(),
+                    0,
+                    false,
+                    now
+                )
+                .is_some()
+            );
+            assert!(matches!(pass.capture_name(7, &target), Err(error) if error == expected));
+        }
     }
 
     /// How many times a stand-in's arguments, and a stand-in ledger, were read.

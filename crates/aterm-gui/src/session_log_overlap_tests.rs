@@ -2362,6 +2362,7 @@ fn by_r1(actor: &ExitActor) -> String {
         ExitActor::Sid(_) | ExitActor::Unknown => "-".to_string(),
         ExitActor::Human => "human".to_string(),
         ExitActor::Ctl => "ctl".to_string(),
+        ExitActor::Harness => "harness".to_string(),
         ExitActor::Bridge => "bridge".to_string(),
     }
 }

@@ -760,6 +760,20 @@ pub fn identity_in_home(home: &Path, email: &str) -> IdentityObservation {
     identity_in_home_with(home, email, || {})
 }
 
+/// The profile a launch under the login directory `home` reads: its legacy `.config.json` where
+/// that takes precedence ([`effective`]), else its `.claude.json`.
+fn profile_in_home(home: &Path) -> PathBuf {
+    effective(&home.join(".claude.json"), Some(home), false)
+}
+
+/// The profile [`identity_in_home`] reads under `home`, where it is there but cannot be opened or
+/// read through: whom it names is then unknown, not none. `None` where it was read, or is absent,
+/// something other than a file, or over [`PROFILE_MAX`].
+pub(super) fn unreadable_profile_in_home(home: &Path) -> Option<PathBuf> {
+    let path = profile_in_home(home);
+    (read_with(&path, |_| Ok(())) == Err(NoProfile::Unreadable)).then_some(path)
+}
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -773,7 +787,7 @@ fn identity_in_home_with(
     email: &str,
     after_read: impl FnOnce(),
 ) -> IdentityObservation {
-    let path = effective(&home.join(".claude.json"), Some(home), false);
+    let path = profile_in_home(home);
     read_with(&path, |bytes| {
         after_read();
         // Keep field-level failures independent: an invalid UUID must not hide
@@ -1507,11 +1521,15 @@ static AGY_USAGE_CACHE: std::sync::Mutex<Option<AgyUsageCacheMap>> = std::sync::
 
 const AGY_USAGE_RETRY_S: i64 = 60;
 
-/// Extracts the signed-in OAuth email from `agy`'s CLI log (`applyAuthResult: email=...`).
-#[must_use]
-pub fn parse_agy_auth_log(bytes: &[u8]) -> Option<String> {
+/// Extracts the latest complete `applyAuthResult:` record from `agy`'s CLI log:
+/// `Some(Some(email))` when `authMethod=consumer` names a valid email, `Some(None)` when the
+/// latest complete record names another `authMethod` (such as `gemini_api_key` or `gateway`), or
+/// `None` when no complete `applyAuthResult:` line is present.
+fn parse_agy_auth_record(bytes: &[u8]) -> Option<Option<String>> {
     let text = String::from_utf8_lossy(bytes);
-    for line in text.lines().rev() {
+    for raw_line in text.split_inclusive('\n').rev() {
+        let ended = raw_line.ends_with('\n');
+        let line = raw_line.trim_end_matches(['\r', '\n']);
         let Some((_, rest)) = line.split_once("applyAuthResult: ") else {
             continue;
         };
@@ -1521,14 +1539,28 @@ pub fn parse_agy_auth_log(bytes: &[u8]) -> Option<String> {
         else {
             continue;
         };
+        if !ended && !after.contains(',') {
+            continue;
+        }
         let method = after.split(',').next().unwrap_or_default().trim();
+        if method.is_empty() {
+            continue;
+        }
         let email = email.trim();
-        return (method == "consumer"
-            && email.contains('@')
-            && !email.chars().any(char::is_whitespace))
-        .then(|| email.to_owned());
+        return Some(
+            (method == "consumer"
+                && email.contains('@')
+                && !email.chars().any(char::is_whitespace))
+            .then(|| email.to_owned()),
+        );
     }
     None
+}
+
+/// Extracts the signed-in OAuth email from `agy`'s CLI log (`applyAuthResult: email=...`).
+#[must_use]
+pub fn parse_agy_auth_log(bytes: &[u8]) -> Option<String> {
+    parse_agy_auth_record(bytes).flatten()
 }
 
 /// Parses `agy -p /usage --output-format json` output into a [`WeeklyFigure`].
@@ -1667,8 +1699,8 @@ where
     logs.into_iter().take(3).find_map(|(_, p)| read_log(&p))
 }
 
-fn agy_log_email(argv: &[String], config: &Path) -> Option<String> {
-    agy_log_scan(argv, config, parse_agy_auth_log)
+fn agy_log_auth_record(argv: &[String], config: &Path) -> Option<Option<String>> {
+    agy_log_scan(argv, config, parse_agy_auth_record)
 }
 
 /// Parses an `agy` or `muse` model label such as `"Gemini 4 Argon (High)"` into
@@ -2211,6 +2243,46 @@ fn agy_quota_store_for(
     ))
 }
 
+enum AgyOverrideObject {
+    None,
+    Object(aterm_json::Map),
+    Blocked,
+}
+
+fn agy_override_object(argv: &[String], cwd: Option<&Path>, user_home: &Path) -> AgyOverrideObject {
+    let Some(opt) = super::upgrade_agy::settings_override(argv) else {
+        return AgyOverrideObject::None;
+    };
+    let Some(raw) = opt else {
+        return AgyOverrideObject::Blocked;
+    };
+    let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(raw).trim_start();
+    if trimmed.starts_with('{') {
+        return match super::witness::parse_settings_object(trimmed) {
+            Some(obj) => AgyOverrideObject::Object(obj),
+            None => AgyOverrideObject::Blocked,
+        };
+    }
+    if raw.is_empty() {
+        return AgyOverrideObject::Blocked;
+    }
+    let raw_path = Path::new(raw);
+    let resolved = if raw_path.is_absolute() {
+        crate::supervise::policy::git_config::normalise(raw_path)
+    } else if let Some(dir) = cwd.filter(|d| d.is_absolute()) {
+        crate::supervise::policy::git_config::normalise(&dir.join(raw_path))
+    } else {
+        return AgyOverrideObject::Blocked;
+    };
+    match crate::supervise::policy::claude_settings::read_settings_in(Some(user_home), &resolved) {
+        Ok(Some(text)) => match super::witness::parse_settings_object(&text) {
+            Some(obj) => AgyOverrideObject::Object(obj),
+            None => AgyOverrideObject::Blocked,
+        },
+        Ok(None) | Err(_) => AgyOverrideObject::Blocked,
+    }
+}
+
 /// The account and weekly quota an `agy` process is signed in as ([`SubscriptionDisplay`]).
 #[must_use]
 pub fn agy_subscription_for(
@@ -2221,11 +2293,27 @@ pub fn agy_subscription_for(
     model: Option<&str>,
     now: i64,
 ) -> Option<SubscriptionDisplay> {
-    let var = |key: &str| non_empty_env_var(env, key);
-    let store = agy_quota_store_for(argv, var("HOME"), var("AGY_CLI_CONFIG_DIR"), user_home);
-    agy_subscription_with_store(argv, env, user_home, prev, model, now, store.as_ref())
+    agy_subscription_in_dir(argv, env, None, user_home, prev, model, now)
 }
 
+/// [`agy_subscription_for`] resolving a relative `--settings` file path against `cwd` when `cwd`
+/// is an absolute directory.
+#[must_use]
+pub fn agy_subscription_in_dir(
+    argv: &[String],
+    env: &[String],
+    cwd: Option<&Path>,
+    user_home: &Path,
+    prev: &SubscriptionDisplay,
+    model: Option<&str>,
+    now: i64,
+) -> Option<SubscriptionDisplay> {
+    let var = |key: &str| non_empty_env_var(env, key);
+    let store = agy_quota_store_for(argv, var("HOME"), var("AGY_CLI_CONFIG_DIR"), user_home);
+    agy_subscription_with_store_in_dir(argv, env, cwd, user_home, prev, model, now, store.as_ref())
+}
+
+#[cfg(all(test, unix))]
 fn agy_subscription_with_store(
     argv: &[String],
     env: &[String],
@@ -2235,32 +2323,82 @@ fn agy_subscription_with_store(
     now: i64,
     store: Option<&super::agy_quota_store::Store>,
 ) -> Option<SubscriptionDisplay> {
+    agy_subscription_with_store_in_dir(argv, env, None, user_home, prev, model, now, store)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper threading cwd and test quota store together"
+)]
+fn agy_subscription_with_store_in_dir(
+    argv: &[String],
+    env: &[String],
+    cwd: Option<&Path>,
+    user_home: &Path,
+    prev: &SubscriptionDisplay,
+    model: Option<&str>,
+    now: i64,
+    store: Option<&super::agy_quota_store::Store>,
+) -> Option<SubscriptionDisplay> {
     let var = |key: &str| non_empty_env_var(env, key);
-    if var("GEMINI_API_KEY").is_some() || var("GOOGLE_API_KEY").is_some() {
+    if var(super::witness::AGY_GATEWAY_URL).is_some()
+        || super::witness::agy_vertex_reason(env).is_some()
+    {
         return None;
     }
+    let ovr = match agy_override_object(argv, cwd, user_home) {
+        AgyOverrideObject::None => None,
+        AgyOverrideObject::Object(obj) => Some(obj),
+        AgyOverrideObject::Blocked => return None,
+    };
     let home_dir = abs_home_dir(env, user_home);
     let config = match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
         Some(dir) if dir.is_absolute() => dir,
         _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
     };
-    let settings: Option<aterm_json::Value> =
-        super::accounts::read_bounded(&config.join("settings.json"), 64 * 1024)
-            .ok()
-            .flatten()
-            .and_then(|t| aterm_json::from_str(&t).ok());
-    if settings
+    if super::footer::under_file_provider_domain(Some(user_home), &config) {
+        return None;
+    }
+    let settings = match crate::supervise::policy::claude_settings::read_settings_in(
+        Some(user_home),
+        &config.join("settings.json"),
+    ) {
+        Ok(Some(text)) => super::witness::parse_settings_object(&text),
+        Ok(None) => None,
+        Err(why) if why.contains("file-provider domain") => return None,
+        Err(_) => None,
+    };
+    let provider = ovr
         .as_ref()
-        .and_then(|s| s.get("auth_method").and_then(aterm_json::Value::as_str))
+        .and_then(|o| o.get("modelProvider"))
+        .or_else(|| settings.as_ref().and_then(|s| s.get("modelProvider")));
+    match provider {
+        None | Some(aterm_json::Value::Null) => {}
+        Some(aterm_json::Value::String(p)) if p.is_empty() => {}
+        Some(_) => return None,
+    }
+    if ovr
+        .as_ref()
+        .and_then(|o| o.get("auth_method"))
+        .or_else(|| settings.as_ref().and_then(|s| s.get("auth_method")))
+        .and_then(aterm_json::Value::as_str)
         .is_some_and(|m| m != "oauth" && m != "google" && m != "consumer")
     {
         return None;
     }
-    let email = agy_log_email(argv, &config).or_else(|| prev.email.clone())?;
+    let email = match agy_log_auth_record(argv, &config) {
+        Some(Some(email)) => email,
+        Some(None) => return None,
+        None => prev.email.clone()?,
+    };
     let active_model = model.map(str::to_owned).or_else(|| {
-        settings
-            .as_ref()
-            .and_then(|s| s.get("model").and_then(aterm_json::Value::as_str))
+        ovr.as_ref()
+            .and_then(|o| o.get("model").and_then(aterm_json::Value::as_str))
+            .or_else(|| {
+                settings
+                    .as_ref()
+                    .and_then(|s| s.get("model").and_then(aterm_json::Value::as_str))
+            })
             .map(str::to_owned)
     });
     let third_party = active_model.as_deref().is_some_and(|m| {
@@ -2456,6 +2594,23 @@ fn parse_selected(bytes: &[u8]) -> Result<Selected, NoProfile> {
             None
         });
     Ok(Selected { profile, email })
+}
+
+/// Match one roster row to the address and provider key captured from one profile read.
+/// This is retained local identity, not authentication or permission to dispatch credentials.
+pub(super) fn matching_row_key_in_home<'a>(
+    home: &Path,
+    rows: &'a [super::accounts::Row],
+) -> Option<(&'a super::accounts::Row, AccountKey)> {
+    let selected = read_with(&profile_in_home(home), parse_selected).ok()?;
+    let key = selected.profile.key?;
+    let email = selected.email.as_deref()?;
+    let mut matching = rows.iter().filter(|row| {
+        row.expected_identity_email()
+            .is_some_and(|expected| super::accounts::email_matches(expected, email))
+    });
+    let row = matching.next()?;
+    matching.next().is_none().then_some((row, key))
 }
 
 impl Selected {

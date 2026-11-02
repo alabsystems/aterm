@@ -11819,24 +11819,30 @@ pub(crate) fn least_view(scale: f32) -> (f32, f32) {
         .1
 }
 
-/// THE LEAST VIEW SETTINGS HOLDS ITSELF IN, BY TEXT SCALE, MEASURED: at each scale, the least
-/// width and height (a 14pt row at a time) at and above which every page, in a dark and a light
-/// theme, shows each control whole on some screen with a line of its name, a Tab to any control
-/// lands on a screen showing a line of its name, a press's one-line status neither covers nor
-/// moves the control pressed, and each Messages entry is whole on a screen: the toolbar, a
-/// card's heading, a line of a name, the tallest control under it and a status's line. At 1×
-/// the width is the most: under 220pt a nested card's rows (Packages, Tab Color) wrap their
-/// names so a control and its name share no screen. A fixed 164x98 window squeezed 2× text
-/// into a 164x96 view, where 127 of 282 Tab landings showed no line of the control's name and 41
-/// controls were never whole; at 1× in 164x96, 58 landings showed none. At 0.85× a short
-/// window's page keeps its heading row from 204pt on, so the least is taller than at 1×.
+/// THE LEAST VIEW SETTINGS HOLDS ITSELF IN, BY TEXT SCALE, MEASURED: at each scale and every scale
+/// it holds, the least width and height (a 14pt row at a time) at and above which every page, in a
+/// dark and a light theme, shows each control whole on some screen with a line of its name, a Tab
+/// or Shift-Tab to any control lands on a screen showing a line of its name, no Page Down screen
+/// shows a row's words without its name, a press's status neither covers nor moves the control
+/// pressed and each Messages entry is whole on a screen. One step under each, a Tab lands on a
+/// control with no line of its name. Narrower, a name wraps off its control: Packages' Share ALab
+/// tools with the fleet at 0.85× in 203x208 and at 1× in 209x208, Harness's Question priority at
+/// 1.25× in 219x264, Packages' Install ALab tools at 1.5× in 231x236 and at 1.75× in 254x250, its
+/// Show a note when cargo or rustc is rerouted at 2× in 277x278. Shorter, no screen holds the
+/// control with its name: Cursor Styles' trail sliders under its preview at 0.85× in 302x194 and at
+/// 0.9× (held by 1×'s least) in 210x194, Question priority at 1.25× in 220x208, at 1.5× in 232x222,
+/// at 1.75× in 255x236 and at 1.95× (held by 2×'s) in 278x250. The least height also says where a
+/// page keeps its heading row ([`compact_page_omits_heading`]): with 180pt at 0.85×, a 264pt view
+/// kept it and left Question priority no screen with its name. A fixed 164x98 window squeezed 2×
+/// text into a 164x96 view, where 127 of 282 Tab landings showed no line of the control's name and
+/// 41 controls were never whole; at 1× in 164x96, 58 landings showed none.
 const LEAST_VIEWS: [(f32, (f32, f32)); 6] = [
-    (0.85, (220.0, 236.0)),
-    (1.0, (220.0, 208.0)),
-    (1.25, (222.0, 236.0)),
-    (1.5, (246.0, 250.0)),
-    (1.75, (287.0, 278.0)),
-    (2.0, (328.0, 292.0)),
+    (0.85, (204.0, 208.0)),
+    (1.0, (210.0, 208.0)),
+    (1.25, (220.0, 222.0)),
+    (1.5, (232.0, 236.0)),
+    (1.75, (255.0, 250.0)),
+    (2.0, (278.0, 264.0)),
 ];
 
 pub(crate) fn scaled_control_height() -> f32 {
@@ -26950,46 +26956,9 @@ fn push_field_card(
             } else {
                 split
             };
-            let head = split.height_of_head();
-            let id = plan.group(head, split.height_of_lead());
-            plan.set_row_gap(id, split.gap);
-            if let Some((top, bottom)) = split.caption() {
-                plan.set_caption(id, top, bottom);
-            }
+            let (id, parts) = plan.split_stops(&split, room, true);
             debug_assert_eq!(id, groups.len());
-            for rows in split.stops(room) {
-                plan.row(
-                    id,
-                    split.rows[rows.clone()]
-                        .iter()
-                        .map(|(_, height)| height + split.gap)
-                        .sum(),
-                    split.rows[rows.clone()]
-                        .iter()
-                        .flat_map(|(row, _)| scroll::focus_keys(row))
-                        .collect(),
-                );
-                plan.set_stop_lead(split.stop_lead(&rows));
-                plan.set_ids(
-                    split.rows[rows.clone()]
-                        .iter()
-                        .map(|(row, _)| row.key.clone())
-                        .collect(),
-                );
-                plan.set_control_rows(split.control_rows(rows.clone()));
-                plan.set_drawn_bands(split.drawn_bands(rows.clone()));
-                let (spans, words) = split.control_spans(rows.clone());
-                plan.set_control_spans(spans);
-                plan.set_keyboard_words(words);
-                plan.set_note(split.notes_only(rows.clone()));
-                plan.set_ink(split.ink(rows.clone()));
-                plan.set_ink_top(split.ink_top(rows.clone()));
-                plan.set_first_controls(split.first_controls(rows.clone()));
-                for (row, _) in &split.rows[rows.clone()] {
-                    plan.add_segments(row);
-                }
-                stops.push(FieldStop::SplitRows(rows));
-            }
+            stops.extend(parts.into_iter().map(FieldStop::SplitRows));
             groups.push(FieldGroup::Split { card: split });
         }
         ListItem::Split(split) => {

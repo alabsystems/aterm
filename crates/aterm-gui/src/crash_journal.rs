@@ -2491,6 +2491,9 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             agent: a_agent,
             supervised: a_supervised,
             held: a_held,
+            claim_worker: a_claim_worker,
+            claim_ended: a_claim_ended,
+            not_claim_worker: a_not_claim_worker,
             holds: a_holds,
             sid: a_sid,
             lineage: a_lineage,
@@ -2515,6 +2518,9 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             agent: b_agent,
             supervised: b_supervised,
             held: b_held,
+            claim_worker: b_claim_worker,
+            claim_ended: b_claim_ended,
+            not_claim_worker: b_not_claim_worker,
             holds: b_holds,
             sid: b_sid,
             lineage: b_lineage,
@@ -2537,6 +2543,9 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             && a_agent == b_agent
             && a_supervised == b_supervised
             && a_held == b_held
+            && a_claim_worker == b_claim_worker
+            && a_claim_ended == b_claim_ended
+            && a_not_claim_worker == b_not_claim_worker
             && a_holds == b_holds
             && a_sid == b_sid
             && a_lineage == b_lineage
@@ -3048,6 +3057,9 @@ pub(crate) mod fixtures {
                 lost: None,
                 held: false,
                 holds: Vec::new(),
+                claim_ended: false,
+                not_claim_worker: false,
+                claim_worker: None,
             },
         ))
     }

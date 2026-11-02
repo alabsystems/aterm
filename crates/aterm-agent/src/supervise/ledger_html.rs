@@ -6,12 +6,22 @@
 use std::fmt::Write as _;
 
 use super::journal::Noted;
-use super::ledger::{Ledger, MarkKind, html_json_str, html_text, stamp, summary_rows, zone};
+use super::ledger::{
+    Ledger, MarkKind, html_json_str, html_text, stamp, stamp_at, summary_rows, zone,
+};
 
 /// The page.
 pub fn render_html(l: &Ledger) -> String {
+    render_html_local(l, &|_| Some(l.tz_offset_s))
+}
+
+/// [`render_html`], asking `local_at` (Unix seconds to UTC offset seconds) at each instant so
+/// table rows, swimlane ticks and hover tooltips across a daylight-saving change carry their own
+/// local clock and offset.
+pub fn render_html_local(l: &Ledger, local_at: &dyn Fn(i64) -> Option<i64>) -> String {
     let s = l.summary();
     let items = l.items();
+    let header_off = local_at(l.now_ms.div_euclid(1000)).unwrap_or(l.tz_offset_s);
     let title = format!("aterm drive ledger — @{}", l.worker);
     let mut out = String::with_capacity(16 * 1024);
     out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
@@ -35,11 +45,11 @@ pub fn render_html(l: &Ledger) -> String {
                 "<b>@{}</b>",
                 html_text(m)
             )),
-        html_text(&stamp(l.now_ms, l.tz_offset_s, true)),
-        html_text(&zone(l.tz_offset_s)),
+        html_text(&stamp(l.now_ms, header_off, true)),
+        html_text(&zone(header_off)),
         l.since_ms.map_or(String::new(), |t| format!(
             " · since {}",
-            html_text(&stamp(t, l.tz_offset_s, true))
+            html_text(&stamp_at(t, header_off, true, local_at))
         ))
     );
 
@@ -104,7 +114,10 @@ pub fn render_html(l: &Ledger) -> String {
             "<tr class=\"lane-{}\"><td class=\"t\">{}</td><td>{}</td><td>{}</td>\
              <td class=\"d\">{}</td></tr>",
             i.lane.name(),
-            html_text(&i.t.map_or_else(|| "-".to_string(), |t| stamp(t, l.tz_offset_s, dated))),
+            html_text(&i.t.map_or_else(
+                || "-".to_string(),
+                |t| stamp_at(t, header_off, dated, local_at)
+            )),
             html_text(i.lane.name()),
             html_text(&i.full),
             html_text(&i.dur)
@@ -113,14 +126,55 @@ pub fn render_html(l: &Ledger) -> String {
     out.push_str("</tbody>\n</table>\n</div>\n</section>\n</main>\n");
 
     out.push_str("<script type=\"application/json\" id=\"ledger-data\">\n");
-    out.push_str(&data_json(l, &items));
+    out.push_str(&data_json(l, &items, header_off, local_at));
     out.push_str("\n</script>\n<script>\n");
     out.push_str(SCRIPT);
     out.push_str("</script>\n</body>\n</html>\n");
     out
 }
 
-fn data_json(l: &Ledger, items: &[super::ledger::Item]) -> String {
+fn zone_samples(
+    t0: i64,
+    t1: i64,
+    placed: &[&super::ledger::Item],
+    header_off: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> Vec<(i64, i64)> {
+    let mut points = Vec::with_capacity(placed.len() + 68);
+    points.push(t0);
+    points.push(t1);
+    for i in placed {
+        if let Some(t) = i.t {
+            points.push(t);
+        }
+    }
+    let span = t1.saturating_sub(t0);
+    if span > 0 {
+        let step = (span / 64).max(15 * 60 * 1000);
+        let mut t = (t0.div_euclid(step) + 1).saturating_mul(step);
+        while t < t1 && points.len() < placed.len() + 260 {
+            points.push(t);
+            t = t.saturating_add(step);
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+    let mut zones: Vec<(i64, i64)> = Vec::new();
+    for ms in points {
+        let off = local_at(ms.div_euclid(1000)).unwrap_or(header_off);
+        if zones.last().map(|&(_, prev)| prev) != Some(off) {
+            zones.push((ms, off));
+        }
+    }
+    zones
+}
+
+fn data_json(
+    l: &Ledger,
+    items: &[super::ledger::Item],
+    header_off: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> String {
     let placed: Vec<&super::ledger::Item> = items.iter().filter(|i| i.t.is_some()).collect();
     let t0 = placed.iter().filter_map(|i| i.t).min().unwrap_or(0);
     let t1 = placed
@@ -129,19 +183,37 @@ fn data_json(l: &Ledger, items: &[super::ledger::Item]) -> String {
         .flatten()
         .max()
         .unwrap_or(t0 + 1);
-    let mut out = format!(
-        "{{\"t0\":{t0},\"t1\":{t1},\"tz\":{},\"aligned\":{},\"items\":[",
-        l.tz_offset_s, l.aligned
-    );
+    let zones = zone_samples(t0, t1, &placed, header_off, local_at);
+    let varied = zones.len() > 1;
+    let mut out = format!("{{\"t0\":{t0},\"t1\":{t1},\"tz\":{header_off}");
+    if varied {
+        out.push_str(",\"zones\":[");
+        for (n, (ms, off)) in zones.iter().enumerate() {
+            if n > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "[{ms},{off}]");
+        }
+        out.push(']');
+    }
+    let _ = write!(out, ",\"aligned\":{},\"items\":[", l.aligned);
     for (n, i) in placed.iter().enumerate() {
         if n > 0 {
             out.push(',');
         }
         let num = |v: Option<i64>| v.map_or("null".to_string(), |v| v.to_string());
+        let tz_field = if varied {
+            let item_off =
+                i.t.and_then(|ms| local_at(ms.div_euclid(1000)))
+                    .unwrap_or(header_off);
+            format!(",\"tz\":{item_off}")
+        } else {
+            String::new()
+        };
         let _ = write!(
             out,
-            "{{\"t\":{},\"end\":{},\"long\":{},\"lane\":{},\"kind\":{},\"cls\":{},\"what\":{},\
-             \"dur\":{}}}",
+            "{{\"t\":{}{tz_field},\"end\":{},\"long\":{},\"lane\":{},\"kind\":{},\
+             \"cls\":{},\"what\":{},\"dur\":{}}}",
             num(i.t),
             num(i.end),
             num(i.long_end),
@@ -479,12 +551,26 @@ pub(super) const SCRIPT: &str = r#"(function () {
     for (var k in attrs) { if (attrs[k] !== null) n.setAttribute(k, attrs[k]); }
     return n;
   }
-  function clock(ms) {
-    var s = Math.floor(ms / 1000) + data.tz;
-    var d = ((s % 86400) + 86400) % 86400;
-    function two(n) { return (n < 10 ? "0" : "") + n; }
-    return two(Math.floor(d / 3600)) + ":" + two(Math.floor((d % 3600) / 60)) + ":" + two(d % 60);
+  function two(n) { return (n < 10 ? "0" : "") + n; }
+  function tzAt(ms) {
+    var z = data.zones;
+    if (!z || !z.length) { return data.tz; }
+    var cur = z[0][1];
+    for (var i = 1; i < z.length && z[i][0] <= ms; i++) { cur = z[i][1]; }
+    return cur;
   }
+  function zoneWord(tz) {
+    var sign = tz < 0 ? "-" : "+";
+    var a = Math.abs(tz);
+    return "UTC" + sign + two(Math.floor(a / 3600)) + ":" + two(Math.floor((a % 3600) / 60));
+  }
+  function clockAt(ms, tz) {
+    var s = Math.floor(ms / 1000) + tz;
+    var d = ((s % 86400) + 86400) % 86400;
+    var hms = two(Math.floor(d / 3600)) + ":" + two(Math.floor((d % 3600) / 60)) + ":" + two(d % 60);
+    return tz === data.tz ? hms : hms + " " + zoneWord(tz);
+  }
+  function clock(ms) { return clockAt(ms, tzAt(ms)); }
   function tell(node, text) {
     node.appendChild(make("title", {})).textContent = text;
     node.addEventListener("mousemove", function (e) {
@@ -550,7 +636,8 @@ pub(super) const SCRIPT: &str = r#"(function () {
       var row = LANES.indexOf(it.lane);
       if (row < 0) { return; }
       var mid = PAD.top + row * ROW + ROW / 2;
-      var text = clock(it.t) + "  " + it.lane + "\n" + it.what +
+      var itemTz = typeof it.tz === "number" ? it.tz : tzAt(it.t);
+      var text = clockAt(it.t, itemTz) + "  " + it.lane + "\n" + it.what +
                  (it.dur && it.dur !== "-" ? "\n" + it.dur : "");
       var node;
       if (it.kind === "reply") {

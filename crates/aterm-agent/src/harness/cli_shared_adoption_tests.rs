@@ -237,6 +237,10 @@ fn fixture(mode: u8) -> (Tmp, Env, Arc<Approval>, Host) {
     (tmp, env, approval, host)
 }
 
+/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// staged evidence (`shared_provider::read_staged_bytes`); off Unix
+/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn an_unknown_attempt_requests_a_successor_without_repeating_the_consumed_action() {
     let (_tmp, env, approval, host) = fixture(0);
@@ -293,6 +297,10 @@ fn an_unknown_attempt_requests_a_successor_without_repeating_the_consumed_action
     assert!(env.accounts_store().load(NOW).unwrap().0.active.is_none());
 }
 
+/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// staged evidence (`shared_provider::read_staged_bytes`); off Unix
+/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_verified_but_unapproved_principal_requests_recovery_without_replaying_it() {
     let (_tmp, env, approval, mut host) = fixture(8);
@@ -399,6 +407,10 @@ impl shared_provider::Provider for FirstResult {
     }
 }
 
+/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// staged evidence (`shared_provider::read_staged_bytes`); off Unix
+/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_proved_unstarted_attempt_resumes_its_original_request_but_an_unknown_one_does_not() {
     for (unknown, suspended) in [(false, false), (true, false), (false, true)] {
@@ -453,6 +465,10 @@ fn a_proved_unstarted_attempt_resumes_its_original_request_but_an_unknown_one_do
     }
 }
 
+/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// staged evidence (`shared_provider::read_staged_bytes`); off Unix
+/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn first_shared_adoption_publishes_only_after_identity_and_retains_one_use_floor() {
     let (_tmp, env, approval, host) = fixture(0);
@@ -538,6 +554,12 @@ fn automatic_first_adoption_refuses_before_consumption_without_a_headless_opener
 #[test]
 fn automatic_first_adoption_does_not_substitute_a_headless_profile_for_a_required_one() {
     for pending in [false, true] {
+        // Pending reconciliation first runs a headless sign-in (`cli::opener_link`), which runs
+        // only on Unix; `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds
+        // the off-Unix refusal.
+        if pending && !cfg!(unix) {
+            continue;
+        }
         let (_tmp, env, approval, host) = fixture(u8::from(pending));
         let store = env.accounts_store();
         if pending {
@@ -570,6 +592,10 @@ fn automatic_first_adoption_does_not_substitute_a_headless_profile_for_a_require
     }
 }
 
+/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// staged evidence (`shared_provider::read_staged_bytes`); off Unix
+/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn first_shared_adoption_preserves_an_existing_default_login_and_selection() {
     let (_tmp, env, approval, mut host) = fixture(0);
@@ -613,6 +639,10 @@ fn first_shared_adoption_preserves_an_existing_default_login_and_selection() {
     );
 }
 
+/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// staged evidence (`shared_provider::read_staged_bytes`); off Unix
+/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn interrupted_first_adoption_reconciles_same_staging_without_another_provider_effect() {
     let (_tmp, env, approval, host) = fixture(1);
@@ -632,6 +662,7 @@ fn interrupted_first_adoption_reconciles_same_staging_without_another_provider_e
     );
 }
 
+#[cfg(unix)]
 struct ChangeDuringProof {
     approval: Arc<Approval>,
     config: PathBuf,
@@ -639,11 +670,13 @@ struct ChangeDuringProof {
     checked: Arc<AtomicUsize>,
 }
 
+#[cfg(unix)]
 struct ChangedProof {
     inner: Box<dyn shared_provider::LoginProof>,
     change: ChangeDuringProof,
 }
 
+#[cfg(unix)]
 impl shared_provider::LoginProof for ChangedProof {
     fn identity(&self) -> &str {
         self.inner.identity()
@@ -666,6 +699,7 @@ impl shared_provider::LoginProof for ChangedProof {
     }
 }
 
+#[cfg(unix)]
 impl shared_provider::Provider for ChangeDuringProof {
     fn execute(
         &self,
@@ -708,6 +742,10 @@ impl shared_provider::Provider for ChangeDuringProof {
     }
 }
 
+/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// staged evidence (`shared_provider::read_staged_bytes`); off Unix
+/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn publication_rechecks_root_and_local_off_after_the_final_credential_read() {
     for off in [
@@ -738,6 +776,10 @@ fn publication_rechecks_root_and_local_off_after_the_final_credential_read() {
     }
 }
 
+/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// staged evidence (`shared_provider::read_staged_bytes`); off Unix
+/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_new_root_generation_can_replace_its_own_unlisted_reservation() {
     let (_tmp, env, approval, mut host) = fixture(1);
@@ -748,6 +790,9 @@ fn a_new_root_generation_can_replace_its_own_unlisted_reservation() {
     assert_eq!(host.calls.load(Ordering::SeqCst), 2);
 }
 
+/// Unix only, where aterm links the headless opener (`cli::opener_link`); off Unix
+/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn local_invalidation_never_resumes_the_older_pending_result() {
     let (_tmp, env, approval, mut host) = fixture(5);
@@ -755,6 +800,32 @@ fn local_invalidation_never_resumes_the_older_pending_result() {
     host.mode = 0;
     assert!(run(&env, &host, &approval).is_err());
     assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    assert!(!host.roster.exists());
+}
+
+/// Off Unix aterm makes no symbolic-link opener (`cli::opener_link`), so automatic Claude
+/// shared adoption refuses before staging, provider calls, or decision consumption.
+#[cfg(not(unix))]
+#[test]
+fn automatic_shared_adoption_refuses_where_aterm_links_no_opener() {
+    let (_tmp, env, approval, host) = fixture(0);
+    let err = run(&env, &host, &approval).expect_err("no headless opener off Unix");
+    assert_eq!(
+        err,
+        opener_link(&env.accounts_store(), &host)
+            .unwrap_err()
+            .to_string()
+    );
+    assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+    assert!(!env.accounts_store().logins_dir().exists());
+    assert!(
+        env.accounts_store()
+            .load_logins(NOW)
+            .unwrap()
+            .0
+            .shared
+            .is_empty()
+    );
     assert!(!host.roster.exists());
 }
 

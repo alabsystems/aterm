@@ -187,7 +187,8 @@ fn a_memory_hog_stand_in() {
         page[0] = 1;
     }
     std::hint::black_box(&hog);
-    println!("touched");
+    // Keep the readiness proof on its own line even after libtest's single-thread prefix.
+    println!("\ntouched");
     let mut line = String::new();
     let _ = std::io::stdin().read_line(&mut line);
     std::hint::black_box(&hog);

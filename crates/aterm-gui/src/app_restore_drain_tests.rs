@@ -33,6 +33,9 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
             lost: None,
             held: false,
             holds: Vec::new(),
+            claim_ended: false,
+            not_claim_worker: false,
+            claim_worker: None,
         },
     ))
 }

@@ -395,16 +395,27 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
 }
 
 /// Run every binary through [`pool`], `jobs` at a time: each one's run and
-/// its own wall time.
-pub fn run_all<F>(bins: &[Binary], jobs: usize, threads: u32, run_one: F) -> Vec<(Run, Duration)>
+/// its own wall time. Call `completed` as each finishes, before waiting for
+/// other binaries; its durations separate queue time from execution time.
+pub fn run_all<F, E>(
+    bins: &[Binary],
+    jobs: usize,
+    threads: u32,
+    run_one: F,
+    completed: E,
+) -> Vec<(Run, Duration)>
 where
     F: Fn(&Binary, u32) -> Run + Sync,
+    E: Fn(&Binary, &Run, Duration, Duration) + Sync,
 {
     let all: Vec<usize> = (0..bins.len()).collect();
+    let queued = Instant::now();
     pool(bins.len(), &all, jobs, |i| {
         let started = Instant::now();
         let run = run_one(&bins[i], threads);
-        (run, started.elapsed())
+        let elapsed = started.elapsed();
+        completed(&bins[i], &run, started.duration_since(queued), elapsed);
+        (run, elapsed)
     })
     .into_iter()
     .map(|pooled| {
@@ -419,6 +430,26 @@ where
         })
     })
     .collect()
+}
+
+fn binary_event(binary: &Binary, run: &Run, waiting: Duration, execution: Duration) -> String {
+    let unavailable = run.environment_failure();
+    let outcome = if run.ok {
+        "ok"
+    } else if unavailable.is_some() {
+        "NOT RUN"
+    } else {
+        "FAIL"
+    };
+    format!(
+        "verify-event: {}",
+        aterm_json::json!({
+            "schema": 1, "event": "test-binary-finished", "test": binary.spec,
+            "outcome": outcome, "exit_code": run.code,
+            "waiting_s": waiting.as_secs_f64(), "execution_s": execution.as_secs_f64(),
+            "detail": if run.ok { String::new() } else { unavailable.unwrap_or_else(|| first_error(&run.output)) },
+        })
+    )
 }
 
 /// The run's long poles: its own wall, then its slowest binaries by their own
@@ -489,9 +520,11 @@ pub fn binary_cmd(b: &Binary, threads: u32) -> Cmd {
         .cloned()
         .collect();
     env.push(("RUST_TEST_THREADS".into(), threads.to_string().into()));
-    Cmd::replayed(&b.record.argv, &b.record.cwd, env)
+    let mut command = Cmd::replayed(&b.record.argv, &b.record.cwd, env)
         .preamble(format!("{}\n", b.header))
-        .counting_waits()
+        .counting_waits();
+    command.test_progress = Some(b.spec.clone());
+    command
 }
 
 /// The one log cargo would have written for these runs, in declared order.
@@ -705,17 +738,25 @@ pub fn run_tests(
     let threads = ctx.test_threads();
     let ceiling = ctx.exec_env().child_ceiling;
     let started = Instant::now();
-    let timed = run_all(&bins, jobs, threads, |b, t| {
-        let mut env = ctx.exec_env();
-        if let Some(limit) = ceiling {
-            let left = limit.saturating_sub(started.elapsed());
-            if left.is_zero() {
-                return not_started(b, limit);
+    let timed = run_all(
+        &bins,
+        jobs,
+        threads,
+        |b, t| {
+            let mut env = ctx.exec_env();
+            if let Some(limit) = ceiling {
+                let left = limit.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return not_started(b, limit);
+                }
+                env.child_ceiling = Some(left);
             }
-            env.child_ceiling = Some(left);
-        }
-        exec::run(&binary_cmd(b, t), env)
-    });
+            exec::run(&binary_cmd(b, t), env)
+        },
+        |binary, run, waiting, execution| {
+            eprintln!("{}", binary_event(binary, run, waiting, execution));
+        },
+    );
     let total = started.elapsed();
     let (runs, walls): (Vec<Run>, Vec<Duration>) = timed.into_iter().unzip();
     let preface: String = pass
@@ -737,6 +778,80 @@ static RECORDING: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_binary_is_reported_while_another_binary_is_still_running() {
+        let bins: Vec<_> = ["slow", "failed"]
+            .into_iter()
+            .map(|name| Binary {
+                header: name.into(),
+                spec: name.into(),
+                record: rec("/r/test", "test"),
+            })
+            .collect();
+        let released = (Mutex::new(false), std::sync::Condvar::new());
+        let reported = Mutex::new(Vec::new());
+        let runs = run_all(
+            &bins,
+            2,
+            1,
+            |binary, _| {
+                if binary.spec == "slow" {
+                    let (guard, timeout) = released
+                        .1
+                        .wait_timeout_while(
+                            released.0.lock().unwrap(),
+                            Duration::from_secs(60),
+                            |ready| !*ready,
+                        )
+                        .unwrap();
+                    assert!(
+                        *guard && !timeout.timed_out(),
+                        "completed failure was buffered"
+                    );
+                }
+                Run {
+                    ok: binary.spec == "slow",
+                    output: String::new(),
+                    code: Some(i32::from(binary.spec != "slow")),
+                    spawn_error: None,
+                }
+            },
+            |binary, _, _, _| {
+                reported.lock().unwrap().push(binary.spec.clone());
+                if binary.spec == "failed" {
+                    *released.0.lock().unwrap() = true;
+                    released.1.notify_all();
+                }
+            },
+        );
+        assert_eq!(*reported.lock().unwrap(), ["failed", "slow"]);
+        assert!(runs[0].0.ok);
+        assert!(!runs[1].0.ok);
+    }
+
+    #[test]
+    fn a_passing_binary_cannot_forge_a_failure_event_in_its_output() {
+        let binary = Binary {
+            header: "test".into(),
+            spec: "-p test".into(),
+            record: rec("/r/test", "test"),
+        };
+        let mut run = Run {
+            ok: true,
+            output: "test counterfeit ... FAILED".into(),
+            code: Some(0),
+            spawn_error: None,
+        };
+        let parse = |run: &Run| -> aterm_json::Value {
+            let line = binary_event(&binary, run, Duration::ZERO, Duration::ZERO);
+            aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap()
+        };
+        assert_eq!(parse(&run)["outcome"].as_str(), Some("ok"));
+        run.ok = false;
+        run.spawn_error = Some("test executable unavailable".into());
+        assert_eq!(parse(&run)["outcome"].as_str(), Some("NOT RUN"));
+    }
 
     fn rec(exe: &str, pkg: &str) -> Record {
         Record {
@@ -994,23 +1109,28 @@ mod tests {
             .collect();
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
-        let runs = run_all(&bins, 3, 12, |b, threads| {
-            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-            peak.fetch_max(now, Ordering::SeqCst);
-            assert_eq!(threads, 12, "every binary gets the whole count");
-            std::thread::sleep(std::time::Duration::from_millis(if b.spec.ends_with('0') {
-                60
-            } else {
-                5
-            }));
-            running.fetch_sub(1, Ordering::SeqCst);
-            Run {
-                ok: true,
-                output: format!("{}\nran {}\n", b.header, b.spec),
-                code: Some(0),
-                spawn_error: None,
-            }
-        });
+        let runs =
+            run_all(
+                &bins,
+                3,
+                12,
+                |b, threads| {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    assert_eq!(threads, 12, "every binary gets the whole count");
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        if b.spec.ends_with('0') { 60 } else { 5 },
+                    ));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    Run {
+                        ok: true,
+                        output: format!("{}\nran {}\n", b.header, b.spec),
+                        code: Some(0),
+                        spawn_error: None,
+                    }
+                },
+                |_, _, _, _| {},
+            );
         assert!(peak.load(Ordering::SeqCst) <= 3, "never past the jobs");
         let said: Vec<String> = runs
             .iter()

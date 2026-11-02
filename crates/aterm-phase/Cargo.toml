@@ -24,11 +24,14 @@ workspace = true
 aterm-agent-names = { workspace = true }
 
 [dev-dependencies]
+# `text_hash` is spelled out, so the library stays clear of astream-wire, which the prover its
+# floors.tsv row names cannot compile; a test holds it to the workspace's FNV-1a.
+aterm-hash = { workspace = true }
 aterm-regex = { workspace = true }
 aterm-tempfile = { workspace = true }
 # The explicit vendor_drift bench resolves managed builds through
-# `aterm pkg which` using the workspace's child builder. The library remains
-# dependency-free; ordinary fixtures do not resolve host-installed builds.
+# `aterm pkg which` using the workspace's child builder. The library does not;
+# ordinary fixtures do not resolve host-installed builds.
 aterm-uds = { workspace = true }
 
 [[test]]

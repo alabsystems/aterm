@@ -152,6 +152,18 @@ impl Selection {
         guard_until(&self.original, false, deadline)?;
         let bootstrap =
             Bootstrap::required_until(&self.original, deadline).map_err(crate::table::failure)?;
+        self.validate_bootstrap(bootstrap, deadline)
+    }
+    fn observe_until(&self, deadline: Instant) -> Result<Bootstrap> {
+        if !crate::runtime::enabled(&self.config)? {
+            return Err(fail());
+        }
+        Observation::observe(&self.original, deadline)?;
+        let (bootstrap, _) = Bootstrap::established_with_journal_until(&self.original, deadline)
+            .map_err(crate::table::failure)?;
+        self.validate_bootstrap(bootstrap, deadline)
+    }
+    fn validate_bootstrap(&self, bootstrap: Bootstrap, deadline: Instant) -> Result<Bootstrap> {
         bootstrap
             .revalidate_custody()
             .map_err(crate::table::failure)?;
@@ -858,7 +870,7 @@ fn logical_paths_in(paths: &Paths, observe_only: bool, deadline: Instant) -> Res
 
 /// Names and receipt counts only. Unconfirmed crash tails remain in their
 /// immutable sources and are never counted as imported committed operations.
-pub(crate) fn status(paths: &Paths) -> Result<Value> {
+pub(crate) fn status(paths: &Paths, deadline: Instant) -> Result<Value> {
     let mut source = paths.clone();
     let mut sources = Vec::new();
     for generation in 0..=MAX_GENERATIONS {
@@ -868,8 +880,8 @@ pub(crate) fn status(paths: &Paths) -> Result<Value> {
         if generation == MAX_GENERATIONS {
             return Err(fail());
         }
-        let bootstrap = selection.authorize()?;
-        let session = Session::observe(&bootstrap)?;
+        let bootstrap = selection.observe_until(deadline)?;
+        let session = Session::observe_until(&bootstrap, deadline)?;
         let mut tables = Vec::new();
         for (region, id, _) in claims(&source)? {
             if region != Region::Primary {
@@ -897,7 +909,7 @@ pub(crate) fn status(paths: &Paths) -> Result<Value> {
         return Ok(Value::Null);
     }
     Ok(
-        json!({"state":if selected(paths).is_ok() {"ready"} else {"pending"},
+        json!({"state":if observed_paths_until(paths, deadline).is_ok() {"ready"} else {"pending"},
         "sources":sources, "original_writer_fenced":true}),
     )
 }
@@ -908,12 +920,14 @@ pub(crate) fn status(paths: &Paths) -> Result<Value> {
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn inspect(paths: &Paths) -> Result<Value> {
     let started = Instant::now();
+    let deadline = admission_deadline();
     let selection = Selection::read(paths)?.ok_or_else(fail)?;
-    let original = selection.authorize()?;
-    let source = Session::observe(&original)?;
+    let original = selection.observe_until(deadline)?;
+    let source = Session::observe_until(&original, deadline)?;
     let next = candidate(paths);
-    let bootstrap = Bootstrap::required(&next).map_err(crate::table::failure)?;
-    let verifier = Session::observe(&bootstrap)?;
+    let (bootstrap, _) = Bootstrap::established_with_journal_until(&next, deadline)
+        .map_err(crate::table::failure)?;
+    let verifier = Session::observe_until(&bootstrap, deadline)?;
     if bootstrap.trust() != original.trust() || source.actor() == verifier.actor() {
         return Err(fail());
     }

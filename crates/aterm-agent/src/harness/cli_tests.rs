@@ -10210,18 +10210,16 @@ fn source_table_rows_treats_held_by_rows_as_elsewhere_and_matches_identity_email
 #[test]
 fn codex_of_env_takes_the_last_duplicate_thread_and_tab_session_entries() {
     let valid = "019a0000-0000-7000-8000-000000000001";
+    let auth = abs("/work/codex-new/auth.json");
     let vars = [
         ("CODEX_THREAD_ID", "not-a-uuid"),
         ("CODEX_THREAD_ID", valid),
         (TAB_SESSION_VAR, ""),
         (TAB_SESSION_VAR, "s-1"),
-        ("CODEX_AUTH_PATH", "/work/codex-new/auth.json"),
+        ("CODEX_AUTH_PATH", auth.as_str()),
     ]
     .map(|(k, v)| (OsString::from(k), OsString::from(v)));
     let (thread, login) = codex_of_env(vars);
     assert_eq!(thread.as_deref(), Some(valid));
-    assert_eq!(
-        login.and_then(|l| l.login),
-        Some("/work/codex-new".to_owned())
-    );
+    assert_eq!(login.and_then(|l| l.login), Some(abs("/work/codex-new")));
 }

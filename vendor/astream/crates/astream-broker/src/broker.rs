@@ -1064,6 +1064,24 @@ fn end_revoked<S: Write>(stream: &mut S, out: &mut Vec<u8>, msg: &str) -> io::Re
     flush_egress(stream, out)
 }
 
+/// End a streaming verb when a retained cold record could not be read back from the log
+/// file: flush any earlier deliveries in `out`, then emit an explicit `ERR_REFUSED`
+/// naming the unreadable offset instead of silently truncating or spinning.
+fn end_unreadable_cold_record<S: Write>(
+    stream: &mut S,
+    out: &mut Vec<u8>,
+    bad_off: u64,
+) -> io::Result<()> {
+    append_frame(
+        out,
+        &encode_response(&Response::Error {
+            code: ERR_REFUSED,
+            msg: format!("cold record at offset {bad_off} could not be read back from the log"),
+        }),
+    )?;
+    flush_egress(stream, out)
+}
+
 /// A fresh 32-byte nonce for one connection's capability handshake.
 ///
 /// HONEST BOUNDARY: what the protocol needs from this value is FRESHNESS — an
@@ -1399,23 +1417,25 @@ fn node_read(path: &Path) -> io::Result<SocketNode> {
 /// (`EAGAIN`, `EINPROGRESS`, `EALREADY`, `EINTR`, `EACCES`, `EMFILE`) proves nothing
 /// stale, so the socket stays. This probe never queues a stream connection.
 #[cfg(unix)]
-fn claim_socket_path(path: &Path) -> io::Result<()> {
-    claim_socket_path_with(path, |path| {
-        let probe = std::os::unix::net::UnixDatagram::unbound()?;
-        kept_from_children(&probe)?;
-        probe.set_nonblocking(true)?;
-        probe.connect(path)
-    })
+fn probe_socket_path(path: &Path) -> io::Result<()> {
+    let probe = match std::os::unix::net::UnixDatagram::unbound() {
+        Ok(probe) => probe,
+        Err(e) => return Err(e),
+    };
+    if let Err(e) = kept_from_children(&probe) {
+        return Err(e);
+    }
+    if let Err(e) = probe.set_nonblocking(true) {
+        return Err(e);
+    }
+    probe.connect(path)
 }
 
 #[cfg(unix)]
-fn claim_socket_path_with(
-    path: &Path,
-    probe: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<()> {
+fn socket_metadata_if_present(path: &Path) -> io::Result<Option<std::fs::Metadata>> {
     use std::os::unix::fs::FileTypeExt;
     let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return Ok(());
+        return Ok(None);
     };
     if !meta.file_type().is_socket() {
         return Err(io::Error::new(
@@ -1426,7 +1446,16 @@ fn claim_socket_path_with(
             ),
         ));
     }
-    match probe(path) {
+    Ok(Some(meta))
+}
+
+#[cfg(unix)]
+fn finish_claim_socket_path(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    outcome: io::Result<()>,
+) -> io::Result<()> {
+    match outcome {
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         outcome => {
@@ -1446,8 +1475,29 @@ fn claim_socket_path_with(
     }
     #[cfg(test)]
     serve_hook(ServeAt::Judged);
-    unlink_if_node(path, SocketNode::of(&meta));
+    unlink_if_node(path, SocketNode::of(meta));
     Ok(())
+}
+
+#[cfg(unix)]
+fn claim_socket_path(path: &Path) -> io::Result<()> {
+    let meta = match socket_metadata_if_present(path) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    finish_claim_socket_path(path, &meta, probe_socket_path(path))
+}
+
+#[cfg(all(test, unix))]
+fn claim_socket_path_with(
+    path: &Path,
+    probe: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let Some(meta) = socket_metadata_if_present(path)? else {
+        return Ok(());
+    };
+    finish_claim_socket_path(path, &meta, probe(path))
 }
 
 /// The `n` the next private socket name takes ([`private_socket_name`]).
@@ -4187,6 +4237,55 @@ impl Broker {
     #[must_use]
     pub fn max_retained_records(&self) -> usize {
         self.shared.max_retained_records.load(Ordering::Relaxed)
+    }
+
+    /// Bound the decoded records this broker's log keeps resident in memory to about
+    /// `budget` bytes of subject and body (the newest record always stays;
+    /// [`BrokerLog::set_resident_budget`]).
+    pub fn set_resident_budget(&self, budget: usize) {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_resident_budget(budget);
+    }
+
+    /// `(resident records, resident bytes, retained records)` currently held in memory
+    /// by this broker's log ([`BrokerLog::residency`]).
+    #[must_use]
+    pub fn residency(&self) -> (usize, usize, usize) {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .residency()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn cold_reads(&self) -> u64 {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cold_reads()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn reset_cold_reads(&self) {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reset_cold_reads();
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn shared_log_frame_at_for_test(&self, idx: usize) -> Option<u64> {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frame_at_for_test(idx)
     }
 
     /// Configure automatic state-carrying compaction whenever the log's retained byte
@@ -8216,7 +8315,8 @@ fn serve_fork_subscribe(
         return end_stream_failure(stream, &mut out, failure);
     }
     let visible = loop {
-        let (chunk, visible) = {
+        let before = cursor;
+        let (step, visible) = {
             let log = shared
                 .log
                 .lock()
@@ -8224,17 +8324,40 @@ fn serve_fork_subscribe(
             let visible = match pinned {
                 Some(v) => v,
                 None => {
-                    let v = shared.head.load(Ordering::Relaxed);
+                    let v = shared.head.load(Ordering::Relaxed).min(log.head().0);
                     pinned = Some(v);
                     v
                 }
             };
             // A snapshot, never told of gaps: it asks for none.
-            let (_, chunk) = next_chunk(&log, &mut cursor, visible, &filt, None, TAIL_CHUNK);
-            (chunk, visible)
+            let (_, step) = next_chunk(
+                &log,
+                &mut cursor,
+                visible,
+                &filt,
+                Some(fork_at),
+                None,
+                TAIL_CHUNK,
+            );
+            (step, visible)
+        };
+        let (chunk, scanned_to) = match step {
+            crate::store::TailStep::Chunk {
+                records,
+                scanned_to,
+            } => (records, scanned_to),
+            crate::store::TailStep::Unreadable(bad_off) => {
+                return end_unreadable_cold_record(stream, &mut out, bad_off);
+            }
         };
         if chunk.is_empty() {
-            break visible;
+            if cursor >= visible || cursor <= before {
+                break visible;
+            }
+            if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
+                return end_stream_failure(stream, &mut out, failure);
+            }
+            continue;
         }
         for rec in chunk {
             if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
@@ -8254,6 +8377,7 @@ fn serve_fork_subscribe(
                 queue_delivery(stream, &mut out, rec)?;
             }
         }
+        cursor = cursor.max(scanned_to);
     };
     flush_egress(stream, &mut out)?;
     if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
@@ -9750,14 +9874,14 @@ fn plan_tail_wakes(
             WakePlan::None
         };
     }
-    let recs = if before < visible {
-        log.visible_slice(Offset(before), Offset(visible))
+    let sums = if before < visible {
+        log.visible_summaries(Offset(before), Offset(visible))
     } else {
         &[]
     };
     let mut has_any_deliverable = false;
-    for r in recs {
-        if !crate::store::is_hidden_record(r) {
+    for s in sums {
+        if !s.is_hidden() {
             has_any_deliverable = true;
             break;
         }
@@ -9774,9 +9898,9 @@ fn plan_tail_wakes(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut first_match: Option<u64> = None;
         if has_any_deliverable {
-            for r in recs {
-                if !crate::store::is_hidden_record(r) && p.filter.matches_str(&r.subject) {
-                    first_match = Some(r.seq.0);
+            for s in sums {
+                if !s.is_hidden() && p.filter.matches_str(s.subject()) {
+                    first_match = Some(s.offset());
                     break;
                 }
             }
@@ -11248,14 +11372,15 @@ fn next_chunk(
     cursor: &mut u64,
     head: u64,
     filter: &Filter,
+    also_at: Option<u64>,
     told: Option<&mut Told>,
     max: usize,
-) -> (Option<crate::proto::Gap>, Vec<Arc<BrokerRecord>>) {
+) -> (Option<crate::proto::Gap>, crate::store::TailStep) {
     let gap = match told {
         Some(t) => log.gap_notice(filter, *cursor, t),
         None => None,
     };
-    (gap, log.read_chunk(cursor, head, max))
+    (gap, log.read_tail_chunk(cursor, head, filter, also_at, max))
 }
 
 struct TailParkerGuard<'a> {
@@ -11338,11 +11463,18 @@ fn tail_fetch_chunk_locked(
     chunk: usize,
     broker_times: bool,
     batch_bts: &mut Vec<Option<u64>>,
-) -> (Option<crate::proto::Gap>, Vec<Arc<BrokerRecord>>) {
-    let (g, b) = if visible > *cursor {
-        next_chunk(log, cursor, visible, filter, told.as_mut(), chunk)
+) -> (Option<crate::proto::Gap>, crate::store::TailStep) {
+    let visible = visible.min(log.head().0);
+    let (g, step) = if visible > *cursor {
+        next_chunk(log, cursor, visible, filter, None, told.as_mut(), chunk)
     } else {
-        (None, Vec::new())
+        (
+            None,
+            crate::store::TailStep::Chunk {
+                records: Vec::new(),
+                scanned_to: *cursor,
+            },
+        )
     };
     if shared.selective_tail_wake.load(Ordering::Relaxed)
         && *cursor >= visible
@@ -11357,12 +11489,14 @@ fn tail_fetch_chunk_locked(
         st.has_unread_match = false;
         parker.needs_wake.store(false, Ordering::Release);
     }
-    if broker_times && !b.is_empty() {
-        for rec in &b {
-            batch_bts.push(log.subject_bt_ms(&rec.subject, rec.seq));
+    if broker_times {
+        if let crate::store::TailStep::Chunk { ref records, .. } = step {
+            for rec in records {
+                batch_bts.push(log.subject_bt_ms(&rec.subject, rec.seq));
+            }
         }
     }
-    (g, b)
+    (g, step)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11380,7 +11514,7 @@ fn tail_park_and_fetch_chunk(
     marked_durable: u64,
     park: Duration,
     batch_bts: &mut Vec<Option<u64>>,
-) -> (Option<crate::proto::Gap>, Vec<Arc<BrokerRecord>>) {
+) -> (Option<crate::proto::Gap>, crate::store::TailStep) {
     let mut guard = shared
         .log
         .lock()
@@ -11446,7 +11580,7 @@ fn tail_park_and_fetch_chunk(
     }
     shared.tail_wakeups.fetch_add(resumes, Ordering::Relaxed);
 
-    let visible = shared.head.load(Ordering::Relaxed);
+    let visible = shared.head.load(Ordering::Relaxed).min(guard.head().0);
     let sighup_pending = shared.has_revocation_file.load(Ordering::Relaxed)
         && astream_sys::sighup_generation() != shared.sighup_seen.load(Ordering::Relaxed);
     let epoch_changed = Some(shared.revocation_epoch.load(Ordering::Relaxed)) != seen_epoch;
@@ -11474,7 +11608,13 @@ fn tail_park_and_fetch_chunk(
             );
         }
     }
-    (None, Vec::new())
+    (
+        None,
+        crate::store::TailStep::Chunk {
+            records: Vec::new(),
+            scanned_to: *cursor,
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11483,6 +11623,7 @@ fn tail_deliver_batch(
     stream: &mut Conn,
     out: &mut Vec<u8>,
     batch: Vec<Arc<BrokerRecord>>,
+    scanned_to: u64,
     batch_bts: &[Option<u64>],
     cursor: &mut u64,
     filter: &Filter,
@@ -11491,6 +11632,14 @@ fn tail_deliver_batch(
     cap_check: &mut StreamCapCheck,
     until: &mut u64,
 ) -> io::Result<Option<bool>> {
+    if batch.is_empty() {
+        if let Some(failure) = stream_failure(shared, peer_id, cap_check, until) {
+            end_stream_failure(stream, out, failure)?;
+            return Ok(None);
+        }
+        *cursor = (*cursor).max(scanned_to);
+        return Ok(Some(false));
+    }
     let mut wrote = false;
     for (i, rec) in batch.into_iter().enumerate() {
         if let Some(failure) = stream_failure(shared, peer_id, cap_check, until) {
@@ -11514,6 +11663,7 @@ fn tail_deliver_batch(
         }
     }
     flush_egress(stream, out)?;
+    *cursor = (*cursor).max(scanned_to);
     Ok(Some(wrote))
 }
 
@@ -11587,6 +11737,8 @@ fn tail_loop(
         } else {
             shared.head.load(Ordering::Acquire) <= cursor
         };
+        let mut scanned_to = cursor;
+        let mut did_scan = false;
         let mut batch = if fast_caught_up {
             Vec::new()
         } else {
@@ -11594,7 +11746,7 @@ fn tail_loop(
                 .log
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let visible = shared.head.load(Ordering::Relaxed);
+            let visible = shared.head.load(Ordering::Relaxed).min(log.head().0);
             if shared.selective_tail_wake.load(Ordering::Relaxed) {
                 let _ = tail_sync_selective_before_read(
                     &parker,
@@ -11604,7 +11756,8 @@ fn tail_loop(
                     &mut told,
                 );
             }
-            let (g, b) = tail_fetch_chunk_locked(
+            let before = cursor;
+            let (g, step) = tail_fetch_chunk_locked(
                 shared,
                 &log,
                 &parker,
@@ -11616,8 +11769,29 @@ fn tail_loop(
                 asks.broker_times,
                 &mut batch_bts,
             );
+            drop(log);
             gap = g;
-            b
+            match step {
+                crate::store::TailStep::Chunk {
+                    records,
+                    scanned_to: st,
+                } => {
+                    scanned_to = st;
+                    did_scan = !records.is_empty() || st > before;
+                    records
+                }
+                crate::store::TailStep::Unreadable(bad_off) => {
+                    if let Some(g) = gap.take() {
+                        if let Some(failure) =
+                            stream_failure(shared, peer_id, &mut cap_check, &mut until)
+                        {
+                            return end_stream_failure(stream, &mut out, failure);
+                        }
+                        write_gap(stream, g)?;
+                    }
+                    return end_unreadable_cold_record(stream, &mut out, bad_off);
+                }
+            }
         };
         if let Some(g) = gap.take() {
             if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
@@ -11626,7 +11800,7 @@ fn tail_loop(
             write_gap(stream, g)?;
             wrote_at = Instant::now();
         }
-        if batch.is_empty() {
+        if !did_scan {
             if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
             }
@@ -11649,7 +11823,8 @@ fn tail_loop(
                 u64::MAX => liveness_poll,
                 t => liveness_poll.min(Duration::from_millis(t.saturating_sub(now_unix_ms()))),
             };
-            let (g, b) = tail_park_and_fetch_chunk(
+            let before = cursor;
+            let (g, step) = tail_park_and_fetch_chunk(
                 shared,
                 &parker,
                 &mut cursor,
@@ -11665,7 +11840,6 @@ fn tail_loop(
                 &mut batch_bts,
             );
             gap = g;
-            batch = b;
             if let Some(g) = gap.take() {
                 if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
                     return end_stream_failure(stream, &mut out, failure);
@@ -11673,21 +11847,36 @@ fn tail_loop(
                 write_gap(stream, g)?;
                 wrote_at = Instant::now();
             }
-            if batch.is_empty() {
-                let head = shared.head.load(Ordering::Relaxed);
-                if !shared.running.load(Ordering::Relaxed) && head <= cursor {
-                    return Ok(());
-                }
-                if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
-                    return end_stream_failure(stream, &mut out, failure);
-                }
-                if head <= cursor {
-                    probed = Instant::now();
-                    if probe_peer(shared, stream) {
-                        return Ok(());
+            match step {
+                crate::store::TailStep::Chunk {
+                    records,
+                    scanned_to: st,
+                } => {
+                    batch = records;
+                    scanned_to = st;
+                    let woke_scan = !batch.is_empty() || st > before;
+                    if !woke_scan {
+                        let head = shared.head.load(Ordering::Relaxed);
+                        if !shared.running.load(Ordering::Relaxed) && head <= cursor {
+                            return Ok(());
+                        }
+                        if let Some(failure) =
+                            stream_failure(shared, peer_id, &mut cap_check, &mut until)
+                        {
+                            return end_stream_failure(stream, &mut out, failure);
+                        }
+                        if head <= cursor {
+                            probed = Instant::now();
+                            if probe_peer(shared, stream) {
+                                return Ok(());
+                            }
+                        }
+                        continue;
                     }
                 }
-                continue;
+                crate::store::TailStep::Unreadable(bad_off) => {
+                    return end_unreadable_cold_record(stream, &mut out, bad_off);
+                }
             }
         }
         let Some(wrote) = tail_deliver_batch(
@@ -11695,6 +11884,7 @@ fn tail_loop(
             stream,
             &mut out,
             batch,
+            scanned_to,
             &batch_bts,
             &mut cursor,
             &filter,

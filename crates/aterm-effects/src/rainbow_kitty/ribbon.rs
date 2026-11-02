@@ -12995,10 +12995,8 @@ mod tests {
                     "the settled band uses the paced tail"
                 );
             }
-            let mut hash = 0xcbf2_9ce4_8422_2325u64;
-            let mut feed = |part: u64| {
-                hash = (hash ^ part).wrapping_mul(0x100_0000_01b3);
-            };
+            let mut hash = aterm_hash::FNV64_OFFSET;
+            let mut feed = |part: u64| hash = aterm_hash::fnv_mix_u64(hash, part);
             for seg in rib.plan_segments() {
                 for part in [seg.x, seg.spine, seg.up, seg.dn, seg.t] {
                     feed(u64::from(part.to_bits()));
@@ -19444,13 +19442,9 @@ mod tests {
 
     /// FNV-1a over `words`.
     fn fold_words(words: impl IntoIterator<Item = u64>) -> u64 {
-        let mut h = 0xcbf2_9ce4_8422_2325u64;
-        for w in words {
-            for b in w.to_le_bytes() {
-                h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-            }
-        }
-        h
+        words
+            .into_iter()
+            .fold(aterm_hash::FNV64_OFFSET, aterm_hash::fnv1a_64_u64_le)
     }
 
     /// The spellings a density is chosen for: the tall comet, the tall flat ribbon, the

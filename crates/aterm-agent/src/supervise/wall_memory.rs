@@ -273,7 +273,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    fn remember_wall(&mut self, wall: &aterm_phase::Wall, program: Program, seq: u64) {
+    pub(super) fn remember_wall(&mut self, wall: &aterm_phase::Wall, program: Program, seq: u64) {
         let conversation = self
             .wall_conversation
             .as_ref()
@@ -406,7 +406,10 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Seed wall memory from an open wall recorded in the approval ledger, waited to the usage
-    /// tap's reset where the row names one.
+    /// tap's reset where the row names one. An open wall older than [`MEMORY_TTL`] past its reset
+    /// is held aside (`stale_open_wall`) and adopted only if the loop's first decided screen is a
+    /// person's own `/login` dialog (`over_limit_screen`), where the dialog kept any resume from
+    /// closing the wall; on any other screen it is dropped so history stays expired.
     pub(super) fn seed_wall_memory(&mut self, open: Option<approvals::OpenWall>) {
         if self.wall_memory.is_some() {
             return;
@@ -414,11 +417,44 @@ impl<C: Ctl> Session<'_, C> {
         let Some(open) = open else {
             return;
         };
+        let Some(kind) =
+            approvals::wall_kind(open.kind, &open.message).filter(|k| k.reads_limited())
+        else {
+            return;
+        };
         let now = self.now_unix();
         let ttl = i64::try_from(MEMORY_TTL.as_secs()).unwrap_or(i64::MAX);
         let waited = open.tap_unix.or(open.reset_unix);
         let since = waited.unwrap_or(open.at_ms / 1000);
         if now > since.saturating_add(ttl) {
+            self.stale_open_wall = Some(open);
+            return;
+        }
+        self.apply_open_wall(open, kind, now, waited);
+    }
+
+    /// Adopt or discard an [`approvals::OpenWall`] that exceeded [`MEMORY_TTL`] at loop startup,
+    /// once the first non-blank decided screen shows whether a person's own `/login` dialog still
+    /// covers the composer.
+    pub(super) fn adopt_stale_wall_on_login_dialog(
+        &mut self,
+        program: Program,
+        rows: &[String],
+        hosted: bool,
+    ) {
+        if rows.iter().all(|r| r.trim().is_empty()) {
+            return;
+        }
+        let Some(open) = self.stale_open_wall.take() else {
+            return;
+        };
+        if self.wall_memory.is_some()
+            || !super::super::policy::login::carried(program)
+            || aterm_phase::login_at_wall(rows).is_some()
+            || !aterm_phase::login_screen(rows).is_some_and(|screen| {
+                super::super::policy::login::over_limit_screen(&self.turn_end, &screen)
+            })
+        {
             return;
         }
         let Some(kind) =
@@ -426,6 +462,21 @@ impl<C: Ctl> Session<'_, C> {
         else {
             return;
         };
+        let now = self.now_unix();
+        let waited = open.tap_unix.or(open.reset_unix);
+        self.apply_open_wall(open, kind, now, waited);
+        if hosted {
+            self.require_seeded_limit_conversation();
+        }
+    }
+
+    fn apply_open_wall(
+        &mut self,
+        open: approvals::OpenWall,
+        kind: aterm_phase::WallKind,
+        now: i64,
+        waited: Option<i64>,
+    ) {
         let key = approvals::wall_reset_key(kind, open.reset.as_deref());
         self.wall_reset = Some((key.clone(), open.reset_unix));
         if let Some(at) = open.tap_unix {
@@ -517,6 +568,11 @@ pub(super) enum StuckOn {
     /// `/usage` probe opens, and the canary is off while that probe is under way, so this
     /// one stands until whoever opened it closes it.
     Panel,
+    /// Claude Code's own `/login` dialog, which [`aterm_phase::login_screen`] reads. The turn
+    /// end carries the one aterm typed and closes a person's own only over a usage limit whose
+    /// act is due ([`super::super::policy::login::over_limit_act`]), so this one stands until
+    /// whoever opened it closes it, or until that act comes due.
+    Login,
 }
 
 /// What the dialog canary calls a screen no reader names ([`StuckOn::Unread`]).
@@ -524,6 +580,21 @@ pub(super) const UNREAD_DIALOG: &str = "a dialog this build does not read";
 
 /// What the dialog canary calls Claude Code's own Settings panel ([`StuckOn::Panel`]).
 pub(super) const SETTINGS_PANEL: &str = "Claude Code's own Settings panel";
+
+/// What the dialog canary calls Claude Code's own `/login` dialog ([`StuckOn::Login`]).
+pub(super) const LOGIN_DIALOG: &str = "Claude Code's own /login sign-in";
+
+impl StuckOn {
+    /// The words the canary names a screen a reader names by, and the exception its third rung
+    /// raises there; `None` for [`Self::Unread`].
+    const fn named(self) -> Option<&'static str> {
+        match self {
+            Self::Unread => None,
+            Self::Panel => Some(SETTINGS_PANEL),
+            Self::Login => Some(LOGIN_DIALOG),
+        }
+    }
+}
 
 impl StuckRung {
     const fn next(self) -> Option<(Self, u32)> {
@@ -639,6 +710,8 @@ impl<C: Ctl> Session<'_, C> {
         }
         let on = if aterm_phase::settings_panel(rows).is_some() {
             StuckOn::Panel
+        } else if aterm_phase::login_screen(rows).is_some() {
+            StuckOn::Login
         } else {
             StuckOn::Unread
         };
@@ -671,7 +744,11 @@ impl<C: Ctl> Session<'_, C> {
             return;
         }
         let dialog = kind == ExceptionKind::Dialog;
-        let panel = dialog && matches!(self.stuck_dialog, Some(((_, StuckOn::Panel), _)));
+        let on = self
+            .stuck_dialog
+            .as_ref()
+            .map_or(StuckOn::Unread, |((_, on), _)| *on);
+        let named = on.named().filter(|_| dialog);
         let call = if dialog || self.fx.since(at) < self.setup.background_settle {
             None
         } else {
@@ -739,14 +816,23 @@ impl<C: Ctl> Session<'_, C> {
         }
         match next {
             StuckRung::Quiet => {}
-            StuckRung::Said if panel => {
+            StuckRung::Said if named.is_some() => {
                 let agent = crate::supervise::screen::status_field(&status, "agent");
+                let closes = match on {
+                    StuckOn::Login => {
+                        "the harness closes a person's own only over a usage limit whose act is \
+                         due, so until then it stands until whoever opened it closes it"
+                    }
+                    StuckOn::Panel | StuckOn::Unread => {
+                        "the harness did not open it and does not close it, so it stands until \
+                         whoever opened it closes it"
+                    }
+                };
                 review.note(&format!(
-                    "STUCK seq={} the agent's own title says idle, and {SETTINGS_PANEL} has \
-                     stood open, unchanged, for {minutes} min (agent={}): the harness did not \
-                     open it and does not close it, so it stands until whoever opened it \
-                     closes it. rows: {}",
+                    "STUCK seq={} the agent's own title says idle, and {} has stood open, \
+                     unchanged, for {minutes} min (agent={}): {closes}. rows: {}",
                     screen.seq,
+                    named.unwrap_or(SETTINGS_PANEL),
                     agent.unwrap_or("-"),
                     tail_rows(&screen.rows),
                 ));
@@ -779,14 +865,18 @@ impl<C: Ctl> Session<'_, C> {
                     screen.seq,
                 )),
             },
-            StuckRung::Told if panel => {
+            StuckRung::Told if named.is_some() => {
                 // A record of a screen this build does not recognise would be false here: the
-                // journal keeps it, and the third rung names the panel.
+                // journal keeps it, and the third rung names the screen.
                 self.stuck_told = Some((self.fx.mono(), None));
+                let whose = match on {
+                    StuckOn::Login => "",
+                    StuckOn::Panel | StuckOn::Unread => ", which the harness did not open",
+                };
                 review.note(&format!(
-                    "STALLED seq={} still so after {minutes} min: {SETTINGS_PANEL}, which the \
-                     harness did not open, noted here alone",
+                    "STALLED seq={} still so after {minutes} min: {}{whose}, noted here alone",
                     screen.seq,
+                    named.unwrap_or(SETTINGS_PANEL),
                 ));
             }
             StuckRung::Told => {
@@ -811,7 +901,8 @@ impl<C: Ctl> Session<'_, C> {
             }
             StuckRung::Raised => {
                 let exception = match witness {
-                    _ if panel => Exception::settings_panel(),
+                    _ if named.is_some() && on == StuckOn::Login => Exception::login_dialog(),
+                    _ if named.is_some() => Exception::settings_panel(),
                     _ if dialog => Exception::dialog(),
                     Witness::Title => Exception::stalled(),
                     Witness::Words(_) => Exception::stalled_on_work(),

@@ -49,7 +49,7 @@ fn env_of(desk: &Desk, now: i64) -> Env {
 }
 
 /// `accounts add <label> [--email <email>]` on `desk`: its exit code, stdout and stderr.
-fn add(desk: &Desk, label: &str, email: Option<&str>) -> (ExitCode, String, String) {
+pub(super) fn add(desk: &Desk, label: &str, email: Option<&str>) -> (ExitCode, String, String) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = run_accounts(
         &AccountsCmd::Add {

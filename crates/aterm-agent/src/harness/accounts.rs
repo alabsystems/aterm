@@ -27,7 +27,7 @@ use sync_commit::usage_target;
 
 #[path = "accounts_directory.rs"]
 mod directory;
-pub(super) use directory::{retained_directory_owner, shared_staging_retained};
+pub(super) use directory::{naming_row, retained_directory_owner, shared_staging_retained};
 
 #[cfg_attr(
     any(test, debug_assertions),
@@ -1963,7 +1963,8 @@ pub struct Binding {
     pub subscription: Option<String>,
     /// When a renewal last answered another account than the row's ([`note_wrong_account`]).
     pub wrong_at: Option<i64>,
-    /// The logins this binding replaced, newest first, at most [`MAX_LEFT`].
+    /// At most [`MAX_LEFT`] retained login directories. Renewals put previous logins newest
+    /// first; a roster departure keeps the last current login at the end for return recovery.
     pub was: Vec<Option<String>>,
     /// What proved the bound login is the row's account, where a sign-in of another CLI's pool
     /// bound it ([`note_proof`]); a Claude Code renewal's proof is its status check, never
@@ -3282,39 +3283,84 @@ pub fn move_account(
     from: &str,
     to: &str,
 ) -> Result<(), String> {
-    for label in [from, to] {
+    move_accounts(state, logins, &[(from, to)])
+}
+
+/// Relabels several accounts at once, each as [`move_account`] relabels one: every pair's
+/// account leaves its first label for its second together, so the accounts of one sync can trade
+/// labels (a swap, or any cycle) with no free label between them. A pair whose labels are equal
+/// is left as it is.
+/// # Errors
+/// A label is invalid, two pairs leave one label or take one label, or a destination that no
+/// pair leaves retains any local account reference. Refusal changes neither snapshot. A
+/// successful move leaves generation allocation to the transaction.
+pub fn move_accounts(
+    state: &mut State,
+    logins: &mut Logins,
+    moves: &[(&str, &str)],
+) -> Result<(), String> {
+    for label in moves.iter().flat_map(|(from, to)| [*from, *to]) {
         if let Some(why) = label_refusal(label) {
             return Err(format!("cannot relabel `{label}`: {why}"));
         }
     }
-    if from == to {
-        return Ok(());
+    let mut map: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut taken = BTreeSet::new();
+    for &(from, to) in moves.iter().filter(|(from, to)| from != to) {
+        if map.insert(from, to).is_some() || !taken.insert(to) {
+            return Err(format!(
+                "cannot move `{from}` to `{to}`: another move leaves or takes the same label; nothing was written"
+            ));
+        }
     }
-    if label_is_retained(state, logins, to) {
-        return Err(format!(
-            "cannot move `{from}` to `{to}`: the destination retains local login or account state; choose an unused label; nothing was written"
-        ));
+    for (from, to) in &map {
+        if !map.contains_key(to) && label_is_retained(state, logins, to) {
+            return Err(format!(
+                "cannot move `{from}` to `{to}`: the destination retains local login or account state; choose an unused label; nothing was written"
+            ));
+        }
     }
-    for label in [from, to] {
-        logins.sign_in_receipts.remove(label);
-        logins
-            .pending_sign_in_invalidations
-            .insert(label.to_owned());
+    for (from, to) in &map {
+        for label in [*from, *to] {
+            logins.sign_in_receipts.remove(label);
+            logins
+                .pending_sign_in_invalidations
+                .insert(label.to_owned());
+        }
     }
-    if let Some(record) = state.accounts.remove(from) {
-        state.accounts.insert(to.to_owned(), record);
-    }
-    if let Some(lease) = state.leases.remove(from) {
-        state.leases.insert(to.to_owned(), lease);
-    }
-    if state.home_accounts.remove(from) {
-        state.home_accounts.insert(to.to_owned());
-    }
-    if state.prepared_accounts.remove(from) {
-        state.prepared_accounts.insert(to.to_owned());
-    }
-    if let Some(binding) = logins.labels.remove(from) {
-        logins.labels.insert(to.to_owned(), binding);
+    let moved: Vec<_> = map
+        .iter()
+        .map(|(from, to)| {
+            (
+                *to,
+                state.accounts.remove(*from),
+                state.leases.remove(*from),
+                state.home_accounts.remove(*from),
+                state.prepared_accounts.remove(*from),
+                logins.labels.remove(*from),
+                state.claimed_at.remove(*from),
+            )
+        })
+        .collect();
+    for (to, record, lease, home, prepared, binding, claimed) in moved {
+        if let Some(at) = claimed {
+            state.claimed_at.insert(to.to_owned(), at);
+        }
+        if let Some(record) = record {
+            state.accounts.insert(to.to_owned(), record);
+        }
+        if let Some(lease) = lease {
+            state.leases.insert(to.to_owned(), lease);
+        }
+        if home {
+            state.home_accounts.insert(to.to_owned());
+        }
+        if prepared {
+            state.prepared_accounts.insert(to.to_owned());
+        }
+        if let Some(binding) = binding {
+            logins.labels.insert(to.to_owned(), binding);
+        }
     }
     for named in state
         .sessions
@@ -3337,14 +3383,15 @@ pub fn move_account(
                 .filter_map(|undo| undo.previous.as_mut()),
         )
     {
-        if named == from {
-            to.clone_into(named);
+        if let Some(to) = map.get(named.as_str()) {
+            (*to).clone_into(named);
         }
     }
     Ok(())
 }
 
-fn label_is_retained(state: &State, logins: &Logins, label: &str) -> bool {
+/// Whether either snapshot still references a label, including pending work.
+pub(super) fn label_is_retained(state: &State, logins: &Logins, label: &str) -> bool {
     logins.labels.contains_key(label)
         || logins.sign_in_receipts.contains_key(label)
         || state.accounts.contains_key(label)

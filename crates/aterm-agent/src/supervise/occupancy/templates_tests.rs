@@ -22,6 +22,7 @@ fn every_line_is_the_mark_a_closed_fact_and_its_rule() {
     let mut lines = Vec::new();
     for held in spans {
         lines.push(wait_nudge(held));
+        lines.push(wait_nudge_slice1(held));
         for (usable, n) in [(1, 1), (1, 3), (2, 3), (u16::MAX, u16::MAX)] {
             for free in [20 * 60_000, u64::MAX] {
                 for avail in [8 * 1024, 96 * 1024, u64::MAX] {
@@ -102,6 +103,81 @@ fn each_rule_says_its_own_numbers() {
         "each kind once, in order: {}",
         plain.text()
     );
+}
+
+/// The `aterm ctl` verbs `text` teaches: the word after `aterm ctl` and its `@<sid>` selector.
+fn taught_verbs(text: &str) -> Vec<String> {
+    text.match_indices("aterm ctl ")
+        .filter_map(|(at, said)| {
+            text[at + said.len()..]
+                .split_whitespace()
+                .map(|w| w.trim_matches('`'))
+                .find(|w| !w.starts_with('@'))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The words after `wake` that `sentence`'s backticked `aterm ctl @self wake …` spells, each
+/// placeholder filled (`<word>` a label, `<condition>` a time atom).
+fn taught_declaration(sentence: &str) -> Option<String> {
+    let (_, rest) = sentence.split_once("`aterm ctl @self wake ")?;
+    let (words, _) = rest.split_once('`')?;
+    Some(words.replace("<word>", "x").replace("<condition>", "in:5m"))
+}
+
+/// THE NUDGE TEACHES THE WAKE (the slice-2 plan's 2.10): from slice 2 its line is slice 1's with
+/// one sentence more, and that sentence names one `aterm ctl` verb, which the control server
+/// serves, spelled as a declaration `wake` reads once its placeholders are filled. Slice 1's line
+/// names none. CONTROLS: a verb nothing serves is read as one, and the sentence without its
+/// `label=` (as the design's §3.2 first spelled it) is refused for the label.
+#[test]
+fn the_nudge_names_one_served_verb_that_slice_ones_did_not() {
+    use crate::supervise::occupancy::wakes::{WakeReq, WakeUsage};
+    for held in [0, 30 * MIN, 5 * HOUR + 6 * MIN, i64::MAX] {
+        let (taught, older) = (wait_nudge(held), wait_nudge_slice1(held));
+        assert_eq!((taught.rule(), taught.fact()), (older.rule(), older.fact()));
+        let (taught, older) = (taught.text(), older.text());
+        let (t, o): (Vec<char>, Vec<char>) = (taught.chars().collect(), older.chars().collect());
+        let head = o.iter().zip(&t).take_while(|(a, b)| a == b).count();
+        let tail = o[head..]
+            .iter()
+            .rev()
+            .zip(t[head..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert_eq!(
+            head + tail,
+            o.len(),
+            "slice 1's line, one insertion: {taught}"
+        );
+        let added: String = t[head..t.len() - tail].iter().collect();
+        let added = added.trim();
+        assert!(
+            added.ends_with('.') && !added.contains(". "),
+            "one sentence inserted: {added:?}"
+        );
+        let verbs = taught_verbs(added);
+        assert_eq!(verbs.len(), 1, "{added}");
+        assert!(
+            aterm_types::control_verbs::spec(&verbs[0]).is_some(),
+            "`{}` is served",
+            verbs[0]
+        );
+        assert_eq!(taught_verbs(older), Vec::<String>::new(), "{older}");
+        let words = taught_declaration(added).expect("the sentence spells a wake");
+        assert!(!words.contains('<'), "every placeholder filled: {words}");
+        let read = WakeReq::parse(&words);
+        assert!(read.is_ok(), "`wake {words}` is read: {read:?}");
+    }
+    let unserved = taught_verbs("`aterm ctl @self wakeup when=x` names a verb");
+    assert_eq!(unserved, ["wakeup"]);
+    assert!(aterm_types::control_verbs::spec(&unserved[0]).is_none());
+    let unlabelled = taught_declaration(
+        "`aterm ctl @self wake when=<condition>` makes aterm tell you here when it holds.",
+    )
+    .expect("spelled");
+    assert_eq!(WakeReq::parse(&unlabelled).err(), Some(WakeUsage::Label));
 }
 
 #[test]
