@@ -9893,9 +9893,6 @@ struct App {
     /// Whether macOS's idle time can be read now ([`platform::user_input_readable_source`]):
     /// `user_input_recent` reads one it cannot read as input just now.
     user_input_readable: fn() -> bool,
-    /// Whether this login's screen is out of a person's reach, locked or switched away
-    /// ([`platform::screen_away_source`]).
-    screen_away: fn() -> bool,
     option_only: platform::OptionOnly,
     #[cfg(target_os = "macos")]
     app_menu_bar: app_menu_bar::MenuBarReader,
@@ -15813,7 +15810,6 @@ impl App {
             lock_modifiers: keymap::no_lock_modifiers,
             user_input_recent: platform::no_recent_user_input_event,
             user_input_readable: platform::user_input_read_as_given,
-            screen_away: platform::screen_never_away,
             option_only: platform::no_option_only,
             #[cfg(target_os = "macos")]
             app_menu_bar: app_menu_bar::no_app_menu_bar,
@@ -28083,7 +28079,6 @@ pub fn main_entry_with_network(
         lock_modifiers: keymap::lock_modifier_source(headless),
         user_input_recent: platform::user_input_source(headless),
         user_input_readable: platform::user_input_readable_source(headless),
-        screen_away: platform::screen_away_source(headless),
         option_only: platform::option_only_source(headless),
         #[cfg(target_os = "macos")]
         app_menu_bar: app_menu_bar::reader(windowed),

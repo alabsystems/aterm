@@ -1462,16 +1462,15 @@ fn a_join_while_the_offer_waits_hands_the_vault_and_password_to_the_startup_once
     app.resolve_system_state_apply();
 }
 
-/// The automatic startup offer is independent of recent input or screen visibility.
-/// A page with no offer waiting does not read either presence signal.
+/// The automatic startup offer is independent of recent input; the obsolete screen reader
+/// is gone. A page with no offer waiting does not read input activity either.
 #[test]
 fn the_page_answers_the_offer_without_waiting_for_screen_presence() {
-    let answers = |input: fn(Duration) -> bool, away: fn() -> bool| {
+    let answers = |input: fn(Duration) -> bool| {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
         app.user_input_recent = input;
-        app.screen_away = away;
         let _ = page(&mut app);
         let (send, receive) = mpsc::channel();
         app.attach_system_state_offer(Request::new(Plan::default(), send));
@@ -1481,22 +1480,15 @@ fn the_page_answers_the_offer_without_waiting_for_screen_presence() {
         }
         receive.try_recv().is_ok()
     };
-    assert!(answers(
-        |_| panic!("startup must not read recent input"),
-        || panic!("startup must not read screen presence")
-    ));
-    assert!(answers(|within| within >= Duration::from_secs(5), || false));
-    assert!(answers(
-        |within| within >= Duration::from_secs(10 * 60),
-        || false
-    ));
-    assert!(answers(|_| true, || true));
+    assert!(answers(|_| panic!("startup must not read recent input")));
+    assert!(answers(|within| within >= Duration::from_secs(5)));
+    assert!(answers(|within| within >= Duration::from_secs(10 * 60)));
+    assert!(answers(|_| true));
 
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
     app.user_input_recent = |_| unreachable!("no offer: no input reading");
-    app.screen_away = || unreachable!("no offer: no screen reading");
     let _ = page(&mut app);
     assert!(app.commit_glassless_native_frame(wid));
     let start = Instant::now();
