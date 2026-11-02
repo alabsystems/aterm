@@ -2121,12 +2121,21 @@ pub struct HeadlessBrowser {
 }
 
 /// Credential extracted from an incoming verification email.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum MailboxCredential {
     /// A verification / sign-in magic link URL.
     MagicLink(String),
     /// A 6-digit one-time verification code (OTP).
     Otp(String),
+}
+
+impl std::fmt::Debug for MailboxCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MagicLink(_) => f.write_str("MagicLink(<redacted>)"),
+            Self::Otp(_) => f.write_str("Otp(<redacted>)"),
+        }
+    }
 }
 
 pub(super) fn is_shell_binary(path: &Path) -> bool {
@@ -8589,7 +8598,21 @@ mod uri_authority_tests {
 
 #[cfg(test)]
 mod credential_debug_tests {
-    use super::MailboxConfig;
+    use super::{MailboxConfig, MailboxCredential};
+
+    #[test]
+    fn mailbox_credential_debug_hides_codes_and_magic_links() {
+        for credential in [
+            MailboxCredential::Otp("674291".into()),
+            MailboxCredential::MagicLink("https://example.invalid/synthetic-private-link".into()),
+        ] {
+            for output in [format!("{credential:?}"), format!("{credential:#?}")] {
+                assert!(!output.contains("674291"));
+                assert!(!output.contains("synthetic-private-link"));
+                assert!(output.contains("<redacted>"));
+            }
+        }
+    }
 
     #[test]
     fn mailbox_debug_does_not_disclose_credentials_or_identity() {

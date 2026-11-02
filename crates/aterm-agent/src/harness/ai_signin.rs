@@ -844,10 +844,17 @@ impl MailCodeAudit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SealedMailCredential {
     kind: String,
     value: String,
+}
+
+impl std::fmt::Debug for SealedMailCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedMailCredential")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Seal a [`MailboxCredential`] to `recipient` and return a single-line base64 ciphertext.

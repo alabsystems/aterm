@@ -1124,3 +1124,16 @@ fn credential_debug_redacts_account_bundle_and_route() {
         assert!(!output.contains(marker));
     }
 }
+
+#[test]
+fn credential_debug_redacts_mail_credential_before_encryption() {
+    let marker = "synthetic-private-mail-code";
+    let credential = SealedMailCredential {
+        kind: "otp".into(),
+        value: marker.into(),
+    };
+    for output in [format!("{credential:?}"), format!("{credential:#?}")] {
+        assert!(!output.contains(marker));
+        assert!(output.contains("SealedMailCredential"));
+    }
+}
