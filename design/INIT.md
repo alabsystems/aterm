@@ -17,7 +17,7 @@ The existing dependency engine is usable. `aterm-converge::Item::after` expresse
 | Missing default GitHub credentials read as “not applicable” | `init_github/native.rs`, `Block::probe` | Keep repository setup pending. |
 | Waiting admission, permission and deferred workstation rows count as complete | `init.rs`, `counts` and `status` | Completion requires verification; waiting returns 75, required OS action 77. |
 | CLI tools installation goes through a terminal and can launch Apple’s installer | `init_clt.rs`, `items/developer.rs`, `macos_doctor/initial.rs` | Use the background update service, with no terminal or installer-window fallback; verify the compiler before completion. The native worker provisions tools before checking vault inputs, independent of System State visibility. |
-| Two unsuccessful automatic settings attempts permanently stop retries for that build | `aterm-cli/src/macos_doctor.rs`, `held_back` | Remove the permanent stop. Keep the retry deadline and persist retries across passes. |
+| Two unsuccessful automatic settings or Secrets attempts permanently stop retries | `aterm-cli/src/macos_doctor.rs`, `held_back`, `initial/secrets_retry.rs` | Remove the permanent stop. Keep the retry deadline and persist retries across passes. |
 | UI describes implementation and recovery history instead of the current state | `aterm-gui/src/system_state.rs` | Proposed replacement: a compact task list with one state and explicit dependency links. See `system-state.html`. |
 
 On the inspected Mac, the existing vault subscriber is running. The configured endpoint returned HTTP 200. After reposting this Mac's join, the server listed two requests with LAN eligibility. The installed client still reports pending. The admission authority needs the corrected behavior too; editing a local source snapshot does not update that remote process.
@@ -112,3 +112,5 @@ Validated locally with Trust's explicitly unverified build lane (no proof claim)
 Several existing test fixtures contained doubled `/Users//` paths that disagreed with the account paths produced by the implementation. These were normalized in test code; no production account paths changed.
 
 Delivery remains local on `codex/lan-init`. GitHub's routed write decision is `write_none`; no configured owner writer is available. The installed app and remote admission service have not been replaced. The native System State interface and full single-coordinator design remain future implementation; the interactive HTML is a reviewable prototype, not a deployed feature.
+
+The Secrets stage also retains indefinite retry with its existing one-to-four-minute capped backoff. Failures no longer become a permanent hold after two attempts. Input changes still bypass the deadline, and unknown reads preserve known fingerprints without resetting the failure history.

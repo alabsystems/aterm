@@ -5555,8 +5555,8 @@ mod parked_secrets_route_tests {
         .unwrap();
         assert_eq!(
             read(4_000).retry_due(),
-            None,
-            "two failed changes stay held"
+            Some(3_240),
+            "failed changes remain retryable after capped backoff"
         );
     }
 }
@@ -12742,7 +12742,7 @@ mod tests {
             execute_initial_for_revision(&mut held, &root, revision, &mut None, SetupHooks::NONE)
                 .unwrap();
             assert!(held.calls.is_empty(), "the unchanged failed try stays held");
-            assert_eq!(parked, reads.park(&root));
+            assert!(!reads.park(&root).facts_changed_since(&parked));
 
             let writer = std::fs::OpenOptions::new()
                 .read(true)
@@ -12760,7 +12760,10 @@ mod tests {
             let mut contended = reads.park(&root);
             assert!(!contended.facts_changed_since(&parked));
             contended.retain_known_from(&parked);
-            assert_eq!(parked, contended, "writer contention does not wake setup");
+            assert!(
+                !contended.facts_changed_since(&parked),
+                "writer contention is no new input"
+            );
             drop(writer);
             assert!(secrets_retry::paused(&root, revision, &reads.pace()).is_some());
 
@@ -12878,7 +12881,10 @@ mod tests {
             let parked = reads.park(&root);
             hold_materialization_attempt(&root, revision, &before);
             client::sync(&paths, None).unwrap();
-            assert_eq!(parked, reads.park(&root), "an unchanged sync stays parked");
+            assert!(
+                !reads.park(&root).facts_changed_since(&parked),
+                "an unchanged sync has no new facts"
+            );
             assert!(secrets_retry::paused(&root, revision, &reads.pace()).is_some());
 
             aterm_machines::port::write_atomic(
@@ -12943,14 +12949,14 @@ mod tests {
                 assert!(report.needs_attention());
                 assert_eq!(next, SetupNext::Retry);
             }
-            assert_eq!(host.minutes(), [0, 1]);
+            assert_eq!(host.minutes(), [0, 1, 3, 7]);
             assert!(
                 host.rest.calls.is_empty(),
                 "repositories still wait for Secrets"
             );
             assert_eq!(
                 lan.log().iter().filter(|line| *line == "install").count(),
-                2
+                4
             );
             let status = lan.status_now();
             let before_pace = host.secrets_pace().unwrap();
@@ -12966,7 +12972,11 @@ mod tests {
             };
             let mark = || mark_with(lan.subscriber().ok().map(secrets_retry::subscriber_running));
             let parked = mark();
-            assert_eq!(parked.retry_due(), None, "two failures hold the timer");
+            assert_eq!(
+                parked.retry_due(),
+                None,
+                "the current retry delay has not expired"
+            );
             assert_eq!(parked, mark(), "stable service state must stay parked");
             let mut unknown = mark_with(None);
             assert!(!unknown.facts_changed_since(&parked));
@@ -13020,8 +13030,8 @@ mod tests {
                     }
                     assert_eq!(
                         lan.log().iter().filter(|line| *line == "install").count(),
-                        4,
-                        "the known new network permits two tries even while subscriber reads fail"
+                        8,
+                        "network changes reset backoff while subscriber reads remain unknown"
                     );
                     let known = host.secrets_pace().unwrap();
                     assert!(secrets_retry::paused(root.path(), revision, &known).is_some());
@@ -13034,10 +13044,10 @@ mod tests {
                         SetupHooks::NONE,
                     )
                     .unwrap();
-                    assert_eq!(host.minutes(), [0, 1, 10, 11]);
-                    4
+                    assert_eq!(host.minutes(), [0, 1, 3, 7, 10, 11, 13, 17]);
+                    8
                 } else {
-                    2
+                    4
                 };
 
             // launchd, the terminal's agent-on or the existing mend can start
@@ -14409,7 +14419,7 @@ mod tests {
     }
 
     #[test]
-    fn a_join_that_keeps_failing_is_journaled_twice_then_waits_for_a_change() {
+    fn a_join_that_keeps_failing_retries_and_network_changes_skip_backoff() {
         use vault::{Lan, Vaulted, authorized, passes};
         let (root, revision) = authorized();
         let lan = Lan::new(true, "home");
@@ -14423,18 +14433,18 @@ mod tests {
             root.path(),
             revision,
             &mut password,
-            0..=1440,
+            0..=20,
             |_, _| {},
         );
-        assert_eq!(host.minutes(), [0, 1]);
+        assert_eq!(host.minutes(), [0, 1, 3, 7, 11, 15, 19]);
         let lines = |lan: &Lan| lan.log().iter().filter(|e| e.starts_with("line ")).count();
-        assert_eq!(lines(&lan), 2, "{:?}", lan.log());
+        assert_eq!(lines(&lan), 7, "{:?}", lan.log());
         assert!(password.is_some(), "kept: no join spent it");
         let last = rows.last().unwrap();
         assert_eq!(last.status, "error", "{rows:?}");
         assert!(
             last.detail.ends_with(
-                "aterm tried this twice by itself and it did not take, so it tries again only when this Mac's network or vault changes, after an update of aterm, or on Set up now or Join in System State"
+                "aterm tries again by itself 4 minutes after this try, and at once when this Mac's network or vault changes or on Set up now or Join in System State"
             ),
             "{last:?}"
         );
@@ -14444,15 +14454,18 @@ mod tests {
             root.path(),
             revision,
             &mut password,
-            1441..=1500,
+            21..=40,
             |minute, host| {
-                if minute == 1441 {
+                if minute == 21 {
                     *host.lan.network.lock().unwrap() = "office".into();
                 }
             },
         );
-        assert_eq!(host.minutes(), [0, 1, 1441, 1442]);
-        assert_eq!(lines(&lan), 4);
+        assert_eq!(
+            host.minutes(),
+            [0, 1, 3, 7, 11, 15, 19, 21, 22, 24, 28, 32, 36, 40]
+        );
+        assert_eq!(lines(&lan), 14);
 
         let (root, revision) = authorized();
         let lan = Lan::new(false, "away");

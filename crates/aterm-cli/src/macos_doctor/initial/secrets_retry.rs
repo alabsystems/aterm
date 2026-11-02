@@ -18,9 +18,6 @@ pub(super) const FIRST_PAUSE: Duration = Duration::from_secs(60);
 /// Maximum backoff pause between unfinished Secrets attempts.
 pub(super) const LONGEST: Duration = Duration::from_secs(4 * 60);
 
-/// Maximum consecutive failed change attempts before waiting for an external change.
-pub(super) const TRIES: u32 = 2;
-
 const BUILDS: usize = 16;
 
 /// Independently readable facts: an unknown component does not hide another's change.
@@ -384,10 +381,6 @@ impl Attempt {
         self.same_row(revision, pace) && self.builds.contains(&pace.build)
     }
 
-    const fn held(&self) -> bool {
-        self.failures >= TRIES
-    }
-
     /// The rows this try left, as the stage gave them with its pause's note.
     fn rows(self) -> Vec<Row> {
         self.rows
@@ -436,7 +429,7 @@ impl Inputs {
     }
 }
 
-/// Returns the cached rows while the last unfinished attempt of `revision` is paused or held.
+/// Returns cached rows until the last unfinished attempt reaches its retry deadline.
 /// The caller holds the profile writer lock. A legacy hold with an exactly
 /// matching complete reading can gain component fingerprints without spending
 /// or resetting an attempt; a failed cache update leaves that hold unchanged.
@@ -452,8 +445,7 @@ pub(super) fn paused(root: &Path, revision: u64, pace: &Pace) -> Option<Vec<Row>
         let _ = last.save(root);
     }
     let due = last.at.saturating_add(pause(last.tries).as_secs());
-    (last.unchanged(revision, pace) && (last.held() || (last.at..due).contains(&pace.now)))
-        .then(|| last.rows())
+    (last.unchanged(revision, pace) && (last.at..due).contains(&pace.now)).then(|| last.rows())
 }
 
 /// The network `reads` reads now, as a try keeps the one it ran on ([`Pace::network`]) and System
@@ -507,8 +499,7 @@ pub(super) fn last_rows(root: &Path, revision: u64, reads: &dyn Reads) -> Option
 
 /// The deadline of a retryable try now due, for a parked worker. A row that
 /// waits ([`super::WAITING`]: a person, an approval, a vault this network does
-/// not have) has no timer, and two failed changes stay held until a fact
-/// changes; an unreached vault ([`super::UNREACHED`]) is asked again. The
+/// not have) has no timer. Failed and unreached vault attempts keep retrying. The
 /// worker consumes a deadline once; only a later actual try advances it.
 pub(super) fn retry_due(root: &Path, revision: u64, now: u64) -> Option<u64> {
     let (at, due) = retry_window(root, revision)?;
@@ -526,7 +517,6 @@ pub(super) fn retry_ahead(root: &Path, revision: u64, now: u64) -> Option<u64> {
 fn retry_window(root: &Path, revision: u64) -> Option<(u64, u64)> {
     let last = Attempt::load(root)?;
     if last.revision != revision
-        || last.held()
         || !last
             .rows
             .iter()
@@ -627,17 +617,13 @@ pub(super) fn record(
     } else {
         0
     };
-    let note = if failures >= TRIES {
-        HELD.to_owned()
-    } else {
-        note(pause(tries))
-    };
+    let note = note(pause(tries));
     for row in rows
         .iter_mut()
         .filter(|row| !matches!(row.status.as_str(), "ok" | "applied"))
     {
         // A row that waits has no timer ([`retry_due`]).
-        let note = if row.status == super::WAITING && failures < TRIES {
+        let note = if row.status == super::WAITING {
             WAITS
         } else {
             &note
@@ -664,16 +650,14 @@ pub(super) fn record(
 
 /// The page's rows for the Secrets stage's `rows` (design §3.6): the vault's one row, named as the
 /// page names it, in the page's words. A step that failed says what aterm does next, as
-/// [`record`] last left the pause ([`PAGE_RETRIES`], or [`PAGE_HELD`] once two tries failed); one
+/// [`record`] last left the pause ([`PAGE_RETRIES`]); one
 /// that could not be confirmed says no more; the rest carry no detail, which the page never shows
 /// for them. The process, the paths and the vault's own words stay in `rows`, for `aterm doctor`
 /// and the log.
-pub(super) fn page(root: &Path, rows: &[Row]) -> super::PassPage {
-    let held = Attempt::load(root).is_some_and(|last| last.held());
+pub(super) fn page(_root: &Path, rows: &[Row]) -> super::PassPage {
     let mut page = super::PassPage::default();
     for row in rows {
         let detail = match row.status.as_str() {
-            "error" if held => PAGE_HELD,
             "error" => PAGE_RETRIES,
             _ => "",
         };
@@ -697,12 +681,6 @@ pub(super) fn page(root: &Path, rows: &[Row]) -> super::PassPage {
 /// What the page says after a failed Secrets try that aterm tries again on its pause: a
 /// transient failure that waits for that try ([`aterm_types::macos_setup::FailureKind`]).
 pub(super) const PAGE_RETRIES: &str = aterm_types::macos_setup::TRIES_AGAIN_BY_ITSELF;
-
-/// What the page says once two tries in a row failed: its tries are spent, so it failed, and only
-/// a change, or a person, asks again.
-pub(super) const PAGE_HELD: &str = aterm_types::macos_setup::TRIED_TWICE;
-
-const HELD: &str = "aterm tried this twice by itself and it did not take, so it tries again only when this Mac's network or vault changes, after an update of aterm, or on Set up now or Join in System State";
 
 /// What a waiting row's try adds: no timer, only a change or a person.
 const WAITS: &str = "aterm tries again by itself when this Mac's network or vault changes, or on Set up now or Join in System State";
@@ -844,7 +822,11 @@ mod tests {
         };
         record(root, 3, &pace("m", 2_000), false, &mut failed()).unwrap();
         record(root, 3, &pace("m", 3_000), false, &mut failed()).unwrap();
-        assert_eq!(retry_due(root, 3, 9_000), None, "failed changes are held");
+        assert_eq!(
+            retry_due(root, 3, 9_000),
+            Some(3_120),
+            "failed changes retry"
+        );
         let mut rows = blocked("offline on another network");
         record(root, 3, &pace("n", 4_000), false, &mut rows).unwrap();
         assert_eq!(
@@ -881,56 +863,25 @@ mod tests {
     }
 
     #[test]
-    fn a_change_that_keeps_failing_is_tried_twice_then_held_until_a_change() {
+    fn repeated_failures_keep_retrying_with_capped_backoff() {
         let root = aterm_tempfile::tempdir().unwrap();
-        let root = root.path();
-        let failed = || {
-            vec![Row {
+        let mut at = 1_000;
+        for attempt in 1..=12 {
+            let mut rows = vec![Row {
                 name: "Secrets vault".into(),
                 status: "error".into(),
-                detail: "joining the vault: which nothing pins".into(),
+                detail: "vault unavailable".into(),
                 elapsed_ms: None,
-            }]
-        };
-        let mut rows = failed();
-        record(root, 3, &pace("m", 1_000), false, &mut rows).unwrap();
-        assert!(
-            rows[0].detail.contains("a minute after this try"),
-            "{rows:?}"
-        );
-        assert!(
-            paused(root, 3, &pace("m", 1_060)).is_none(),
-            "the second try"
-        );
-        let mut rows = failed();
-        record(root, 3, &pace("m", 1_060), false, &mut rows).unwrap();
-        assert!(rows[0].detail.ends_with(HELD), "{rows:?}");
-        for later in [1_061, 1_060 + 3_600, 1_060 + 86_400] {
-            let shown = paused(root, 3, &pace("m", later)).expect("held");
-            assert_eq!(shown[0].detail, rows[0].detail);
+            }];
+            record(root.path(), 3, &pace("m", at), false, &mut rows).unwrap();
+            let due = at + pause(attempt).as_secs();
+            assert!(paused(root.path(), 3, &pace("m", due - 1)).is_some());
+            assert!(paused(root.path(), 3, &pace("m", due)).is_none());
+            assert_eq!(retry_due(root.path(), 3, due), Some(due));
+            assert!(paused(root.path(), 3, &pace("changed", at + 1)).is_none());
+            assert_eq!(page(root.path(), &rows).rows[0].detail, PAGE_RETRIES);
+            at = due;
         }
-        assert!(paused(root, 3, &pace("n", 1_100)).is_none(), "marks");
-        assert!(paused(root, 4, &pace("m", 1_100)).is_none(), "run");
-        let mut other = pace("m", 1_100);
-        other.build = "1.0.0+gdef".into();
-        assert!(paused(root, 3, &other).is_none(), "build");
-
-        let mut rows = failed();
-        record(root, 3, &other, false, &mut rows).unwrap();
-        assert!(rows[0].detail.ends_with(HELD), "{rows:?}");
-        assert!(
-            paused(root, 3, &pace("m", 1_200)).is_some(),
-            "held for both"
-        );
-        let mut third = pace("m", 1_200);
-        third.build = "1.0.0+gthird".into();
-        let mut rows = blocked("the vault does not answer");
-        record(root, 3, &third, false, &mut rows).unwrap();
-        assert!(
-            rows[0].detail.contains("a minute after this try"),
-            "{rows:?}"
-        );
-        assert!(paused(root, 3, &pace("m", 1_260)).is_none(), "the control");
     }
 
     #[test]
@@ -945,7 +896,7 @@ mod tests {
                 elapsed_ms: None,
             }]
         };
-        let unknown = pace("unchanged source and interface", 1_000);
+        let mut unknown = pace("unchanged source and interface", 1_000);
         record(root, 3, &unknown, false, &mut failed()).unwrap();
         record(root, 3, &unknown, false, &mut failed()).unwrap();
         assert!(paused(root, 3, &unknown).is_some());
@@ -961,6 +912,7 @@ mod tests {
         known.now += FIRST_PAUSE.as_secs();
         record(root, 3, &known, false, &mut failed()).unwrap();
         assert!(paused(root, 3, &known).is_some());
+        unknown.now = known.now;
         assert!(paused(root, 3, &unknown).is_some(), "busy is no new fact");
         // Even a recorded outcome whose post-stage read was contended keeps
         // the earlier identity; an unknown/known cycle never re-arms it.
