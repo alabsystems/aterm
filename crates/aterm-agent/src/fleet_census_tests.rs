@@ -234,6 +234,37 @@ fn census_joins_five_sources_identically_across_stewards_and_classifies_straggle
 
     let roundtrip = SwarmCensus::from_json(&census_a.to_json()).expect("roundtrip JSON");
     assert_eq!(roundtrip, census_a);
+    let saturated = SwarmCensus::from_json(
+        r#"{"generated_at":1,"members":[],"stragglers":[],"summary":{"p2_ratio_bps":5000000000}}"#,
+    )
+    .expect("large p2_ratio_bps saturates instead of wrapping to zero");
+    assert_eq!(saturated.summary.p2_ratio_bps, u32::MAX);
+    #[cfg(unix)]
+    {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        write_cached_census(&state, &census_a).expect("write cached census");
+        assert_eq!(read_cached_census(&state).as_ref(), Some(&census_a));
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(&outside, census_a.to_json()).expect("write outside");
+        std::fs::remove_file(state.join(CENSUS_CACHE_FILE)).expect("rm cache");
+        std::os::unix::fs::symlink(&outside, state.join(CENSUS_CACHE_FILE)).expect("symlink cache");
+        assert!(
+            read_cached_census(&state).is_none(),
+            "symlinked swarm-census.json must be refused"
+        );
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".secrets")).expect("secrets dir");
+        let outside_pool = tmp.path().join("outside-pool.toml");
+        std::fs::write(&outside_pool, pool.to_toml()).expect("write outside pool");
+        std::os::unix::fs::symlink(&outside_pool, home.join(".secrets").join("ai-pool.toml"))
+            .expect("symlink ai-pool.toml");
+        let symlink_inputs = collect_local_census_inputs(&state, Some(&home), Vec::new(), now_s);
+        assert!(
+            symlink_inputs.pool.is_none(),
+            "symlinked ~/.secrets/ai-pool.toml must be refused"
+        );
+    }
 
     // Natural `m<N>` ordering: m22 comes before m100 (and alias m32 folded into m100!).
     assert_eq!(census_a.members.len(), 2);
@@ -507,6 +538,71 @@ fn healthy_pool_inputs(now: u64) -> CensusInputs {
         converge_failures: 0,
     });
     inputs
+}
+
+#[test]
+fn census_window_eligibility_expires_despite_retained_window_and_fresh_presence() {
+    let seen = 1_793_300_000;
+    let day = 24 * 60 * 60;
+    let mut mismatches = Vec::new();
+    for window in [false, true] {
+        let mut inputs = healthy_pool_inputs(seen);
+        inputs.heartbeats[0].facts.window = window;
+        inputs.heartbeats[0].facts.window_last = Some(seen);
+        inputs.heartbeats[0].received_at = Some(seen);
+        inputs.bonjour_hosts.push(BonjourHostInput {
+            name: "m22".into(),
+            dot_local: "m22.local".into(),
+            is_linux: false,
+            seen_at: seen,
+        });
+        for (age, eligible) in [(0, true), (day, true), (day + 1, false), (8 * day, false)] {
+            inputs.now_s = seen + age;
+            inputs.bonjour_hosts[0].seen_at = inputs.now_s;
+            let census = SwarmCensus::compute(&inputs);
+            let member = &census.members[0];
+            if member.eligible != eligible {
+                mismatches.push((window, age, member.eligible));
+            }
+            assert!(member.in_fleet);
+            assert_eq!(
+                member.window, window,
+                "the historical report remains available"
+            );
+            assert_eq!(member.window_last, Some(seen));
+            assert_eq!(member.last_seen, Some(inputs.now_s));
+            assert_eq!(
+                member.accounts.warm, 1,
+                "the existing assignment is retained"
+            );
+            assert_eq!(member.monitor_status(inputs.now_s), "online (swarm)");
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "incorrect window eligibility: {mismatches:?}"
+    );
+}
+
+#[test]
+fn census_window_eligibility_requires_a_valid_window_timestamp() {
+    let now = 1_793_300_000;
+    for window_last in [None, Some(now + 1)] {
+        let mut inputs = healthy_pool_inputs(now);
+        inputs.heartbeats[0].facts.window_last = window_last;
+        inputs.heartbeats[0].received_at = Some(now);
+        let census = SwarmCensus::compute(&inputs);
+        let member = &census.members[0];
+        assert!(
+            member.window,
+            "the retained window flag is not an eligibility grant"
+        );
+        assert_eq!(member.window_last, None);
+        assert!(
+            !member.eligible,
+            "missing or future evidence: {window_last:?}"
+        );
+    }
 }
 
 fn wall_report(node: &str, label: &str, received_at: u64) -> HeartbeatInput {
@@ -965,7 +1061,7 @@ fn census_excludes_denied_and_log_held_out_members_from_book_facts_and_walled_ac
     store_pushed_facts(&state, denied_id.node(), &payload).unwrap();
     let facts_path = state
         .join(aterm_net::fleet_member::SWARM_FACTS_DIR)
-        .join(format!("{}.txt", denied_id.node()));
+        .join(format!("{}.facts", denied_id.node()));
     std::fs::File::options()
         .write(true)
         .open(&facts_path)
@@ -1219,5 +1315,157 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
         vec![("m2", Some(good_id.node()), Some(now_s - 2), 1)],
         "log-admitted member with node_key must bind node_id, resolve age1 recipient in server_heard, and count its lease without being shadowed by denied m8"
     );
+
+    // Even if `inputs.roster.members` contains a stale label-denied row (`m40`) before active `m2`
+    // sharing `m2`'s `node_id` and `node_key`, `SwarmCensus::compute` must not propagate `m2`'s
+    // active `node_id` / `node_key` into `deny_nodes` or drop `m2`.
+    inputs.roster.deny_labels.push("m40".to_owned());
+    inputs.roster.members.insert(
+        0,
+        SwarmMember {
+            recipient: "age1m40stale".to_owned(),
+            vault_name: "m40".to_owned(),
+            label: "m40".to_owned(),
+            aliases: Vec::new(),
+            hint: None,
+            admitted_ms: 500,
+            claimed_label: None,
+            claimed_at_ms: None,
+            node_id: Some(good_id.node().to_owned()),
+            node_key: Some(good_id.key().hex()),
+        },
+    );
+    let census_with_stale = SwarmCensus::compute(&inputs);
+    assert_eq!(
+        census_with_stale
+            .members
+            .iter()
+            .map(|m| (m.label.as_str(), m.node.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![("m2", Some(good_id.node()))],
+        "stale label-denied row sharing node_id/node_key with active m2 must not poison m2 in SwarmCensus::compute"
+    );
+
+    // Even when `aterm-swarm-roster` in `vault` has empty `deny_nodes` (`m8` still listed as a
+    // member with `node_id: None, node_key: Some(denied_id.key().hex())`), if `LocalLog` holds
+    // `denied_id.key()` out (because a log member rotated from `denied_id` to `good_id` in
+    // `records`), `collect_local_census_inputs` must propagate `denied_id`'s key and node into
+    // `roster.deny_nodes` and exclude `m8` from `SwarmCensus::compute`.
+    let roster_without_explicit_deny = SwarmRoster {
+        members: vec![
+            SwarmMember {
+                recipient: "age1m2".to_owned(),
+                vault_name: "m2".to_owned(),
+                label: "m2".to_owned(),
+                aliases: Vec::new(),
+                hint: None,
+                admitted_ms: 100,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: Some(good_id.key().hex()),
+            },
+            SwarmMember {
+                recipient: "age1m8".to_owned(),
+                vault_name: "m8".to_owned(),
+                label: "m8".to_owned(),
+                aliases: Vec::new(),
+                hint: None,
+                admitted_ms: 100,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: Some(denied_id.key().hex()),
+            },
+        ],
+        deny_labels: Vec::new(),
+        deny_nodes: Vec::new(),
+    };
+    let adm = aterm_secrets::client::admin_open(&paths).expect("admin open");
+    let mut doc = adm.doc.clone();
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        aterm_secrets::swarm_roster::ROSTER_ENTRY,
+        roster_without_explicit_deny.to_toml().as_bytes(),
+    )
+    .expect("set roster without explicit deny");
+    aterm_secrets::client::admin_publish(&paths, &adm, &doc)
+        .expect("publish roster without explicit deny");
+    aterm_secrets::client::admin_seed_swarm_roster(&paths, &[]).expect("seed roster");
+    aterm_secrets::client::seed_vault_genesis(&paths, &dir.path().join("test.genesis"))
+        .expect("seed genesis");
+    aterm_secrets::client::admin_mirror_log(&paths, &[]).expect("mirror log");
+    assert!(crate::fleet_log::ensure_local_node_key_in_log(
+        &paths, &denied_id, None
+    ));
+    assert!(crate::fleet_log::ensure_local_node_key_in_log(
+        &paths, &good_id, None
+    ));
+    aterm_secrets::client::sync(&paths, None).expect("sync local copy");
+    let log_held_out_inputs = collect_local_census_inputs(&state, Some(&home), Vec::new(), now_s);
+    assert!(
+        log_held_out_inputs
+            .roster
+            .is_node_denied(&denied_id.key().hex()),
+        "log-held-out node_key must be added to roster.deny_nodes by collect_local_census_inputs"
+    );
+    assert!(
+        log_held_out_inputs.roster.is_node_denied(denied_id.node()),
+        "log-held-out peer node_id must be added to roster.deny_nodes by collect_local_census_inputs"
+    );
+    let log_held_out_census = SwarmCensus::compute(&log_held_out_inputs);
+    assert!(
+        !log_held_out_census.members.iter().any(|m| m.label == "m8"),
+        "member whose node_key is held out by LocalLog must be excluded from census.members: {:?}",
+        log_held_out_census.members
+    );
+
+    // Even when `<state>/swarm-census.json` is fresher than `CENSUS_REFRESH_S`, if it still lists
+    // a member (`m8`) that is now denied / held out by `LocalLog` (or if `swarm-facts/` holds an
+    // unpruned fact for that denied node), both `read_or_compute_census` and `serve_fleet_census`
+    // must immediately recompute and prune rather than serving the stale cached census.
+    let mut stale_cached = log_held_out_census.clone();
+    stale_cached.generated_at = now_s;
+    stale_cached.members.push(CensusMember {
+        label: "m8".to_owned(),
+        aliases: Vec::new(),
+        node: Some(denied_id.node().to_owned()),
+        host: Some("m8.local".to_owned()),
+        version: Some("0.147.0".to_owned()),
+        window: true,
+        window_last: Some(now_s - 5),
+        sessions: 1,
+        accounts: MemberAccountSummary::default(),
+        last_seen: Some(now_s - 1),
+        converge_failures: 0,
+        eligible: true,
+        in_fleet: true,
+        in_commons: true,
+    });
+    for served in [false, true] {
+        write_cached_census(&state, &stale_cached).expect("seed stale cached census");
+        store_pushed_facts(&state, denied_id.node(), &payload).expect("seed unpruned denied facts");
+        let fresh_read = if served {
+            let wire = serve_fleet_census(&state, Some(&home), now_s + 5).expect("serve census");
+            SwarmCensus::from_json(&wire).expect("parse served census")
+        } else {
+            read_or_compute_census(&state, Some(&home), false, now_s + 5).expect("read census")
+        };
+        assert_eq!(
+            fresh_read.generated_at,
+            now_s + 5,
+            "fresh cache containing newly denied member must be recomputed (served={served})"
+        );
+        assert!(
+            !fresh_read.members.iter().any(|m| m.label == "m8"),
+            "recomputed census must exclude denied m8 (served={served}): {:?}",
+            fresh_read.members
+        );
+        assert!(
+            read_pushed_facts(&state).is_empty(),
+            "denied node facts must be pruned when checking cached census (served={served})"
+        );
+    }
+
     running.stop();
 }

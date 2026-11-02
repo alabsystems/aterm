@@ -394,10 +394,7 @@ fn census(sys: &dyn System, user: &User, process: &str) -> Result<Vec<u32>, Stri
         Some(0) => {
             let mut pids = Vec::new();
             for line in text.lines() {
-                let pid = line
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
+                let pid = crate::parse_uint::<u32>(line.trim())
                     .filter(|pid| *pid > 1 && *pid <= i32::MAX as u32)
                     .ok_or_else(|| format!("unrecognized {process} process list"))?;
                 if pids.contains(&pid) {

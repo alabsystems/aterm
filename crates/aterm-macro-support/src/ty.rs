@@ -284,6 +284,10 @@ impl<'a> Reader<'a> {
                 Some(toks) => {
                     let mut trait_reader = Reader { toks, i: 0 };
                     let trait_path = trait_reader.path()?;
+                    if trait_reader.i != toks.len() || trait_path.qself.is_some() {
+                        return None;
+                    }
+                    leading_colon = trait_path.leading_colon;
                     segments.extend(trait_path.segments);
                 }
                 None => leading_colon = true,
@@ -371,6 +375,9 @@ impl<'a> Reader<'a> {
         let Some(TokenTree::Group(g)) = self.peek() else {
             return Ty::Other;
         };
+        if g.delimiter() != Delimiter::Parenthesis {
+            return Ty::Other;
+        }
         let inner: Vec<TokenTree> = g.stream().into_iter().collect();
         self.i += 1;
         let inputs = split_commas(inner)
@@ -413,6 +420,9 @@ impl<'a> Reader<'a> {
 
     /// Return the index of the `>` closing the `<` at `open`, ignoring `->`.
     fn matching_angle(&self, open: usize) -> Option<usize> {
+        if !matches!(self.toks.get(open), Some(tt) if is_punct(tt, '<')) {
+            return None;
+        }
         let mut depth = 0usize;
         let mut after_joint_minus = false;
         for (i, tt) in self.toks.iter().enumerate().skip(open) {
@@ -489,28 +499,39 @@ fn generic_arg(tokens: &[TokenTree]) -> GenericArg {
 
 fn top_level_keyword(tokens: &[TokenTree], word: &str) -> Option<usize> {
     let mut depth = 0usize;
+    let mut after_joint_minus = false;
     for (i, tt) in tokens.iter().enumerate() {
+        let mut joint_minus = false;
         match tt {
-            TokenTree::Punct(p) if p.as_char() == '<' => depth += 1,
-            TokenTree::Punct(p) if p.as_char() == '>' => depth = depth.saturating_sub(1),
+            TokenTree::Punct(p) => match p.as_char() {
+                '<' => depth += 1,
+                '>' if !after_joint_minus => depth = depth.saturating_sub(1),
+                '-' => joint_minus = p.spacing() == Spacing::Joint,
+                _ => {}
+            },
             TokenTree::Ident(id) if depth == 0 && id.to_string() == word => return Some(i),
             _ => {}
         }
+        after_joint_minus = joint_minus;
     }
     None
 }
 
 fn top_level_eq(tokens: &[TokenTree]) -> Option<usize> {
     let mut depth = 0usize;
+    let mut after_joint_minus = false;
     for (i, tt) in tokens.iter().enumerate() {
+        let mut joint_minus = false;
         if let TokenTree::Punct(p) = tt {
             match p.as_char() {
                 '<' => depth += 1,
-                '>' => depth = depth.saturating_sub(1),
+                '>' if !after_joint_minus => depth = depth.saturating_sub(1),
+                '-' => joint_minus = p.spacing() == Spacing::Joint,
                 '=' if depth == 0 && p.spacing() == Spacing::Alone => return Some(i),
                 _ => {}
             }
         }
+        after_joint_minus = joint_minus;
     }
     None
 }

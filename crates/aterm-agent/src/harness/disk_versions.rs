@@ -67,6 +67,14 @@ pub fn read(roots: &super::Roots, processes: super::discover::Processes<'_>) -> 
             processes,
             roots.mounts.as_ref(),
         );
+        if let Some(holds) = roots.first_exec.as_deref() {
+            let now = std::time::SystemTime::now();
+            for v in out.entries.iter_mut().filter(|v| v.kept.is_none()) {
+                if v.path != *live && crate::harness::first_exec::held(holds, &v.path, now) {
+                    v.kept = Some(crate::harness::first_exec::KEPT.to_owned());
+                }
+            }
+        }
     }
     out
 }
@@ -383,7 +391,7 @@ impl Hashes {
         let ino = |e: &Value| {
             e.get("ino")
                 .and_then(Value::as_str)
-                .and_then(|s| s.parse::<u128>().ok())
+                .and_then(crate::parse_uint::<u128>)
         };
         for (path, e) in v
             .get("files")

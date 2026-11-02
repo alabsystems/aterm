@@ -47,7 +47,21 @@ fn admission_source_is_retained_without_changing_light_or_licences() {
             assert_eq!(plain.ribbon_segments(), bound.ribbon_segments());
             let recorded = bound.admission_log().last().unwrap();
             assert_eq!(recorded.source, source);
+            assert_eq!(recorded.program_row_refusal, None);
+            assert_eq!(recorded.parked_boundary, None);
+            assert!(
+                recorded
+                    .line(at)
+                    .split_ascii_whitespace()
+                    .any(|field| field == "program_row=none")
+            );
             assert_eq!(plain.admission_log().last().unwrap().source, None);
+            assert!(
+                recorded
+                    .line(at)
+                    .split_ascii_whitespace()
+                    .any(|field| field == "boundary_origin=none")
+            );
             if source.is_none() {
                 let row = recorded.line(at);
                 assert!(
@@ -69,10 +83,23 @@ fn admission_source_is_retained_without_changing_light_or_licences() {
             assert_eq!(declined.phase, AdmissionPhase::Declined);
         }
         assert_eq!(declined.source, Some(a));
+        assert_eq!(declined.program_row_refusal, None);
         assert_eq!(
             bound.admission_log().take(3).copied().collect::<Vec<_>>(),
             prior
         );
+        let mut unknown = *declined;
+        unknown.phase = AdmissionPhase::Declined;
+        unknown.reason = CursorGlow::DECLINE_PROGRAM_ROW;
+        unknown.licence = AdmissionRecord::LICENCE_NONE;
+        let line = unknown.line(late);
+        let fields: std::collections::BTreeMap<_, _> = line
+            .split_ascii_whitespace()
+            .filter_map(|field| field.split_once('='))
+            .collect();
+        assert_eq!(fields.get("program_row"), Some(&"unknown"));
+        assert_eq!(fields.get("boundary_origin"), Some(&"unknown"));
+        assert!(!fields.contains_key("landing_foreign"));
     }
 }
 

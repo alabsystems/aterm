@@ -66,6 +66,21 @@ pub fn never_cut(text: &str, render: impl Fn(&str) -> String) -> String {
     render(&without)
 }
 
+fn unquoted_at(s: &str, target: usize) -> bool {
+    let mut quoted = false;
+    let mut chars = s[..target].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => quoted = !quoted,
+            '\\' if !quoted => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    !quoted
+}
+
 /// The resume line `text` names after [`THEN_RESUME_WITH`], and the byte range of the whole clause
 /// (the marker and the line): the line runs from the marker to the end of the first
 /// `--resume <id>` after it, the pair [`command`] always ends with.
@@ -77,7 +92,14 @@ fn named_line(text: &str) -> Option<(std::ops::Range<usize>, &str)> {
     let end = rest.match_indices(FLAG).find_map(|(i, _)| {
         let id_at = i + FLAG.len();
         let id = rest.get(id_at..id_at + 36)?;
-        upgrade::is_session_id(id).then_some(id_at + 36)
+        if rest[..id_at + 36].contains('\n') || !unquoted_at(rest, i) {
+            return None;
+        }
+        let boundary = rest
+            .as_bytes()
+            .get(id_at + 36)
+            .is_none_or(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'-' | b'_'));
+        (boundary && upgrade::is_session_id(id)).then_some(id_at + 36)
     })?;
     Some((at..start + end, &rest[..end]))
 }
@@ -103,7 +125,10 @@ pub fn command(argv: &[String], session_id: &str) -> Option<String> {
 fn typed(program: &str, words: &[String]) -> Option<String> {
     let mut line = String::from(program);
     for word in words {
-        if word.chars().any(char::is_control) {
+        if word
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
             return None;
         }
         line.push(' ');
@@ -127,7 +152,11 @@ pub fn bare(session_id: &str) -> Option<String> {
 pub fn with_env(env: &[(&str, &str)], line: &str) -> Option<String> {
     let mut out = String::new();
     for (name, value) in env {
-        if !env_name(name) || value.chars().any(char::is_control) {
+        if !env_name(name)
+            || value
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
             return None;
         }
         let plain = !value.is_empty()
@@ -165,9 +194,10 @@ pub fn home_env(
         .collect()
 }
 
-/// Whether `name` can be an environment variable's in a line: `[A-Z0-9_]+`.
+/// Whether `name` can be an environment variable's in a line: `[A-Z_][A-Z0-9_]*`.
 fn env_name(name: &str) -> bool {
     !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
         && name
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
@@ -210,7 +240,14 @@ fn env_word_len(rest: &str) -> Option<usize> {
 #[must_use]
 pub fn bare_of(line: &str) -> Option<String> {
     let (env, line) = split_env(line);
-    let (_, id) = line.rsplit_once(" --resume ")?;
+    let (head, id) = line.rsplit_once(" --resume ")?;
+    if !unquoted_at(line, head.len()) {
+        return None;
+    }
+    let words = super::upgrade_drive::last_command(line);
+    if words.first().map(String::as_str) != Some("claude") {
+        return None;
+    }
     bare(id).map(|bare| format!("{env}{bare}"))
 }
 
@@ -218,7 +255,10 @@ pub fn bare_of(line: &str) -> Option<String> {
 #[must_use]
 pub fn mode_of(line: &str) -> Option<String> {
     let (env, line) = split_env(line);
-    let (_, id) = line.rsplit_once(" --resume ")?;
+    let (head, id) = line.rsplit_once(" --resume ")?;
+    if !unquoted_at(line, head.len()) {
+        return None;
+    }
     let words = super::upgrade_drive::last_command(line);
     if words.first().map(String::as_str) != Some("claude") {
         return None;

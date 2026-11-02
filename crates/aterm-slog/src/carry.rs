@@ -193,7 +193,7 @@ fn roll_word(r: &Rollup) -> String {
 fn read_roll(raw: &str) -> Option<Rollup> {
     let n: Vec<u32> = raw
         .split(',')
-        .map(|v| v.parse().ok())
+        .map(crate::line::parse_u)
         .collect::<Option<Vec<u32>>>()?;
     if n.len() != 18 {
         return None;
@@ -444,7 +444,7 @@ impl Log {
         }
         let hk = |k: &str| -> Result<u64, CarryError> {
             kv_of(head, 2, k)
-                .and_then(|v| v.parse().ok())
+                .and_then(crate::line::parse_u)
                 .ok_or(CarryError::Line("a carry header field"))
         };
         let (ep, base) = (hk("ep")?, hk("base")?);
@@ -458,17 +458,14 @@ impl Log {
         let ids: Vec<u32> = kv_of(head, 2, "ids")
             .ok_or(CarryError::Line("a carry header's ids"))?
             .split(',')
-            .map(|v| v.parse().ok())
+            .map(crate::line::parse_u)
             .collect::<Option<Vec<u32>>>()
             .filter(|v| v.len() == 3)
             .ok_or(CarryError::Line("a carry header's ids"))?;
         let ep = u32::try_from(ep).map_err(|_| CarryError::Line("an epoch"))?;
         let base = u32::try_from(base).map_err(|_| CarryError::Line("an epoch"))?;
         let ms_head: Option<u64> = match kv_of(head, 2, "ms") {
-            Some(v) => Some(
-                v.parse()
-                    .map_err(|_| CarryError::Line("a carry's ms head"))?,
-            ),
+            Some(v) => Some(crate::line::parse_u(v).ok_or(CarryError::Line("a carry's ms head"))?),
             None => None,
         };
         let mirror = match ms_head {
@@ -477,7 +474,7 @@ impl Log {
                     .and_then(super::BusCursor::parse)
                     .ok_or(CarryError::Line("a carry's mirror cursor"))?;
                 let snap_ms: u64 = kv_of(head, 2, "snap")
-                    .and_then(|v| v.parse().ok())
+                    .and_then(crate::line::parse_u)
                     .ok_or(CarryError::Line("a carry's snapshot head"))?;
                 let prior = match kv_of(head, 2, "prior") {
                     Some(v) => {
@@ -487,9 +484,8 @@ impl Log {
                         Some(super::Prior {
                             landed: super::BusCursor::parse(c)
                                 .ok_or(CarryError::Line("a carry's prior space"))?,
-                            ms_head: h
-                                .parse()
-                                .map_err(|_| CarryError::Line("a carry's prior space"))?,
+                            ms_head: crate::line::parse_u(h)
+                                .ok_or(CarryError::Line("a carry's prior space"))?,
                         })
                     }
                     None => None,
@@ -554,7 +550,7 @@ impl Log {
                         return Err(CarryError::Line("a session's kind"));
                     }
                     let opened = flag(g("opened")?)?;
-                    let t: u64 = g("t")?.parse().map_err(|_| CarryError::Line("a time"))?;
+                    let t: u64 = crate::line::parse_u(g("t")?).ok_or(CarryError::Line("a time"))?;
                     let roll = read_roll(g("roll")?).ok_or(CarryError::Line("a rollup"))?;
                     if g("closed")? != "0" {
                         return Err(CarryError::Shape("a closed session is not carried"));
@@ -647,7 +643,7 @@ impl Log {
                     let g = |k: &str| kv_of(line, 2, k).ok_or(CarryError::Line("an open line"));
                     let kind = Kind::from_word(g("kind")?);
                     let parent = node_of(Some(g("par")?))?;
-                    let t: u64 = g("t")?.parse().map_err(|_| CarryError::Line("a time"))?;
+                    let t: u64 = crate::line::parse_u(g("t")?).ok_or(CarryError::Line("a time"))?;
                     let orphan = flag(g("orphan")?)?;
                     let roll = read_roll(g("roll")?).ok_or(CarryError::Line("a rollup"))?;
                     if !matches!(n.lvl, Lvl::Run | Lvl::Turn | Lvl::Step)
@@ -689,9 +685,8 @@ impl Log {
                         let (n, rest) = rest
                             .split_once(' ')
                             .ok_or(CarryError::Record("a record line without its ms"))?;
-                        let n: u64 = n
-                            .parse()
-                            .map_err(|_| CarryError::Record("a record line without its ms"))?;
+                        let n: u64 = crate::line::parse_u(n)
+                            .ok_or(CarryError::Record("a record line without its ms"))?;
                         (n, rest)
                     } else {
                         (0, rest)
@@ -806,9 +801,12 @@ impl Log {
         for (rec, ms) in recs.into_iter().zip(rec_ms) {
             let bytes = encoded_size(&rec, Tier::Content)
                 .map_err(|_| CarryError::Record("a record past its byte bound"))?;
+            // A carry with an `ms` head keeps each record's `ms` as its writer gave it (an
+            // older writer's field-less amend among them); one without numbers the records
+            // the mirror publishes afresh, as `Log::push` would (fix unit E5).
             let ms = match ms_head {
                 Some(_) => ms,
-                None if rec.is_bus_class() => {
+                None if rec.is_mirrored() => {
                     dense += 1;
                     dense
                 }
@@ -963,7 +961,7 @@ fn kv_of<'a>(line: &'a str, skip: usize, key: &str) -> Option<&'a str> {
 }
 
 fn num_of(raw: Option<&str>) -> Result<u64, CarryError> {
-    raw.and_then(|v| v.parse().ok())
+    raw.and_then(crate::line::parse_u)
         .ok_or(CarryError::Line("a number"))
 }
 

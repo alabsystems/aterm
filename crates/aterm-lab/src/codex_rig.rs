@@ -60,38 +60,20 @@ pub fn stand_ins(bin: &Path) -> std::io::Result<PathBuf> {
     Ok(lab)
 }
 
-/// Every process's command line, as `ps -axo pid=,command=` prints it.
-#[must_use]
-pub fn commands() -> Vec<(i32, String)> {
-    aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-axo", "pid=,command="])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| {
-                    let l = l.trim_start();
-                    let (pid, cmd) = l.split_once(' ')?;
-                    Some((pid.parse().ok()?, cmd.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Every process a run started.
+/// Every process a run started: `root`, each process whose command line names `scratch`, and
+/// what descends from them, in one read of the process table ([`crate::procs::commands`]).
 #[must_use]
 pub fn ours(root: i32, scratch: &Path) -> Vec<i32> {
     let s = scratch.to_string_lossy().into_owned();
     let me = i32::try_from(std::process::id()).unwrap_or(0);
+    let rows = crate::procs::commands();
     let mut roots: Vec<i32> = vec![root];
     roots.extend(
-        commands()
-            .into_iter()
-            .filter(|(p, c)| *p != me && c.contains(&s))
-            .map(|(p, _)| p),
+        rows.iter()
+            .filter(|(p, _, c)| *p != me && c.contains(&s))
+            .map(|(p, ..)| *p),
     );
-    let table = crate::procs::table();
+    let table: Vec<(i32, i32)> = rows.iter().map(|(p, pp, _)| (*p, *pp)).collect();
     let mut all: Vec<i32> = Vec::new();
     for r in roots {
         all.extend(crate::procs::descendants_in(&table, r));
@@ -546,7 +528,8 @@ pub fn nanos() -> u128 {
         .map_or(0, |d| d.as_nanos())
 }
 
-/// `ps [-A|-e] [-p PIDS] -o FIELD[=],…` from the kernel's process records.
+/// `ps [-A|-e] [-p PIDS] -o FIELD[=],…` from the kernel's process records, each column as
+/// `/bin/ps` prints it to a pipe, one space apart where `ps` pads each to its widest value.
 #[must_use]
 pub fn ps_main(args: &[String]) -> i32 {
     let (fields, rows) = match ps_rows(args, kproc::records, kproc::record) {
@@ -557,37 +540,109 @@ pub fn ps_main(args: &[String]) -> i32 {
         }
     };
     let now = crate::util::now_secs();
-    let mut out = String::new();
+    let locale = ps_locale(|name| std::env::var(name).ok(), crate::sys::locale_codeset);
+    let read = Readers {
+        tty: &crate::sys::tty_name,
+        comm: &|r: &kproc::Record| in_locale(locale, |l| kproc::ps_comm(r, l)),
+        args: &|r: &kproc::Record| in_locale(locale, |l| kproc::ps_args(r, l)),
+    };
+    let mut out = Vec::new();
     for r in &rows {
-        out.push_str(&ps_line(r, &fields, now));
-        out.push('\n');
+        out.extend(ps_line(r, &fields, now, &read));
+        out.push(b'\n');
     }
-    let _ = std::io::stdout().write_all(out.as_bytes());
+    let _ = std::io::stdout().write_all(&out);
     i32::from(rows.is_empty())
 }
 
+/// A `-o` column of the stand-in ([`ps_line`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Pid,
+    Ppid,
+    Pgid,
+    Tpgid,
+    /// The terminal's name less its `tty` or `cua` head (`s003`).
+    Tt,
+    /// The terminal's whole name (`ttys003`).
+    Tty,
+    Lstart,
+    Etime,
+    /// `argv[0]`.
+    Comm,
+    /// The kernel's short name (`p_comm`).
+    Ucomm,
+    /// The whole command line (`args`).
+    Args,
+    /// The whole command line, cut as `comm` is where another column follows (`command`).
+    Command,
+    /// `Z` for a zombie, as `ps`'s `stat` leads with it (what Codex's daemon reads of the column);
+    /// any other state unread, `-`.
+    Stat,
+    /// A keyword the stand-in has no reader for: `-`, no value, never another column's.
+    Unread,
+}
+
+impl Field {
+    /// The bytes `ps` prints of this column where another column follows it: `comm` and
+    /// `command` 16, `args` 64, cut even inside a character. Every other column is whole, and so
+    /// is the last.
+    fn cut(self) -> Option<usize> {
+        match self {
+            Field::Comm | Field::Command => Some(16),
+            Field::Args => Some(64),
+            _ => None,
+        }
+    }
+}
+
+/// Each `ps` keyword the stand-in reads, and its column.
+const FIELDS: &[(&str, Field)] = &[
+    ("pid", Field::Pid),
+    ("ppid", Field::Ppid),
+    ("pgid", Field::Pgid),
+    ("tpgid", Field::Tpgid),
+    ("tt", Field::Tt),
+    ("tty", Field::Tty),
+    ("lstart", Field::Lstart),
+    ("etime", Field::Etime),
+    ("comm", Field::Comm),
+    ("ucomm", Field::Ucomm),
+    ("args", Field::Args),
+    ("command", Field::Command),
+    ("stat", Field::Stat),
+];
+
 /// The `-o` fields `args` ask for and the records they choose, as `ps` chooses them: every
 /// process (`all`) with `-A` or `-e` or with no `-p`, else each pid `-p` lists (`one`), pid 0
-/// never. A `-p` list holds pids split by commas and spaces; an empty one, or a word that is no
-/// pid, is refused.
+/// never. An `-o` list holds keywords split by commas and spaces, each with its header after an
+/// `=`; a keyword [`FIELDS`] lacks is [`Field::Unread`]. A `-p` list holds pids split the same
+/// way; an empty one, or a word that is no pid, is refused.
 fn ps_rows(
     args: &[String],
     all: impl FnOnce() -> Option<Vec<kproc::Record>>,
     one: impl FnMut(u32) -> Option<kproc::Record>,
-) -> Result<(Vec<String>, Vec<kproc::Record>), String> {
+) -> Result<(Vec<Field>, Vec<kproc::Record>), String> {
     let (mut fields, mut pids, mut every) = (Vec::new(), None::<Vec<u32>>, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-A" | "-e" => every = true,
-            "-o" => fields.extend(
-                it.next()
-                    .map(String::as_str)
-                    .unwrap_or("")
-                    .split(',')
-                    .filter(|f| !f.is_empty())
-                    .map(|f| f.trim_end_matches('=').to_string()),
-            ),
+            "-o" => {
+                let list = it.next().map(String::as_str).unwrap_or("");
+                for word in list.split(|c: char| c == ',' || c.is_ascii_whitespace()) {
+                    let word = word.split_once('=').map_or(word, |(keyword, _)| keyword);
+                    if word.is_empty() {
+                        continue;
+                    }
+                    fields.push(
+                        FIELDS
+                            .iter()
+                            .find(|(name, _)| *name == word)
+                            .map_or(Field::Unread, |&(_, field)| field),
+                    );
+                }
+            }
             "-p" => {
                 let listed = pids.get_or_insert_with(Vec::new);
                 for piece in it.next().map(String::as_str).unwrap_or("").split(',') {
@@ -612,23 +667,112 @@ fn ps_rows(
     Ok((fields, rows.into_iter().filter(|r| r.pid > 0).collect()))
 }
 
-/// One `ps -o` line for `r`, its `fields` in order, `etime` measured at `now` (unix seconds).
-fn ps_line(r: &kproc::Record, fields: &[String], now: i64) -> String {
+/// What [`ps_line`] reads past the kernel's record: a terminal's name ([`crate::sys::tty_name`]
+/// for a live process), and `comm` and `args` ([`kproc::ps_comm`] and [`kproc::ps_args`] in
+/// `ps`'s locale, [`in_locale`]).
+struct Readers<'a> {
+    tty: &'a dyn Fn(Option<i32>) -> String,
+    comm: &'a dyn Fn(&kproc::Record) -> String,
+    args: &'a dyn Fn(&kproc::Record) -> String,
+}
+
+/// One `ps -o` line for `r`: its `fields` in order, one space apart, `etime` measured at `now`
+/// (unix seconds), what the record does not hold read by `read`, and a column another follows cut
+/// where `ps` cuts it ([`Field::cut`]).
+fn ps_line(r: &kproc::Record, fields: &[Field], now: i64, read: &Readers<'_>) -> Vec<u8> {
     let start = i64::try_from(r.start_s).unwrap_or(0);
-    fields
-        .iter()
-        .map(|f| match f.as_str() {
-            "pid" => r.pid.to_string(),
-            "ppid" => r.ppid.to_string(),
-            "pgid" => r.pgid.to_string(),
-            "tpgid" => r.tpgid.to_string(),
-            "tty" | "tt" => crate::sys::tty_name(r.tty),
-            "lstart" => lstart(start),
-            "etime" => etime(now - start),
-            _ => r.comm.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut line = Vec::new();
+    for (at, f) in fields.iter().enumerate() {
+        let value = match f {
+            Field::Pid => r.pid.to_string(),
+            Field::Ppid => r.ppid.to_string(),
+            Field::Pgid => r.pgid.to_string(),
+            Field::Tpgid => r.tpgid.to_string(),
+            Field::Tt => short_tty(&(read.tty)(r.tty)).to_string(),
+            Field::Tty => (read.tty)(r.tty),
+            Field::Lstart => lstart(start),
+            Field::Etime => etime(now - start),
+            Field::Comm => (read.comm)(r),
+            Field::Ucomm => r.comm.clone(),
+            Field::Args | Field::Command => (read.args)(r),
+            Field::Stat if r.zombie => "Z".to_string(),
+            Field::Stat | Field::Unread => "-".to_string(),
+        };
+        let mut value = value.into_bytes();
+        if let Some(cut) = f.cut().filter(|_| at + 1 < fields.len()) {
+            value.truncate(cut);
+        }
+        if at > 0 {
+            line.push(b' ');
+        }
+        line.extend(value);
+    }
+    line
+}
+
+/// `ps`'s `tt` of the terminal named `name`: the name less a `tty` or `cua` head.
+fn short_tty(name: &str) -> &str {
+    name.strip_prefix("tty")
+        .or_else(|| name.strip_prefix("cua"))
+        .unwrap_or(name)
+}
+
+/// The locale categories `ps`'s `setlocale(LC_ALL, "")` sets, by the variables that name them.
+const LOCALE_CATEGORIES: [&str; 6] = [
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+];
+
+/// The rendering `ps` prints `comm` and `args` in: the locale its `setlocale(LC_ALL, "")` sets
+/// from the environment read through `var`. Each category is the first of `LC_ALL`, its own
+/// variable and `LANG` set to a non-empty value, else `C`; a name `codeset` cannot load for its
+/// category (it answers the loaded locale's codeset, or `None`) fails the whole call, which leaves
+/// `ps` in C. Otherwise `LC_CTYPE`'s codeset decides: `UTF-8` is the UTF-8 rendering, `US-ASCII`
+/// (C's and POSIX's) the C one, and any other (`ISO8859-1`, `SJIS`) neither (`None`,
+/// [`in_locale`]).
+fn ps_locale(
+    var: impl Fn(&str) -> Option<String>,
+    codeset: impl Fn(&str, &str) -> Option<String>,
+) -> Option<kproc::Locale> {
+    let mut ctype = String::new();
+    for category in LOCALE_CATEGORIES {
+        let name = ["LC_ALL", category, "LANG"]
+            .into_iter()
+            .find_map(|name| var(name).filter(|value| !value.is_empty()))
+            .unwrap_or_else(|| "C".to_string());
+        let Some(set) = codeset(category, &name) else {
+            return Some(kproc::Locale::C);
+        };
+        if category == "LC_CTYPE" {
+            ctype = set;
+        }
+    }
+    match ctype.as_str() {
+        "UTF-8" => Some(kproc::Locale::Utf8),
+        "US-ASCII" => Some(kproc::Locale::C),
+        _ => None,
+    }
+}
+
+/// `read` (a `comm` or `args` reader) in `ps`'s rendering `locale` ([`ps_locale`]). In a codeset
+/// with no rendering here (`None`), the value both renderings agree on, which is ASCII text that
+/// every codeset prints alike, else `-`.
+fn in_locale(locale: Option<kproc::Locale>, read: impl Fn(kproc::Locale) -> String) -> String {
+    match locale {
+        Some(locale) => read(locale),
+        None => {
+            let c = read(kproc::Locale::C);
+            if c == read(kproc::Locale::Utf8) {
+                c
+            } else {
+                "-".to_string()
+            }
+        }
+    }
 }
 
 /// `ps`'s `lstart`: `%a %b %e %H:%M:%S %Y` in local time (`TZ` honoured).
@@ -760,33 +904,286 @@ pub const MCP_ECHO_TOOL: &str = "lab_echo";
 mod tests {
     use super::*;
 
-    /// A `ps -o` line is the kernel record's fields in the order asked, a process with no
-    /// terminal at `??` and its elapsed time from its start.
-    #[test]
-    fn a_ps_line_reads_the_kernel_record() {
-        let r = kproc::Record {
+    /// A record on the terminal numbered 3, started at 1000.
+    fn record() -> kproc::Record {
+        kproc::Record {
             pid: 4242,
             ppid: 1,
             pgid: 4240,
-            tpgid: 0,
-            tty: None,
+            tpgid: 4240,
+            tty: Some(3),
             uid: 501,
             comm: "zsh".to_string(),
             start_s: 1_000,
             start_us: 7,
             zombie: false,
+        }
+    }
+
+    /// The line `-p <pid> -o <o>` chooses and prints of `r`, read by `read`, `etime` at 1065.
+    fn line_of(o: &str, r: &kproc::Record, read: &Readers<'_>) -> Vec<u8> {
+        let pid = r.pid.to_string();
+        let args = ["-p", pid.as_str(), "-o", o].map(str::to_string);
+        let (fields, rows) =
+            ps_rows(&args, || None, |pid| (pid == r.pid).then(|| r.clone())).expect("parses");
+        assert_eq!(rows.len(), 1, "{o}");
+        ps_line(&rows[0], &fields, 1_065, read)
+    }
+
+    /// A `ps -o` line is the kernel record's fields in the order asked, each keyword its own
+    /// column: `tt` the terminal's name less its head and `tty` all of it, `etime` from its
+    /// start, `comm` and `args` (and `command`) from their readers, `ucomm` the kernel's short
+    /// name, `stat` `Z` for a zombie and `-` else, a keyword with no reader `-`, and a process
+    /// with no terminal at `??`. A `comm` or `command` another column follows is cut to 16 bytes
+    /// and an `args` to 64, even inside a character; the last column is whole.
+    #[test]
+    fn a_ps_line_reads_the_kernel_record() {
+        let tty = |dev: Option<i32>| match dev {
+            Some(3) => "ttys003".to_string(),
+            None => "??".to_string(),
+            Some(other) => panic!("no terminal {other}"),
         };
-        let fields: Vec<String> = ["pid", "ppid", "pgid", "tty", "etime", "comm"]
-            .iter()
-            .map(|f| (*f).to_string())
-            .collect();
-        assert_eq!(ps_line(&r, &fields, 1_065), "4242 1 4240 ?? 01:05 zsh");
-        assert_eq!(ps_line(&r, &["tpgid".to_string()], 1_065), "0");
+        let read = Readers {
+            tty: &tty,
+            comm: &|_: &kproc::Record| "-zsh".to_string(),
+            args: &|_: &kproc::Record| "-zsh -l".to_string(),
+        };
+        let r = record();
+        let every = "pid=,ppid=,pgid=,tpgid=,tt=,tty=,lstart=,etime=,comm=,ucomm=,args=,command=,\
+                     stat=,rss=";
+        assert_eq!(
+            String::from_utf8(line_of(every, &r, &read)).expect("UTF-8"),
+            format!(
+                "4242 1 4240 4240 s003 ttys003 {} 01:05 -zsh zsh -zsh -l -zsh -l - -",
+                lstart(1_000)
+            )
+        );
+        let dead = kproc::Record {
+            zombie: true,
+            tty: None,
+            ..record()
+        };
+        assert_eq!(line_of("stat=,tt=,tty=", &dead, &read), b"Z ?? ??");
+        let comm = "/ééééééééé";
+        let args = format!("/{} -l", "a".repeat(70));
+        let long = Readers {
+            tty: &tty,
+            comm: &|_: &kproc::Record| comm.to_string(),
+            args: &|_: &kproc::Record| args.clone(),
+        };
+        let cut: [&[u8]; 7] = [
+            "/ééééééé".as_bytes(),
+            &[0xc3],
+            b" ",
+            &args.as_bytes()[..64],
+            b" ",
+            &args.as_bytes()[..16],
+            b" 4242",
+        ];
+        assert_eq!(
+            line_of("comm=,args=,command=,pid=", &r, &long),
+            cut.concat()
+        );
+        assert_eq!(
+            line_of("pid=,comm=", &r, &long),
+            format!("4242 {comm}").into_bytes()
+        );
+        assert_eq!(
+            line_of("pid=,args=", &r, &long),
+            format!("4242 {args}").into_bytes()
+        );
+        assert_eq!(short_tty("cuau0"), "u0");
+        assert_eq!(short_tty("console"), "console");
+    }
+
+    /// A `/bin/sleep 600` its `argv[0]` names, killed and reaped once dropped.
+    struct Sleeping(i32);
+
+    impl Sleeping {
+        fn named(arg0: &str) -> Sleeping {
+            Sleeping(
+                crate::procs::spawn_kept(
+                    aterm_uds::spawnfd::command("/bin/sleep")
+                        .arg0(arg0)
+                        .arg("600"),
+                )
+                .expect("spawn sleep"),
+            )
+        }
+
+        fn record(&self) -> kproc::Record {
+            kproc::record(u32::try_from(self.0).expect("a pid")).expect("its record")
+        }
+    }
+
+    impl Drop for Sleeping {
+        fn drop(&mut self) {
+            let _ = crate::sys::kill(self.0, libc::SIGKILL);
+            if !crate::procs::wait_gone(self.0, Duration::from_secs(60)) {
+                eprintln!("sleep {} was not reaped", self.0);
+            }
+        }
+    }
+
+    /// What `/bin/ps -o <o> -p <pid>` prints with `env` its whole environment (and this test's
+    /// `TZ`), waited for as a one-minute hang detector.
+    fn ps_says(o: &str, pid: i32, env: &[(&str, &str)]) -> Vec<u8> {
+        let pid = pid.to_string();
+        let mut cmd = aterm_uds::spawnfd::command("/bin/ps");
+        cmd.args(["-o", o, "-p", pid.as_str()]).env_clear();
+        if let Ok(tz) = std::env::var("TZ") {
+            cmd.env("TZ", tz);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out =
+            aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(60))
+                .expect("/bin/ps answers within a minute");
+        assert!(out.status.success(), "{out:?}");
+        out.stdout
+    }
+
+    /// The stand-in's columns of a live process, each keyword read through its own table, are
+    /// the ones `/bin/ps` prints: `comm` its `argv[0]`, `args` and `command` its whole command
+    /// line, each cut where another column follows, `ucomm` the kernel's short name. The terminal
+    /// columns are left to `a_ps_line_reads_the_kernel_record`: two `devname` scans of a live
+    /// terminal can disagree under pty churn.
+    #[test]
+    fn a_live_process_reads_as_ps_prints_it() {
+        let sleep = Sleeping::named(&format!("/lab/{}-sleep", "a".repeat(70)));
+        let pid = sleep.record().pid.to_string();
+        let read = Readers {
+            tty: &crate::sys::tty_name,
+            comm: &|r: &kproc::Record| kproc::ps_comm(r, kproc::Locale::C),
+            args: &|r: &kproc::Record| kproc::ps_args(r, kproc::Locale::C),
+        };
+        let words = |line: &[u8]| {
+            String::from_utf8_lossy(line)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for o in [
+            "pid=,ppid=,pgid=,tpgid=,comm=,ucomm=,command=,lstart=,args=",
+            "args=,comm=,pid=",
+        ] {
+            let args = ["-p", pid.as_str(), "-o", o].map(str::to_string);
+            let (fields, rows) = ps_rows(&args, || None, kproc::record).expect("parses");
+            assert_eq!(rows.len(), 1, "{o}");
+            let ours = ps_line(&rows[0], &fields, 0, &read);
+            let theirs = ps_says(o, sleep.0, &[("LC_ALL", "C")]);
+            assert_eq!(words(&ours), words(&theirs), "{o}");
+        }
+    }
+
+    /// `ps` renders a name outside ASCII in the locale its `setlocale(LC_ALL, "")` makes, and so
+    /// does the stand-in, reading this Mac's locales: C with nothing set, with a name no locale
+    /// has, with `UTF-8` (a `LC_CTYPE` alone) or with any one category refused, UTF-8 in a UTF-8
+    /// locale and C in a US-ASCII one. In ISO8859-1, which neither rendering is, the stand-in
+    /// prints such a name `-` and an ASCII one as `ps` does.
+    #[test]
+    fn a_name_outside_ascii_reads_as_ps_prints_it_in_its_locale() {
+        let odd = Sleeping::named("/lab/é-sleep");
+        let plain = Sleeping::named("/lab/plain-sleep");
+        let comm = |sleep: &Sleeping, env: &[(&str, &str)]| {
+            let r = sleep.record();
+            let locale = ps_locale(
+                |name| {
+                    env.iter()
+                        .find(|(k, _)| *k == name)
+                        .map(|(_, v)| (*v).to_string())
+                },
+                crate::sys::locale_codeset,
+            );
+            format!("{}\n", in_locale(locale, |l| kproc::ps_comm(&r, l))).into_bytes()
+        };
+        let envs: [&[(&str, &str)]; 8] = [
+            &[],
+            &[("LANG", "en_US.UTF-8")],
+            &[("LC_ALL", "C.UTF-8")],
+            &[("LANG", "UTF-8")],
+            &[("LANG", "bogus")],
+            &[("LC_CTYPE", "en_US.UTF-8"), ("LANG", "bogus")],
+            &[("LC_ALL", ""), ("LC_CTYPE", "en_US.UTF-8")],
+            &[("LANG", "en_US.US-ASCII")],
+        ];
+        for env in envs {
+            for sleep in [&odd, &plain] {
+                assert_eq!(comm(sleep, env), ps_says("comm=", sleep.0, env), "{env:?}");
+            }
+        }
+        let latin: &[(&str, &str)] = &[("LANG", "en_US.ISO8859-1")];
+        assert_eq!(comm(&odd, latin), b"-\n");
+        assert_eq!(comm(&plain, latin), ps_says("comm=", plain.0, latin));
+    }
+
+    /// `ps` prints in the locale `setlocale(LC_ALL, "")` makes: each category the first of
+    /// `LC_ALL`, its own variable and `LANG` set to a non-empty value, else C; C again when any
+    /// category's name does not load (an unknown name, or `UTF-8`, which only `LC_CTYPE` loads);
+    /// else UTF-8 or C by `LC_CTYPE`'s codeset, and no rendering for another codeset. This Mac's
+    /// loader answers the codesets the stand-in reads.
+    #[test]
+    fn the_locale_is_the_one_ps_runs_in() {
+        let codeset = |category: &str, name: &str| {
+            match name {
+                "C" | "POSIX" => Some("US-ASCII"),
+                "en_US.UTF-8" | "C.UTF-8" => Some("UTF-8"),
+                "UTF-8" if category == "LC_CTYPE" => Some("UTF-8"),
+                "en_US.ISO8859-1" => Some("ISO8859-1"),
+                _ => None,
+            }
+            .map(str::to_string)
+        };
+        let locale = |set: &[(&str, &str)]| {
+            ps_locale(
+                |name| {
+                    set.iter()
+                        .find(|(k, _)| *k == name)
+                        .map(|(_, v)| (*v).to_string())
+                },
+                codeset,
+            )
+        };
+        let (c, utf8) = (Some(kproc::Locale::C), Some(kproc::Locale::Utf8));
+        assert_eq!(locale(&[]), c);
+        assert_eq!(locale(&[("LANG", "en_US.UTF-8")]), utf8);
+        assert_eq!(locale(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")]), c);
+        assert_eq!(
+            locale(&[
+                ("LC_ALL", ""),
+                ("LC_CTYPE", "POSIX"),
+                ("LANG", "en_US.UTF-8")
+            ]),
+            c
+        );
+        assert_eq!(locale(&[("LC_CTYPE", "C.UTF-8"), ("LANG", "C")]), utf8);
+        assert_eq!(locale(&[("LC_CTYPE", "UTF-8"), ("LANG", "C")]), utf8);
+        assert_eq!(locale(&[("LANG", "bogus")]), c, "a name no locale has");
+        assert_eq!(locale(&[("LANG", "UTF-8")]), c, "a name LC_COLLATE refuses");
+        assert_eq!(
+            locale(&[("LC_CTYPE", "en_US.UTF-8"), ("LANG", "bogus")]),
+            c,
+            "one category refused"
+        );
+        assert_eq!(locale(&[("LANG", "en_US.ISO8859-1")]), None);
+        let mac = crate::sys::locale_codeset;
+        assert_eq!(mac("LC_CTYPE", "en_US.UTF-8").as_deref(), Some("UTF-8"));
+        assert_eq!(mac("LC_CTYPE", "UTF-8").as_deref(), Some("UTF-8"));
+        assert_eq!(mac("LC_COLLATE", "UTF-8"), None);
+        assert_eq!(mac("LC_CTYPE", "C").as_deref(), Some("US-ASCII"));
+        assert_eq!(
+            mac("LC_CTYPE", "en_US.ISO8859-1").as_deref(),
+            Some("ISO8859-1")
+        );
+        assert_eq!(mac("LC_CTYPE", "bogus"), None);
+        assert_eq!(mac("LC_ALL", "C"), None, "no one category");
     }
 
     /// `-p` chooses exactly the pids it lists, as `ps` does: pid 0 (`kernel_task`, which the
     /// kernel's table does hold) is never a row, and a list that names no pid is refused rather
-    /// than read as no `-p` at all. Without `-p`, or with `-A`, every process is chosen.
+    /// than read as no `-p` at all. Without `-p`, or with `-A`, every process is chosen. An `-o`
+    /// list splits on commas and spaces alike, each keyword's header dropped.
     #[test]
     fn the_pid_list_chooses_exactly_its_pids() {
         let record = |pid: u32| kproc::Record {
@@ -821,11 +1218,25 @@ mod tests {
             assert!(chosen(&["-p", refused]).is_err(), "-p {refused:?}");
         }
         assert!(chosen(&["-p"]).is_err(), "-p with no list");
-        let (fields, _) = ps_rows(&["-o".to_string(), "pid=,ppid=".to_string()], every, |_| {
-            None
-        })
-        .expect("fields");
-        assert_eq!(fields, ["pid", "ppid"]);
+        let fields =
+            |o: &str| ps_rows(&["-o".to_string(), o.to_string()], every, |_| None).map(|(f, _)| f);
+        assert_eq!(
+            fields("pid=,ppid=PARENT,tt,command="),
+            Ok(vec![Field::Pid, Field::Ppid, Field::Tt, Field::Command])
+        );
+        assert_eq!(
+            fields("stat=,pid=,rss="),
+            Ok(vec![Field::Stat, Field::Pid, Field::Unread])
+        );
+        assert_eq!(
+            fields("pid, ppid"),
+            Ok(vec![Field::Pid, Field::Ppid]),
+            "spaces split -o too"
+        );
+        assert_eq!(
+            fields("pid  ppid,,comm\targs"),
+            Ok(vec![Field::Pid, Field::Ppid, Field::Comm, Field::Args])
+        );
     }
 
     #[test]

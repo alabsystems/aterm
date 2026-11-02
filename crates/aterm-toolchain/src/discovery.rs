@@ -9,6 +9,9 @@ use std::time::Duration;
 
 pub use crate::rustup::rustup_home;
 
+/// The shared `aterm.toml` admission budget for Settings, packages and store discovery.
+pub const MAX_ATERM_CONFIG_BYTES: usize = 512 * 1024;
+
 /// The seed-first Trust stage2 recreator and seal command shared across remedies.
 #[macro_export]
 macro_rules! trust_recreate_bootstrap_cmd {
@@ -19,13 +22,13 @@ macro_rules! trust_recreate_bootstrap_cmd {
     };
 }
 
-/// Whether `path` is a runnable file: not a directory, with an execute bit.
+/// Whether `path` is a runnable file: a regular file with an execute bit.
 #[cfg(unix)]
 #[must_use]
 pub fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
-        .map(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
 }
 
@@ -33,9 +36,19 @@ fn is_pending_stub(path: &Path) -> bool {
     use std::io::Read as _;
     const HEAD: u64 = 256;
     const MARKER: &str = "atpkg pending-program stub";
-    let Ok(file) = std::fs::File::open(path) else {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let Ok(file) = options.open(path) else {
         return false;
     };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return false;
+    }
     let mut head = Vec::new();
     if file.take(HEAD).read_to_end(&mut head).is_err() {
         return false;
@@ -43,12 +56,12 @@ fn is_pending_stub(path: &Path) -> bool {
     String::from_utf8_lossy(&head).contains(MARKER)
 }
 
-/// Whether `path` exists and is not a directory (Windows has no execute permission bit).
+/// Whether `path` exists and is a regular file (Windows has no execute permission bit).
 #[cfg(not(unix))]
 #[must_use]
 pub fn is_executable_file(path: &Path) -> bool {
     std::fs::metadata(path)
-        .map(|m| !m.is_dir())
+        .map(|m| m.is_file())
         .unwrap_or(false)
 }
 
@@ -58,8 +71,37 @@ pub fn tool_file(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
+fn strip_unquoted_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else {
+            match ch {
+                '"' => in_double = true,
+                '\'' => in_single = true,
+                '#' => return &line[..idx],
+                _ => {}
+            }
+        }
+    }
+    line
+}
+
 fn table_header(line: &str) -> Option<&str> {
-    let head = line.split('#').next().unwrap_or(line).trim_end();
+    let head = strip_unquoted_comment(line).trim_end();
     if head.starts_with("[[") {
         return Some("");
     }
@@ -152,11 +194,32 @@ pub fn pinned_channel_in(toml: &str) -> Option<String> {
     None
 }
 
+fn read_bounded_text(path: &Path, max_bytes: usize) -> Option<String> {
+    use std::io::Read as _;
+    let sentinel = u64::try_from(max_bytes).ok()?.checked_add(1)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(sentinel).read_to_end(&mut buf).ok()?;
+    if buf.len() > max_bytes {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
 /// [`pinned_channel_in`] over `<root>/rust-toolchain.toml`.
 #[must_use]
 pub fn pinned_channel(root: &Path) -> Option<String> {
-    std::fs::read_to_string(root.join("rust-toolchain.toml"))
-        .ok()
+    read_bounded_text(&root.join("rust-toolchain.toml"), 64 << 10)
         .as_deref()
         .and_then(pinned_channel_in)
 }
@@ -180,24 +243,8 @@ fn pinned_sysroot(dir: &Path, channel: &str) -> Option<PathBuf> {
     let driver = [format!("{channel}c"), channel.to_string()]
         .into_iter()
         .map(|n| dir.join(tool_file(&n)))
-        .find(|p| is_executable_file(p))?;
-    #[expect(
-        clippy::disallowed_types,
-        reason = "a std-only probe: this crate takes no dependency, so it cannot reach aterm-uds"
-    )]
-    let Ok(out) = std::process::Command::new(&driver)
-        .arg("--print")
-        .arg("sysroot")
-        .output()
-    else {
-        return None;
-    };
-    if !out.status.success() {
-        return None;
-    }
-    let Ok(sysroot) = String::from_utf8(out.stdout) else {
-        return None;
-    };
+        .find(|p| is_executable_file(p) && !is_pending_stub(p))?;
+    let sysroot = bounded_stdout(&driver, &["--print", "sysroot"], DATE_PROBE_BOUND)?;
     let sysroot = sysroot.trim();
     (!sysroot.is_empty() && Path::new(sysroot).join("lib/rustlib").is_dir())
         .then(|| PathBuf::from(sysroot))
@@ -207,7 +254,7 @@ fn pinned_sysroot(dir: &Path, channel: &str) -> Option<PathBuf> {
 #[must_use]
 pub fn atpkg_prefix(home: &Path, xdg_config_home: Option<&Path>) -> PathBuf {
     if let Some(xdg) = xdg_config_home.filter(|d| !d.as_os_str().is_empty()) {
-        if let Ok(text) = std::fs::read_to_string(xdg.join("aterm/aterm.toml"))
+        if let Some(text) = read_bounded_text(&xdg.join("aterm/aterm.toml"), MAX_ATERM_CONFIG_BYTES)
             && let Some(configured) = configured_prefix_in(&text, home)
         {
             return configured;
@@ -215,16 +262,20 @@ pub fn atpkg_prefix(home: &Path, xdg_config_home: Option<&Path>) -> PathBuf {
         return default_atpkg_prefix(home);
     }
     #[cfg(windows)]
-    if let Ok(text) = std::fs::read_to_string(
-        home.join("AppData")
+    if let Some(text) = read_bounded_text(
+        &home
+            .join("AppData")
             .join("Roaming")
             .join("aterm")
             .join("aterm.toml"),
+        MAX_ATERM_CONFIG_BYTES,
     ) {
         return configured_prefix_in(&text, home).unwrap_or_else(|| default_atpkg_prefix(home));
     }
-    if let Ok(text) = std::fs::read_to_string(home.join(".config/aterm/aterm.toml"))
-        && let Some(configured) = configured_prefix_in(&text, home)
+    if let Some(text) = read_bounded_text(
+        &home.join(".config/aterm/aterm.toml"),
+        MAX_ATERM_CONFIG_BYTES,
+    ) && let Some(configured) = configured_prefix_in(&text, home)
     {
         return configured;
     }
@@ -351,7 +402,7 @@ fn commit_date(bin: &Path) -> Option<String> {
     ["trustc", "rustc"]
         .iter()
         .map(|n| bin.join(tool_file(n)))
-        .filter(|p| is_executable_file(p))
+        .filter(|p| is_executable_file(p) && !is_pending_stub(p))
         .find_map(|driver| {
             let text = bounded_stdout(&driver, &["-vV"], DATE_PROBE_BOUND)?;
             let date = text
@@ -439,17 +490,14 @@ fn view_presents(entry: &Path, store_prefix: &Path) -> Option<PathBuf> {
         return None;
     }
     let store = || Some(store_stage2_bin(store_prefix));
-    let Ok(marker) = std::fs::read_to_string(store_prefix.join("links").join(STORE_CHANNEL)) else {
+    let Some(marker) = read_bounded_text(&store_prefix.join("links").join(STORE_CHANNEL), 64 << 10)
+    else {
         return store();
     };
     let Some(checkout) = marker.lines().find_map(|line| {
-        let value = line
-            .trim()
-            .strip_prefix("checkout")?
-            .trim_start()
-            .strip_prefix('=')?;
-        let value = value.trim().strip_prefix('"')?.strip_suffix('"')?;
-        (!value.contains(['"', '\\'])).then(|| PathBuf::from(value))
+        let rhs = strip_toml_key(line.trim(), "checkout")?;
+        let value = parse_toml_string(rhs)?;
+        (!value.is_empty()).then(|| PathBuf::from(value))
     }) else {
         return store();
     };
@@ -522,7 +570,11 @@ impl Toolchain {
         let mut demoted = None;
         let (tool_dir, store_bin) = if let Some(explicit) = stage2_bin {
             let dir = physical(explicit.to_path_buf());
-            if is_executable_file(&dir.join(&targo)) && !is_pinned_toolchain(&dir, pinned) {
+            let driver = dir.join(&targo);
+            if is_executable_file(&driver)
+                && !is_pending_stub(&driver)
+                && !is_pinned_toolchain(&dir, pinned)
+            {
                 refused = Some(dir.clone());
             }
             (dir, None)
@@ -534,9 +586,10 @@ impl Toolchain {
                 .and_then(|prefix| view_presents(&entry, prefix))
                 .unwrap_or_else(|| entry.join("bin"));
             let store_bin = store_prefix.map(store_stage2_bin);
+            let rustup_targo = rustup.join(&targo);
             let stale = store_prefix
                 .filter(|_| pinned.unwrap_or(STORE_CHANNEL) == STORE_CHANNEL)
-                .filter(|_| is_executable_file(&rustup.join(&targo)))
+                .filter(|_| is_executable_file(&rustup_targo) && !is_pending_stub(&rustup_targo))
                 .and_then(|prefix| older_than_store(&rustup, prefix));
             let head: Vec<PathBuf> = match (&stale, &store_bin) {
                 (Some(_), Some(store)) => vec![store.clone(), rustup.clone()],
@@ -577,7 +630,7 @@ impl Toolchain {
         let mut borrowed = Vec::new();
         let mut tool = |name: &'static str| {
             let own = tool_dir.join(tool_file(name));
-            if is_executable_file(&own) {
+            if is_executable_file(&own) && !is_pending_stub(&own) {
                 return Some(own);
             }
             if explicit {
@@ -632,13 +685,13 @@ impl Toolchain {
     /// True when an executable `targo` matching the pinned channel was found.
     #[must_use]
     pub fn have_targo(&self) -> bool {
-        self.refused.is_none() && is_executable_file(&self.targo)
+        self.refused.is_none() && is_executable_file(&self.targo) && !is_pending_stub(&self.targo)
     }
 
     /// True when `trustdoc` is an executable file in `stage2_dir`.
     #[must_use]
     pub fn have_trustdoc(&self) -> bool {
-        is_executable_file(&self.trustdoc)
+        is_executable_file(&self.trustdoc) && !is_pending_stub(&self.trustdoc)
     }
 
     /// Prepend `stage2_dir` to `inherited` `PATH` when [`Self::have_targo`] is true.
@@ -926,6 +979,18 @@ mod tests {
                 "pinned={pinned:?}"
             );
             assert!(!t.have_targo(), "pinned={pinned:?}");
+            let explicit = Toolchain::discover_with_store(
+                Some(&stubs),
+                &rustup_home(None, &home),
+                Some(&prefix),
+                OsStr::new(""),
+                pinned,
+            );
+            assert!(!explicit.have_targo(), "explicit pending stub is not targo");
+            assert!(
+                explicit.refused.is_none(),
+                "pending stub is absent, not an impostor"
+            );
         }
         let _ = fs::remove_dir_all(&home);
     }
@@ -1244,7 +1309,7 @@ mod tests {
         fs::write(
             prefix.join("links/trust"),
             format!(
-                "program = \"trust\"\ncheckout = \"{}\"\n",
+                "program = \"trust\"\ncheckout = '{}' # literal with comment\n",
                 checkout.display()
             ),
         )
@@ -1590,17 +1655,32 @@ mod tests {
             pinned_channel(Path::new("/nonexistent-repo")).as_deref(),
             None
         );
+        let tmp = mktemp_dir("atv-pin-bounded").expect("mktemp");
+        fs::write(
+            tmp.join("rust-toolchain.toml"),
+            format!(
+                "[toolchain]\nchannel = \"trust\"\n# {}\n",
+                "x".repeat(65 << 10)
+            ),
+        )
+        .expect("write");
+        assert_eq!(
+            pinned_channel(&tmp),
+            None,
+            "an oversized rust-toolchain.toml is rejected"
+        );
+        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn a_targo_that_is_not_the_pinned_toolchain_is_refused_not_adopted() {
         let tmp = mktemp_dir("atv-pin").expect("mktemp");
-        let bin = tmp.join("bin");
-        fs::create_dir_all(&bin).expect("mkdir");
-        exec_stub(&bin.join("targo"));
+        let bare = tmp.join("bare");
+        fs::create_dir_all(&bare).expect("mkdir");
+        exec_stub(&bare.join("targo"));
 
         let t = Toolchain::discover(
-            Some(&bin),
+            Some(&bare),
             Path::new("/unused"),
             OsStr::new(""),
             Some("trust"),
@@ -1608,9 +1688,12 @@ mod tests {
         assert!(!t.have_targo(), "fail-closed: not the pinned toolchain");
         assert!(t.refused.is_some());
 
-        exec_stub(&bin.join("trustc"));
+        let half = tmp.join("half");
+        fs::create_dir_all(&half).expect("mkdir");
+        exec_stub(&half.join("targo"));
+        exec_stub(&half.join("trustc"));
         let t = Toolchain::discover(
-            Some(&bin),
+            Some(&half),
             Path::new("/unused"),
             OsStr::new(""),
             Some("trust"),
@@ -1621,9 +1704,12 @@ mod tests {
         );
         assert!(t.refused.is_some());
 
-        driver_stub(&bin.join("trustc"));
+        let pinned = tmp.join("pinned");
+        fs::create_dir_all(&pinned).expect("mkdir");
+        exec_stub(&pinned.join("targo"));
+        driver_stub(&pinned.join("trustc"));
         let t = Toolchain::discover(
-            Some(&bin),
+            Some(&pinned),
             Path::new("/unused"),
             OsStr::new(""),
             Some("trust"),
@@ -1631,9 +1717,8 @@ mod tests {
         assert!(t.have_targo());
         assert!(t.refused.is_none());
 
-        fs::remove_file(bin.join(tool_file("trustc"))).expect("rm");
         let t = Toolchain::discover(
-            Some(&bin),
+            Some(&bare),
             Path::new("/unused"),
             OsStr::new(""),
             Some("stable"),
@@ -1686,6 +1771,27 @@ mod tests {
             !t.have_targo(),
             "fail-closed: a directory is not the verified driver"
         );
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt as _;
+            use std::os::unix::fs::PermissionsExt as _;
+            let fifo_dir = tmp.join("fifo-bin");
+            fs::create_dir_all(&fifo_dir).expect("mkdir fifo-bin");
+            let fifo = fifo_dir.join(tool_file("targo"));
+            let c_fifo = CString::new(fifo.as_os_str().as_bytes()).expect("cstr");
+            // SAFETY: `c_fifo` is a live NUL-terminated path in our private temp directory; `mkfifo` retains no pointer.
+            assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o755) }, 0, "mkfifo");
+            fs::set_permissions(&fifo, fs::Permissions::from_mode(0o755)).expect("chmod fifo");
+            assert!(!is_executable_file(&fifo));
+            assert!(!is_pending_stub(&fifo));
+            let t =
+                Toolchain::discover(Some(&fifo_dir), Path::new("/unused"), OsStr::new(""), None);
+            assert!(
+                !t.have_targo(),
+                "fail-closed: an executable FIFO is not a driver and must not hang discovery"
+            );
+        }
         fs::remove_dir_all(&tmp).ok();
     }
 
